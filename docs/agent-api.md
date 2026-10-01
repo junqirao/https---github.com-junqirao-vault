@@ -110,6 +110,20 @@ MountState = {
   # 正在创建 iSCSI 目标"）。阶段**只前进不回退**（迟到的服务端事件不会让界面倒着走）。
   phase,
   mounted_at, last_heartbeat_at, last_error,
+  # session_active：**实测**的本机 iSCSI 会话状态 —— 本机发起端当前是否还有到 target_iqn 的
+  #   活动连接（Get-IscsiSession 里 IsConnected 为真的会话）。
+  #   为什么要有它：state 只是**代理的记录/意图**，盘是否真的挂着由会话决定。会话被系统或
+  #   用户断开（MSiSCSI 服务重启、长时间断网、手动在发起程序里断开）之后，记录仍是 mounted，
+  #   界面于是显示"已挂载 + 卸载"，而盘根本不在 —— 用户既用不了盘、点卸载还会因为"挂载点
+  #   不存在"失败（真实诉求："挂载和卸载的按钮应以实际为准，看对应的 iSCSI 连接是否在活动中的"）。
+  #   界面判定**一律看它**：实测无会话时显示"已断开"、主按钮换成"挂载"。
+  #   代理对 mounted / error 记录（后者语义是"本机还有残留待清理"，也可能还挂着）每 ≈20s 实测
+  #   一次，结论变化时推 mount 事件；mounting/unmounting/revoked 不实测。
+  #   ⚠️ 只有实测为真才是 true；探测失败**不猜**（保持原值，绝不把好盘显示成断线）。
+  # session_checked_at：最近一次**得出会话结论**的时刻（毫秒）；结论不变时不刷新，不写盘。
+  #   0/缺省 = **尚未核对**（代理刚启动、记录刚从状态文件加载）。此时界面按 state 展示，
+  #   **不得**把 session_active 的缺省值当成"断线"（旧代理没有这两个字段，同样按 state 展示）。
+  session_active, session_checked_at,
   # ⚠️ last_error / last_error_detail 只在**真失败**时有值：state="error"（挂载失败，或
   #    心跳连续失败超过租约 TTL）与 state="revoked"（被服务端撤销）。
   #    state="mounted" 的挂载**永远不带错误**：心跳偶发失败只进日志与 server.last_error，
@@ -164,7 +178,10 @@ POST /agent/mount
   #          → New-IscsiTargetPortal（幂等）→ Connect-IscsiTarget（含 CHAP）
   #          → 等待会话连接 → 磁盘上线 → 挂载点分配（盘符或目录）
   #          → 执行 post_script（变量注入）→ 回写 /v1/leases/{id}/mounted
-  # 幂等：同一 allocation 已挂载时直接返回既有状态
+  # 幂等：同一 allocation 已挂载**且实测会话还在**（session_active）时直接返回既有状态。
+  #   判据必须带上实测会话，只看记录会撒谎：会话断掉后记录仍是 mounted，直接返回等于告诉
+  #   用户"已挂载"，而盘根本不在。实测无会话（或尚未核对/探测失败）时照常走完整流程去真重连，
+  #   幂等步骤会复用门户/会话，服务端也复用租约 —— 用户不必先"卸载"再"挂载"。
   #
   # **失败不留记录**（真实反馈："都错误了就不要有挂载记录了"）：
   #   - 用户主动挂载/重新挂载失败 → 清理这次尝试并**删除挂载记录**（不再留一条永久"错误"）；
@@ -186,6 +203,9 @@ POST /agent/unmount
   # 只有一种失败：**挂载点还在**（盘符/目录仍属于该卷，Windows 认为卷被占用）→ 带
   # stage="mount_point" 返回 500，记录回滚成卸载前的状态（盘确实还挂着，界面如实显示）。
   # 用户关掉占用它的程序再点一次即可，不需要"强制卸载"这种第二入口。
+  # 判"挂载点还在不在"有两条兜底：磁盘号已知且查不到挂载点；**或本机实测已无活动会话**
+  #   （盘随会话消失，挂载点不可能还在）。后者专治"会话被断后记录仍是已挂载"：进程重启后
+  #   磁盘号无从得知，只有前者时会既挂不上又卸不掉 —— 这条路径下卸载照常走完并删除记录。
   # 挂载点一旦移除（含报错但实际已不存在），后面几步都只是清残留：任一步失败只记日志、
   # 不中断，记录照样删除（服务端 release 会停用目标把残留会话踢掉）—— 因此不会留下
   # "盘符没了、状态还写着已挂载、还得再点一次强制卸载"的记录。
@@ -400,6 +420,11 @@ PATCH /agent/config
 GET /agent/events
   ↑ text/event-stream，事件类型：
      event: mount       data: MountState
+                       # 挂载/卸载/阶段推进时推；**会话实测结论变化时也推**（见 MountState
+                       # 的 session_active）—— 会话断开/恢复时 state 仍是 mounted，界面靠这条
+                       # 事件把"卸载"按钮翻回"挂载"、标签翻成"已断开"，不必用户手动刷新。
+                       # 因此界面不得把"收到 state=mounted"当成"刚挂上"：只有**亲眼看到它从
+                       # 非 mounted 变成 mounted** 才提示"已挂载"（会话实测不会产生这种变化）。
      event: unmount     data: {allocation_id}
      event: revoked     data: {allocation_id, reason}   # 服务端踢下线，代理已自行卸载
      event: server      data: {connected, last_error}   # 连接状态**真正变化**时才发（值未变不发）

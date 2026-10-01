@@ -11,7 +11,8 @@ import (
 // ---------- iscsi targets ----------
 
 const targetCols = `id, target_name, disk_id, purpose, allocation_id, auth_mode, chap_user,
-	chap_secret_enc, reverse_chap_secret_enc, enabled, desired_enabled, read_only, created_at, updated_at`
+	chap_secret_enc, reverse_chap_secret_enc, enabled, desired_enabled, read_only,
+	applied_fingerprint, applied_at, actual_iqn, created_at, updated_at`
 
 type targetRow struct {
 	ID                   string  `db:"id"`
@@ -26,6 +27,9 @@ type targetRow struct {
 	Enabled              bool    `db:"enabled"`
 	DesiredEnabled       bool    `db:"desired_enabled"`
 	ReadOnly             bool    `db:"read_only"`
+	AppliedFingerprint   string  `db:"applied_fingerprint"`
+	AppliedAt            int64   `db:"applied_at"`
+	ActualIQN            string  `db:"actual_iqn"`
 	CreatedAt            int64   `db:"created_at"`
 	UpdatedAt            int64   `db:"updated_at"`
 }
@@ -44,6 +48,9 @@ func (r targetRow) toDomain() *domain.IscsiTarget {
 		Enabled:              r.Enabled,
 		DesiredEnabled:       r.DesiredEnabled,
 		ReadOnly:             r.ReadOnly,
+		AppliedFingerprint:   r.AppliedFingerprint,
+		AppliedAt:            r.AppliedAt,
+		ActualIQN:            r.ActualIQN,
 		CreatedAt:            r.CreatedAt,
 		UpdatedAt:            r.UpdatedAt,
 	}
@@ -61,7 +68,7 @@ func (s *Store) CreateIscsiTarget(ctx context.Context, t *domain.IscsiTarget) er
 		`INSERT INTO iscsi_targets (`+targetCols+`)
 		 VALUES (:id, :target_name, :disk_id, :purpose, :allocation_id, :auth_mode, :chap_user,
 		         :chap_secret_enc, :reverse_chap_secret_enc, :enabled, :desired_enabled, :read_only,
-		         :created_at, :updated_at)`,
+		         :applied_fingerprint, :applied_at, :actual_iqn, :created_at, :updated_at)`,
 		map[string]any{
 			"id":                      t.ID,
 			"target_name":             t.TargetName,
@@ -75,6 +82,9 @@ func (s *Store) CreateIscsiTarget(ctx context.Context, t *domain.IscsiTarget) er
 			"enabled":                 t.Enabled,
 			"desired_enabled":         t.DesiredEnabled,
 			"read_only":               t.ReadOnly,
+			"applied_fingerprint":     t.AppliedFingerprint,
+			"applied_at":              t.AppliedAt,
+			"actual_iqn":              t.ActualIQN,
 			"created_at":              t.CreatedAt,
 			"updated_at":              t.UpdatedAt,
 		})
@@ -214,6 +224,46 @@ func (s *Store) SetIscsiTargetAllocation(ctx context.Context, targetID, allocati
 		return fmt.Errorf("store: 绑定 iSCSI 目标到分配失败: %w", err)
 	}
 	return mustAffect(res, apperr.IscsiTargetNotFound().WithArg("id", targetID))
+}
+
+// MarkIscsiTargetApplied 记录"这份期望状态已经成功下发到平台"。
+//
+// 这是挂载路径跳过重复下发的依据：指纹一致即认为平台侧就是我们上次下发的那份配置
+// （平台侧被外部改动的纠偏交给对账器，见 docs/implementation.md 5.3）。
+func (s *Store) MarkIscsiTargetApplied(ctx context.Context, id, fingerprint string) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE iscsi_targets SET applied_fingerprint = ?, applied_at = ?, updated_at = ? WHERE id = ?`),
+		fingerprint, nowMillis(), nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 写入 iSCSI 下发记账失败: %w", err)
+	}
+	return mustAffect(res, apperr.IscsiTargetNotFound().WithArg("id", id))
+}
+
+// ClearIscsiTargetApplied 抹掉下发记账（平台侧目标已被拆除或被判定为漂移）。
+//
+// 实际 IQN 一并清空：目标都没了，记着的连接名不再有意义。
+func (s *Store) ClearIscsiTargetApplied(ctx context.Context, id string) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE iscsi_targets
+		 SET applied_fingerprint = '', applied_at = 0, actual_iqn = '', updated_at = ?
+		 WHERE id = ?`),
+		nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 清除 iSCSI 下发记账失败: %w", err)
+	}
+	return mustAffect(res, apperr.IscsiTargetNotFound().WithArg("id", id))
+}
+
+// SetIscsiTargetActualIQN 记录平台侧实际用于连接的 IQN（Windows 会改写目标名）。
+func (s *Store) SetIscsiTargetActualIQN(ctx context.Context, id, iqn string) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE iscsi_targets SET actual_iqn = ?, updated_at = ? WHERE id = ?`),
+		iqn, nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 写入 iSCSI 实际 IQN 失败: %w", err)
+	}
+	return mustAffect(res, apperr.IscsiTargetNotFound().WithArg("id", id))
 }
 
 // DeleteIscsiTarget 删除目标及其 initiator 白名单。

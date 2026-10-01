@@ -10,7 +10,6 @@ import (
 	"vault/internal/domain"
 	"vault/internal/job"
 	"vault/internal/lock"
-	"vault/internal/platform"
 	"vault/internal/store"
 )
 
@@ -844,20 +843,18 @@ func (s *DiskService) detachTargets(ctx context.Context, path string, targetName
 	if s.Iscsi == nil {
 		return
 	}
+	if s.IscsiSvc == nil {
+		// 装配异常（App.New 一定会回填）：宁可不拆，也不在这里再写一套平台调用 ——
+		// 多一套实现正是"短名寻址、目标删不掉"的成因。
+		s.Log.Error("未装配 iSCSI 服务，跳过平台侧目标拆除", "path", path)
+		return
+	}
 	for _, name := range targetNames {
 		if strings.TrimSpace(name) == "" {
 			continue
 		}
-		if err := s.Iscsi.DetachLun(ctx, name, path); err != nil {
-			s.Log.Warn("解除目标映射失败", "target", name, "error", err)
-		}
-		// 只停用（不带 BackingRef）：保持映射不动，随后由 RemoveTarget 一并拆除。
-		if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: name, Enabled: false}); err != nil {
-			s.Log.Warn("停用目标失败", "target", name, "error", err)
-		}
-		if err := s.Iscsi.RemoveTarget(ctx, name); err != nil {
-			s.Log.Warn("删除目标失败", "target", name, "error", err)
-		}
+		// 目标拆除走唯一实现：寻址名由服务按 iqn_prefix 现推（短名问不到平台）。
+		s.IscsiSvc.TeardownTargetByShortName(ctx, name, TeardownOptions{DetachDiskPath: path})
 	}
 	if err := s.Iscsi.RemoveVirtualDisk(ctx, path); err != nil {
 		s.Log.Warn("移除 iSCSI 虚拟盘登记失败", "path", path, "error", err)

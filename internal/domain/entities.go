@@ -186,8 +186,21 @@ type Repository struct {
 	// 这类自相矛盾的配置。
 	MaxDiffDisks int `db:"max_diff_disks" json:"max_diff_disks"`
 	// QuotaBytes 应用层配额（母盘占用由 owner 独担，见 docs/implementation.md 13.2-⑧）。
+	//
+	// 存量老数据的兼容字段：新建库已经不再写它（界面也不再收集，见 RepoService.Create
+	// 的容量口径说明），>0 时仍按"库级上限"校验。
 	QuotaBytes int64 `db:"quota_bytes" json:"quota_bytes"`
-	// UsedBytes 已用量（母盘 + 本库名下差异盘物理占用）。
+	// CapacityBytes 库容量：建库时设定的容量（那块盘的 VHDX 标称容量）。
+	//
+	// **不落 repositories 表**，唯一真源是建库时创建的那块盘（共享模式母盘 parent、
+	// 独享模式自己的 standalone 盘）的 size_bytes，由 store 读取时联表派生，
+	// 免得库里再存一份容量、之后随母盘维护/重建漂移。读不到盘记录时为 0，
+	// 调用方（前端卡片）据此回退成"不显示分母"。
+	CapacityBytes int64 `db:"capacity_bytes" json:"capacity_bytes"`
+	// UsedBytes 已用量：本库名下**差异盘**的记账占用之和（见 store.repoUsageSQL）。
+	//
+	// 注意口径：母盘不在其中 —— 它的容量只在建库时作为"容量占用"校验一次，不记账。
+	// 因此独享库（不派生差异盘）恒为 0。
 	UsedBytes int64     `db:"used_bytes" json:"used_bytes"`
 	State     RepoState `db:"state" json:"state"`
 	// Meta 逻辑记录字段，JSON 序列化存储。

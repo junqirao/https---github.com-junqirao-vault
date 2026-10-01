@@ -26,7 +26,17 @@ type IscsiTarget struct {
 	// DesiredEnabled 期望启用状态，供对账器收敛。
 	DesiredEnabled bool `db:"desired_enabled" json:"desired_enabled"`
 	// ReadOnly 是否以只读方式发布（母盘临时共享必须为只读）。
-	ReadOnly  bool  `db:"read_only" json:"read_only"`
+	ReadOnly bool `db:"read_only" json:"read_only"`
+	// AppliedFingerprint 上次成功下发到平台的**期望状态指纹**（十六进制 SHA-256）。
+	//
+	// 非空表示"当前这份期望状态确实下发过"，是挂载路径跳过重复下发的唯一判据：
+	// 平台侧的实际状态由对账器读回核对（见 docs/implementation.md 5.3）。
+	AppliedFingerprint string `db:"applied_fingerprint" json:"-"`
+	// AppliedAt 上次成功下发的时间（Unix 毫秒）。
+	AppliedAt int64 `db:"applied_at" json:"-"`
+	// ActualIQN 平台侧实际用于连接的 IQN（Windows 会改写目标名）。
+	// 下发或对账时读回一次即持久化，后续挂载直接复用，避免每次挂载都读回。
+	ActualIQN string `db:"actual_iqn" json:"actual_iqn,omitempty"`
 	CreatedAt int64 `db:"created_at" json:"created_at"`
 	UpdatedAt int64 `db:"updated_at" json:"updated_at"`
 }

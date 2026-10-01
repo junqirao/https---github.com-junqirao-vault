@@ -13,6 +13,8 @@ const TONE_BY_VALUE: Record<string, Tone> = {
   succeeded: 'success',
   ok: 'success',
   mounted: 'success',
+  // 记录说已挂载，但代理实测本机已无活动会话（盘实际不在）—— 不是错误，但必须显眼。
+  disconnected: 'warning',
   compatible: 'success',
   idle: 'default',
   allocated: 'default',

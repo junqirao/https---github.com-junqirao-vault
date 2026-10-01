@@ -72,6 +72,8 @@ export interface RepoDTO {
   parent_condition?: ParentCondition
   max_diff_disks: number
   quota_bytes: number
+  /** 库容量：建库时设定的容量（那块盘的 VHDX 标称容量），服务端读时派生。 */
+  capacity_bytes: number
   used_bytes: number
   state: RepoState
   group?: string
@@ -543,4 +545,45 @@ export interface FsStat {
   file_count: number
   total_bytes: number
   truncated?: boolean
+}
+
+/** 孤儿文件分类（与后端 app.OrphanKind* 一致）。 */
+export type OrphanKind = 'diff' | 'parent' | 'other'
+
+/**
+ * 一个未被数据库登记的磁盘文件（GET /v1/system/orphans 的一项）。
+ *
+ * 这类文件只由对账（reconcile）发现，而它"仅报告"的表现就是一屏 WARN 日志 —— 用户看到
+ * 却无处处理，因此才有管理端「孤儿磁盘」页面：扫出来、由人确认后逐个删。
+ */
+export interface OrphanFileDTO {
+  /** 绝对路径。 */
+  path: string
+  /** 该文件所属的存储根（界面用来分组与展示）。 */
+  root: string
+  kind: OrphanKind
+  /** 文件长度（逻辑大小；VHDX 多为稀疏文件，物理占用可能更小）。 */
+  size_bytes: number
+  /** 最后修改时间（毫秒）。 */
+  modified_at: number
+}
+
+/** GET /v1/system/orphans 的响应：一次现扫的结果。 */
+export interface OrphanScanDTO {
+  /** 扫描时间（毫秒）。 */
+  at: number
+  roots: string[]
+  /** 扫过的 .vhdx 文件数（含已登记的）。 */
+  checked: number
+  files: OrphanFileDTO[]
+  total_bytes: number
+  /** 未能扫描的位置说明（平台不支持、根不可访问等），原样展示。 */
+  skipped?: string[]
+}
+
+/** POST /v1/system/orphans/delete 的响应。 */
+export interface OrphanDeleteResultDTO {
+  path: string
+  /** 释放的字节数。 */
+  freed_bytes: number
 }

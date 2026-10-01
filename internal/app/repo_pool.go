@@ -306,14 +306,11 @@ func (s *DiskService) runResetDiff(ctx context.Context, j *domain.Job, rep job.R
 
 	// 4) 重新发布：盘子换了，平台侧必须重新 Import + 映射 + 建启用状态。
 	//
-	// 先丢掉指纹缓存：上一步的 deleteDiskPhysical 已经把平台侧的目标删掉了，
-	// 但指纹只认"上次下发的内容"，如果这次的目标配置与上次完全一致（用户没连过、
-	// initiator 本来就是空的），指纹会认为"没变化"而跳过下发 —— 结果是下一个用户
-	// 连上一个根本不存在的目标。
+	// 下发记账不必在这里手工清：上一步的 deleteDiskPhysical 走的是统一拆除路径，
+	// 删目标时已把记账一起清掉（见 IscsiService.teardownTargetLocked → clearAppliedByName）。
+	// 它是按目标短名查 DB 再清，与寻址名（完整 IQN）无关；一旦残留就会
+	// "以为已下发过"而跳过，让下一个用户连上一个根本不存在的目标。
 	if s.IscsiSvc != nil {
-		for i := range targets {
-			s.IscsiSvc.forgetPushedSpec(targets[i].TargetName)
-		}
 		if err := s.IscsiSvc.EnsurePoolTarget(ctx, repo, disk); err != nil {
 			return err
 		}

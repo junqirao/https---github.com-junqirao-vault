@@ -147,6 +147,34 @@ func InvalidParam(field string) *Error {
 	return New(CodeInvalidParam, http.StatusBadRequest).WithArg("field", field)
 }
 
+// ---- system：孤儿磁盘文件（对账发现、管理端手动清理，见 app/orphan.go）----
+
+// OrphanPathInvalid 传入的路径不在任何生效存储根的 disks 目录下（或不是 .vhdx 文件）。
+//
+// 删除接口是本系统里唯一"按用户给的路径直接删文件"的接口，参数校验即最后一道防线，
+// 因此比普通参数校验更严（绝对路径 + .vhdx + 必须落在根白名单的 disks_dir 之下）。
+func OrphanPathInvalid() *Error {
+	return New("system.orphan_path_invalid", http.StatusBadRequest)
+}
+
+// OrphanRegistered 该文件已被数据库登记为磁盘，不能当作孤儿删除。
+//
+// 页面上的清单是扫描那一刻的快照，点删除前必须重新确认：期间文件可能已被建库/派生
+// 重新用上。宁可报错，也不能删掉真实在用的盘。
+func OrphanRegistered() *Error {
+	return New("system.orphan_registered", http.StatusConflict)
+}
+
+// OrphanNotFound 孤儿文件已不存在（可能已被删除，或已被对账移入孤儿目录）。
+func OrphanNotFound() *Error {
+	return New("system.orphan_not_found", http.StatusNotFound)
+}
+
+// OrphanDeleteFailed 删除失败（最常见的原因是文件正被程序占用）。
+func OrphanDeleteFailed() *Error {
+	return New("system.orphan_delete_failed", http.StatusInternalServerError)
+}
+
 // ---- platform ----
 
 // PlatformUnsupported 当前平台后端不具备该能力（如 Windows 上的 LVM 池管理）。

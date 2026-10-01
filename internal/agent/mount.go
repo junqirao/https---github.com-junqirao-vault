@@ -85,9 +85,25 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	unlock := e.a.locks.Lock("alloc:" + allocationID)
 	defer unlock()
 
-	// 幂等：同一 allocation 已挂载时直接返回既有状态。
+	// 幂等：同一 allocation 已挂载、且**实测本机确实还有活动会话**时，直接返回既有状态。
+	//
+	// 判据必须带上实测会话，只看记录会撒谎（真实诉求："挂载和卸载的按钮应以实际为准，
+	// 看对应的 iSCSI 连接是否在活动中的"）：会话被断之后记录仍是 mounted，直接返回
+	// 等于告诉用户"已挂载"，而盘根本不在 —— 用户既看不到盘、也拿不到任何解释。
+	// 此时应当照常走完整流程去真重连（幂等步骤会复用门户/会话，服务端也复用租约）。
+	//
+	// 尚未核对（刚启动，session_checked_at=0）与实测失败都**不**算命中：宁可多做一次
+	// 幂等的挂载，也不谎报"已经挂好了"。
 	if existing, _, ok := e.a.store.GetMount(allocationID); ok && existing.State == MountStateMounted {
-		return &existing, nil
+		active, verified := e.a.probeMountSession(ctx, allocationID)
+		if mountIdempotent(existing, active, verified) {
+			if latest, _, ok := e.a.store.GetMount(allocationID); ok {
+				return &latest, nil
+			}
+			return &existing, nil
+		}
+		e.a.logger.Info("记录是已挂载但本机已无活动会话，按实际未挂载重新挂载",
+			"allocation_id", allocationID, "target_iqn", existing.TargetIQN)
 	}
 	client, err := e.a.serverClient()
 	if err != nil {
@@ -313,6 +329,11 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		m.LastError = ""
 		// 挂载成功：清掉上一次的原始报错，避免诊断面板显示已经解决了的旧故障。
 		m.LastErrorDetail = ""
+		// 会话刚由本流程建立成功（WaitConnected 已确认），如实记为实测活动，
+		// 界面的"挂载/卸载"按钮据此判定（见 session_probe.go）。
+		m.SessionActive = true
+		m.SessionCheckedAt = now
+		r.SessionProbeFailures = 0
 		r.NextHeartbeatAt = now + r.heartbeatInterval().Milliseconds()
 		cp := *m
 		out = cp
@@ -504,17 +525,30 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 	// ① 移除挂载点（盘符或目录）。必须在磁盘下线之前做：盘一旦 Offline，盘符就没了。
 	if path := strings.TrimSpace(ms.MountPath); path != "" {
 		if err := e.a.vol.Unmount(ctx, path); err != nil {
-			// 幂等兜底：报错但挂载点其实已经不在了（磁盘早已下线、路径被系统摘除）时视为已完成 ——
-			// 否则会为了一个不存在的挂载点中断整次卸载，把后面的断开会话一起拖没。
-			if e.mountPointGone(ctx, ms, rt) {
-				e.a.logger.Info("挂载点已不存在，视为已移除",
-					"allocation_id", allocationID, "mount_path", path)
-			} else {
+			// 幂等兜底，两种"挂载点确实不在了"都必须视为已移除 —— 否则会为了一个不存在的
+			// 挂载点中断整次卸载，把后面的断开会话、回写释放、删记录一起拖没：
+			//
+			//   - 磁盘早已知晓（进程内记着磁盘号）却查不到挂载点；
+			//   - **本机已无活动会话**：盘随会话一起消失了，挂载点不可能还在。这条专治
+			//     "会话被断后记录仍是已挂载"的场景（进程重启后磁盘号无从得知，前一条
+			//     兜底会失效，于是用户既挂不上又卸不掉 —— 见 session_probe.go）。
+			pointGone := e.mountPointGone(ctx, ms, rt)
+			active, verified := false, false
+			if !pointGone {
+				active, verified = e.a.probeMountSession(ctx, allocationID)
+			}
+			if !mountPointRemoved(pointGone, active, verified) {
 				// 挂载点真的还在（盘符/目录仍属于该卷，Windows 认为卷正被占用）：
 				// 此时磁盘确实还挂着，如实失败并回滚状态才是对的 —— 继续往下做只会让
 				// 下线、断开跟着一起失败，最后留下"盘还挂着但记录已删"的假象。
 				return fail("mount_point", err)
 			}
+			reason := "挂载点已不存在"
+			if !pointGone {
+				reason = "本机已无活动会话（盘随会话消失）"
+			}
+			e.a.logger.Info("挂载点已不存在，视为已移除",
+				"allocation_id", allocationID, "mount_path", path, "reason", reason)
 		}
 	}
 	// 从这一步起，本机已经"看不出还挂着东西"了 —— 后续失败一律不回滚状态。

@@ -31,6 +31,29 @@ func fromJSON(s string, v any) {
 const repoCols = `id, name, mode, owner_id, parent_disk_id, parent_version, parent_condition,
 	max_diff_disks, quota_bytes, used_bytes, state, meta, created_at, updated_at`
 
+// repoCapacitySQL 是"库容量"的派生表达式（库容量 = 建库时设定的容量，见 domain.Repository.CapacityBytes）。
+//
+// 容量不落 repositories 表：唯一真源是建库时创建的那块盘的 size_bytes，所以读取时联表派生。
+// 共享库取它的母盘（parent_disk_id 指向的当前母盘）；无母盘的库（独享模式：它那块盘是
+// standalone，parent_disk_id 为空）退回按 repo_id 找它自己的盘，否则独享库永远派生不出容量。
+//
+// 用 coalesce 套两个标量子查询而不是 join：引用它的列表查询还要 ORDER BY / LIMIT，
+// 联表一旦出多行（同一库存在多块 parent/standalone 盘）同一个库就会在列表里重复出现，
+// 标量子查询天然只出一行；代价是每行两次索引点查，存储库是十几个量级，可以接受。
+const repoCapacitySQL = `COALESCE(
+		(SELECT p.size_bytes FROM disks p WHERE p.id = r.parent_disk_id),
+		(SELECT MAX(s.size_bytes) FROM disks s
+		  WHERE s.repo_id = r.id AND s.kind = '` + string(domain.DiskKindStandalone) + `'),
+		0)`
+
+// repoReadCols 是"读存储库"的列清单：repoCols + 派生的 capacity_bytes。
+//
+// 不能并入 repoCols：那份列表同时用作 INSERT 的列清单（见 CreateRepository）。
+// 引用它的查询必须把 repositories 别名为 r（repoCapacitySQL 依赖这个别名）。
+const repoReadCols = `r.id, r.name, r.mode, r.owner_id, r.parent_disk_id, r.parent_version,
+	r.parent_condition, r.max_diff_disks, r.quota_bytes, r.used_bytes, r.state, r.meta,
+	r.created_at, r.updated_at, ` + repoCapacitySQL + ` AS capacity_bytes`
+
 // repoRow 是 repositories 表的扁平映射，用于解决 meta 的 JSON 编解码。
 type repoRow struct {
 	ID              string  `db:"id"`
@@ -43,10 +66,12 @@ type repoRow struct {
 	MaxDiffDisks    int     `db:"max_diff_disks"`
 	QuotaBytes      int64   `db:"quota_bytes"`
 	UsedBytes       int64   `db:"used_bytes"`
-	State           string  `db:"state"`
-	Meta            string  `db:"meta"`
-	CreatedAt       int64   `db:"created_at"`
-	UpdatedAt       int64   `db:"updated_at"`
+	// CapacityBytes 是读时派生的库容量（见 repoCapacitySQL），不是表里的列。
+	CapacityBytes int64  `db:"capacity_bytes"`
+	State         string `db:"state"`
+	Meta          string `db:"meta"`
+	CreatedAt     int64  `db:"created_at"`
+	UpdatedAt     int64  `db:"updated_at"`
 }
 
 func (r repoRow) toDomain() *domain.Repository {
@@ -59,6 +84,7 @@ func (r repoRow) toDomain() *domain.Repository {
 		ParentVersion: r.ParentVersion,
 		MaxDiffDisks:  r.MaxDiffDisks,
 		QuotaBytes:    r.QuotaBytes,
+		CapacityBytes: r.CapacityBytes,
 		UsedBytes:     r.UsedBytes,
 		State:         domain.RepoState(r.State),
 		CreatedAt:     r.CreatedAt,
@@ -120,7 +146,7 @@ func nullableCondition(r *domain.Repository) any {
 func (s *Store) GetRepository(ctx context.Context, id string) (*domain.Repository, error) {
 	var row repoRow
 	err := s.q.GetContext(ctx, &row,
-		s.q.Rebind(`SELECT `+repoCols+` FROM repositories WHERE id = ?`), id)
+		s.q.Rebind(`SELECT `+repoReadCols+` FROM repositories r WHERE r.id = ?`), id)
 	if err != nil {
 		return nil, notFound(err, func() *apperr.Error { return apperr.RepoNotFound().WithArg("id", id) })
 	}
@@ -131,7 +157,7 @@ func (s *Store) GetRepository(ctx context.Context, id string) (*domain.Repositor
 func (s *Store) GetRepositoryByName(ctx context.Context, name string) (*domain.Repository, error) {
 	var row repoRow
 	err := s.q.GetContext(ctx, &row,
-		s.q.Rebind(`SELECT `+repoCols+` FROM repositories WHERE name = ?`), name)
+		s.q.Rebind(`SELECT `+repoReadCols+` FROM repositories r WHERE r.name = ?`), name)
 	if err != nil {
 		return nil, notFound(err, func() *apperr.Error { return apperr.RepoNotFound().WithArg("name", name) })
 	}
@@ -155,13 +181,13 @@ func (s *Store) ListRepositories(ctx context.Context, ownerID string, limit, off
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	query := `SELECT ` + repoCols + ` FROM repositories`
+	query := `SELECT ` + repoReadCols + ` FROM repositories r`
 	args := []any{}
 	if ownerID != "" {
-		query += ` WHERE owner_id = ?`
+		query += ` WHERE r.owner_id = ?`
 		args = append(args, ownerID)
 	}
-	query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+	query += ` ORDER BY r.created_at DESC LIMIT ? OFFSET ?`
 	args = append(args, limit, offset)
 
 	var rows []repoRow

@@ -129,6 +129,7 @@ export { LeaseList, type LeaseListProps } from './features/lease/LeaseList'
 export { JobList } from './features/job/JobList'
 export { AuditList } from './features/audit/AuditList'
 export { StorageList } from './features/storage/StorageList'
+export { OrphanDisks } from './features/system/OrphanDisks'
 export { SystemSettings, type SystemSettingsProps } from './features/system/SystemSettings'
 export { ClientSettings, type ClientSettingsProps } from './features/settings/ClientSettings'
 

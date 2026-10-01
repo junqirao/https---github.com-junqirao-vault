@@ -32,6 +32,8 @@ import type {
   LvmPoolStatusDTO,
   MemberDTO,
   MountSpec,
+  OrphanDeleteResultDTO,
+  OrphanScanDTO,
   ParentAction,
   RepoDTO,
   ConfigResponse,
@@ -105,6 +107,18 @@ export class VaultApi extends ApiClient {
 
   auditLogs(params?: { user_id?: string; action?: string; limit?: number; offset?: number }): Promise<ListResponse<AuditDTO>> {
     return this.request<ListResponse<AuditDTO>>('GET', '/v1/system/audit', undefined, params)
+  }
+
+  /** 现扫一遍孤儿磁盘文件（未登记却真实存在的 .vhdx；仅超级管理员）。 */
+  scanOrphans(): Promise<OrphanScanDTO> {
+    return this.request<OrphanScanDTO>('GET', '/v1/system/orphans')
+  }
+
+  /**
+   * 删除一个孤儿磁盘文件（仅超级管理员；不可逆，服务端会在删除前重新校验它仍未被登记）。
+   */
+  deleteOrphan(path: string): Promise<OrphanDeleteResultDTO> {
+    return this.request<OrphanDeleteResultDTO>('POST', '/v1/system/orphans/delete', { path })
   }
 
   // ---- 平台存储池（LVM thin pool / dm-cache；仅超级管理员，Windows 返回 501） ----

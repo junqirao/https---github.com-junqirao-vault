@@ -14,7 +14,7 @@ import type { RepoDTO } from '../../api/types'
 import { useAuth } from '../../hooks/useAuth'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { formatBytes, formatTime } from '../../utils/format'
+import { formatTime, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { RepoMountActions, RepoMountStateTag, RepoMountStatus, useRepoMount } from './RepoMount'
 
@@ -39,13 +39,8 @@ interface RepoCardProps {
 function RepoCard({ repo, currentUserId, onOpen }: RepoCardProps): JSX.Element {
   const { t } = useI18n()
   const mountController = useRepoMount(repo, currentUserId)
-  // 库**没有配额**：库只有"容量"（建库时设定），这个容量就是它占用的配额。
-  // 因此卡片上只展示"这个库占用了多少配额"；只有存量数据里残留了库级配额（>0）时才带分母。
-  const percent = repo.quota_bytes > 0 ? Math.min(100, Math.round((repo.used_bytes / repo.quota_bytes) * 100)) : 0
-  const capacity =
-    repo.quota_bytes > 0
-      ? `${formatBytes(repo.used_bytes)} / ${formatBytes(repo.quota_bytes)}`
-      : formatBytes(repo.used_bytes)
+  // 用量口径统一在 repoUsage 里（分母 = 库容量），卡片只负责画。
+  const { percent, text: usage } = repoUsage(repo)
 
   return (
     <Card
@@ -89,7 +84,7 @@ function RepoCard({ repo, currentUserId, onOpen }: RepoCardProps): JSX.Element {
           <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
             {t('repo.used')}
           </Typography.Text>
-          <Typography.Text style={{ fontSize: fontSize.sm }}>{capacity}</Typography.Text>
+          <Typography.Text style={{ fontSize: fontSize.sm }}>{usage}</Typography.Text>
         </div>
         <Progress
           percent={percent}
@@ -170,13 +165,10 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
       { title: t('field.mode'), dataIndex: 'mode', key: 'mode', width: 200, render: (value: string) => repoModeLabel(value) },
       { title: t('field.group'), dataIndex: 'group', key: 'group', render: (value?: string) => value || '-' },
       {
-        // 与卡片一致：库只有容量、没有配额，这里展示"该库占用了多少配额"。
+        // 与卡片同一口径（分母 = 库容量，见 repoUsage）；表格里只出文字，不出进度条。
         title: t('repo.used'),
         key: 'size',
-        render: (_value, repo) =>
-          repo.quota_bytes > 0
-            ? `${formatBytes(repo.used_bytes)} / ${formatBytes(repo.quota_bytes)}`
-            : formatBytes(repo.used_bytes)
+        render: (_value, repo) => repoUsage(repo).text
       },
       {
         title: t('common.status'),

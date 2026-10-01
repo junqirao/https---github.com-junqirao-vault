@@ -176,6 +176,23 @@ type MountState struct {
 	MountedAt       int64  `json:"mounted_at,omitempty"`
 	LastHeartbeatAt int64  `json:"last_heartbeat_at,omitempty"`
 	LastError       string `json:"last_error,omitempty"`
+	// SessionActive 是**实测**的本机 iSCSI 会话状态：本机发起端当前是否还有到
+	// TargetIQN 的活动连接（Get-IscsiSession 里 IsConnected 为真的会话）。
+	//
+	// 为什么记录里要存"实测值"：state 只是**代理的意图/记录**，磁盘是否真的挂着由会话决定。
+	// 会话被系统或用户断开（服务重启、网络长时间中断、手动在 iSCSI 发起程序里断开）后，
+	// 记录仍写着 mounted —— 界面于是显示"已挂载"并给出"卸载"按钮，而用户既用不了这块盘、
+	// 点卸载还会因为"挂载点不存在"失败（真实诉求："挂载和卸载的按钮应以实际为准，
+	// 看对应的 iSCSI 连接是否在活动中"）。
+	//
+	// ⚠️ 只有**实测为真**时才是 true；探测失败一律不猜（保持原值，见 probeMountSession）。
+	SessionActive bool `json:"session_active,omitempty"`
+	// SessionCheckedAt 是最近一次**得出结论**的实测时刻（毫秒时间戳）。
+	//
+	// 只在结论变化时刷新（每 20s 一轮都写盘没必要，见 recordSessionProbe）。
+	// 0 表示**尚未核对**（代理刚启动、记录刚从状态文件加载）：界面此时不应把
+	// session_active=false 当成"断线"，而应按记录状态展示 —— 见 docs/agent-api.md。
+	SessionCheckedAt int64 `json:"session_checked_at,omitempty"`
 	// LastErrorDetail 是最近一次失败的**原始报错文本**（如 PowerShell 脚本自报的 .NET 异常），
 	// 供本机诊断展示（见 mountErrorDetailOf 的说明：这是"原始报错只进日志"的刻意例外，
 	// 只出现在本状态里，不进任何 API 错误响应）。
@@ -199,6 +216,11 @@ type mountRuntime struct {
 	HeartbeatFailCount int
 	HeartbeatFailSince int64
 	NextHeartbeatAt    int64
+	// SessionProbeFailures 是会话实测连续失败次数（只在内存中）。
+	//
+	// 用途：探测走一次 PowerShell，宿主机上 PowerShell 出问题时会**每轮**都失败；
+	// 只在首次失败与恢复时各记一条日志，避免 20s 一次的报错把日志刷满。
+	SessionProbeFailures int
 	// HeartbeatError 表示当前 state=error 是"心跳连续失败超过 TTL"造成的（磁盘其实还挂着）。
 	//
 	// 它把这类 error 与"挂载失败后保留的 error 记录"区分开：前者要继续发心跳（服务端恢复后
@@ -281,6 +303,11 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 				if m.AllocationID == "" {
 					continue
 				}
+				// 上次进程实测的会话状态一律作废：进程重启不等于会话消失（iSCSI 会话归操作
+				// 系统管），沿用旧结论会在两个方向上撒谎。复位成"尚未核对"，由会话实测
+				// 循环（约 20s 内）或启动时的自动挂载写入真实值。
+				m.SessionActive = false
+				m.SessionCheckedAt = 0
 				s.mounts[m.AllocationID] = &m
 			}
 		}

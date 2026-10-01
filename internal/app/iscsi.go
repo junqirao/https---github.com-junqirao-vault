@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"vault/internal/apperr"
@@ -32,63 +31,57 @@ const defaultChapSecretChars = 15
 //
 // 授权模型：**一个分配对应一个独立目标**（见 docs/implementation.md 5.3），
 // 因为 Windows 的 CHAP 是"每目标一组账号"，无法在同一目标内区分多用户。
+//
+// # 分配与分发：下发一次，之后只读库
+//
+// Windows 上一次全量下发（建/改目标 + 授权 + CHAP + 映射 + 启用）实测约 **35 秒**
+// （两次 Set-IscsiServerTarget 各约 15 秒 + 一次映射约 5 秒），而"连一块已经连过的盘"
+// 在业务上是**分发**动作，不该付这份成本（真实工单："再连一次要等 1 分钟"）。
+//
+// 因此把两件事分开（见 docs/implementation.md 5.3）：
+//
+//   - **分配阶段**（建库预创建 EnsurePoolTarget / 首次挂载 / 配置变更）：全量下发一次，
+//     下发成功后把**期望状态指纹**写进 `iscsi_targets.applied_fingerprint`；
+//   - **分发阶段**（之后每次挂载）：只拿 DB 里的指纹与新构造的期望状态比一比，一致就整段跳过 ——
+//     连"读回平台现状"都不做（读回同样要跑 PowerShell，目标多时更慢）。
+//
+// 指纹包含 CHAP 密钥与只读标志（密钥只进哈希，绝不落库/进日志）：平台侧读不回这两项，
+// 所以"读现状比对"本来就证明不了"CHAP 仍是上次那组"，反而是它把跳过判死的原因之一。
+//
+// 平台侧被外部改动的兜底放在**对账器**里（ReconcileTargets）：目标不存在 → 重建；
+// 启用状态不符 → 按 DB 收敛；读回与记录不一致 → 告警（见该函数的说明）。
 type IscsiService struct {
 	Deps
 	Disks *DiskService
-
-	// pushedMu / pushedSpecs 缓存"本次进程内已成功下发过的目标期望状态指纹"（key=目标名）。
-	//
-	// 为什么需要它：Windows 上一次全量下发（建/改目标 + 授权 + CHAP + 映射 + 启用）实测约 **15 秒**，
-	// 而**每次挂载**、每次对账都会走到 pushTarget（真实工单："每次挂载都要等十几秒"）。
-	// 而平台层的 GetTarget 只能读回 Name/Enabled/Initiators/Devices 四类字段，**读不回 CHAP 与只读标志**，
-	// 所以只靠"读现状比对"无法证明"CHAP 仍是上次下发的那一组"。
-	//
-	// 跳过下发需要**两个条件同时成立**（见 targetUnchanged）：
-	//  ① 指纹一致 → 期望状态与上次成功下发时逐字段相同（含密钥；密钥只进哈希，绝不进日志/DB）；
-	//  ② 现状比对 → Windows 侧没被外部改动（启用状态 / 授权列表 / 映射盘）。
-	// 进程重启后缓存为空 → 首次仍会全量下发一次（安全侧）。
-	pushedMu    sync.Mutex
-	pushedSpecs map[string]string
-
-	// actualIQNMu / actualIQNs 记录**平台侧实际的目标名**（key 为短名，小写）。
-	//
-	// 为什么必须读回来：即便我们按 IQN 下发，平台也可能按自己的规则改写目标名
-	// （Windows 目标服务器就有这种形态）。下发给客户端的 IQN 只要与平台实际存储的不一致，
-	// 表现就是"端口通、登录失败"。读回后再下发，等于以平台为准。
-	// 纯内存即可：每次挂载都会先走 Publish（见 LeaseService.RequestMount）。
-	actualIQNMu sync.Mutex
-	actualIQNs  map[string]string
 }
 
-// targetIQN 返回该目标**应当下发给客户端**的 IQN：优先用平台读回的实际名字，
-// 读回记录缺失时回退到按前缀推导（列表展示等未下发过的场景）。
+// targetIQN 返回该目标**应当下发给客户端**的 IQN：优先用下发/对账时读回并持久化的实际名字，
+// 从未读回过时回退到按前缀推导（列表展示等未下发过的场景）。
+//
+// 为什么必须读回一次：即便我们按 IQN 下发，平台也可能按自己的规则改写目标名
+// （Windows 目标服务器就有这种形态）。下发给客户端的 IQN 只要与平台实际存储的不一致，
+// 表现就是"端口通、登录失败"。读回后落库，等于以平台为准且只付一次读回成本。
 func (s *IscsiService) targetIQN(t *domain.IscsiTarget) string {
 	if t == nil {
 		return ""
 	}
-	key := strings.ToLower(strings.TrimSpace(t.TargetName))
-	s.actualIQNMu.Lock()
-	actual := s.actualIQNs[key]
-	s.actualIQNMu.Unlock()
-	if strings.TrimSpace(actual) != "" {
+	if actual := strings.TrimSpace(t.ActualIQN); actual != "" {
 		return actual
 	}
 	return t.IQN(s.iqnPrefix())
 }
 
-// rememberActualIQN 记录平台侧实际的目标名。
-func (s *IscsiService) rememberActualIQN(shortName, actual string) {
-	shortName = strings.ToLower(strings.TrimSpace(shortName))
+// rememberActualIQN 记录平台侧实际的目标名（落库，跨重启有效；未变化时不写）。
+func (s *IscsiService) rememberActualIQN(ctx context.Context, t *domain.IscsiTarget, actual string) {
 	actual = strings.TrimSpace(actual)
-	if shortName == "" || actual == "" {
+	if t == nil || t.ID == "" || actual == "" || actual == strings.TrimSpace(t.ActualIQN) {
 		return
 	}
-	s.actualIQNMu.Lock()
-	if s.actualIQNs == nil {
-		s.actualIQNs = make(map[string]string)
+	if err := s.Store.SetIscsiTargetActualIQN(ctx, t.ID, actual); err != nil {
+		s.Log.Warn("写回 iSCSI 实际 IQN 失败", "target", t.TargetName, "actual_iqn", actual, "error", err)
+		return
 	}
-	s.actualIQNs[shortName] = actual
-	s.actualIQNMu.Unlock()
+	t.ActualIQN = actual
 }
 
 // legacyWinIQNPrefix 是 Windows 目标服务器给"非 IQN 形态"目标名加上的默认命名权。
@@ -188,6 +181,8 @@ func isRewrittenIQN(actual, iqn string) bool {
 //
 // 旧目标用的是短名，而客户端拿到的 IQN 从来就没对上过 —— 也就是说它们从未被成功连接，
 // 因此删除是安全的。删除失败不阻断（新目标仍会创建，映射冲突时会有明确报错）。
+//
+// 只在"真的要下发"时才调用（见 pushTarget）：它要枚举平台上的全部目标，也是一次 PowerShell。
 func (s *IscsiService) migrateLegacyTargetName(ctx context.Context, shortName, iqn string) {
 	if s.Iscsi == nil || strings.EqualFold(strings.TrimSpace(shortName), strings.TrimSpace(iqn)) {
 		return
@@ -207,7 +202,7 @@ func (s *IscsiService) migrateLegacyTargetName(ctx context.Context, shortName, i
 			s.Log.Warn("删除旧命名 iSCSI 目标失败", "legacy", name, "error", rmErr)
 			continue
 		}
-		s.forgetPushedSpec(name)
+		s.clearAppliedByName(ctx, name)
 	}
 }
 
@@ -401,8 +396,11 @@ func (s *IscsiService) ReconcileTargets(ctx context.Context) error {
 			}
 			// Windows 侧不存在：用 SetTarget（upsert）重建目标并按 DB 期望值启用。
 			// 重建前先清掉旧命名的目标：它们与新 IQN 目标会争抢同一个 VHDX 的映射。
+			//
+			// 必须**强制**下发：记账里的指纹可能还留着（目标是被外部删掉的），
+			// 走会跳过的 pushTarget 会把"重建"变成空操作。
 			s.migrateLegacyTargetName(ctx, t.TargetName, iqn)
-			if err := s.pushTarget(ctx, t, t.DesiredEnabled); err != nil {
+			if err := s.forcePushTarget(ctx, t, t.DesiredEnabled); err != nil {
 				s.Log.Error("重建 iSCSI 目标失败", "target", t.TargetName, "error", err)
 				continue
 			}
@@ -413,12 +411,8 @@ func (s *IscsiService) ReconcileTargets(ctx context.Context) error {
 		}
 		if info.Enabled != t.DesiredEnabled {
 			enabled := t.DesiredEnabled
-			spec, sErr := s.buildTargetSpec(ctx, t, enabled)
-			if sErr != nil {
-				s.Log.Error("构造目标期望状态失败", "target", t.TargetName, "error", sErr)
-				continue
-			}
-			if err := s.Iscsi.EnsureTarget(ctx, spec); err != nil {
+			// 强制下发：平台现状已经确知与期望不符，跳过判据在这里不适用。
+			if err := s.forcePushTarget(ctx, t, enabled); err != nil {
 				s.Log.Error("收敛目标启用状态失败", "target", t.TargetName, "error", err)
 				continue
 			}
@@ -426,6 +420,21 @@ func (s *IscsiService) ReconcileTargets(ctx context.Context) error {
 				s.Log.Warn("写回目标启用状态失败", "target", t.TargetName, "error", err)
 			}
 			s.Log.Info("已收敛 iSCSI 目标启用状态", "target", t.TargetName, "enabled", enabled)
+			continue
+		}
+		// 启用状态一致，但读回与"已下发的期望状态"对不上：平台被外部改动过
+		// （授权列表被清、映射被换、目标被改名）。这里**只告警、不自动重下发**：
+		// 下发一次约 35 秒，对账要遍历全部目标，逐个重下发会撑爆对账预算（见 5.11）；
+		// 而且比对本身依赖平台读回的字段形态，误判的代价（每轮对账把"已下发"全部重置）
+		// 比漏报大得多。真正的自愈入口是上面的 404 重建与启用状态收敛。
+		if t.AppliedAt > 0 {
+			if expected, bErr := s.buildTargetSpec(ctx, t, t.DesiredEnabled); bErr == nil &&
+				!targetInfoMatches(expected, info) {
+				s.Log.Warn("iSCSI 目标平台现状与已下发的期望状态不一致（授权/映射可能被外部改动），"+
+					"如需重新下发请对该目标执行一次鉴权变更或重新挂载",
+					"target", t.TargetName, "enabled", info.Enabled, "initiators", len(info.Initiators),
+					"devices", len(info.Devices))
+			}
 		}
 	}
 	return nil
@@ -532,15 +541,15 @@ func (s *IscsiService) EnsurePoolTarget(ctx context.Context, repo *domain.Reposi
 	defer unlock()
 
 	iqn := target.IQN(s.iqnPrefix())
-	// 一次性迁移：清掉"旧命名"（短名）的目标，否则同一个 VHDX 会被两个目标同时映射。
-	s.migrateLegacyTargetName(ctx, target.TargetName, iqn)
-
-	// 这里是整条建库链路最慢的一步（Windows 上一次全量下发实测约 15 秒，见 pushedMu 说明）。
-	if err := s.pushTarget(ctx, target, true); err != nil {
+	// 这里是整条建库链路最慢的一步：Windows 上一次全量下发实测约 35 秒（见 IscsiService 说明）。
+	// 付一次就够 —— 期望状态与"已下发"记账都进了 DB，之后的每次挂载只是分发。
+	if _, err := s.pushTarget(ctx, target, true); err != nil {
 		return err
 	}
+	// 读回平台侧**实际**的目标名（可能被改写）并落库：下发过一次之后，
+	// 挂载路径直接用这个值，不必每次再读回。
 	if found := s.discoverActualTargetName(ctx, iqn, target.TargetName); found != "" {
-		s.rememberActualIQN(target.TargetName, found)
+		s.rememberActualIQN(ctx, target, found)
 	}
 	if err := s.Store.SetIscsiTargetEnabled(ctx, target.ID, true); err != nil {
 		return err
@@ -615,51 +624,53 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	defer unlock()
 
 	iqn := target.IQN(s.iqnPrefix())
-	// 一次性迁移：清掉"旧命名"（短名）的目标，否则同一个 VHDX 会同时被两个目标映射。
-	s.migrateLegacyTargetName(ctx, target.TargetName, iqn)
 
-	// 阶段推进：整条链路最慢的一步（Windows 上一次全量下发实测约 15 秒，见 pushedMu 说明）。
+	// 阶段推进：分配阶段（首次挂载 / 配置变更）要全量下发一次，Windows 实测约 35 秒
+	// （两次 Set-IscsiServerTarget 各约 15 秒 + 一次映射约 5 秒）；分发阶段整段跳过。
+	// 两者的分工见 IscsiService 的说明。
 	s.emitMountPhase(allocationID, MountPhaseConfiguringTarget)
-	if err := s.pushTarget(ctx, target, true); err != nil {
+	pushed, err := s.pushTarget(ctx, target, true)
+	if err != nil {
 		return nil, err
 	}
-	// 读回平台侧**实际**的目标名，作为下发给客户端的 IQN。
-	//
-	// 以平台为准而不是以推导值为准：只要两者不一致，客户端就是"端口通、登录失败"。
-	// 读不到时回退到推导值并告警（不阻塞挂载，让排障有据）。
-	actual := iqn
-	if found := s.discoverActualTargetName(ctx, iqn, target.TargetName); found != "" {
-		switch {
-		case strings.EqualFold(found, iqn):
-			// 平台原样保留，无需任何日志。
-		case isRewrittenIQN(found, iqn):
-			// 平台把我们的 IQN 套进了自己的命名里（Windows 的常态形态，见 isRewrittenIQN）。
-			// **每次挂载都会走到这里**，故只记 Debug：它对"能不能连上"没有任何解释力，
-			// 却在 WARN 级别刷屏（真实工单：每次挂载都看到这条）。
-			s.Log.Debug("平台改写了目标名，以实际值为准",
-				"target", target.TargetName, "expected", iqn, "actual", found)
-		default:
-			// 真异常：读回的名字与下发的目标毫无关联（外部改动 / 串到别的目标）。
-			s.Log.Warn("平台侧实际目标名与下发的 IQN 无关，以实际值为准",
-				"target", target.TargetName, "expected", iqn, "actual", found)
-		}
-		actual = found
-	} else {
-		s.Log.Warn("下发后读不回 iSCSI 目标（平台可能改写了目标名），按推导 IQN 下发",
-			"target", target.TargetName, "iqn", iqn)
-	}
-	s.rememberActualIQN(target.TargetName, actual)
 
-	// 诊断：把平台侧读回的实际状态记下来（名字 / 启用 / initiator 授权 / 映射）。
-	//
-	// connect 阶段失败报 "target name is not found or is marked as hidden from login" 时，
-	// 只有这几项能定案：到底是被 Windows 改了名、没启用、还是 initiator 白名单拒绝
-	// （真实事故：目标明明 created+enabled+mapped，客户端仍连不上）。挂载失败时请贴这行。
-	if s.Iscsi != nil {
+	// 实际 IQN 与诊断只在"刚下发过 / 还没读回过"时做：两者都要再起一次 PowerShell，
+	// 而分发路径（已下发且已读回）用落库的值就够了。
+	if pushed || strings.TrimSpace(target.ActualIQN) == "" {
+		// 读回平台侧**实际**的目标名，作为下发给客户端的 IQN。
+		//
+		// 以平台为准而不是以推导值为准：只要两者不一致，客户端就是"端口通、登录失败"。
+		// 读不到时回退到推导值并告警（不阻塞挂载，让排障有据）。
+		if found := s.discoverActualTargetName(ctx, iqn, target.TargetName); found != "" {
+			switch {
+			case strings.EqualFold(found, iqn):
+				// 平台原样保留，无需任何日志。
+			case isRewrittenIQN(found, iqn):
+				// 平台把我们的 IQN 套进了自己的命名里（Windows 的常态形态，见 isRewrittenIQN）。
+				// 这是**下发后**的正常形态，故只记 Debug：它对"能不能连上"没有任何解释力，
+				// 却在 WARN 级别刷屏（真实工单：每次挂载都看到这条）。
+				s.Log.Debug("平台改写了目标名，以实际值为准",
+					"target", target.TargetName, "expected", iqn, "actual", found)
+			default:
+				// 真异常：读回的名字与下发的目标毫无关联（外部改动 / 串到别的目标）。
+				s.Log.Warn("平台侧实际目标名与下发的 IQN 无关，以实际值为准",
+					"target", target.TargetName, "expected", iqn, "actual", found)
+			}
+			s.rememberActualIQN(ctx, target, found)
+		} else {
+			s.Log.Warn("下发后读不回 iSCSI 目标（平台可能改写了目标名），按推导 IQN 下发",
+				"target", target.TargetName, "iqn", iqn)
+		}
+
+		// 诊断：把平台侧读回的实际状态记下来（名字 / 启用 / initiator 授权 / 映射）。
+		//
+		// connect 阶段失败报 "target name is not found or is marked as hidden from login" 时，
+		// 只有这几项能定案：到底是被 Windows 改了名、没启用、还是 initiator 白名单拒绝
+		// （真实事故：目标明明 created+enabled+mapped，客户端仍连不上）。挂载失败时请贴这行。
 		// 按寻址名（iqn）读回——TargetIqn 是连接名，`-TargetName` 查不到它。
 		if info, err := s.Iscsi.GetTarget(ctx, iqn); err == nil && info != nil {
 			s.Log.Info("iSCSI 目标实际状态",
-				"target", actual,
+				"target", s.targetIQN(target),
 				"enabled", info.Enabled,
 				"initiators", strings.Join(info.Initiators, ","),
 				"mapped_devices", len(info.Devices))
@@ -700,22 +711,12 @@ func (s *IscsiService) Unpublish(ctx context.Context, targetID string) error {
 		}
 	}
 	if s.Iscsi != nil {
-		// 按**寻址名**（下发的完整 IQN = Windows TargetName）操作。
-		// 不能用 targetIQN：那是客户端连接用的 TargetIqn（Windows 改写后的名字）。
-		iqn := target.IQN(s.iqnPrefix())
-		if diskPath != "" {
-			if err := s.Iscsi.DetachLun(ctx, iqn, diskPath); err != nil {
-				s.Log.Warn("解除映射失败", "target", target.TargetName, "error", err)
-			}
-		}
-		if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: iqn, Enabled: false}); err != nil {
-			s.Log.Warn("停用目标失败", "target", target.TargetName, "error", err)
-		}
-		if err := s.Iscsi.RemoveTarget(ctx, iqn); err != nil {
-			s.Log.Warn("删除目标失败", "target", target.TargetName, "error", err)
-		}
-		// 目标已删除：丢弃指纹，避免下次"以为已下发过"而跳过（见 pushedSpecs 的说明）。
-		s.forgetPushedSpec(iqn)
+		// 按**寻址名**拆，走唯一实现（见 teardownTargetLocked）。不能用短名
+		// （target.TargetName）：平台上不存在这个名字，三步会静默变成 not_found；
+		// 也不能用 targetIQN（客户端连接名，Windows 改写后的形态）。
+		// 本方法已持有 lock.TargetKey，故用不加锁版本。
+		_ = s.teardownTargetLocked(ctx, target.TargetName, target.IQN(s.iqnPrefix()),
+			TeardownOptions{DetachDiskPath: diskPath})
 	}
 	if err := s.restoreDiskState(ctx, target); err != nil {
 		return err
@@ -725,6 +726,95 @@ func (s *IscsiService) Unpublish(ctx context.Context, targetID string) error {
 	}
 	s.audit(ctx, "", "iscsi.unpublish", "target:"+target.TargetName, "", domain.AuditResultOK)
 	return nil
+}
+
+// TeardownOptions 描述一次目标拆除的附加动作。
+type TeardownOptions struct {
+	// DetachDiskPath 非空时，先解除该路径在本目标上的 LUN 映射。
+	// 映射是"目标 + 路径"成对登记的，解除必须带上目标；留空表示只拆目标本身。
+	DetachDiskPath string
+	// skipDisable 跳过"先停用再删除"里的停用，只有对账清孤儿用（见 TeardownOrphanTarget）。
+	skipDisable bool
+}
+
+// TeardownTarget 按 DB 目标拆除平台侧目标（并清掉下发指纹）。调用方无需持锁。
+//
+// 这是**唯一**的目标拆除实现：删盘/回收（DiskService）、撤销发布（Unpublish）、
+// 撤销母盘临时共享（RepoService）、对账清理孤儿（App.reconcileIscsi）都调它。
+// 此前四条路径各写一套，寻址名一半用**短名**、一半用**完整 IQN**；短名在平台上查不到，
+// 于是"解映射 → 停用 → 删除"全部静默变成 not_found（脚本把"目标不存在"当幂等成功），
+// 结果是磁盘删了、目标还挂着的"孤儿目标"；"停用"那步还会按短名凭空建出一个新目标。
+// （真实诉求："磁盘已删但 iSCSI 目标还挂着的自动清理"。）
+func (s *IscsiService) TeardownTarget(ctx context.Context, t *domain.IscsiTarget, opt TeardownOptions) {
+	if t == nil {
+		return
+	}
+	unlock := s.Locks.Acquire(lock.TargetKey(t.TargetName))
+	defer unlock()
+	_ = s.teardownTargetLocked(ctx, t.TargetName, t.IQN(s.iqnPrefix()), opt)
+}
+
+// TeardownTargetByShortName 按**目标短名**拆除：寻址名由 iqn_prefix 现推。
+//
+// 存在的必要：存储库回收任务在事务里先删掉 iscsi_targets 记录，后台任务手里只剩短名
+// 快照（见 diskArtifact）。短名不是寻址名，绝不能直接拿去问平台。
+func (s *IscsiService) TeardownTargetByShortName(ctx context.Context, shortName string, opt TeardownOptions) {
+	shortName = strings.TrimSpace(shortName)
+	if shortName == "" {
+		return
+	}
+	unlock := s.Locks.Acquire(lock.TargetKey(shortName))
+	defer unlock()
+	iqn := (&domain.IscsiTarget{TargetName: shortName}).IQN(s.iqnPrefix())
+	_ = s.teardownTargetLocked(ctx, shortName, iqn, opt)
+}
+
+// TeardownOrphanTarget 拆除**平台上存在、DB 已无记录**的孤儿目标。
+//
+// name 必须是**平台读回的目标名**（ListTargets 的 Name）：孤儿恰恰是"名字不符合我们的
+// 推导规则"的那批（旧短名形态、平台改写形态），按前缀推导寻址名只会又找不到它。
+func (s *IscsiService) TeardownOrphanTarget(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	unlock := s.Locks.Acquire(lock.TargetKey(name))
+	defer unlock()
+	// 跳过停用：删除本身就会带走会话，而对账预算只有 60s、一次 PowerShell 要 15-20 秒
+	// （真实事故：大批孤儿时日志刷屏 context deadline exceeded），多一步必然删不动。
+	return s.teardownTargetLocked(ctx, name, name, TeardownOptions{skipDisable: true})
+}
+
+// teardownTargetLocked 是目标拆除的唯一实现：解映射（可选）→ 停用 → 删除 → 清指纹。
+// 调用方必须已持有 lock.TargetKey(shortName)。iqn 是可问到平台的**寻址名**，
+// shortName 只用于日志与指纹清理。
+//
+//   - 先停用再删除：停用让在线 initiator 立刻掉线；删除失败时目标至少停在停用态，
+//     不会继续对外提供数据。
+//   - 全程尽力而为：目标可能已被人工删掉，失败只记日志，由调用方决定是否中断
+//     （删盘路径的真正失败点是文件删不掉，见 removeDiskFile）。
+func (s *IscsiService) teardownTargetLocked(ctx context.Context, shortName, iqn string, opt TeardownOptions) error {
+	if s.Iscsi == nil || strings.TrimSpace(iqn) == "" {
+		return nil
+	}
+	if opt.DetachDiskPath != "" {
+		if err := s.Iscsi.DetachLun(ctx, iqn, opt.DetachDiskPath); err != nil {
+			s.Log.Warn("解除目标映射失败", "target", shortName, "iqn", iqn, "path", opt.DetachDiskPath, "error", err)
+		}
+	}
+	if !opt.skipDisable {
+		if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: iqn, Enabled: false}); err != nil {
+			s.Log.Warn("停用目标失败", "target", shortName, "iqn", iqn, "error", err)
+		}
+	}
+	err := s.Iscsi.RemoveTarget(ctx, iqn)
+	if err != nil {
+		s.Log.Warn("删除目标失败", "target", shortName, "iqn", iqn, "error", err)
+	}
+	// 目标已删除：丢弃下发记账，避免下次"以为已下发过"而跳过（见 IscsiService 的说明）。
+	// 按短名查（DB 记录用它做主键定位），平台上的寻址名（iqn）与它可能是两个形态。
+	s.clearAppliedByName(ctx, shortName)
+	return err
 }
 
 // SetAuthorization 以"先读后合并再整体回写"的方式更新 initiator 白名单。
@@ -861,11 +951,8 @@ func (s *IscsiService) SetAuth(ctx context.Context, targetID string, in SetAuthI
 		unlock := s.Locks.Acquire(lock.TargetKey(target.TargetName))
 		defer unlock()
 		// CHAP 凭据已写入 target（含密文），buildTargetSpec 会解密后放进期望状态。
-		spec, sErr := s.buildTargetSpec(ctx, target, target.DesiredEnabled)
-		if sErr != nil {
-			return nil, sErr
-		}
-		if err := s.Iscsi.EnsureTarget(ctx, spec); err != nil {
+		// 必须强制下发：凭据已经变了，跳过判据在这里只会把新密钥留在 DB 里。
+		if err := s.forcePushTarget(ctx, target, target.DesiredEnabled); err != nil {
 			return nil, err
 		}
 	}
@@ -892,11 +979,8 @@ func (s *IscsiService) DisableTarget(ctx context.Context, targetName string) err
 	if s.Iscsi != nil {
 		if target != nil {
 			// 全量下发（Enabled=false）：保持 ACL/CHAP/映射不变，只把目标停用。
-			spec, sErr := s.buildTargetSpec(ctx, target, false)
-			if sErr != nil {
-				return sErr
-			}
-			if err := s.Iscsi.EnsureTarget(ctx, spec); err != nil {
+			// 必须强制下发：这里的目的就是**改变**平台状态，跳过判据不适用。
+			if err := s.forcePushTarget(ctx, target, false); err != nil {
 				return err
 			}
 		} else if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: targetName, Enabled: false}); err != nil {
@@ -1020,8 +1104,40 @@ func (s *IscsiService) awaitBackingReady(ctx context.Context, disk *domain.Disk)
 	}
 }
 
-// pushTarget 把 DB 中的目标配置全量下发给平台后端（enabled 由调用方给出）。
-func (s *IscsiService) pushTarget(ctx context.Context, target *domain.IscsiTarget, enabled bool) error {
+// pushTarget 把 DB 中的目标配置下发给平台后端（enabled 由调用方给出）。
+//
+// 返回值 pushed=false 表示"当前这份期望状态早就下发过、本次整段跳过"（分发阶段的快路径）。
+//
+// 跳过判据**只看持久化记账**（applied_fingerprint），不再每次读回平台现状：
+//
+//   - 读回本身也要起一次 PowerShell（目标多时枚举更慢），是"再连一次要等很久"的另一半成本；
+//   - 平台读不回 CHAP 与只读标志，靠现状比对证明不了"密钥仍是上次那组"，反而会把跳过判死。
+//
+// 平台侧被外部删除/停用由对账器收敛（见 ReconcileTargets），代价是发现得晚（对账周期），
+// 换来的是挂载路径不再付这份钱。
+func (s *IscsiService) pushTarget(ctx context.Context, target *domain.IscsiTarget, enabled bool) (bool, error) {
+	if s.Iscsi == nil {
+		return false, errNotImplemented
+	}
+	spec, err := s.buildTargetSpec(ctx, target, enabled)
+	if err != nil {
+		return false, err
+	}
+	if s.targetApplied(target, spec) {
+		s.Log.Info("iSCSI 目标已按当前期望状态下发过，跳过下发", "target", spec.Name)
+		return false, nil
+	}
+	// 一次性迁移：清掉"旧命名"（短名）的目标，否则同一个 VHDX 会同时被两个目标映射。
+	// 只在真要下发时做 —— 它要枚举平台上的全部目标，同样是一次 PowerShell。
+	s.migrateLegacyTargetName(ctx, target.TargetName, spec.Name)
+	if err := s.applyTargetSpec(ctx, target, spec); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// forcePushTarget 无条件全量下发（对账、鉴权变更、停用等"已经确知平台现状与期望不符"的场景）。
+func (s *IscsiService) forcePushTarget(ctx context.Context, target *domain.IscsiTarget, enabled bool) error {
 	if s.Iscsi == nil {
 		return errNotImplemented
 	}
@@ -1029,55 +1145,75 @@ func (s *IscsiService) pushTarget(ctx context.Context, target *domain.IscsiTarge
 	if err != nil {
 		return err
 	}
-	// 无变化则跳过下发：本次全量下发在 Windows 上实测约 15 秒，而挂载路径每次都会走到这里，
-	// 绝大多数时候目标状态根本没变（真实工单：每次挂载都要等十几秒）。
-	if s.targetUnchanged(ctx, spec) {
-		s.Log.Info("iSCSI 目标状态未变化，跳过下发", "target", spec.Name)
-		return nil
-	}
+	return s.applyTargetSpec(ctx, target, spec)
+}
+
+// applyTargetSpec 下发一个构造好的期望状态，并把"已下发"记账写回 DB。
+func (s *IscsiService) applyTargetSpec(ctx context.Context, target *domain.IscsiTarget, spec platform.TargetSpec) error {
 	if err := s.Iscsi.EnsureTarget(ctx, spec); err != nil {
 		return err
 	}
-	s.rememberPushedSpec(spec)
+	s.markApplied(ctx, target, spec)
 	return nil
 }
 
-// targetUnchanged 判断本次全量下发是否可以安全跳过（判据见 IscsiService.pushedSpecs 的说明）。
-func (s *IscsiService) targetUnchanged(ctx context.Context, spec platform.TargetSpec) bool {
-	if s.lastPushedSpec(spec.Name) != targetSpecFingerprint(spec) {
+// targetApplied 判断"当前这份期望状态是否已经成功下发到平台"。
+//
+// 指纹逐字段包含 Name/Enabled/ReadOnly/BackingRef/CHAP（含密钥哈希）/授权列表，
+// 因此任何一项变了（换盘、轮换密钥、改白名单、停用/启用）都不再命中 → 重新下发。
+func (s *IscsiService) targetApplied(target *domain.IscsiTarget, spec platform.TargetSpec) bool {
+	if target == nil || target.ID == "" || target.AppliedAt <= 0 {
 		return false
 	}
-	info, err := s.Iscsi.GetTarget(ctx, spec.Name)
-	if err != nil || info == nil {
-		// 读不到现状（目标不存在或查询失败）：老实下发。
-		// 绝不因为"我记得下发过"就跳过一个可能已经不存在的目标。
+	if strings.TrimSpace(target.AppliedFingerprint) == "" {
 		return false
 	}
-	return targetInfoMatches(spec, info)
+	return target.AppliedFingerprint == targetSpecFingerprint(spec)
 }
 
-// lastPushedSpec 读取某目标上次成功下发的指纹；从未下发过时返回空串。
-func (s *IscsiService) lastPushedSpec(name string) string {
-	s.pushedMu.Lock()
-	defer s.pushedMu.Unlock()
-	return s.pushedSpecs[name]
-}
-
-// rememberPushedSpec 记录某目标成功下发的指纹（key 统一小写，与目标名大小写不敏感一致）。
-func (s *IscsiService) rememberPushedSpec(spec platform.TargetSpec) {
-	s.pushedMu.Lock()
-	defer s.pushedMu.Unlock()
-	if s.pushedSpecs == nil {
-		s.pushedSpecs = make(map[string]string)
+// markApplied 记录"这份期望状态已成功下发"。
+//
+// 写库失败只告警：最坏结果是下次多下发一次（15 秒），不该让一次成功的下发变成失败。
+func (s *IscsiService) markApplied(ctx context.Context, target *domain.IscsiTarget, spec platform.TargetSpec) {
+	fp := targetSpecFingerprint(spec)
+	if err := s.Store.MarkIscsiTargetApplied(ctx, target.ID, fp); err != nil {
+		s.Log.Warn("写回 iSCSI 下发记账失败", "target", target.TargetName, "error", err)
+		return
 	}
-	s.pushedSpecs[strings.ToLower(strings.TrimSpace(spec.Name))] = targetSpecFingerprint(spec)
+	target.AppliedFingerprint = fp
+	target.AppliedAt = time.Now().UnixMilli()
 }
 
-// forgetPushedSpec 丢弃某目标的指纹（目标被删除后必须调用，避免下次"以为已下发"）。
-func (s *IscsiService) forgetPushedSpec(name string) {
-	s.pushedMu.Lock()
-	defer s.pushedMu.Unlock()
-	delete(s.pushedSpecs, strings.ToLower(strings.TrimSpace(name)))
+// clearApplied 抹掉下发记账（平台侧目标已被拆除或被判定为漂移），下次必须重新下发。
+func (s *IscsiService) clearApplied(ctx context.Context, target *domain.IscsiTarget) {
+	if target == nil || target.ID == "" {
+		return
+	}
+	if err := s.Store.ClearIscsiTargetApplied(ctx, target.ID); err != nil {
+		if !isNotFound(err) {
+			s.Log.Warn("清除 iSCSI 下发记账失败", "target", target.TargetName, "error", err)
+		}
+		return
+	}
+	target.AppliedFingerprint = ""
+	target.AppliedAt = 0
+	target.ActualIQN = ""
+}
+
+// clearAppliedByName 按目标短名抹掉下发记账（DB 里没有这条记录时静默返回）。
+func (s *IscsiService) clearAppliedByName(ctx context.Context, shortName string) {
+	shortName = strings.TrimSpace(shortName)
+	if shortName == "" {
+		return
+	}
+	target, err := s.Store.GetIscsiTargetByName(ctx, shortName)
+	if err != nil {
+		if !isNotFound(err) {
+			s.Log.Warn("读取目标失败，未清除其下发记账", "target", shortName, "error", err)
+		}
+		return
+	}
+	s.clearApplied(ctx, target)
 }
 
 // targetSpecFingerprint 计算目标期望状态的指纹（含 CHAP 密钥，但密钥只作为哈希输入）。
@@ -1111,7 +1247,7 @@ func targetSpecFingerprint(spec platform.TargetSpec) string {
 // targetInfoMatches 用**可读回的实际状态**校验期望状态是否已经生效。
 //
 // 只比可读的子集（Enabled / Initiators / 映射盘）：CHAP 与只读标志读不回来，
-// 它们由"指纹一致"来兜底（见 pushedSpecs）。
+// 它们由"期望状态指纹的持久化记账"来兜底（见 targetApplied / AppliedFingerprint）。
 func targetInfoMatches(spec platform.TargetSpec, info *platform.TargetInfo) bool {
 	if info == nil {
 		return false
@@ -1134,7 +1270,7 @@ func targetInfoMatches(spec platform.TargetSpec, info *platform.TargetInfo) bool
 // 必须先把通配项 `IQN:*` 归一掉：平台脚本在"白名单为空"时会下发通配（Windows 上
 // 空列表 == 拒绝所有，必须显式放开，见 iscsi_set_target.ps1），因此读回的是 `["IQN:*"]`，
 // 而我们期望的是空列表 `[]`。若直接用 sameStringsFold 比较，二者永远不等 →
-// targetInfoMatches 永远 false → targetUnchanged 的跳过优化彻底失效 →
+// targetInfoMatches 永远 false → pushTarget 的"已下发就跳过"彻底失效 →
 // **每次挂载都重付一次约 15 秒的全量下发**（真实工单：挂载慢十几秒）。
 // `IQN:*` 与"空"语义相同（都是"不限制发起端"），故视为等价。
 func initiatorsMatch(expected, actual []string) bool {
@@ -1209,7 +1345,12 @@ func (s *IscsiService) pushInitiatorIDs(ctx context.Context, target *domain.Iscs
 		return err
 	}
 	spec.Initiators = initiatorValues(ids)
-	return s.Iscsi.EnsureTarget(ctx, spec)
+	if err := s.Iscsi.EnsureTarget(ctx, spec); err != nil {
+		return err
+	}
+	// 白名单是期望状态的一部分：必须记账，否则下次挂载会因为指纹不一致而白跑一次全量下发。
+	s.markApplied(ctx, target, spec)
+	return nil
 }
 
 // restoreDiskState 目标移除后把磁盘状态从 published 恢复为 ready。

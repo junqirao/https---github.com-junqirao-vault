@@ -27,6 +27,9 @@ type renameIscsiBackend struct {
 	pushed  []platform.TargetSpec
 	actual  map[string]platform.TargetInfo
 	removed []string
+	// detached 记录 DetachLun 的寻址名，removedDisks 记录被移除登记的虚拟盘。
+	detached     []string
+	removedDisks []string
 	// rewrite 非空时：平台把下发的目标名改写成自己的形态后存储。
 	rewrite func(specName string) string
 }
@@ -106,6 +109,146 @@ func (f *renameIscsiBackend) lastPushed() platform.TargetSpec {
 	return f.pushed[len(f.pushed)-1]
 }
 
+// DetachLun 记录**寻址名**：拆除链路的回归点就是"拿短名去问平台"。
+func (f *renameIscsiBackend) DetachLun(_ context.Context, name, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.detached = append(f.detached, name+"|"+path)
+	return nil
+}
+
+func (f *renameIscsiBackend) RemoveVirtualDisk(_ context.Context, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removedDisks = append(f.removedDisks, path)
+	return nil
+}
+
+func (f *renameIscsiBackend) detachedNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.detached...)
+}
+
+func (f *renameIscsiBackend) removedDiskCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.removedDisks)
+}
+
+// targetCount 是平台侧现存目标数。短名寻址的"停用"那步会凭空建出一个目标，
+// 于是这个数会多出来 —— 这正是断言它的意义。
+func (f *renameIscsiBackend) targetCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.actual)
+}
+
+func (f *renameIscsiBackend) pushedNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.pushed))
+	for _, spec := range f.pushed {
+		out = append(out, spec.Name)
+	}
+	return out
+}
+
+// 拆除链路的回归：所有拆除入口都必须按**寻址名**（下发的完整 IQN）问平台。
+// 用短名问会静默变成 not_found（磁盘删了、目标还挂着），"停用"那步还会凭空建目标。
+func TestUnpublishAddressesFullIQN(t *testing.T) {
+	ctx := context.Background()
+	const short = "vault-1111-2222"
+	backend := newRenameBackend(nil)
+	svc := newIqnTestService(t, backend)
+	target, allocID := seedPublishFixture(t, svc, short)
+	if _, err := svc.Publish(ctx, allocID); err != nil {
+		t.Fatalf("Publish 失败：%v", err)
+	}
+	if got := backend.targetCount(); got != 1 {
+		t.Fatalf("发布后平台侧应有 1 个目标，实际 %d 个", got)
+	}
+	if err := svc.Unpublish(ctx, target.ID); err != nil {
+		t.Fatalf("Unpublish 失败：%v", err)
+	}
+	want := svc.iqnPrefix() + ":" + short
+	if got := backend.removedNames(); len(got) != 1 || got[0] != want {
+		t.Fatalf("Unpublish 必须按完整 IQN 拆除，实际删除 %v（期望 [%s]）", got, want)
+	}
+	if got := backend.targetCount(); got != 0 {
+		t.Fatalf("Unpublish 后平台侧不应残留目标，实际 %d 个", got)
+	}
+	for _, name := range backend.pushedNames() {
+		if name == short {
+			t.Fatalf("不得用短名寻址下发（会凭空建目标）：%v", backend.pushedNames())
+		}
+	}
+}
+
+func TestTeardownByShortNameAddressesFullIQN(t *testing.T) {
+	ctx := context.Background()
+	const short = "vault-3333-4444"
+	path := filepath.Join("C:", "vault", "disk.vhdx")
+	backend := newRenameBackend(nil)
+	svc := newIqnTestService(t, backend)
+	target, allocID := seedPublishFixture(t, svc, short)
+	if _, err := svc.Publish(ctx, allocID); err != nil {
+		t.Fatalf("Publish 失败：%v", err)
+	}
+	if applied, err := svc.Store.GetIscsiTarget(ctx, target.ID); err != nil || applied.AppliedAt == 0 {
+		t.Fatalf("下发后必须留下记账（applied_at>0）：applied_at=%d err=%v", applied.AppliedAt, err)
+	}
+
+	svc.TeardownTargetByShortName(ctx, short, TeardownOptions{DetachDiskPath: path})
+
+	want := svc.iqnPrefix() + ":" + short
+	if got := backend.removedNames(); len(got) != 1 || got[0] != want {
+		t.Fatalf("回收路径必须按完整 IQN 拆除，实际删除 %v（期望 [%s]）", got, want)
+	}
+	if got := backend.detachedNames(); len(got) != 1 || got[0] != want+"|"+path {
+		t.Fatalf("解映射必须带寻址名，实际 %v", got)
+	}
+	if got := backend.targetCount(); got != 0 {
+		t.Fatalf("拆除后平台侧不应残留目标，实际 %d 个", got)
+	}
+	// 记账必须清掉：否则下次同配置下发会被"以为已下发过"跳过，目标再也建不回来。
+	// 实际 IQN 一并清空：目标都没了，记着的连接名不再有意义。
+	stored, err := svc.Store.GetIscsiTarget(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("读取目标失败：%v", err)
+	}
+	if stored.AppliedAt != 0 || stored.AppliedFingerprint != "" || stored.ActualIQN != "" {
+		t.Fatalf("拆除后必须清掉下发记账，实际 applied_at=%d fingerprint=%q actual_iqn=%q",
+			stored.AppliedAt, stored.AppliedFingerprint, stored.ActualIQN)
+	}
+}
+
+func TestDiskDetachTargetsAddressesFullIQN(t *testing.T) {
+	ctx := context.Background()
+	const short = "vault-5555-6666"
+	path := filepath.Join("C:", "vault", "disk.vhdx")
+	backend := newRenameBackend(nil)
+	iscsi := newIqnTestService(t, backend)
+	_, allocID := seedPublishFixture(t, iscsi, short)
+	if _, err := iscsi.Publish(ctx, allocID); err != nil {
+		t.Fatalf("Publish 失败：%v", err)
+	}
+
+	disks := &DiskService{Deps: iscsi.Deps, IscsiSvc: iscsi}
+	disks.detachTargets(ctx, path, []string{short})
+
+	want := iscsi.iqnPrefix() + ":" + short
+	if got := backend.removedNames(); len(got) != 1 || got[0] != want {
+		t.Fatalf("删盘/回收必须按完整 IQN 拆除，实际删除 %v（期望 [%s]）", got, want)
+	}
+	if got := backend.removedDiskCount(); got != 1 {
+		t.Fatalf("虚拟盘登记应被移除一次，实际 %d 次", got)
+	}
+	if got := backend.targetCount(); got != 0 {
+		t.Fatalf("拆除后平台侧不应残留目标，实际 %d 个", got)
+	}
+}
+
 // newIqnTestService 构造带锁的 IscsiService（Publish 需要 Locks 与 Disk 后端）。
 func newIqnTestService(t *testing.T, backend platform.IscsiBackend) *IscsiService {
 	t.Helper()
@@ -164,8 +307,8 @@ func TestPushTargetSendsFullIQN(t *testing.T) {
 	svc := newIqnTestService(t, backend)
 	target, _ := seedPublishFixture(t, svc, "vault-aaaa-bbbb")
 
-	if err := svc.pushTarget(ctx, target, true); err != nil {
-		t.Fatalf("下发失败：%v", err)
+	if pushed, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
+		t.Fatalf("下发失败：pushed=%v err=%v", pushed, err)
 	}
 	name := backend.lastPushed().Name
 	if !strings.HasPrefix(name, "iqn.") {
@@ -197,8 +340,14 @@ func TestPublishUsesPlatformActualNameAsIQN(t *testing.T) {
 	if _, err := svc.Publish(ctx, allocID); err != nil {
 		t.Fatalf("Publish 失败：%v", err)
 	}
+	// 平台实际名字必须**落库**：这既让后续挂载不必再读回平台（分发快路径），
+	// 也保证服务重启后下发给客户端的 IQN 仍然是平台认得的那一个。
+	stored, err := svc.Store.GetIscsiTarget(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("读取目标失败：%v", err)
+	}
 	want := legacyWinIQNPrefix + short
-	if got := svc.targetIQN(target); got != want {
+	if got := svc.targetIQN(stored); got != want {
 		t.Fatalf("下发客户端的 IQN=%q，期望平台实际名字 %q", got, want)
 	}
 	// 客户端拿到的 IQN 必须能在平台上查到 —— 这才是"能登录"的前提。
@@ -326,8 +475,13 @@ func TestPublishDoesNotWarnOnPlatformRewrittenIQN(t *testing.T) {
 		t.Fatalf("平台改写目标名是常态，不该产生 WARN，实际日志：\n%s", logs)
 	}
 
+	// 平台实际名字由 Publish 读回并落库，客户端 IQN 取自这份记录（重启后也一致）。
+	stored, err := svc.Store.GetIscsiTarget(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("读取目标失败：%v", err)
+	}
 	want := legacyWinIQNPrefix + "win-host-" + "iqn.2026-01.com.vault:" + short + "-target"
-	if got := svc.targetIQN(target); got != want {
+	if got := svc.targetIQN(stored); got != want {
 		t.Fatalf("改写后仍必须以平台实际名字下发，got=%q want=%q", got, want)
 	}
 	if info, err := backend.GetTarget(ctx, "iqn.2026-01.com.vault:"+short); err != nil || info == nil {

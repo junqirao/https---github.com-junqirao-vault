@@ -256,3 +256,57 @@ func TestRecomputeUsageFallsBackToLogicalSize(t *testing.T) {
 		t.Fatalf("物理未知时应按逻辑大小 %d 计费，实际=%d", size, user.UsedBytes)
 	}
 }
+
+// TestRepoCapacityDerivedFromStartDisk 守住存储库卡片进度条的**分母**（库容量）。
+//
+// 库容量不落 repositories 表，是读时从"建库那块盘"派生的（见 store.repoCapacitySQL）。
+// 一旦这个派生失效（例如只认 parent_disk_id、或误用 quota_bytes），卡片上的
+// 「已用 / 容量」就会退化成"没有分母、进度条永远空着"——那正是用户报的问题。
+func TestRepoCapacityDerivedFromStartDisk(t *testing.T) {
+	ctx := context.Background()
+	st := openAppTestStore(t)
+	repoID, _ := seedRepoWithOwner(t, st)
+
+	// 还没建盘：派生不出容量，必须是 0（前端据此回退成不显示分母，而不是除以 0）。
+	repo, err := st.GetRepository(ctx, repoID)
+	if err != nil {
+		t.Fatalf("回查存储库失败：%v", err)
+	}
+	if repo.CapacityBytes != 0 {
+		t.Fatalf("无建库盘时容量应为 0，实际=%d", repo.CapacityBytes)
+	}
+
+	// 建库时创建的那块盘（共享模式 = 母盘），容量 10GB。
+	const size int64 = 10 << 30
+	parent := &domain.Disk{
+		RepoID:    repoID,
+		Kind:      domain.DiskKindParent,
+		VHDXPath:  filepath.Join("C:", "vault", "disks", "parents", "base.vhdx"),
+		SizeBytes: size,
+		State:     domain.DiskStateReady,
+	}
+	if err := st.CreateDisk(ctx, parent); err != nil {
+		t.Fatalf("建母盘记录失败：%v", err)
+	}
+	pid := parent.ID
+	repo.ParentDiskID = &pid
+	if err := st.UpdateRepository(ctx, repo); err != nil {
+		t.Fatalf("回填母盘失败：%v", err)
+	}
+
+	// 单查与列表都要带上派生列（卡片走的是列表接口）。
+	got, err := st.GetRepository(ctx, repoID)
+	if err != nil {
+		t.Fatalf("回查存储库失败：%v", err)
+	}
+	if got.CapacityBytes != size {
+		t.Fatalf("库容量应派生自母盘 = %d，实际=%d", size, got.CapacityBytes)
+	}
+	list, err := st.ListRepositories(ctx, "", 10, 0)
+	if err != nil {
+		t.Fatalf("查询存储库列表失败：%v", err)
+	}
+	if len(list) != 1 || list[0].CapacityBytes != size {
+		t.Fatalf("列表里的库容量 = %v，期望 1 条、容量 %d", list, size)
+	}
+}

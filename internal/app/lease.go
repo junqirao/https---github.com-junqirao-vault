@@ -98,6 +98,20 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 		}
 	}
 
+	// 状态机校验：库必须处于 active —— 建库中（creating）、删除中、异常都不允许挂载。
+	//
+	// domain.RepoStateCreating 的注释早就写明"该状态下拒绝分配与挂载"，但**挂载这一侧一直
+	// 没落地**：用户在建库中的卡片/详情页直接点挂载，服务端要么去发布一块还没派生好的池位盘、
+	// 要么报"目标不存在"，报错与"建库中"完全对不上（真实反馈："逻辑有误啊，creating 中的
+	// 存储库不允许挂载啊"）。分配侧（repo.Allocate）早已拦截，这里补齐挂载侧；
+	// 前端同时按这个状态把按钮置灰并写清原因（见 useRepoMount）。
+	if repo.State != domain.RepoStateActive {
+		if repo.State == domain.RepoStateCreating {
+			return nil, apperr.RepoCreating()
+		}
+		return nil, apperr.New("repo.state_invalid", 409).WithArg("state", string(repo.State))
+	}
+
 	// 状态机校验：共享库的差异盘必须在 derived 条件下且指纹/版本一致（见 5.4）。
 	if repo.IsShared() {
 		if err := domain.CanMount(repo.Condition(), disk.ParentVersion, repo.ParentVersion, s.parentFingerprintOK(ctx, repo)); err != nil {

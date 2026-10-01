@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -169,7 +168,7 @@ func (a *App) reconcileIscsi(ctx context.Context, rep *ReconcileReport,
 		rep.Checked++
 	}
 
-	if a.Deps.Iscsi == nil {
+	if a.Deps.Iscsi == nil || a.iscsi == nil {
 		rep.NotChecked = append(rep.NotChecked, "iscsi_orphans: 本机未装配 iSCSI 目标管理器，已跳过")
 		return
 	}
@@ -207,7 +206,9 @@ func (a *App) reconcileIscsi(ctx context.Context, rep *ReconcileReport,
 		if deleted >= maxOrphanDelete {
 			continue
 		}
-		if err := a.Deps.Iscsi.RemoveTarget(ctx, w.Name); err != nil {
+		// 走统一拆除实现：孤儿恰恰是"名字不符合我们推导规则"的目标，必须按平台读回的
+		// 名字寻址（见 IscsiService.TeardownOrphanTarget）。
+		if err := a.iscsi.TeardownOrphanTarget(ctx, w.Name); err != nil {
 			report("iscsi.orphan_target", w.Name, "删除孤儿目标失败", false)
 			log.Warn("删除孤儿 iSCSI 目标失败", "target", w.Name, "error", err)
 			continue
@@ -390,20 +391,21 @@ func (a *App) checkDiffParentVersion(ctx context.Context, d *domain.Disk,
 
 // reconcileOrphanFiles 扫描各白名单根的 disks 目录下未被数据库登记的文件。
 //
-// 对每个根各扫一次（各自 disks 与 orphan 目录），合并结果；报告里带上所属根。
-// 互为父子的根只扫上游那一个，避免同一区域被重复扫描/重复报告。
-// 差异盘 / 母盘类孤儿只报告（可能承载用户数据，见 5.11）；
+// 扫描本身交给 collectOrphanFiles（与管理端「孤儿磁盘」页面共用同一份实现）；
+// 这里只决定**怎么处理**：差异盘 / 母盘类孤儿只报告（可能承载用户数据，见 5.11），
 // 其余孤儿 VHDX 移入**同根**的 meta/orphan/（保证同卷移动）。
+//
+// 日志刻意降噪（真实反馈："打出来没用啊，干脆直接给个管理页面能手动删掉这些盘得了"）：
+// 逐个文件打 WARN 会把日志刷满，而当时用户也无事可做；现在每轮只打**一条汇总 WARN**
+// 并指名去管理端页面处理，单个文件的明细降到 Debug（需要时调日志级别即可拿到）。
 func (a *App) reconcileOrphanFiles(ctx context.Context, rep *ReconcileReport,
 	report func(kind, ref, detail string, fixed bool), log *slog.Logger, dbPaths map[string]bool) {
 	// 本扫描的前提是"磁盘 = storages.path 目录下的 .vhdx 文件"，只对 Windows 成立；
 	// Linux 上磁盘是 LVM thin LV（不在 storages.path 目录里），故整体跳过并记录。
 	if a.platformKind() != platform.KindWindows {
-		rep.NotChecked = append(rep.NotChecked,
-			"orphan_vhdx_scan: 仅适用于 Windows 的 VHDX 文件布局，当前平台已跳过")
+		rep.NotChecked = append(rep.NotChecked, orphanScanSkipOtherPlatform)
 		return
 	}
-	raw := a.raw()
 	guards, err := a.storageGuards(ctx)
 	if err != nil {
 		// 读存储失败不应静默跳过（否则会表现为"没有任何根"）；记录后跳过本轮扫描。
@@ -413,67 +415,52 @@ func (a *App) reconcileOrphanFiles(ctx context.Context, rep *ReconcileReport,
 	if guards.Empty() {
 		return
 	}
-	scanned := make([]string, 0, guards.Len())
-	for _, guard := range guards.Guards() {
+	files, checked, skipped := a.collectOrphanFiles(ctx, guards, dbPaths, log)
+	rep.Checked += checked
+	rep.NotChecked = append(rep.NotChecked, skipped...)
+
+	raw := a.raw()
+	counts := map[string]int{}
+	for _, f := range files {
 		if ctx.Err() != nil {
-			return
+			break
 		}
-		if isUnderAny(guard.Root, scanned) {
-			log.Debug("跳过被上游根覆盖的白名单根", "root", guard.Root)
-			continue
-		}
-		scanned = append(scanned, guard.Root)
-		rootLabel := guard.Root
+		counts[f.Kind]++
+		detail := "根 " + f.Root
+		log.Debug("发现未登记的磁盘文件", "path", f.Path, "kind", f.Kind, "size_bytes", f.SizeBytes)
 
-		disksRoot, err := guard.Resolve(raw.Storage.DisksDir)
-		if err != nil {
-			continue
+		switch f.Kind {
+		case OrphanKindDiff, OrphanKindParent:
+			// 可能承载用户数据：只报告，由管理员在「孤儿磁盘」页面确认后手动删除。
+			kind := "orphan_diff_disk"
+			if f.Kind == OrphanKindParent {
+				kind = "orphan_parent_disk"
+			}
+			report(kind, f.Path, "存在未被登记的"+orphanKindLabel(f.Kind)+
+				"文件（可能承载用户数据，仅报告，可在"+orphanAdminPageHint+"删除；"+detail+"）", false)
+		default:
+			orphanRoot := ""
+			if g, ok := guards.GuardForPath(f.Path); ok {
+				orphanRoot, _ = g.Resolve(raw.Storage.OrphanDir)
+			}
+			if orphanRoot == "" {
+				report("orphan_vhdx", f.Path,
+					"存在未被登记的 VHDX 文件（未配置孤儿目录，仅报告，可在"+orphanAdminPageHint+"删除；"+detail+"）", false)
+				continue
+			}
+			if err := moveToOrphan(f.Path, orphanRoot); err != nil {
+				log.Warn("移动孤儿 VHDX 失败", "path", f.Path, "root", f.Root, "error", err)
+				report("orphan_vhdx", f.Path, "存在未被登记的 VHDX 文件（移动失败；"+detail+"）", false)
+				continue
+			}
+			report("orphan_vhdx", f.Path, "未被登记的 VHDX 文件已移入同根孤儿目录（"+detail+"）", true)
+			a.audit(ctx, "system", "reconcile.orphan_vhdx", "file:"+f.Path, "moved", domain.AuditResultOK)
 		}
-		if _, statErr := os.Stat(disksRoot); statErr != nil {
-			continue
-		}
-		orphanRoot, _ := guard.Resolve(raw.Storage.OrphanDir)
+	}
 
-		_ = filepath.Walk(disksRoot, func(p string, fi os.FileInfo, walkErr error) error {
-			if walkErr != nil {
-				return nil
-			}
-			if ctx.Err() != nil {
-				return fs.SkipAll
-			}
-			if fi.IsDir() {
-				return nil
-			}
-			if !strings.EqualFold(filepath.Ext(p), ".vhdx") {
-				return nil
-			}
-			rep.Checked++
-			if dbPaths[pathKeyLocal(p)] {
-				return nil
-			}
-			rel := strings.ToLower(filepath.ToSlash(strings.TrimPrefix(p, disksRoot)))
-			switch {
-			case strings.Contains(rel, "/diffs/") || strings.HasPrefix(rel, "/diffs/"):
-				report("orphan_diff_disk", p, "存在未被登记的差异盘文件（可能承载用户数据，仅报告；根 "+rootLabel+"）", false)
-				log.Warn("发现孤儿差异盘文件（仅报告）", "path", p, "root", rootLabel)
-			case strings.Contains(rel, "/parents/") || strings.HasPrefix(rel, "/parents/"):
-				report("orphan_parent_disk", p, "存在未被登记的母盘文件（仅报告；根 "+rootLabel+"）", false)
-				log.Warn("发现孤儿母盘文件（仅报告）", "path", p, "root", rootLabel)
-			default:
-				if orphanRoot == "" {
-					report("orphan_vhdx", p, "存在未被登记的 VHDX 文件（未配置孤儿目录，仅报告；根 "+rootLabel+"）", false)
-					return nil
-				}
-				if err := moveToOrphan(p, orphanRoot); err != nil {
-					log.Warn("移动孤儿 VHDX 失败", "path", p, "root", rootLabel, "error", err)
-					report("orphan_vhdx", p, "存在未被登记的 VHDX 文件（移动失败；根 "+rootLabel+"）", false)
-					return nil
-				}
-				report("orphan_vhdx", p, "未被登记的 VHDX 文件已移入同根孤儿目录（根 "+rootLabel+"）", true)
-				a.audit(ctx, "system", "reconcile.orphan_vhdx", "file:"+p, "moved", domain.AuditResultOK)
-			}
-			return nil
-		})
+	if len(files) > 0 {
+		log.Warn("发现未登记的磁盘文件（仅报告，可在"+orphanAdminPageHint+"逐个删除）",
+			"diff", counts[OrphanKindDiff], "parent", counts[OrphanKindParent], "other", counts[OrphanKindOther])
 	}
 }
 

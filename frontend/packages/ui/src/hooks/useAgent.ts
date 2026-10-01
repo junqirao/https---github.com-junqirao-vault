@@ -278,12 +278,18 @@ function applyEvent(event: AgentEvent): void {
       // 同理，`unmounting` 收到 mounted 是**卸载失败后的状态恢复**（磁盘其实还挂着，只是
       // 移除挂载点这一步失败，见 docs/implementation.md 5.5），不是"刚挂上"，也不能弹提示 ——
       // 真实反馈："点了卸载，然后提示挂载成功？"
+      //
+      // 再同理，**会话实测**也会推 mount 事件（会话断开/恢复时刷新 session_active，state 仍是
+      // mounted，见 internal/agent/session_probe.go）。这类事件与"刚挂上"无关，所以要求
+      // `previous` 必须存在：连"之前是不是 mounted"都不知道（尚未拿到这条记录）就没有
+      // 任何理由弹"已挂载"。真正的挂载流程一定先经过 mounting 状态，不会因此漏提示。
       const previous = current?.mounts.find((item) => item.allocation_id === event.mount.allocation_id)
       if (current) setSnapshot({ state: { ...current, mounts: upsertMount(current.mounts, event.mount) } })
       if (
+        previous !== undefined &&
         event.mount.state === 'mounted' &&
-        previous?.state !== 'mounted' &&
-        previous?.state !== 'unmounting'
+        previous.state !== 'mounted' &&
+        previous.state !== 'unmounting'
       ) {
         notify(t('agent.event.mounted', { name: event.mount.repo_name || event.mount.allocation_id }))
       }

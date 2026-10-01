@@ -18,6 +18,36 @@ export function formatBytes(bytes: number | undefined | null): string {
   return `${negative ? '-' : ''}${value.toFixed(digits)} ${unit}`
 }
 
+/**
+ * 存储库用量：进度条百分比 + 「已用 / 总量」文案。
+ *
+ * 卡片、详情页概览、管理端表格共用同一个口径，三处必须显示同一个数。
+ *
+ * 分母取**库容量**（建库时设定的容量 = 那块盘的 VHDX 标称容量，服务端读时派生）。
+ * 不能拿 `quota_bytes` 当分母：库没有"配额"概念，新建库根本不写这个字段（恒为 0），
+ * 于是百分比恒为 0、进度条永远空着 —— 界面上就是"看不出用了多少"。
+ * 存量老库里若还残留库级配额（>0），回退用它当分母，免得老库退化成没有分母。
+ *
+ * 容量也没派生出来时（0，例如盘记录已回收）分母为 0：此时只报已用量，
+ * 绝不除零，也不假装进度条是 0%（那会被读成"没占用"）。
+ */
+export function repoUsage(repo?: {
+  used_bytes?: number
+  capacity_bytes?: number
+  quota_bytes?: number
+}): { percent: number; text: string } {
+  const used = repo?.used_bytes ?? 0
+  const capacity = repo?.capacity_bytes && repo.capacity_bytes > 0 ? repo.capacity_bytes : 0
+  const total = capacity > 0 ? capacity : (repo?.quota_bytes ?? 0)
+  if (total <= 0) return { percent: 0, text: formatBytes(used) }
+  // 超 100% 是真的会发生的：用量按"每个差异盘按容量预留"计，共享库多位用户同时在建盘时
+  // 会短暂超过单份容量。钳到 100 只影响条形长度，文字仍显示真实数值。
+  return {
+    percent: Math.min(100, Math.round((used / total) * 100)),
+    text: `${formatBytes(used)} / ${formatBytes(total)}`
+  }
+}
+
 /** 容量输入框统一使用的单位后缀（存量值仍是字节，只在表单里换算成 M 展示/录入）。 */
 export const CAPACITY_UNIT = 'M'
 

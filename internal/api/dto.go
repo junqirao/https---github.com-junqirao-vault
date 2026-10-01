@@ -109,13 +109,20 @@ type repoDTO struct {
 	//
 	// MaxDiffDisks 是它改名前的字段，两者**永远同值**：老字段保留一段时间，
 	// 免得已发布的前端读不到这个数（差异盘数量是卡片上的关键信息）。
-	ShareCount   int            `json:"share_count"`
-	MaxDiffDisks int            `json:"max_diff_disks"`
-	QuotaBytes   int64          `json:"quota_bytes"`
-	UsedBytes    int64          `json:"used_bytes"`
-	State        string         `json:"state"`
-	Group        string         `json:"group,omitempty"`
-	ClientConfig map[string]any `json:"client_config,omitempty"`
+	ShareCount   int   `json:"share_count"`
+	MaxDiffDisks int   `json:"max_diff_disks"`
+	QuotaBytes   int64 `json:"quota_bytes"`
+	// CapacityBytes 库容量：建库时设定的容量（那块盘的 VHDX 标称容量）。
+	//
+	// 卡片上的「已用 / 容量」进度条用它当分母。**不要用 QuotaBytes 当分母**：
+	// 库没有"配额"概念，新建库根本不写这个字段（恒为 0），老前端就是拿它算百分比，
+	// 于是进度条永远是空的 —— 卡片上看不出用了多少。它是读时从母盘派生的
+	// （见 domain.Repository.CapacityBytes），读不到盘记录时为 0，前端回退成不显示分母。
+	CapacityBytes int64          `json:"capacity_bytes"`
+	UsedBytes     int64          `json:"used_bytes"`
+	State         string         `json:"state"`
+	Group         string         `json:"group,omitempty"`
+	ClientConfig  map[string]any `json:"client_config,omitempty"`
 	// Pool 是否为池化共享库：建库时已把差异盘池建好并发布，分配即用（挂载免等）。
 	Pool bool `json:"pool"`
 	// Prepare 建库进度：state=creating 时前端据此显示"正在派生差异盘 3/5"。
@@ -140,7 +147,8 @@ func toRepoDTO(r *domain.Repository) repoDTO {
 		ID: r.ID, Name: r.Name, Mode: string(r.Mode), OwnerID: r.OwnerID,
 		ParentVersion: r.ParentVersion,
 		ShareCount:    r.MaxDiffDisks, MaxDiffDisks: r.MaxDiffDisks,
-		QuotaBytes: r.QuotaBytes, UsedBytes: r.UsedBytes, State: string(r.State),
+		QuotaBytes: r.QuotaBytes, CapacityBytes: r.CapacityBytes,
+		UsedBytes: r.UsedBytes, State: string(r.State),
 		Group: r.Meta.Group, ClientConfig: r.Meta.ClientConfig,
 		Pool:      r.Meta.Pool,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,

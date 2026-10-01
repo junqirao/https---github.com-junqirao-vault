@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Alert, Button, Descriptions, Dropdown, Form, Input, InputNumber, Modal, Space, Tabs } from 'antd'
+import { Alert, Button, Descriptions, Dropdown, Form, Input, InputNumber, Modal, Progress, Space, Tabs } from 'antd'
 import type { MenuProps } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -12,7 +12,8 @@ import { StatusTag } from '../../components/StatusTag'
 import { useApi } from '../../api/provider'
 import type { ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
 import { useI18n } from '../../i18n'
-import { formatBytes, formatTime } from '../../utils/format'
+import { palette, spacing } from '../../tokens/palette'
+import { formatTime, repoUsage } from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
@@ -105,6 +106,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   if (repoQuery.isLoading) return <LoadingState text={t('common.loading')} />
 
   const repo = repoQuery.data
+  // 用量口径与卡片、管理端表格一致（分母 = 库容量，见 repoUsage）。
+  const { percent: usagePercent, text: usageText } = repoUsage(repo)
 
   const openEdit = (target: RepoDTO): void => {
     editForm.setFieldsValue({
@@ -175,8 +178,20 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                   </Descriptions.Item>
                   <Descriptions.Item label={t('repo.parentVersion')}>{repo?.parent_version ?? '-'}</Descriptions.Item>
                   {/* 库**没有配额**：库只有"容量"（建库时设定），这个容量就是它占用的配额
-                      （计入用户已用配额）。所以这里只展示占用了多少，不再提供配额输入。 */}
-                  <Descriptions.Item label={t('repo.used')}>{formatBytes(repo?.used_bytes)}</Descriptions.Item>
+                      （计入用户已用配额）。所以这里只展示占用了多少，不再提供配额输入。
+                      口径与卡片、管理端表格一致（分母 = 库容量，见 repoUsage）。 */}
+                  <Descriptions.Item label={t('repo.used')}>
+                    <div style={{ minWidth: 160 }}>
+                      <div>{usageText}</div>
+                      <Progress
+                        percent={usagePercent}
+                        size="small"
+                        strokeColor={palette.accent}
+                        trailColor={palette.neutralFill}
+                        style={{ marginBottom: 0, marginTop: spacing.xxs }}
+                      />
+                    </div>
+                  </Descriptions.Item>
                   <Descriptions.Item label={t('field.maxDiffDisks')}>{repo?.max_diff_disks ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label={t('common.createdAt')}>{formatTime(repo?.created_at)}</Descriptions.Item>
                 </Descriptions>

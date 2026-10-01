@@ -9,7 +9,7 @@ import type { RepoDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
-import { MountStateCell, openTargetOf } from '../mount/MountControls'
+import { MountStateCell, mountSessionLive, openTargetOf } from '../mount/MountControls'
 
 /** 存储库卡片上的挂载能力控制器。 */
 export interface RepoMountController {
@@ -17,14 +17,33 @@ export interface RepoMountController {
   mount: AgentMountState | undefined
   /** 挂载点：盘符模式为 "E:"，目录模式为绝对目录。 */
   mountPath: string
-  /** 已挂载（挂载点可用、可打开）。 */
+  /** 已挂载（挂载点可用、可打开）：要求记录是 mounted **且实测会话还在**。 */
   mounted: boolean
+  /**
+   * 实测的本机 iSCSI 会话状态：true/false；undefined = 尚未核对（按记录展示）。
+   *
+   * 界面判断"这块盘到底挂没挂上"一律看它，不看记录（见 mountSessionLive）。
+   */
+  sessionLive: boolean | undefined
+  /** 记录还在，但代理实测本机已无活动会话（盘实际不在了）。 */
+  sessionLost: boolean
   /** 代理侧状态机进行中（挂载中 / 卸载中）。 */
   pending: boolean
   /** 本次操作请求进行中。 */
   busy: boolean
-  /** 可执行挂载（代理可用，且已有分配或本人有权自建分配）。 */
+  /**
+   * 可执行挂载（代理可用、库已就绪，且已有分配或本人有权自建分配）。
+   *
+   * 含"库已就绪"这一条：建库中（creating）的库还没有可挂的盘，服务端也会拒绝
+   * （repo.creating），按钮提前置灰并说明原因。
+   */
   canMount: boolean
+  /**
+   * 可执行卸载（代理可用，且已有分配或本人有权自建分配）。
+   *
+   * **与库状态无关**：库异常/删除中时，本机已经挂上的盘反而更需要能摘掉。
+   */
+  canUnmount: boolean
   /** 不可挂载的原因文案；可挂载时为空。 */
   disabledReason: string | undefined
   error: unknown
@@ -71,15 +90,27 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
   }, [agent.state, allocationId, repo.id])
 
   const isOwner = repo.owner_id === currentUserId
-  const mounted = mount?.state === 'mounted'
+  // 实测会话状态：界面判断"挂没挂上"以此为准（会话被断后记录仍是 mounted，会撒谎）。
+  const sessionLive = mountSessionLive(mount)
+  const sessionLost = mount !== undefined && sessionLive === false
+  // 断线时不再算"已挂载"：挂载点已随会话消失，不能显示、也不能打开（真实诉求：
+  // "挂载和卸载的按钮应以实际为准，看对应的 iSCSI 连接是否在活动中的"）。
+  const mounted = mount?.state === 'mounted' && !sessionLost
   const pending = mount?.state === 'mounting' || mount?.state === 'unmounting'
-  const canMount = agent.available && (allocationId !== undefined || isOwner)
+  // 库必须 active 才能挂载：建库中（creating）时差异盘还没派生出来，此时"挂载"点了也只会
+  // 换来一句对不上的报错（真实反馈："逻辑有误啊，creating 中的存储库不允许挂载啊"）。
+  // 服务端同样拦住（RequestMount → repo.creating），这里只是提前把按钮置灰并说清原因。
+  const repoReady = repo.state === 'active'
+  const canUnmount = agent.available && (allocationId !== undefined || isOwner)
+  const canMount = canUnmount && repoReady
 
   const disabledReason = !agent.available
     ? t('agent.hostMissing')
-    : canMount
-      ? undefined
-      : t('repo.card.notAllocated')
+    : !repoReady
+      ? t('repo.card.notReady', { state: t(`state.repo.${repo.state}`) })
+      : canMount
+        ? undefined
+        : t('repo.card.notAllocated')
 
   const invalidate = useCallback(async (): Promise<void> => {
     await queryClient.invalidateQueries({ queryKey: ['repo-allocations', repo.id] })
@@ -120,7 +151,8 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
   }, [agent, invalidate, mount])
 
   const openMountDir = useCallback(async (): Promise<void> => {
-    if (!mount || mount.state !== 'mounted') return
+    // 会话已断时挂载点不存在，打开只会报"路径不存在"（mounted 已含实测会话判定）。
+    if (!mount || !mounted) return
     setError(null)
     try {
       await agentApi.openPath(openTargetOf(mount))
@@ -133,9 +165,12 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     mount,
     mountPath: mount?.mount_path ?? '',
     mounted,
+    sessionLive,
+    sessionLost,
     pending,
     busy,
     canMount,
+    canUnmount,
     disabledReason,
     error,
     mountRepo,
@@ -151,23 +186,25 @@ export interface RepoMountActionsProps {
 /** 卡片头部的挂载/卸载按钮：与「打开」图标并排，随标题行垂直居中。 */
 export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Element {
   const { t } = useI18n()
-  const { mount, pending, busy, canMount, disabledReason } = controller
-  const disabled = !canMount || pending
+  const { mount, sessionLost, pending, busy, canMount, canUnmount, disabledReason } = controller
+  // 卸载只受"代理可用 + 有分配"约束，与库状态无关：库异常/建库中时仍要能摘掉本机的盘。
+  const mountDisabled = !canMount || pending
+  const unmountDisabled = !canUnmount || pending
+  // 记录在、但实测已无活动会话（会话被断/服务重启）：盘实际不在了，"卸载"是错的入口 ——
+  // 用户点它只是把记录收掉，盘还是挂不上。此时给"挂载"：代理会先清理残留再真重连
+  // （服务端/代理自己闭环），用户不必先卸载再挂载。
+  const showMount = mount === undefined || sessionLost
 
   return (
     // 卡片整卡可点进详情，按钮区的事件不得冒泡触发跳转。
     <span style={{ display: 'inline-flex', flexShrink: 0 }} onClick={(event) => event.stopPropagation()}>
-      {mount ? (
-        <Button size="small" disabled={disabled} loading={busy} onClick={() => void controller.unmountRepo()}>
-          {t('action.unmount')}
-        </Button>
-      ) : (
+      {showMount ? (
         <Tooltip title={disabledReason}>
           <span style={{ display: 'inline-block' }}>
             <Button
               size="small"
               type="primary"
-              disabled={disabled}
+              disabled={mountDisabled}
               loading={busy}
               onClick={() => void controller.mountRepo()}
             >
@@ -175,6 +212,10 @@ export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Ele
             </Button>
           </span>
         </Tooltip>
+      ) : (
+        <Button size="small" disabled={unmountDisabled} loading={busy} onClick={() => void controller.unmountRepo()}>
+          {t('action.unmount')}
+        </Button>
       )}
     </span>
   )

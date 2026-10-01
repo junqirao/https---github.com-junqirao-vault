@@ -101,6 +101,9 @@ func New(d Deps) *App {
 	// 建库预创建（JobPrepareRepo）与释放回池（JobResetDiff）要一边建盘一边下发目标，
 	// 两个服务互相引用（Iscsi 已持有 Disks），回填即可，不必再拆一层。
 	a.disk.IscsiSvc = a.iscsi
+	// 撤销母盘临时共享（stopTempShare）也要拆目标：目标拆除只有一套实现
+	// （IscsiService.TeardownTarget），RepoService 不再自己拼平台的三个调用。
+	a.repo.IscsiSvc = a.iscsi
 	a.lease = &LeaseService{Deps: d, Repos: a.repo, Disks: a.disk, Iscsi: a.iscsi}
 	a.upload = &UploadService{Deps: d, Disks: a.disk, Repos: a.repo}
 	a.storage = &StorageService{Deps: d}

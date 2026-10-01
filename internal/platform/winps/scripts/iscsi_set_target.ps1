@@ -231,7 +231,11 @@ try {
         $createArgs = @{ TargetName = $TargetName }
         if ($Description) { $createArgs['Description'] = $Description }
         if ($InitiatorIdsJson -ne '') {
-            $initialIds = @(ConvertFrom-Json -InputObject $InitiatorIdsJson | Where-Object { $_ })
+            # ⚠️ 同 volume_find_iscsi_disk.ps1 的坑：PS 5.1 的 ConvertFrom-Json 把 JSON 数组
+            # 整体当一个对象输出（不展开），直接进管道会让 `.Count` 恒为 1、元素还是数组，
+            # 于是"多个 initiator"被压成一个（拼接后的脏字符串）下发。先对变量展开再过滤。
+            $decodedIds = ConvertFrom-Json -InputObject $InitiatorIdsJson
+            $initialIds = @($decodedIds | Where-Object { $_ })
             if ($initialIds.Count -gt 0) {
                 # 建目标同样要按参数类型转换（否则同样报 Cannot convert ... to InitiatorId）。
                 $newCommand = Get-Command -Name New-IscsiServerTarget -ErrorAction Stop
@@ -269,7 +273,9 @@ try {
     # 访问控制由单向 CHAP 负责。
     $bindMode = 'unchanged'
     if ($InitiatorIdsJson -ne '') {
-        $ids = @(ConvertFrom-Json -InputObject $InitiatorIdsJson | Where-Object { $_ })
+        # 同上：必须先在变量上展开成元素，否则多客户端共享同一目标时白名单只下发第一个。
+        $decodedIds = ConvertFrom-Json -InputObject $InitiatorIdsJson
+        $ids = @($decodedIds | Where-Object { $_ })
         if ($ids.Count -eq 0) {
             # 空 = open：下发通配"任意 initiator"，而不是留一个拒绝所有的空列表。
             $ids = @('IQN:*')

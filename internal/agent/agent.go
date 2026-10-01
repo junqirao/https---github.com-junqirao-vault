@@ -264,6 +264,13 @@ func (a *Agent) Start(ctx context.Context) (string, error) {
 		a.runSessionRenewalLoop(a.baseCtx)
 	})
 
+	// 已挂载记录的会话实测：界面按钮与状态标签以**实际会话**为准，不看记录（见 session_probe.go）。
+	a.wg.Add(1)
+	safeGo(a.logger, "mount_session_probe", func() {
+		defer a.wg.Done()
+		a.runMountSessionProbeLoop(a.baseCtx)
+	})
+
 	// 启动即预检本机 iSCSI 发起端（只读）：不就绪时界面会挂横幅，而不是等挂载失败才知道。
 	safeGo(a.logger, "iscsi_probe", func() {
 		probeCtx, cancel := context.WithTimeout(a.baseCtx, defaultProbeTimeout)

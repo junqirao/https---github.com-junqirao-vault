@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -263,6 +264,48 @@ func (r *Router) handleEvents(w http.ResponseWriter, req *http.Request) {
 // 危险操作默认只报告；报告中 AutoFixed=false 表示仅记录未执行修复（见 5.11）。
 func (r *Router) handleGetReconcile(w http.ResponseWriter, req *http.Request) {
 	r.writeJSON(w, http.StatusOK, r.deps.App.LastReconcileReport())
+}
+
+// handleScanOrphans 现扫一遍孤儿磁盘文件（仅超级管理员）。
+//
+// 与管理端「孤儿磁盘」页面一一对应：对账只报告（见 5.11），这里给出一份**可操作清单**
+// （路径、所属根、分类、大小、修改时间），由管理员确认后逐个删除。刻意不复用对账报告的
+// 旧快照：用户点开页面时要看到的是"此刻磁盘上真实存在什么"。
+func (r *Router) handleScanOrphans(w http.ResponseWriter, req *http.Request) {
+	scan, err := r.deps.App.ScanOrphanFiles(req.Context())
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusOK, scan)
+}
+
+// orphanDeleteRequest 是删除孤儿文件的请求体。
+type orphanDeleteRequest struct {
+	// Path 要删除的文件绝对路径（来自扫描结果，服务端会重新校验它仍在存储根的 disks 下）。
+	Path string `json:"path"`
+}
+
+// handleDeleteOrphan 删除一个孤儿磁盘文件（仅超级管理员）。
+//
+// 不可逆，因此必须留下**谁删了哪个文件**的审计；服务端在删除前会重新确认该文件确实
+// 还没有被数据库登记（页面清单可能已经过期，见 app.DeleteOrphanFile 的四道闸门）。
+func (r *Router) handleDeleteOrphan(w http.ResponseWriter, req *http.Request) {
+	var in orphanDeleteRequest
+	if err := r.decodeJSON(req, &in); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	res, err := r.deps.App.DeleteOrphanFile(req.Context(), in.Path)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	if p, err := r.principal(req); err == nil {
+		r.deps.App.Audit(req.Context(), p.UserID, "system.orphan_delete",
+			"file:"+res.Path, "freed_bytes="+strconv.FormatInt(res.FreedBytes, 10), domain.AuditResultOK)
+	}
+	r.writeJSON(w, http.StatusOK, res)
 }
 
 // ---- 初始化（Bootstrap）----

@@ -38,10 +38,19 @@ function Find-IscsiDisk {
 try {
     if ($SizeBytes -le 0) { throw 'SizeBytes 必须为正数' }
 
+    # ⚠️ Windows PowerShell 5.1 的 ConvertFrom-Json 把 JSON 数组**整体当成一个对象**输出
+    # （不展开元素），因此 `@(ConvertFrom-Json ... | Where-Object {...})` 交到手里的 `$_`
+    # 是**整个数组**而不是它的元素 —— 再 `[int]` 转换就抛
+    # "无法将 System.Object[] 转换为 System.Int32"，整个脚本以 find_iscsi_disk_failed 收场。
+    # 后果是**本机只要已经挂了一块盘（UsedDiskNumbers 非空），后续每次挂载都失败**
+    # （真实事故：池位盘预创建后连挂第二块盘必然失败）。
+    # 修法：不要在管道里消费它，在**变量**上用 @(...) 强制展开成元素。
     $used = @()
     if ($UsedDiskNumbers -and $UsedDiskNumbers -ne '') {
-        $parsed = @(ConvertFrom-Json -InputObject $UsedDiskNumbers | Where-Object { $_ -ne $null })
-        foreach ($item in $parsed) { $used += [int]$item }
+        $decoded = ConvertFrom-Json -InputObject $UsedDiskNumbers
+        foreach ($item in @($decoded)) {
+            if ($null -ne $item) { $used += [int]$item }
+        }
     }
 
     $refreshNote = ''

@@ -966,12 +966,17 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 
 > CHAP 密钥强度：Windows CHAP secret 需 **12~16 字节**（用于单向 CHAP），建议 16 字节 Base64。
 
-> **目标下发是幂等的，并且"期望状态没变化就不下发"**（`IscsiService.pushTarget`）：
-> 先比"期望状态指纹"（含 CHAP 密钥，密钥只作为哈希输入、绝不进日志/DB），再用 `GetTarget` 读一次现状，
-> 两者都一致才跳过。原因：Windows 上一次全量下发（建/改目标 + 授权 + CHAP + 映射 + 启用）实测约 **15 秒**，
+> **目标下发只做一次，之后只读库**（`IscsiService.pushTarget` + `targetApplied`）：
+> "这份期望状态是否已下发过"以**数据库里的持久化记账**为准（`iscsi_targets.applied_fingerprint` /
+> `applied_at` / `actual_iqn`），而不是进程内存。命中即整段跳过下发，**且不再向平台读回现状**。
+> 原因：Windows 上一次全量下发（建/改目标 + 授权 + CHAP + 映射 + 启用）实测约 **15 秒**，
 > 而**每次挂载**都会走到这步（真实工单："每次挂载都要等十几秒"）。
-> `TargetInfo` 只能读回 启用状态 / 授权 / 映射盘，**读不回 CHAP 与只读标志**，所以必须叠加指纹；
-> 进程重启后指纹缓存为空 → 首次仍会全量下发（安全侧）；读不到现状（目标不存在/查询失败）一律老实下发。
+> 期望状态指纹逐字段包含 Name/Enabled/ReadOnly/BackingRef/CHAP（含密钥哈希）/授权列表，
+> 所以换盘、轮换密钥、改白名单、停用/启用任何一项变了都不再命中 → 自动重新下发；
+> CHAP 密钥只作为哈希输入，绝不进日志，DB 里只留指纹。
+> 记账随进程重启仍然有效：**分配阶段全量下发一次，之后的分发阶段直接命中并跳过**，
+> 不再付这份成本。只有拆除（`clearApplied`）、对账判定漂移、鉴权/停用变更时才走强制下发
+> （`forcePushTarget`），把记账清空或刷新。
 
 ### 5.4 存储库状态机、维护状态与母盘保护
 
@@ -1085,6 +1090,30 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 > 用户抱怨的地方；现在这类情况一律收敛为"卸载成功"。**回滚只发生在"什么都没拆掉"时**，
 > 已拆掉一部分却回滚等于向界面谎报"还挂着"（真实反馈："点了卸载，然后提示挂载成功？
 > 磁盘状态还是已挂载"）——前端收到 `mounted` 事件还会弹一条"已挂载"提示。
+
+> **挂载 / 卸载按钮以实测会话为准**（真实诉求："在客户端挂载和卸载的按钮应以实际为准，看对应的
+> iSCSI 连接是否是在活动中的"）：`MountState.state` 只是**代理的记录/意图**，盘是否真的挂着由会话
+> 决定。会话被系统或用户断开（MSiSCSI 服务重启、长时间断网、手动在发起程序里断开）之后记录仍是
+> `mounted` —— 界面显示"已挂载 + 卸载"，而盘根本不在：用户既用不了盘，点"卸载"还会在 ① 步
+> 因挂载点不存在而失败。处理口径：
+>   - **代理**每 ≈20s 对每条 `mounted` / `error` 记录实测一次（`Get-IscsiSession` 的
+>     `IsConnected`，约 0.5~1.5s），结论写进 `MountState.session_active / session_checked_at`，
+>     **结论变化时推 `mount` 事件** → 界面按钮与标签自动翻转，无需用户刷新（见
+>     `internal/agent/session_probe.go`）。`error` 记录也要测：它的语义就是"本机还有残留待清理"，
+>     而且 Windows 的持久会话（`-IsPersistent`）会自己把会话连回来，不实测就永远不知道。
+>     只测 mounted/error（mounting/unmounting 正在转场，revoked 随即被卸载删除）；
+>     **探测失败、发起端未就绪一律不猜**（保持上次结论）；结论不变时不写盘、不推事件
+>     （每 20s 一轮，否则就是状态文件写个不停 + 事件风暴）。
+>   - **界面**判定"挂没挂上"一律看 `session_active`：实测无会话 → 标签显示"已断开"、主按钮换回
+>     "挂载"（点它=代理先清理残留再真重连，用户不必先卸载再挂载）；`session_checked_at=0`
+>     （尚未核对，代理刚启动）或旧代理没有该字段 → 按记录状态展示，**不得**把"没有证据"当"断线"。
+>   - **挂载幂等判据**随之从"记录是 mounted"收紧为"记录是 mounted **且实测会话还在**"：否则会话
+>     断了之后点"挂载"会直接返回既有状态，等于谎报"已经挂好了"。
+>   - **卸载**的"挂载点是否还在"多一条兜底：本机实测已无活动会话 ⇒ 盘随会话消失、挂载点不可能
+>     还在。没有这条兜底，进程重启后的断线记录会既挂不上又卸不掉（磁盘号无从得知，原有的
+>     "磁盘号已知且查不到挂载点"兜底失效）。
+>   - 记录**不因断线被删**：租约/分配仍按原语义留在服务端（`ReapExpired` 只把租约标成 `expired`，
+>     从不停用目标、也不回收分配），用户点"挂载"或"卸载"各自由既有链路闭环。
 
 > **目录挂载的坑**：`Add-PartitionAccessPath -AccessPath` 要求目标目录**已存在且为空**，且其父路径所在卷为 NTFS。客户端启动时需预检并给出明确错误提示。
 >
@@ -1888,6 +1917,21 @@ GET    /v1/system/reconcile              仅 super_admin；返回最近一次对
 ```
 > 对账**默认只报告不自动修复**，危险操作（删孤儿 target/VHDX）一律不自动执行。
 
+**孤儿磁盘（仅 super_admin）**
+
+```
+GET    /v1/system/orphans                现扫各生效存储根 disks/ 下未被数据库登记的 .vhdx
+                                         {at, roots[], checked, files[{path, root, kind, size_bytes,
+                                          modified_at}], total_bytes, skipped[]}
+POST   /v1/system/orphans/delete         删除一个孤儿文件 body: {path}
+                                         → {path, freed_bytes}
+```
+> 对账发现这类文件只打**一条汇总 WARN**并指向管理端「孤儿磁盘」页面（逐个文件的明细降到 Debug），
+> 由管理员在该页面确认后逐个删除。删除是不可逆操作，服务端在删前**重新校验**：绝对路径 + `.vhdx`
+> + 落在某个生效存储根的 `disks_dir` 之下 + **此刻未被任何磁盘记录引用**（页面清单是扫描快照，可能已过期）。
+> 错误码：`system.orphan_path_invalid`(400) / `system.orphan_registered`(409) / `system.orphan_not_found`(404) /
+> `system.orphan_delete_failed`(500)。删除写入审计 `system.orphan_delete`。
+
 **平台存储池（LVM thin pool / dm-cache；仅 super_admin，Windows 返回 501）**
 
 ```
@@ -1960,6 +2004,23 @@ func (r *Runner) RunScript(ctx context.Context, script string, params map[string
     // 4) 解析 stdout 的最后一行 JSON；stderr 入日志
 }
 ```
+
+**踩坑：Windows PowerShell 5.1 的 `ConvertFrom-Json` 不展开 JSON 数组。**
+
+它把数组**整个当成一个对象**输出，所以 `@(ConvertFrom-Json -InputObject $json | Where-Object {$_})`
+拿到的 `$_` 是**整个数组**而不是元素，`.Count` 恒为 1；再 `[int]` 转换就直接抛
+`无法将 System.Object[] 转换为 System.Int32`。正确写法是先落变量、再用 `@(...)` 展开：
+
+```powershell
+$decoded = ConvertFrom-Json -InputObject $InitiatorIdsJson
+foreach ($item in @($decoded)) { ... }
+```
+
+> 真实事故：`volume_find_iscsi_disk.ps1` 用管道写法解析 `-UsedDiskNumbers`，于是
+> **本机只要已经挂了一块盘（列表非空），后续每次挂载都在 find_disk 阶段失败**
+> （池位盘预创建后连挂第二块盘必然失败）。
+> 护栏：`winps/find_iscsi_disk_script_test.go`（真机跑脚本、注入假 `Get-Disk`）+
+> `winps/scripts_guard_test.go`（跨平台扫内嵌脚本，禁止 `ConvertFrom-Json ... |` 与丢失 BOM）。
 
 ```go
 // platform/winps/scripts/iscsi_publish.ps1

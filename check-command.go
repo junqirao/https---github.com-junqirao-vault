@@ -824,6 +824,14 @@ func checkWindowsVolume(r *report, sb *sandbox, vhdx string) bool {
 			r.script("D11 volume_unmount.ps1（卸载目录挂载点）", "& .\\scripts\\volume_unmount.ps1",
 				sb.script("volume_unmount.ps1"), "-AccessPath", mountDir)
 		}
+
+		// 盘符模式的卸载也必须覆盖：D11 只走目录模式，而盘符分支曾把
+		// -DiskNumber/-PartitionNumber 与 -DriveLetter 混传（不同参数集）→ 参数绑定即失败，
+		// 盘符挂载永远卸不掉，界面还误报"盘正被程序占用"（见 volume_unmount.ps1 的 .NOTES）。
+		if letter != "" {
+			r.script("D11b volume_unmount.ps1（卸载盘符挂载点）", "& .\\scripts\\volume_unmount.ps1",
+				sb.script("volume_unmount.ps1"), "-AccessPath", letter)
+		}
 	} else {
 		r.warn("D7 起的卷脚本", "D6 未返回 disk_number，跳过后续依赖磁盘号的脚本", "")
 	}

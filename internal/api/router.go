@@ -99,6 +99,9 @@ func (r *Router) routes() {
 		g.Patch("/v1/system/config", r.requireSuperAdmin(r.handlePatchConfig))
 		g.Get("/v1/system/audit", r.requireSuperAdmin(r.handleListAudit))
 		g.With(r.requireSuperAdminMW).Get("/v1/system/reconcile", r.handleGetReconcile)
+		// 孤儿磁盘文件：对账只报告（见 5.11），这里由管理员在「孤儿磁盘」页面上逐个手动删除。
+		g.With(r.requireSuperAdminMW).Get("/v1/system/orphans", r.handleScanOrphans)
+		g.With(r.requireSuperAdminMW).Post("/v1/system/orphans/delete", r.handleDeleteOrphan)
 
 		// 平台存储池（LVM thin pool / dm-cache）：读取现状与块设备列表、初始化池。
 		// 仅超级管理员；Windows 后端返回 501 platform.unsupported，前端据此隐藏入口。

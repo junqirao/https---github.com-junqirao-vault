@@ -26,7 +26,12 @@ import (
 // 不设上限的话一次误填就能把服务端占住几十分钟。需要更多并发用户就建多个库。
 const maxPreparedDisks = 32
 
-type RepoService struct{ Deps }
+type RepoService struct {
+	Deps
+	// IscsiSvc 用来拆除母盘临时共享的 iSCSI 目标：目标拆除只有一套实现
+	// （IscsiService.TeardownTarget），这里不再自己拼平台的三个调用。
+	IscsiSvc *IscsiService
+}
 
 // parentIDOf 取库的母盘 ID；没有母盘（独享库或数据异常）时返回空串。
 func parentIDOf(repo *domain.Repository) string {
@@ -264,6 +269,9 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 	if err != nil {
 		return nil, nil, err
 	}
+	// 派生列：库容量就是当场算出的那块盘的标称容量（见 domain.Repository.CapacityBytes）。
+	// 这里刚建好记录、还没人回读，补上它，创建响应里的库才和后续 Get/List 口径一致。
+	repo.CapacityBytes = size
 
 	if preparing {
 		// 预创建：母盘 → 共享数量个差异盘 → 同数量的 iSCSI 目标（见 DiskService.runPrepareRepo）。
@@ -336,6 +344,12 @@ func (s *RepoService) Update(ctx context.Context, id string, in UpdateRepoInput)
 	})
 	if err != nil {
 		return nil, err
+	}
+	// 回读一次拿派生列：库容量不落库（见 domain.Repository.CapacityBytes），而上面
+	// LockRepository 的行锁查询不带派生列。缺了它，"编辑存储库"的响应里容量为 0，
+	// 前端拿这个库画进度条就没有分母。
+	if updated, err := s.Store.GetRepository(ctx, id); err == nil {
+		out = updated
 	}
 	s.audit(ctx, "", "repo.update", "repo:"+id, "", domain.AuditResultOK)
 	return out, nil
@@ -1237,16 +1251,14 @@ func (s *RepoService) stopTempShare(ctx context.Context, repo *domain.Repository
 				diskPath = d.VHDXPath
 			}
 		}
-		if s.Iscsi != nil && diskPath != "" {
-			if err := s.Iscsi.DetachLun(ctx, name, diskPath); err != nil {
-				s.Log.Warn("解除临时共享映射失败", "target", name, "error", err)
-			}
-			if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: name, Enabled: false}); err != nil {
-				s.Log.Warn("停用临时共享目标失败", "target", name, "error", err)
-			}
-			if err := s.Iscsi.RemoveTarget(ctx, name); err != nil {
-				s.Log.Warn("删除临时共享目标失败", "target", name, "error", err)
-			}
+		// 目标拆除走唯一实现（见 IscsiService.teardownTargetLocked）：临时共享的目标名
+		// 同样是**短名**（tempTargetName），直接拿它去问平台必然 not_found —— 原来
+		// "解映射 + 停用 + 删除"三步全是空转，目标一直挂在平台上。没有磁盘路径时只拆
+		// 目标（映射随目标一起消失）。
+		if s.IscsiSvc != nil {
+			s.IscsiSvc.TeardownTarget(ctx, target, TeardownOptions{DetachDiskPath: diskPath})
+		} else if s.Iscsi != nil {
+			s.Log.Error("未装配 iSCSI 服务，跳过临时共享目标拆除", "target", name)
 		}
 		if target.AllocationID != nil {
 			if err := deleteAllocationIfExists(ctx, s.Store, *target.AllocationID); err != nil {

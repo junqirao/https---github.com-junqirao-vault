@@ -56,6 +56,24 @@ export interface AgentMountState {
    * 只出现在挂载状态里（诊断面板/挂载状态悬浮可读、可复制），不进任何 API 错误响应。
    */
   last_error_detail?: string
+  /**
+   * **实测**的本机 iSCSI 会话状态：本机发起端当前是否还有到 target_iqn 的活动连接。
+   *
+   * state 只是代理的**记录/意图**，这块盘是否真的挂着由会话决定：会话被系统或用户断开
+   * （MSiSCSI 服务重启、长时间断网、手动在发起程序里断开）之后记录仍是 mounted，
+   * 界面于是显示"已挂载 + 卸载"，而盘根本不在 —— 用户既用不了盘、点卸载还会失败。
+   * 代理每 ≈20s 实测一次（Get-IscsiSession），界面的挂载/卸载按钮以它为准。
+   *
+   * ⚠️ 只有实测为真时才是 true；探测失败不猜（保持原值）。
+   */
+  session_active?: boolean
+  /**
+   * 最近一次**得出会话结论**的时刻（毫秒时间戳）；结论不变时不刷新。
+   *
+   * 缺省/0 表示**尚未核对**（代理刚启动）：此时**不能**把 session_active 的缺省值
+   * 当成"断线"，要按 state 展示（判定请统一走 mountSessionLive）。
+   */
+  session_checked_at?: number
 }
 
 export type DownloadStatus = 'running' | 'done' | 'failed' | 'canceled'

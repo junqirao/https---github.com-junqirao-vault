@@ -18,7 +18,7 @@ import { useI18n } from '../../i18n'
 import { palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime } from '../../utils/format'
 import { diskKindLabel } from '../../utils/labels'
-import { MountActionButtons, MountDialog } from '../mount/MountControls'
+import { MountActionButtons, MountDialog, mountSessionLive } from '../mount/MountControls'
 
 export interface RepoDisksProps {
   repoId: string
@@ -284,8 +284,20 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
       key: 'mount_state',
       width: 110,
       render: (_value, disk) => {
-        const state = diskMountState(allocationsByDisk.get(disk.id) ?? [])
+        const allocs = allocationsByDisk.get(disk.id) ?? []
+        const state = diskMountState(allocs)
         if (!state) return '-'
+        // 自己的记录若被代理**实测**已无活动会话：服务端分配状态仍是"已挂载"，但这块盘
+        // 在本机实际已不在了，如实显示"已断开"（真实诉求：标签与按钮都以实际会话为准）。
+        // 别人的分配无从得知对方的会话，只按服务端状态展示。
+        const mine = allocs.find((alloc) => alloc.user_id === currentUserId)
+        if (state === 'mounted' && mountSessionLive(mine ? mountByAllocation.get(mine.id) : undefined) === false) {
+          return (
+            <Tooltip title={t('agent.mount.sessionLost')}>
+              <StatusTag group="mount" value="disconnected" />
+            </Tooltip>
+          )
+        }
         const meta = MOUNT_STATE_META[state]
         return (
           <Tag bordered={false} color={meta.color}>
@@ -300,7 +312,9 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
       width: 180,
       render: (_value, disk) => {
         const mine = (allocationsByDisk.get(disk.id) ?? []).find((alloc) => alloc.user_id === currentUserId)
-        const path = mine ? mountByAllocation.get(mine.id)?.mount_path : undefined
+        const mineMount = mine ? mountByAllocation.get(mine.id) : undefined
+        // 实测已无活动会话时挂载点早已随会话消失：再显示旧路径就是撒谎（点开只会报路径不存在）。
+        const path = mountSessionLive(mineMount) === false ? undefined : mineMount?.mount_path
         if (!path) return '-'
         return (
           <Tooltip title={path}>

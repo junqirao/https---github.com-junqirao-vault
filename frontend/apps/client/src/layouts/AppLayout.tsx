@@ -8,6 +8,7 @@ import {
   DatabaseOutlined,
   DesktopOutlined,
   DownOutlined,
+  FileSearchOutlined,
   FileTextOutlined,
   HddOutlined,
   SettingOutlined,
@@ -73,6 +74,8 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
     { key: '/admin/users', icon: <TeamOutlined />, label: t('nav.users') },
     { key: '/admin/repos', icon: <AppstoreOutlined />, label: t('nav.repos') },
     { key: '/admin/storages', icon: <DatabaseOutlined />, label: t('nav.storages') },
+    // 紧挨「存储」：孤儿磁盘就是存储根里"未登记却真实存在"的 VHDX，属于存储侧清理入口。
+    { key: '/admin/orphans', icon: <FileSearchOutlined />, label: t('nav.orphans') },
     { key: '/admin/leases', icon: <HddOutlined />, label: t('nav.leases') },
     { key: '/admin/jobs', icon: <DashboardOutlined />, label: t('nav.jobs') },
     { key: '/admin/audit', icon: <AuditOutlined />, label: t('nav.audit') },

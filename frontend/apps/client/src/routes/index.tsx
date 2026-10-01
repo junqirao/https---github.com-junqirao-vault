@@ -8,6 +8,7 @@ import {
   LeaseList,
   LogViewer,
   MyRepos,
+  OrphanDisks,
   PageShell,
   RepoCreateForm,
   RepoDetail,
@@ -168,6 +169,7 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
         />
         <Route path="leases" element={<LeaseList canRevoke />} />
         <Route path="storages" element={<StorageList />} />
+        <Route path="orphans" element={<OrphanDisks />} />
         <Route path="jobs" element={<JobList />} />
         <Route path="audit" element={<AuditList />} />
         <Route path="logs" element={<LogViewer />} />
