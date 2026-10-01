@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      CSP：仅允许本地资源与内联样式/脚本（Vite dev 需要内联脚本）；
+      禁止加载任何外部来源的脚本，connect-src 放开以便访问任意服务端地址。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src *; font-src 'self' data:;"
+    />
+    <title>Vault</title>
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+      }
+      /*
+        统一盒模型：工程未引入 antd reset，默认 content-box 会让「100vh + padding」
+        恒定溢出，导致始终出现页面级滚动条。这里全局改为 border-box 消除根因。
+      */
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+      /*
+        antd 的 <App> 会在 #root 下渲染一层 div.ant-app 包裹层（默认无高度），
+        整屏页面用 height:100% 时需要这层也是确定高度，否则百分比高度会退化为内容高度。
+      */
+      #root > .ant-app {
+        height: 100%;
+      }
+      body {
+        background: #f5f5f7;
+        color: rgba(0, 0, 0, 0.88);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+          'Microsoft YaHei', Helvetica, Arial, sans-serif;
+        /*
+          只关闭**过渡**（装饰性动效），**绝不能关闭 animation（@keyframes）**。
+
+          ⚠️ 这里曾经同时写了 `animation: none !important`，结果是全站所有加载指示器
+          全部静止：antd 的 Spin（旋转，见 antd/es/spin/style 的 antSpinMove/antRotate
+          关键帧）、Skeleton 的扫光、按钮的 loading 图标都依赖 CSS animation，
+          被全局 !important 覆盖后"看起来就像卡死了"（实际请求都正常）。
+          需要"简洁无动效"时请只关 transition，或按组件单独处理。
+        */
+        transition: none !important;
+      }
+      * {
+        transition: none !important;
+      }
+
+      /*
+        滚动条样式。
+        Chromium 默认滚动条（带箭头、方块轨道）与整体简洁风格不搭，这里统一为：
+        细窄、圆角、半透明、悬停加深；用透明边框 + background-clip 做出内缩效果，
+        这样在浅色与深色背景下都不突兀。
+      */
+      * {
+        /* Firefox / 新版规范：粗细与颜色 */
+        scrollbar-width: thin;
+        scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
+      }
+      /* 滚动条尺寸：比 Chromium 默认更细窄 */
+      ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+      ::-webkit-scrollbar-track,
+      ::-webkit-scrollbar-corner {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background-color: rgba(0, 0, 0, 0.18);
+        border: 2px solid transparent;
+        border-radius: 999px;
+        background-clip: content-box;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background-color: rgba(0, 0, 0, 0.34);
+      }
+      ::-webkit-scrollbar-thumb:active {
+        background-color: rgba(0, 0, 0, 0.45);
+      }
+      /* 隐藏滚动条两端的箭头按钮（Chromium 默认会渲染） */
+      ::-webkit-scrollbar-button {
+        display: none;
+        width: 0;
+        height: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,51 @@
+# Vault 仓库忽略规则
+
+# ---------------------------------------------------------------------------
+# ⚠️ 更新签名私钥（绝不入库）
+# ---------------------------------------------------------------------------
+# Vault-Server sign keygen 产出的 keys/update-private.pem 是**发布方私钥**：
+# 一旦入库/泄露，任何人都能伪造客户端更新并推送给所有用户（等于放弃整条更新信任链）。
+# 私钥必须离线保存（发布机/硬件密钥库），仓库里只允许出现**公钥**（base64 文本）。
+keys/
+*.pem
+
+# 发布目录（含已签名的产物，体积大且可由源码重新生成）
+release/
+# build.py 调用 Vault-Server sign 时使用的中间打包目录
+build/
+
+# 客户端自更新的运行期目录（%ProgramData%\Vault\update 的项目内副本 /
+# 联调时用 -config 指到项目内时产生）：含 staged 产物、备份与 updater.log
+update/
+
+# build.py 产出的**服务端镜像分发目录**（= 配置里的 update.artifacts_dir）
+# 内含 manifest.json / manifest.json.sig / artifacts/，应由 release 流程生成后部署，
+# 不随源码入库（否则容易误把旧清单当成"已发布版本"）。
+updates/
+
+# build.py 的构建状态（记录客户端源码指纹，用于判断是否需要递增版本）
+# 属于本机构建缓存，不同机器/CI 之间不应共享。
+.build-state.json
+
+# 构建产物
+dist/
+*.exe
+
+# electron / electron-builder 的下载缓存（由 build.py 指向此处，避免污染系统目录）
+.cache/
+
+# 本地配置（真实配置含 master_key，绝不入库）
+config.yaml
+data/
+logs/
+pki/
+
+# Go
+*.test
+*.out
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

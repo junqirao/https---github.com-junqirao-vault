@@ -1,0 +1,313 @@
+# Vault 服务端配置示例（目标平台：Windows Server）
+#
+# 使用方式：
+#   copy config.example.yaml config.yaml
+#   然后按需修改，并用 `Vault-Server.exe -config config.yaml` 启动。
+#
+# 说明：
+#   - 配置项支持热重载（保存文件即生效），但 TLS / 监听地址 / 数据库驱动等
+#     需要重启才真正生效；热重载只影响新的请求与新的响应内容。
+#   - 部分字段支持环境变量覆盖（VAULT_SERVER_NAME / VAULT_HTTP_LISTEN /
+#     VAULT_DB_DRIVER / VAULT_DB_SQLITE_PATH / VAULT_STORAGE_ROOT /
+#     VAULT_LOG_LEVEL / VAULT_LOG_DIR / VAULT_MASTER_KEY 等）。
+#   - 管理端「系统设置 → 服务端配置」展示**全量配置表**（每项都有说明）：可在线修改的项
+#     保存后会写回本文件（并自动备份 <本文件>.bak）；不能改的项会置灰并注明原因。
+#     写回会重新序列化本文件（注释丢失，可随时从本示例抄回）。
+
+# ---------------------------------------------------------------------------
+# 服务端标识
+# ---------------------------------------------------------------------------
+server:
+  # 服务端唯一标识。留空则首次启动生成并写回本文件。
+  # ⚠️ 必须跨重启保持稳定：客户端证书里绑定了该值（换值会导致客户端证书失效）。
+  instance_id: ""
+  # 展示用别名（管理页与客户端"多服务端"列表使用）。留空时取主机名。
+  name: ""
+
+# ---------------------------------------------------------------------------
+# HTTP 服务
+# ---------------------------------------------------------------------------
+http:
+  # 监听地址。单端口对外只提供 **REST API 与 SSE**（服务端不再承载任何 Web 静态资源，
+  # 管理界面与用户界面已合并进客户端应用）。
+  # 仅监听本机可写 127.0.0.1:8443；对外提供服务用 0.0.0.0:8443。
+  listen: "0.0.0.0:8443"
+  tls:
+    # 生产环境务必保持 true：口令登录与 CHAP 密钥下发都依赖传输加密。
+    enabled: true
+
+    # ★ 证书完全由服务端自行管理，无需任何外部证书文件，开箱即用 TLS：
+    #   - 服务端在 <本配置文件所在目录>/pki/ 下自建 CA，并自动签发 pki/server.crt / server.key；
+    #     不存在则创建，已存在则复用；若 SAN 主机集合变化（换 IP / 换域名）会自动重签；
+    #   - 客户端首次连接时通过指纹核对建立信任（TOFU），见 docs/implementation.md 9.1。
+    #
+    # 下面两项只表示"把证书再导出一份副本"的位置（相对路径基于本文件所在目录解析），
+    # 便于运维查看、备份，或交给前置反向代理使用。**留空则不导出**，不影响 HTTPS 工作。
+    # 导出是幂等的：内容没变就不会写盘；导出失败只记日志，不影响服务启动。
+    cert_file: "pki/server.crt"
+    key_file: "pki/server.key"
+
+# ---------------------------------------------------------------------------
+# 数据库（sqlite | mysql）
+# ---------------------------------------------------------------------------
+database:
+  driver: "sqlite"
+  sqlite:
+    # 必须位于本地磁盘（不允许 UNC / 映射网络驱动器）。
+    # 必须与 storage.whitelist_root 在同一台机器上。
+    path: "data/vault.db"
+  mysql:
+    # driver=mysql 时必填，形如：
+    # user:pass@tcp(127.0.0.1:3306)/vault?charset=utf8mb4&parseTime=true&loc=Local
+    dsn: ""
+    max_open_conns: 25
+    max_idle_conns: 5
+
+# ---------------------------------------------------------------------------
+# 存储布局（VHDX「存储」）
+# ---------------------------------------------------------------------------
+# ★ 概念变更：原来的"存储目录"/"白名单根"现在叫「存储（Storage）」，是一个可以
+#   在管理端**在线增删改**的实体；数据库（storages 表）是唯一真源。
+#   下面的 whitelist_root(s) 仅作为「存储」的**首次初始化种子**：服务端首次启动
+#   （storages 表为空）时会把它们写入数据库；之后请在管理端「存储」模块维护，
+#   **本配置不再实时生效**（仅当数据库里一条存储都没有时才作为兜底）。
+#
+# ★ 平台差异（重要，见 docs/implementation.md 5.15）：
+#   - Windows：没有"底层卷"概念，「存储」就是 NTFS 卷上的一个普通目录 —— 上面的
+#     "首次初始化种子"语义完整适用，下面的 whitelist_root(s) 会被种进数据库。
+#   - Linux：磁盘/VHDX 由 LVM thin LV 承载，「存储」也升级为**受管的 thin LV**：
+#     服务端负责 lvcreate → mkfs → 挂载到挂载点目录，再把它当作 disks/staging/meta 的根。
+#     此时：
+#       * 下面的 whitelist_root(s) / VAULT_STORAGE_ROOTS 会被**跳过**（不种入数据库）。
+#         宿主机普通目录会让落盘静默落到根文件系统上而绕过 thin pool，因此不做种子；
+#         请在管理端「存储」模块创建存储（会自动建卷、格式化、挂载）。
+#       * whitelist_roots 在 Linux 上只保留一个作用：作为 GET /v1/fs/* 与建库 source_dir 的
+#         默认浏览白名单来源（source_roots 留空时回退到它）。
+#       * 挂载点默认 /var/lib/vault/storages/<名称>-<短 ID>，创建时可自定义；
+#         挂载持久化由服务端启动时幂等挂载 + 定期对账负责，**不写 /etc/fstab、
+#         也不生成 systemd unit**。手工 umount 会在最迟 5 分钟后被自动重挂。
+storage:
+  # 「存储」种子（单根旧写法，保持兼容）：留空 whitelist_roots 时使用本字段。
+  # 建议独立数据盘，例如 D:\VaultData
+  whitelist_root: "D:\\VaultData"
+  # 「存储」种子（多根）：非空时优先于 whitelist_root，可配置多个存储路径。
+  #   - 首次启动会把每个根写成一条「存储」（名称取路径最后一段），之后请在管理端维护。
+  #   - 多个存储可以位于同一块盘/同一个卷：统计磁盘可用空间时会**按卷去重**，
+  #     不会重复统计（例如 D:\Vault 与 D:\Vault\extra 只按 D:\ 这一块盘算一次）。
+  #   - 互为父子的存储（如 D:\Vault 与 D:\Vault\extra）只算上游那一个。
+  #   - 新建存储库时可指定目标「存储」；未指定时在**启用**的存储里按"所在卷可用空间最大"自动选；
+  #     差异盘优先与母盘同根（同卷）；同卷并列时取顺序靠前的存储。
+  #   - 分块上传的暂存目录会建在"选定的目标存储"下，保证与建盘同卷。
+  #   - 回收站/孤儿区按存储各一份：<storage>\meta\trash、<storage>\meta\orphan。
+  #   - 删除「存储」只删记录、**绝不删除磁盘文件**；该存储下仍有磁盘时拒绝删除。
+  # 也可以用环境变量覆盖：VAULT_STORAGE_ROOTS（分号或逗号分隔）。
+  whitelist_roots:
+    - "D:\\VaultData"
+    # - "E:\\VaultData"
+  # 相对各个「存储」根的子目录。disks_dir 与 staging_dir 必须同卷，
+  # 否则分块上传完成后无法原子改名。
+  disks_dir: "disks"
+  staging_dir: "staging"
+  # 允许被浏览（GET /v1/fs/*）与作为"源目录"（POST /v1/repos 的 source_dir）的服务端
+  # 本地目录白名单。**留空则回退为当前生效的存储根**（storages 表中启用的存储路径），
+  # 因此默认行为与历史一致：所有存储根可用。
+  #   - 非空时只允许这些目录及其子目录；其它目录一律 403（source_dir.not_allowed）。
+  #   - 相对路径按**本配置文件所在目录**解析（与 update.artifacts_dir / pki 同一套语义）。
+  #   - 用于"从服务端本地目录建库"时，把源目录也纳入进来，例如 D:\Games。
+  # source_roots:
+  #   - "D:\\Games"
+  #   - "E:\\SteamLibrary"
+  # 软删除（trash）与孤儿文件（orphan）暂存目录（相对各根，即 <root>\meta\trash 等）。
+  trash_dir: "meta/trash"
+  orphan_dir: "meta/orphan"
+  # 是否强制校验 disks_dir 与 staging_dir 同卷（默认 true，建议保持）。
+  require_same_volume: true
+  # 新建共享库时，单个母盘允许的差异盘默认上限（0 或负数表示不限制）。
+  default_max_diff_disks: 50
+  # VHDX 容量向上取整粒度（**MB**）。默认 1（按 MB 取整）。
+  #
+  # 为什么不是 GB：GB 粒度会把空目录/小目录也推导成 1GB 的标称容量，而分配时是
+  # **按母盘标称容量预留用量**的，于是"一点空间都没用就占了 1G"（真实反馈）。
+  # VHDX 是动态盘，标称容量只是上限，按 MB 取整既不会写不下也不会凭空吃配额。
+  # （旧字段 size_granularity_gb 已废弃：保留仅为兼容旧配置，不再参与计算。）
+  size_granularity_mb: 1
+  # 容量预留千分比（文件系统元数据 + 碎片）。100 = 10%（且不低于 512MB）。
+  size_reserve_permille: 100
+  # 卷可用空间低于该千分比时禁止新建存储库 / 新建分配。150 = 15%。
+  min_volume_free_permille: 150
+  # 软删除保留天数（到期由后台任务清理）。
+  trash_retention_days: 7
+
+# ---------------------------------------------------------------------------
+# 平台后端（虚拟磁盘 / 存储池 / iSCSI 目标）
+# ---------------------------------------------------------------------------
+# ★ 平台后端由**构建产物**决定，本节的 kind 只作显式声明与一致性校验：
+#   - Windows 包：虚拟磁盘 = VHDX 文件，iSCSI = IscsiTarget 角色模块，无"存储池"概念；
+#   - Linux 包  ：虚拟磁盘 = LVM thin LV（差异盘 = thin snapshot），iSCSI = LIO，
+#                 并支持用管理端"块设备选择器"建 thin pool / 挂 dm-cache(SSD 加速 HDD)。
+#   声明为 windows 却跑在 Linux 上会在启动时直接报错（避免用错误的引用格式操作磁盘）。
+#
+# ⚠️ Linux 上的 storages.path 仍是**真实本地目录**（分块上传暂存、回收站所在），
+#    磁盘本身不落在该目录里，而是由本节的 vg/thin_pool 决定的 LVM thin LV。
+platform:
+  # auto（按运行 OS，默认）| windows | linux
+  kind: "auto"
+
+  # --- 仅 Linux(LVM) 有意义 ---
+  lvm:
+    # 目标卷组名。**不得含 '-'**：'/' 与 '-' 会被 device-mapper 转义，
+    # 使 /dev/mapper/<vg>-<lv> 的解析不可逆。
+    vg: "vg0"
+    # 目标 thin pool 名（限制同上）。
+    thin_pool: "vault"
+    # thin pool chunk 大小与元数据大小（建池时使用；池已存在则忽略）。
+    chunk_size: "256K"
+    metadata_size: "4G"
+    # 下面两项仅用于**校验与告警**：真正的自动扩容由宿主机的 lvm.conf +
+    # lvm2-monitor 执行，本服务不修改宿主机配置。
+    autoextend_threshold: 80
+    autoextend_percent: 20
+    # 应用层空间闸门：thin pool 数据/元数据使用率达到该百分比即拒绝新建磁盘。
+    watermark_percent: 90
+
+  iscsi:
+    # 后端实现名。Linux 目前只支持 lio（直接读写 configfs，无需 targetcli/Python）。
+    backend: "lio"
+    # LIO 在 configfs 中的挂载点（仅 Linux）。
+    configfs_root: "/sys/kernel/config/target"
+    # 下发给客户端的 iSCSI 门户地址（挂载时客户端按此地址连接）。
+    #
+    # **第一条生效**，格式 <host>[:port]，端口缺省为 3260。
+    #   - 填具体地址（如 "192.168.1.10:3260"）：客户端就按它连 —— 多网卡/多网段服务器
+    #     必须这样显式指定，否则服务端只能自动推导，可能派发到客户端不可达的网卡；
+    #   - 填通配地址（如 "0.0.0.0:3260"，默认）：地址自动推导 —— 依次尝试
+    #     http.listen 的主机部分 → 本机第一个非回环 IPv4 → 主机名；只取其端口。
+    portals:
+      - "0.0.0.0:3260"
+    # 目标 IQN 前缀：完整 IQN = <prefix>:<target_name>。
+    iqn_prefix: "iqn.2026-01.com.vault"
+
+# ---------------------------------------------------------------------------
+# 客户端版本兼容区间（见实现文档 3.4.2）
+# ---------------------------------------------------------------------------
+# 语义（三者不同，勿混淆）：
+#   enabled=false        → 整体关闭客户端版本区间检查（仅协议版本仍强校验）
+#   min/max 字段缺失      → 按服务端版本自动推导
+#   min/max 显式写空串 "" → 该端不限制
+#   min/max 显式写非法值   → 启动失败（fail-fast，避免全量客户端被判不兼容）
+client_compat:
+  enabled: true
+  min: ""
+  max: ""
+
+# ---------------------------------------------------------------------------
+# 日志（仅输出到文件，按天切分）
+# ---------------------------------------------------------------------------
+log:
+  # debug | info | warn | error
+  level: "info"
+  # 日志目录；留空则只输出到 stdout（前台调试用）。
+  dir: "logs"
+  # 日志保留天数（<=0 表示不清理）。
+  keep_days: 30
+  # 是否同时输出到控制台。
+  also_console: false
+
+# ---------------------------------------------------------------------------
+# 安全
+# ---------------------------------------------------------------------------
+security:
+  # 数据保险箱根密钥（AES-256-GCM，用于加密 CHAP 密钥等敏感字段）。
+  # 留空则首次启动生成 32 字节随机密钥并写回本文件。
+  # ⚠️ 丢失该密钥将无法解密已落库的 CHAP 密钥（需重新配置所有目标鉴权）。
+  master_key: ""
+
+  # 超级管理员账号**存放在数据库中**，由客户端初始化向导创建（口令以 argon2id 哈希落库）。
+  # 本配置不再保存账号与口令哈希；下面两个开关只控制"能否通过向导初始化"与"该角色能否登录"。
+
+  # 是否允许通过初始化接口创建首个超级管理员。
+  # 仅在系统**尚未初始化**（无超级管理员且无任何数据）时有意义——初始化是一次性的。
+  # 设为 false 可彻底关闭自助初始化（改用 CLI 引导），适用于离线/高安全场景。
+  bootstrap_enabled: true
+
+  # 首次启动后允许初始化的时间窗口，自服务端首次启动计时。
+  # 留空或 "0s" 表示不限制。设置窗口可降低"部署后长期未初始化、被局域网内他人抢注"的风险。
+  bootstrap_window: ""
+
+  # 内置超级管理员角色是否允许登录。
+  # 关闭后该角色账号立即无法登录（账号数据保留），用于收紧权限或锁定恢复。
+  super_admin_enabled: true
+
+  # 管理页会话有效期。
+  session_ttl: "12h"
+  # 防爆破：窗口内失败次数达到阈值即锁定。
+  login_max_failures: 5
+  login_lock_window: "15m"
+  login_lock: "15m"
+  # 客户端租约有效期（超时未心跳即判定离线）。
+  lease_ttl: "120s"
+  # 下发给客户端的心跳间隔（客户端定时器，UI 关闭也需维持）。
+  lease_heartbeat_interval: "30s"
+  # 踢下线后的重连抑制窗口（目标保持 disabled 的时间）。
+  revoke_cooldown: "5m"
+  # 一次性注册令牌（enrollment token）有效期。
+  enrollment_token_ttl: "15m"
+
+# ---------------------------------------------------------------------------
+# 客户端更新分发（服务端只做 mirror，不参与签名）
+# ---------------------------------------------------------------------------
+# ★ 安全模型（见 docs/implementation.md 7.4.2）：
+#   更新包由**发布方私钥**统一签名，客户端内置发布方公钥验签。
+#   服务端只做"存储 + 分发"：
+#     - 绝不持有更新签名私钥（否则任一服务端被攻陷即可推恶意更新）；
+#     - 绝不解析/改写 manifest 的任何字节（哪怕补一个字段都会让客户端验签失败）。
+#   因此本节的配置**不会影响也不会削弱**更新包的信任链。
+#
+# ★ 发布流程：
+#   1) 发布方（离线环境）：
+#        Vault-Server sign keygen -out-dir ./keys
+#        #   → keys/update-private.pem（⚠️ 绝不可入库）、keys/update-public.txt
+#   2) 构建各产物，并用**同一把私钥**生成发布目录：
+#        Vault-Server sign release -dir ./release -channel stable -version 0.2.0 \
+#                           -notes "修复若干问题" \
+#                           -key ./keys/update-private.pem \
+#                           -artifact agent=./dist/Vault-Agent.exe \
+#                           -artifact client=./dist/vault-client-setup.exe \
+#                           -artifact client_web=./dist/Vault-Web-0.2.0.zip
+#        #   → release/manifest.json、release/manifest.json.sig、release/artifacts/*
+#        #   - artifact=client   ：Electron 本体安装包（替换整个客户端）
+#        #   - artifact=client_web：渲染层资源包（Vite dist/，仅热更界面，平台无关）
+#   3) 自检（上传前必做）：
+#        Vault-Server sign verify -dir ./release -pub ./keys/update-public.txt
+#   4) 把 release 目录的**内容**整体放到本机的 artifacts_dir（相对路径见下）：
+#        - manifest.json        → <artifacts_dir>/manifest.json
+#        - manifest.json.sig    → <artifacts_dir>/manifest.json.sig
+#        - artifacts/*          → <artifacts_dir>/artifacts/*
+#      注：由 build.py 产出的服务端部署包**已内置**本次构建的发布内容，
+#          开箱部署即可分发，无需手工拷贝；此处仅用于手工更新/替换的情形。
+#      ⚠️ 复制后**不要**做任何编辑/格式化/行尾转换（CRLF 也会破坏签名）。
+#      注：签名工具挂在 Vault-Server 的 sign 子命令上，仅发布方在构建/发布阶段使用；
+#      服务端运行时永不签名，私钥不参与任何 serve 路径。
+#   5) 客户端内置同一把公钥（构建期注入）：
+#        go build -ldflags "-X vault/internal/agent.updatePublicKeyBase64=$(cat keys/update-public.txt)" \
+#          -o Vault-Agent.exe ./cmd/vault-agent
+#      未注入时客户端回退到开发公钥（其私钥不在仓库中），任何更新都会验签失败。
+#
+# ★ 客户端自更新链路（供排障）：代理下载 → 校验 sha256（边下边算）→ 尽力而为的 Authenticode
+#   校验 → 写 update\pending.json → 复制自身为临时副本并以其执行替换 + 重启 →
+#   下次启动对账；连续 3 次未成功则用备份回滚（见 docs/implementation.md 7.4）。
+# ★ 渲染层资源热更（client_web，见 docs/implementation.md 7.4.5）：不替换 Electron 本体，
+#   仅把 Vite 产出的 dist/ 热更到 %ProgramData%\Vault\webapp\<version>\ 并原子切换 current.json。
+update:
+  # 更新包（发布目录内容）的存放目录。**相对路径按配置文件所在目录解析**（与 pki/ 同一套语义），
+  # 因此无论服务端被计划任务/脚本以何种工作目录启动，都能稳定定位。
+  # 建议用绝对路径（例如 D:\VaultUpdates）；服务端部署包内已内置 updates/ 发布内容。
+  # 留空 = 不提供更新分发（GET /v1/system/update/* 一律返回 404 update.no_manifest）。
+  artifacts_dir: "updates"
+  # 默认分发通道。必须与 manifest.json 里的 channel 一致：
+  # 服务端一次只镜像一份发布目录，客户端带 ?channel=<其它值> 请求时返回 404，
+  # 避免把另一通道的清单发过去（客户端会因通道不匹配而拒绝）。
+  channel: "stable"
+  # 低于此版本的客户端将被强制升级（留空表示不强制）。
+  # 该值用于版本契约的展示与提示；真正的区间判定见上面的 client_compat。
+  min_client_version: ""

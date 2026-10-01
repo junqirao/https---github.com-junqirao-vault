@@ -1,0 +1,554 @@
+//go:build linux
+
+package linuxlvm
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"vault/internal/apperr"
+	"vault/internal/platform"
+)
+
+// mapperPrefix 是 device-mapper 设备节点目录。
+const mapperPrefix = "/dev/mapper/"
+
+// headFingerprintBytes 指纹计算读取的头部字节数（1MiB），与 winvhd 的口径一致。
+const headFingerprintBytes = 1 << 20
+
+// maxLVNameLen 是映射出的 LV 名长度上限；LVM 的 dm 名上限 127 字节，留出 vg 前缀与转义余量。
+const maxLVNameLen = 100
+
+// lvNameRe 约束本包创建的 VG 与 LV 名。
+//
+// 之所以禁止 '-'：device-mapper 会把名字里的 '-' 转义成 '--'
+// （VG 名 "my-vg" 的节点是 /dev/mapper/my--vg-lv），
+// 于是 "/dev/mapper/<vg>-<lv>" 就无法靠"第一个 '-' 切分"反解出 (vg, lv)。
+// 把 VG/LV 名限制在 [A-Za-z0-9_+.] 后，ref 才可逆、且 lvRef 的字符串等于真实 dm 节点。
+var lvNameRe = regexp.MustCompile(`^[A-Za-z0-9_+.]+$`)
+
+// lvRef 由 VG/LV 名拼出 device-mapper 引用。
+func lvRef(vg, lv string) string { return mapperPrefix + vg + "-" + lv }
+
+// parseRef 把引用拆回 (vg, lv)。
+//
+// VG/LV 名都不含 '-'，所以"第一个 '-'"必然是分隔符，切分是无歧义的。
+func parseRef(ref string) (vg, lv string, err error) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(ref), mapperPrefix)
+	if !ok {
+		return "", "", apperr.InvalidParam("ref")
+	}
+	i := strings.IndexByte(rest, '-')
+	if i <= 0 || i == len(rest)-1 {
+		return "", "", apperr.InvalidParam("ref")
+	}
+	vg, lv = rest[:i], rest[i+1:]
+	if !lvNameRe.MatchString(vg) || !lvNameRe.MatchString(lv) {
+		return "", "", apperr.InvalidParam("ref")
+	}
+	return vg, lv, nil
+}
+
+// DiskRef 依据"本地存储目录 + 布局标识(rel)"生成 LV 引用。
+//
+// storageRoot 只是 storages.path（真实本地目录，暂存/回收站所在），**不参与**引用推导：
+// Linux 上磁盘是薄LV，落在后端配置的 VG 里，与 storages.path 目录无关。
+// 因此这里只用 rel 推导 LV 名，VG 取构造时的 Options.VG。
+func (m *Manager) DiskRef(storageRoot, rel string) (string, error) {
+	vg := strings.TrimSpace(m.vg)
+	if !lvNameRe.MatchString(vg) {
+		return "", apperr.New(apperr.CodeUnavailable, http.StatusInternalServerError).
+			WithArg("reason", "lvm_vg_not_configured")
+	}
+	lv, err := mapLVName(rel)
+	if err != nil {
+		return "", err
+	}
+	return lvRef(vg, lv), nil
+}
+
+// mapLVName 把平台中性的相对布局标识映射为 LV 名。
+//
+// 规则：去掉 .vhdx 后缀；把 '/'、'\' 与 '-' 统一折叠为 '_'；其余字符原样。
+// 折叠 '-'（rel 里的 <id> 是含 '-' 的 uuid）是为了满足 lvNameRe 的约束——
+// 否则 LVM 会把 '-' 转义成 '--'，使 /dev/mapper/<vg>-<lv> 无法逆解析（详见 lvNameRe 说明）。
+// 长度上限 100，超长返回 InvalidParam("rel")。
+func mapLVName(rel string) (string, error) {
+	r := strings.TrimSpace(rel)
+	if r == "" {
+		return "", apperr.InvalidParam("rel")
+	}
+	if strings.HasSuffix(strings.ToLower(r), ".vhdx") {
+		r = r[:len(r)-len(".vhdx")]
+	}
+	var b strings.Builder
+	b.Grow(len(r))
+	for _, c := range r {
+		switch c {
+		case '/', '\\', '-':
+			b.WriteByte('_')
+		default:
+			b.WriteRune(c)
+		}
+	}
+	name := b.String()
+	if name == "" || len(name) > maxLVNameLen || !lvNameRe.MatchString(name) {
+		return "", apperr.InvalidParam("rel")
+	}
+	return name, nil
+}
+
+// Exists 判断引用对应的 LV 是否存在。
+//
+// 契约没有 ctx，这里用一个短超时的后台上下文（只读探测不应长时间阻塞调用方）。
+func (m *Manager) Exists(ref string) bool {
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return false
+	}
+	return m.exists(vg, lv)
+}
+
+func (m *Manager) exists(vg, lv string) bool {
+	ctx, cancel := m.probeCtx()
+	defer cancel()
+	out, err := m.run(ctx, "lvs", "--noheadings", "-o", "lv_name", vg+"/"+lv)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(out) != ""
+}
+
+// Create 创建一块逻辑容量为 sizeBytes 的 thin LV。
+//
+// 用 lvcreate --type thin -n <lv> -V <sizeBytes>B -T <vg>/<pool>：
+//   - -V 指定**虚拟容量**（thin 卷对外呈现的大小）；
+//   - -T 指定承载它的 thin pool（vg/pool 形式）；
+//   - 不传 -L：thin LV 不预分配物理空间，-L 会被理解为"数据子卷大小"而非虚拟容量。
+func (m *Manager) Create(ctx context.Context, ref string, sizeBytes int64) error {
+	if sizeBytes <= 0 {
+		return apperr.InvalidParam("size_bytes")
+	}
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return err
+	}
+	pool, err := m.poolPath(vg)
+	if err != nil {
+		return err
+	}
+	// 建盘前先过水位闸门：thin snapshot/LV 无法限制单卷的物理增长，写爆单盘会拖垮整个 pool。
+	if err := m.checkWatermark(ctx, vg); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, err := m.run(ctx, "lvcreate",
+		"--type", "thin",
+		"-n", lv,
+		"-V", strconv.FormatInt(sizeBytes, 10)+"B",
+		"-T", pool,
+	); err != nil {
+		return err
+	}
+	m.logger.Info("已创建 thin LV", "ref", ref, "size_bytes", sizeBytes)
+	return nil
+}
+
+// CreateDiff 以 parentRef 为原点创建 thin snapshot 作为差异盘（容量继承父盘）。
+func (m *Manager) CreateDiff(ctx context.Context, childRef, parentRef string) error {
+	cvg, clv, err := parseRef(childRef)
+	if err != nil {
+		return err
+	}
+	pvg, plv, err := parseRef(parentRef)
+	if err != nil {
+		return err
+	}
+	if cvg != pvg {
+		// thin snapshot 只能与原点同 VG。
+		return apperr.InvalidParam("parent_ref")
+	}
+	if err := m.checkWatermark(ctx, cvg); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// ⚠️ 绝不能带 -L/--size：一旦指定 size，LVM 会把 thin snapshot 退化为旧式 COW 快照
+	// （vsize 与 size 分离），并立即按 size 占用物理空间，很快写满整个 pool。
+	if _, err := m.run(ctx, "lvcreate", "-s", "-n", clv, pvg+"/"+plv); err != nil {
+		return err
+	}
+	m.logger.Info("已创建 thin snapshot", "child", childRef, "parent", parentRef)
+	return nil
+}
+
+// Clone 完整复制一块虚拟磁盘到 dstRef（目标已存在时返回错误）。
+//
+// Linux 上用 thin snapshot 实现：它在创建瞬间即持有与源盘一致的全部内容，
+// 且是独立可用的 LV（原点后续被删也不影响它），是 LVM 语意下的"零拷贝全量克隆"；
+// 相比 dd 整盘拷贝，避免了按虚拟容量搬运巨量稀疏块。
+// 克隆后重置磁盘标识，保证克隆盘能被 Windows 端当作独立盘识别。
+func (m *Manager) Clone(ctx context.Context, srcRef, dstRef string) error {
+	if m.Exists(dstRef) {
+		return apperr.New(apperr.CodeConflict, http.StatusConflict).WithArg("ref", dstRef)
+	}
+	if err := m.CreateDiff(ctx, dstRef, srcRef); err != nil {
+		return err
+	}
+	if err := m.ResetDiskIdentifier(ctx, dstRef); err != nil {
+		if platform.IsUnsupported(err) {
+			// 内容已完整复制，仅缺"改标识"这一步：告警而非失败，由上层决定降级。
+			m.logger.Warn("克隆完成但无法重置磁盘标识（缺少 ntfslabel）", "dst", dstRef)
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// Activate 在服务端本地激活 LV，使其出现 /dev/mapper 节点。
+//
+// -K 不可省：thin snapshot 建出来后默认带 skip-activation 标记（lv_attr 第 10 位为 'k'），
+// 不带 -K 的 lvchange -ay 会被拒。readOnly 不在此落实（只读由 iSCSI/LIO 的 per-ACL 承担）。
+func (m *Manager) Activate(ctx context.Context, ref string, readOnly bool) error {
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, err := m.run(ctx, "lvchange", "-ay", "-K", vg+"/"+lv); err != nil {
+		return err
+	}
+	m.logger.Info("已激活 LV", "ref", ref, "read_only", readOnly)
+	return nil
+}
+
+// Deactivate 取消本地激活。幂等（本就未激活时 lvchange 会报错，这里吞掉）。
+func (m *Manager) Deactivate(ctx context.Context, ref string) error {
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, err := m.run(ctx, "lvchange", "-an", vg+"/"+lv); err != nil {
+		m.logger.Debug("停用 LV 未成功（可能本就未激活）", "ref", ref, "err", err.Error())
+	}
+	return nil
+}
+
+// Delete 删除 LV。幂等（不存在视为成功）。
+func (m *Manager) Delete(ctx context.Context, ref string) error {
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.exists(vg, lv) {
+		m.logger.Info("LV 不存在，跳过删除（幂等）", "ref", ref)
+		return nil
+	}
+	// 先停用再删除；停用失败忽略（可能本就未激活）。
+	// ⚠️ 说明：LV 若被 iSCSI backstore(iblock) 打开，lvremove 会被内核拒绝，
+	// 所以调用方必须先在 iSCSI 侧下线对应 LUN 再调用本方法。
+	if _, err := m.run(ctx, "lvchange", "-an", vg+"/"+lv); err != nil {
+		m.logger.Debug("删除前停用 LV 未成功（忽略）", "ref", ref, "err", err.Error())
+	}
+	if _, err := m.run(ctx, "lvremove", "-y", vg+"/"+lv); err != nil {
+		return err
+	}
+	m.logger.Info("已删除 LV", "ref", ref)
+	return nil
+}
+
+// PhysicalSize 返回该 thin LV 的**独占**物理占用（字节）。
+//
+// 首选 thin_ls（thin-provisioning-tools）：它直接读池元数据，能区分 mapped / exclusive，
+// 不会把快照与原点共享的块重复计入。
+// 退化口径：thin_ls 缺失或解析失败时，用 lvs 的 lv_size × data_percent/100 估算。
+// 两种口径的差异：退化版对同一池里的多个快照会把共享块**各自计入**（重复计数），
+// 数值偏大，只能用于展示，不能用于配额精算。
+func (m *Manager) PhysicalSize(ref string) (int64, error) {
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return 0, err
+	}
+	if n, err := m.thinExclusiveBytes(vg, lv); err == nil {
+		return n, nil
+	} else {
+		m.logger.Warn("thin_ls 不可用或解析失败，退化为 lvs data_percent 估算：该口径会把快照共享块重复计入，仅供展示",
+			"ref", ref, "err", err.Error())
+	}
+	return m.estimatePhysicalBytes(vg, lv)
+}
+
+// thinExclusiveBytes 用 thin_ls 读取该 thin LV 的独占物理占用。
+func (m *Manager) thinExclusiveBytes(vg, lv string) (int64, error) {
+	if _, err := LookPath("thin_ls"); err != nil {
+		return 0, err
+	}
+	ctx, cancel := m.probeCtx()
+	defer cancel()
+
+	pool, err := m.poolOf(ctx, vg, lv)
+	if err != nil {
+		return 0, err
+	}
+	if pool == "" {
+		return 0, fmt.Errorf("not a thin volume")
+	}
+	majmin, err := m.kernelID(ctx, vg, lv)
+	if err != nil {
+		return 0, err
+	}
+	chunk, err := m.chunkSizeOf(ctx, vg, pool)
+	if err != nil {
+		return 0, err
+	}
+	// thin_ls 读的是池的元数据设备 <vg>-<pool>_tmeta。
+	tmeta := mapperPrefix + vg + "-" + pool + "_tmeta"
+	if _, err := os.Stat(tmeta); err != nil {
+		return 0, err
+	}
+	out, err := Run(ctx, m.logger, "thin_ls", "--no-headers",
+		"-o", "DEV,MAPPED_BLOCKS,EXCLUSIVE_BLOCKS", tmeta)
+	if err != nil {
+		return 0, err
+	}
+	blocks := int64(-1)
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[0] != majmin {
+			continue
+		}
+		// 独占块优先（更贴合"独占物理占用"）；老版本可能没有第三列。
+		if len(f) >= 3 {
+			if v, e := strconv.ParseInt(f[2], 10, 64); e == nil && v > 0 {
+				blocks = v
+				break
+			}
+		}
+		if v, e := strconv.ParseInt(f[1], 10, 64); e == nil {
+			blocks = v
+		}
+		break
+	}
+	if blocks < 0 {
+		return 0, fmt.Errorf("thin_ls 未找到设备 %s 的条目", majmin)
+	}
+	return blocks * chunk, nil
+}
+
+// estimatePhysicalBytes 是 thin_ls 不可用时的降级估算：lv_size × data_percent/100。
+func (m *Manager) estimatePhysicalBytes(vg, lv string) (int64, error) {
+	ctx, cancel := m.probeCtx()
+	defer cancel()
+	rows, err := m.lvsRows(ctx, "-o", "lv_size,data_percent", vg+"/"+lv)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, apperr.New(CodeVHDFailed, http.StatusInternalServerError).WithArg("ref", lvRef(vg, lv))
+	}
+	size := rowInt(rows[0], "lv_size")
+	pct := rowFloat(rows[0], "data_percent")
+	return int64(float64(size) * pct / 100), nil
+}
+
+// poolOf 返回某 thin LV 所属的 thin pool 名；非 thin 卷返回空串。
+func (m *Manager) poolOf(ctx context.Context, vg, lv string) (string, error) {
+	rows, err := m.lvsRows(ctx, "-o", "pool_lv", vg+"/"+lv)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", fmt.Errorf("lvs 无结果")
+	}
+	return strings.TrimSpace(rowStr(rows[0], "pool_lv")), nil
+}
+
+// kernelID 返回 LV 的 <major>:<minor>，用于在 thin_ls 输出里定位对应条目。
+func (m *Manager) kernelID(ctx context.Context, vg, lv string) (string, error) {
+	rows, err := m.lvsRows(ctx, "-o", "lv_kernel_major,lv_kernel_minor", vg+"/"+lv)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", fmt.Errorf("lvs 无结果")
+	}
+	maj := strings.TrimSpace(rowStr(rows[0], "lv_kernel_major"))
+	min := strings.TrimSpace(rowStr(rows[0], "lv_kernel_minor"))
+	if maj == "" || min == "" {
+		return "", fmt.Errorf("LV 未激活，无内核设备号")
+	}
+	return maj + ":" + min, nil
+}
+
+// chunkSizeOf 返回 thin pool 的 chunk 大小（字节）。
+func (m *Manager) chunkSizeOf(ctx context.Context, vg, pool string) (int64, error) {
+	out, err := m.run(ctx, "lvs", "--noheadings", "--units", "b", "--nosuffix", "-o", "chunksize", vg+"/"+pool)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("chunksize 非法")
+	}
+	return n, nil
+}
+
+// lvSizeBytes 返回 LV 的虚拟容量（字节）。
+func (m *Manager) lvSizeBytes(vg, lv string) (int64, error) {
+	ctx, cancel := m.probeCtx()
+	defer cancel()
+	rows, err := m.lvsRows(ctx, "-o", "lv_size", vg+"/"+lv)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, fmt.Errorf("lvs 无结果")
+	}
+	return rowInt(rows[0], "lv_size"), nil
+}
+
+// Fingerprint 返回内容指纹，形如 size=<字节>;head=<首1MiB的sha256>。
+//
+// 首 MiB 读不满不是错误（刚建/稀疏的 LV 可能没写满），按实际读到的字节计算。
+func (m *Manager) Fingerprint(ref string) (string, error) {
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(lvRef(vg, lv))
+	if err != nil {
+		return "", apperr.New(CodeAccessDenied, http.StatusInternalServerError).
+			WithCause(err).WithArg("ref", ref)
+	}
+	defer f.Close() //nolint:errcheck
+
+	hasher := sha256.New()
+	if _, err := io.CopyN(hasher, f, headFingerprintBytes); err != nil && err != io.EOF {
+		return "", apperr.New(CodeVHDFailed, http.StatusInternalServerError).WithCause(err)
+	}
+	size, err := m.lvSizeBytes(vg, lv)
+	if err != nil {
+		size = 0 // 尺寸读不到仍给出头部指纹
+	}
+	return fmt.Sprintf("size=%d;head=%s", size, hex.EncodeToString(hasher.Sum(nil))), nil
+}
+
+// Optimize 回收未使用空间：仅做文件系统层的 fstrim。
+//
+// 之所以只做 FS 层：Linux 上 thin 空间的真正回收主要依赖 iSCSI 客户端下发 UNMAP
+// （需 TPG 打开 emulate_tpu=1），本方法不触碰块层，**绝不破坏数据**；
+// 设备未挂载时无文件系统可 trim，直接返回（不报错）。
+func (m *Manager) Optimize(ctx context.Context, ref string) error {
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return err
+	}
+	mp, err := mountPointOf(lvRef(vg, lv))
+	if err != nil {
+		m.logger.Debug("读取 /proc/mounts 失败，跳过 fstrim", "ref", ref, "err", err.Error())
+		return nil
+	}
+	if mp == "" {
+		m.logger.Debug("LV 未挂载，跳过 fstrim（块层回收靠 iSCSI UNMAP）", "ref", ref)
+		return nil
+	}
+	if _, err := m.run(ctx, "fstrim", mp); err != nil {
+		return err
+	}
+	m.logger.Info("已对 LV 执行 fstrim", "ref", ref, "mountpoint", mp)
+	return nil
+}
+
+// ResetDiskIdentifier 重置磁盘标识（克隆盘去重必需）。
+//
+// 用 ntfslabel --new-serial <dev> 给卷写入新的 NTFS 序列号，避免克隆盘在 Windows 端
+// 因磁盘/卷标识与源盘相同而被判定为同一卷（KB2983588）。
+// 缺少 ntfslabel 时返回 ErrUnsupported，由上层决定降级。
+// TODO(待真机验证)：需 LV 已激活且未挂载；对非 NTFS 卷该命令会失败。
+func (m *Manager) ResetDiskIdentifier(ctx context.Context, ref string) error {
+	if _, err := LookPath("ntfslabel"); err != nil {
+		return platform.ErrUnsupported
+	}
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return err
+	}
+	if _, err := m.run(ctx, "ntfslabel", "--new-serial", lvRef(vg, lv)); err != nil {
+		return err
+	}
+	m.logger.Info("已重置 NTFS 序列号", "ref", ref)
+	return nil
+}
+
+// checkWatermark 是建盘前的空间闸门。
+//
+// 原因：thin snapshot/LV 无法限制单个卷的物理增长，单卷写爆会拖垮整个 pool；
+// 且 thin pool 的**元数据**打满比数据打满更致命（元数据满后所有写失败）。
+// 任一百分比达到阈值即拒绝，并把两个百分比带给前端。
+func (m *Manager) checkWatermark(ctx context.Context, vg string) error {
+	pool, err := m.poolPath(vg)
+	if err != nil {
+		return err
+	}
+	out, err := m.run(ctx, "lvs", "--reportformat", "json", "-o", "data_percent,metadata_percent", pool)
+	if err != nil {
+		// 池不存在时读不到水位：交给后续 lvcreate 报错，不在这里误报"空间不足"。
+		m.logger.Warn("读取 thin pool 水位失败，跳过水位闸门", "pool", pool, "err", err.Error())
+		return nil
+	}
+	rows, err := parseReportRows(out, "lv")
+	if err != nil || len(rows) == 0 {
+		m.logger.Warn("解析 thin pool 水位失败，跳过水位闸门", "pool", pool)
+		return nil
+	}
+	dataPct := rowFloat(rows[0], "data_percent")
+	metaPct := rowFloat(rows[0], "metadata_percent")
+	if dataPct >= m.watermark || metaPct >= m.watermark {
+		return apperr.New(CodeInsufficientSpace, http.StatusInsufficientStorage).
+			WithArg("data_percent", dataPct).
+			WithArg("metadata_percent", metaPct).
+			WithArg("watermark_percent", m.watermark)
+	}
+	return nil
+}
+
+// mountPointOf 在 /proc/mounts 中查找某设备节点的挂载点；未挂载返回空串。
+func mountPointOf(dev string) (string, error) {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		if f[0] == dev {
+			return unescapeMountField(f[1]), nil
+		}
+	}
+	return "", nil
+}
+
+// unescapeMountField 还原 /proc/mounts 对空格等字符的八进制转义。
+func unescapeMountField(s string) string {
+	return strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`).Replace(s)
+}

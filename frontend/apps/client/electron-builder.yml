@@ -1,0 +1,46 @@
+appId: com.vault.client
+productName: Vault
+copyright: Copyright © 2026 Vault
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+
+# 把 Vault-Agent.exe 放进安装目录根（即 Vault.exe 同级）。
+# 客户端主进程启动时会在"主程序同目录"查找该代理，找不到则进入降级模式
+# （界面能开，但无法挂载 iSCSI 存储库）。
+# 源文件由 build.py 在调用 electron-builder 之前从 dist/ 复制到 build/ 下。
+extraFiles:
+  - from: build/Vault-Agent.exe
+    to: Vault-Agent.exe
+
+electronVersion: 32.2.0
+
+win:
+  # 应用图标（同时用于 exe、任务栏与窗口）：512×512 PNG，electron-builder 会转成 .ico。
+  icon: build/icon.png
+
+  # 客户端默认需要管理员权限运行。
+  #
+  # 原因：挂载/卸载存储库要执行 AttachVirtualDisk、diskpart、iscsicli 等需要管理员
+  # 权限的操作。把要求写进 Vault.exe 的清单（requireAdministrator）后，双击时会由
+  # UAC 直接提权，用户不必再手动"以管理员身份运行"；代理由 Vault.exe 派生，因此同样
+  # 具备管理员权限，不会再返回 agent.admin_required。
+  requestedExecutionLevel: requireAdministrator
+
+  # 只产出可直接运行的程序目录（release/win-unpacked），**不做安装包**。
+  #
+  # 原因：
+  #   1. 客户端就是"electron 打包出来的程序"，解压双击 Vault.exe 即用，无需安装；
+  #   2. 跳过 nsis/portable 目标可以免去下载 NSIS 工具链（GitHub Releases 在
+  #      部分网络下不可达，会导致构建失败）。
+  # 如将来确实需要安装包，把 target 改回 nsis 即可。
+  target:
+    - target: dir
+      arch:
+        - x64

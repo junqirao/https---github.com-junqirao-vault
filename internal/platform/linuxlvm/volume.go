@@ -1,0 +1,305 @@
+//go:build linux
+
+package linuxlvm
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"vault/internal/apperr"
+	"vault/internal/domain"
+	"vault/internal/platform"
+)
+
+// mountOptions 是 ntfs-3g 的挂载选项。big_writes 显著提升大块写入吞吐（建盘拷入场景）。
+const mountOptions = "big_writes"
+
+// EnsureFormatted 幂等地初始化并格式化卷。目前只支持 NTFS。
+func (m *Manager) EnsureFormatted(ctx context.Context, ref, fileSystem, label string) (*platform.Volume, error) {
+	if !strings.EqualFold(strings.TrimSpace(fileSystem), "NTFS") {
+		return nil, apperr.InvalidParam("file_system")
+	}
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return nil, err
+	}
+	// 先激活，保证 /dev/mapper 节点存在——未激活的 LV 没有设备节点，blkid/mkfs 都会失败。
+	if err := m.Activate(ctx, ref, false); err != nil {
+		return nil, err
+	}
+	dev := lvRef(vg, lv)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	fs, _ := m.blkidType(ctx, dev)
+	switch {
+	case strings.EqualFold(fs, "ntfs"):
+		m.logger.Info("已有 NTFS 文件系统，跳过格式化", "ref", ref)
+	case fs != "":
+		// 已有其它文件系统：绝不覆盖用户数据。
+		return nil, apperr.New(CodeMountFailed, http.StatusInternalServerError).
+			WithArg("existing_fs", fs)
+	default:
+		args := []string{"-Q"}
+		if l := strings.TrimSpace(label); l != "" {
+			args = append(args, "-L", l)
+		}
+		args = append(args, dev)
+		if _, err := m.run(ctx, "mkfs.ntfs", args...); err != nil {
+			return nil, err
+		}
+		m.logger.Info("已格式化 NTFS", "ref", ref, "label", label)
+	}
+
+	size, err := m.lvSizeBytes(vg, lv)
+	if err != nil {
+		size = 0
+	}
+	// 刻意不在此 Deactivate：LV 需要保持激活供 iSCSI(LIO iblock) 发布使用。
+	return &platform.Volume{Device: ref, FileSystem: "NTFS", SizeBytes: size}, nil
+}
+
+// MountAndCopy 一次性完成"激活 → 格式化 → 递归拷入 sourceDir 内容 → 校验 → 卸载"。
+//
+// 校验口径与项目既有 CopyTree 一致：目标侧文件数/字节数不得少于源，否则 platform.copy_failed。
+func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string) (int, int64, error) {
+	src := filepath.Clean(sourceDir)
+	info, err := os.Stat(src)
+	if err != nil || !info.IsDir() {
+		return 0, 0, apperr.InvalidParam("source_dir")
+	}
+
+	// EnsureFormatted 内部会 Activate，保证设备节点存在。
+	if _, err := m.EnsureFormatted(ctx, ref, fileSystem, label); err != nil {
+		return 0, 0, err
+	}
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return 0, 0, err
+	}
+	dev := lvRef(vg, lv)
+
+	mnt, err := os.MkdirTemp("", "vault-ntfs-")
+	if err != nil {
+		return 0, 0, apperr.New(CodeMountFailed, http.StatusInternalServerError).WithCause(err)
+	}
+	// defer 保证失败路径也清理临时目录。
+	defer func() { _ = os.Remove(mnt) }()
+
+	if _, err := m.run(ctx, "mount", "-t", "ntfs-3g", "-o", mountOptions, dev, mnt); err != nil {
+		return 0, 0, err
+	}
+	mounted := true
+	// defer 保证失败路径也卸载（即使 ctx 已取消也要尽力卸载，避免留下脏挂载）。
+	defer func() {
+		if !mounted {
+			return
+		}
+		if _, err := m.run(context.WithoutCancel(ctx), "umount", mnt); err != nil {
+			m.logger.Warn("卸载临时挂载点失败", "ref", ref, "mountpoint", mnt, "err", err.Error())
+		}
+	}()
+
+	srcFiles, srcBytes, err := countTree(src)
+	if err != nil {
+		return 0, 0, apperr.New(CodeCopyFailed, http.StatusInternalServerError).WithCause(err)
+	}
+	dstFiles, dstBytes, err := copyTree(ctx, src, mnt)
+	if err != nil {
+		return dstFiles, dstBytes, apperr.New(CodeCopyFailed, http.StatusInternalServerError).WithCause(err)
+	}
+	if _, err := m.run(ctx, "sync"); err != nil {
+		m.logger.Warn("sync 失败", "ref", ref, "err", err.Error())
+	}
+	if _, err := m.run(ctx, "umount", mnt); err != nil {
+		return dstFiles, dstBytes, apperr.New(CodeMountFailed, http.StatusInternalServerError).WithCause(err)
+	}
+	mounted = false
+
+	// 尽力而为地修复 NTFS 日志（ntfsfix -d 清 dirty flag）；缺失或失败只告警，不影响建盘结果。
+	if _, err := LookPath("ntfsfix"); err == nil {
+		if _, err := m.run(ctx, "ntfsfix", "-d", dev); err != nil {
+			m.logger.Warn("ntfsfix 失败（忽略）", "ref", ref, "err", err.Error())
+		}
+	}
+
+	if dstFiles < srcFiles || dstBytes < srcBytes {
+		m.logger.Error("卷内容复制校验失败",
+			"src_dir", src, "src_files", srcFiles, "src_bytes", srcBytes,
+			"dst_files", dstFiles, "dst_bytes", dstBytes)
+		return dstFiles, dstBytes, apperr.New(CodeCopyFailed, http.StatusInternalServerError).
+			WithArg("src_files", srcFiles).
+			WithArg("dst_files", dstFiles).
+			WithArg("src_bytes", srcBytes).
+			WithArg("dst_bytes", dstBytes)
+	}
+	m.logger.Info("已完成卷格式化与内容拷贝", "ref", ref, "files", dstFiles, "bytes", dstBytes)
+	return dstFiles, dstBytes, nil
+}
+
+// SpaceUsageOf 返回路径所在卷的标识、文件系统与可用/总空间。
+//
+// 入参 path 通常是 storages.path：Linux 下它可能是某个存储 thin LV 的**挂载点**，
+// 也可能是宿主文件系统上的普通目录（登记已有目录的逃生入口）。
+// 因此这里**以 statfs 为准**取实际容量与文件系统，而不是按配置的 VG 硬编码：
+//   - Name 取承载该路径的设备（mountinfo 的 source），供 PathGuardSet 按卷去重——
+//     若回退成 VG 名，多个存储会被去重塌成一条；
+//   - TotalBytes 取 statfs 的总量（存储卷即其 LV 虚拟大小）；
+//   - FreeBytes 取 **min(statfs 可用, VG 剩余)**：thin 卷不自增长，写满虚拟大小即 ENOSPC，
+//     只看 statfs 会让 PathGuardSet.Pick 选到一个已装不下的根。
+func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.VolumeSpace, error) {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return nil, apperr.InvalidParam("path")
+	}
+	size, err := statfsSize(p)
+	if err != nil {
+		return nil, apperr.New(CodeVHDFailed, http.StatusInternalServerError).
+			WithCause(err).WithArg("path", p)
+	}
+
+	name, fsType := p, ""
+	if e, ok := mountOf(p); ok {
+		name, fsType = e.source, e.fsType
+	}
+
+	free := size.freeBytes
+	if vgFree, vgErr := m.vgFreeBytes(ctx); vgErr == nil && vgFree > 0 && vgFree < free {
+		free = vgFree
+	}
+	return &domain.VolumeSpace{
+		Name:       name,
+		FileSystem: fsType,
+		FreeBytes:  free,
+		TotalBytes: size.totalBytes,
+	}, nil
+}
+
+// FileSystemOf 返回路径所在卷的文件系统名。
+//
+// Linux 侧卷就是承载该路径的文件系统：优先给 statfs/mountinfo 的**真实**类型；
+// 路径暂时不可 stat（如存储根尚未挂载）时退化为按配置 VG 校验，保持既有"根可用性"语义。
+func (m *Manager) FileSystemOf(ctx context.Context, path string) (string, error) {
+	if e, ok := mountOf(path); ok && e.fsType != "" {
+		return e.fsType, nil
+	}
+	vg := m.volumeNameOf(path)
+	if vg == "" {
+		return "", apperr.InvalidParam("path")
+	}
+	if !m.vgExists(ctx, vg) {
+		return "", apperr.New(apperr.CodeUnavailable, http.StatusInternalServerError).WithArg("path", path)
+	}
+	return "LVM", nil
+}
+
+// volumeNameOf 把入参归一化为 VG 名：仅在入参确实是 "<vg>/..." 或
+// "/dev/mapper/<vg>-..." 时取其中的 VG，否则回退到配置的 VG。
+//
+// 之所以要回退：调用方传进来的 storages.path 是本地普通目录（如 /var/lib/vault），
+// 用 vgFromPath 解析会失败，而它的空间口径本就应该按承载磁盘的 VG 统计。
+func (m *Manager) volumeNameOf(path string) string {
+	if vg, err := vgFromPath(path); err == nil && m.vgExists(context.Background(), vg) {
+		return vg
+	}
+	return strings.TrimSpace(m.vg)
+}
+
+// vgFromPath 从 "<vg>/<thin_pool>" 或 "/dev/mapper/<vg>-<lv>" 中提取 VG 名。
+func vgFromPath(path string) (string, error) {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return "", apperr.InvalidParam("path")
+	}
+	if rest, ok := strings.CutPrefix(p, mapperPrefix); ok {
+		i := strings.IndexByte(rest, '-')
+		if i <= 0 {
+			return "", apperr.InvalidParam("path")
+		}
+		p = rest[:i]
+	} else if i := strings.IndexAny(p, "/\\"); i >= 0 {
+		p = p[:i]
+	}
+	p = strings.TrimSpace(p)
+	if !lvNameRe.MatchString(p) {
+		return "", apperr.InvalidParam("path")
+	}
+	return p, nil
+}
+
+// countTree 统计目录树下的常规文件数与总字节数。
+func countTree(root string) (files int, bytes int64, err error) {
+	err = filepath.Walk(root, func(_ string, fi os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if fi.Mode().IsRegular() {
+			files++
+			bytes += fi.Size()
+		}
+		return nil
+	})
+	return files, bytes, err
+}
+
+// copyTree 递归把 src 目录内容复制进 dst，返回复制的常规文件数与字节数。
+//
+// 自己实现而不依赖 cp：需要精确统计文件数/字节数用于校验（与既有 CopyTree 口径一致），
+// 且避免 cp 在 ntfs-3g 上 sparse/权限语义不可控带来的差异。
+func copyTree(ctx context.Context, src, dst string) (int, int64, error) {
+	var files int
+	var bytes int64
+	err := filepath.Walk(src, func(path string, fi os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if fi.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil // 跳过符号链接/设备等特殊文件
+		}
+		n, err := copyFile(path, target, fi.Mode())
+		if err != nil {
+			return err
+		}
+		files++
+		bytes += n
+		return nil
+	})
+	return files, bytes, err
+}
+
+// copyFile 复制单个常规文件并返回写入的字节数。
+func copyFile(src, dst string, mode os.FileMode) (int64, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return 0, err
+	}
+	defer in.Close() //nolint:errcheck
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
+	if err != nil {
+		return 0, err
+	}
+	n, err := io.Copy(out, in)
+	if err != nil {
+		_ = out.Close()
+		return 0, err
+	}
+	if err := out.Close(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
