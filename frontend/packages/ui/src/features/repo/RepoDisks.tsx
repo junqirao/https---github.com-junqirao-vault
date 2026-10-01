@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Button, Form, Input, Modal, Progress, Space, Tooltip, Typography } from 'antd'
+import { useEffect, useMemo, useState } from 'react'
+import { Alert, Button, Form, Input, Modal, Progress, Select, Space, Tag, Tooltip, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -9,21 +9,50 @@ import { ErrorNotice } from '../../components/ErrorNotice'
 import { SectionCard } from '../../components/SectionCard'
 import { StatusTag } from '../../components/StatusTag'
 import { agentApi } from '../../api/agentClient'
-import type { DownloadState } from '../../api/agentTypes'
+import type { AgentMountMode, AgentMountState, DownloadState } from '../../api/agentTypes'
 import { ApiError } from '../../api/errors'
 import { useApi } from '../../api/provider'
-import type { DiskDTO } from '../../api/types'
+import type { AllocationDTO, AllocationState, DiskDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
+import { palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime } from '../../utils/format'
 import { diskKindLabel } from '../../utils/labels'
+import { MountActionButtons, MountDialog } from '../mount/MountControls'
 
 export interface RepoDisksProps {
   repoId: string
+  isSuperAdmin: boolean
+  currentUserId: string
+  /** 当前用户的显示名：非管理员无法拉取用户列表，用于自己的分配列回退显示。 */
+  currentUserName: string
 }
 
-/** 存储库下的磁盘列表（支持回收空间与异步删除）。 */
-export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
+/**
+ * 分配状态 → 挂载语义（未挂载 / 挂载中 / 已挂载 / 释放中）。
+ *
+ * 磁盘的 `mounted` 字段是**服务端本机挂载**标记，客户端把自己的盘挂到本机后不会回写它，
+ * 因此永远显示"未挂载"。真正能反映"谁挂载了"的是分配状态（代理挂载成功后会回写为 mounted）。
+ */
+const MOUNT_STATE_META: Record<AllocationState, { labelKey: string; color?: string }> = {
+  allocated: { labelKey: 'repo.mount.notMounted' },
+  mounting: { labelKey: 'state.mount.mounting', color: palette.accent },
+  mounted: { labelKey: 'repo.mount.mounted', color: palette.success },
+  releasing: { labelKey: 'state.allocation.releasing', color: palette.warning },
+  released: { labelKey: 'state.allocation.released' }
+}
+
+/** 磁盘的挂载状态：由该盘上的分配状态聚合得出（一条挂上即视为已挂载）。 */
+function diskMountState(allocs: AllocationDTO[]): AllocationState | null {
+  if (allocs.length === 0) return null
+  if (allocs.some((alloc) => alloc.state === 'mounted')) return 'mounted'
+  if (allocs.some((alloc) => alloc.state === 'mounting')) return 'mounting'
+  if (allocs.some((alloc) => alloc.state === 'releasing')) return 'releasing'
+  return 'allocated'
+}
+
+/** 存储库下的磁盘列表：磁盘 + 分配（谁在用/挂载）+ 挂载与卸载 + 回收空间与异步删除。 */
+export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName }: RepoDisksProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const queryClient = useQueryClient()
@@ -33,6 +62,16 @@ export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
   const [copyDisk, setCopyDisk] = useState<DiskDTO | null>(null)
   const [copyForm] = Form.useForm<{ target_dir: string; file_name: string }>()
   const { config: agentConfig, downloads, refreshDownloads } = agent
+
+  // 分配（用户 + 差异盘）与挂载操作（分配/释放/挂载/卸载）合并在此面板。
+  const [selectedUser, setSelectedUser] = useState<string | undefined>(undefined)
+  const [pendingRelease, setPendingRelease] = useState<AllocationDTO | null>(null)
+  const [mountTarget, setMountTarget] = useState<AllocationDTO | null>(null)
+  const [mountMode, setMountMode] = useState<AgentMountMode>('letter')
+  const [mountPath, setMountPath] = useState('')
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [pendingUnmount, setPendingUnmount] = useState<AgentMountState | null>(null)
+  const [pendingForce, setPendingForce] = useState<AgentMountState | null>(null)
 
   // 刷新页面后恢复进行中/历史下载；属背景恢复，失败不阻断页面（用户主动操作失败时会另行提示）。
   useEffect(() => {
@@ -44,8 +83,48 @@ export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
     queryFn: () => api.listRepoDisks(repoId)
   })
 
+  const allocationsQuery = useQuery({
+    queryKey: ['repo-allocations', repoId],
+    queryFn: () => api.listAllocations(repoId)
+  })
+
+  const usersQuery = useQuery({
+    queryKey: ['users', 'options'],
+    queryFn: () => api.listUsers({ limit: 200 }),
+    enabled: isSuperAdmin
+  })
+
+  const userName = useMemo(() => {
+    const map = new Map<string, string>()
+    // 非管理员拿不到用户列表，至少让自己那条显示成用户名而不是 UUID。
+    if (currentUserName) map.set(currentUserId, currentUserName)
+    for (const user of usersQuery.data?.items ?? []) map.set(user.id, user.username)
+    return map
+  }, [usersQuery.data, currentUserId, currentUserName])
+
+  /** 磁盘 → 该盘上的活跃分配（差异盘一对一；独享库多用户共用同一盘）。 */
+  const allocationsByDisk = useMemo(() => {
+    const map = new Map<string, AllocationDTO[]>()
+    for (const alloc of allocationsQuery.data?.items ?? []) {
+      if (alloc.state === 'released') continue
+      const list = map.get(alloc.disk_id) ?? []
+      list.push(alloc)
+      map.set(alloc.disk_id, list)
+    }
+    return map
+  }, [allocationsQuery.data])
+
+  /** 分配 → 本机代理的挂载状态（只包含本客户端自己的挂载）。 */
+  const mountByAllocation = useMemo(() => {
+    const map = new Map<string, AgentMountState>()
+    for (const mount of agent.state?.mounts ?? []) map.set(mount.allocation_id, mount)
+    return map
+  }, [agent.state])
+
   const invalidate = (): void => {
     void queryClient.invalidateQueries({ queryKey: ['repo-disks', repoId] })
+    void queryClient.invalidateQueries({ queryKey: ['repo-allocations', repoId] })
+    void queryClient.invalidateQueries({ queryKey: ['leases'] })
     void queryClient.invalidateQueries({ queryKey: ['jobs'] })
   }
 
@@ -82,6 +161,67 @@ export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
     onError: (err) => setError(err)
   })
 
+  const allocateMutation = useMutation({
+    mutationFn: (userId: string) => api.allocate(repoId, userId),
+    onSuccess: () => {
+      setSelectedUser(undefined)
+      invalidate()
+    },
+    onError: (err) => setError(err)
+  })
+
+  const releaseMutation = useMutation({
+    mutationFn: (allocationId: string) => api.releaseAllocation(allocationId),
+    onSuccess: () => {
+      setPendingRelease(null)
+      invalidate()
+    },
+    onError: (err) => setError(err)
+  })
+
+  /** 代理操作统一包一层：记录错误与忙状态，成功后刷新分配（分配状态随挂载变化）避免重复代码。 */
+  const runAgentAction = async (allocationId: string, action: () => Promise<unknown>): Promise<void> => {
+    setError(null)
+    setBusyId(allocationId)
+    try {
+      await action()
+      invalidate()
+    } catch (err) {
+      setError(err)
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const openMountDialog = (allocation: AllocationDTO): void => {
+    setMountMode(agentConfig?.default_mount_mode ?? 'letter')
+    setMountPath(agentConfig?.default_mount_dir ?? '')
+    setError(null)
+    setMountTarget(allocation)
+  }
+
+  /**
+   * 卸载：普通卸载失败（磁盘/会话/挂载点在本机早已不存在等）时给出**强制卸载**出口。
+   *
+   * 代理会跳过失败的清理步骤、尽力拆除残留并删除记录。没有这个出口，脏记录
+   * （如"卡在卸载中"）永远无法从界面删除。
+   */
+  const runUnmount = async (mount: AgentMountState, force = false): Promise<void> => {
+    setError(null)
+    setBusyId(mount.allocation_id)
+    try {
+      await agent.unmount({ allocation_id: mount.allocation_id, force })
+      setPendingForce(null)
+      invalidate()
+    } catch (err) {
+      setError(err)
+      if (!force) setPendingForce(mount)
+    } finally {
+      setBusyId(null)
+      setPendingUnmount(null)
+    }
+  }
+
   const openCopy = (disk: DiskDTO): void => {
     setCopyDisk(disk)
     copyForm.setFieldsValue({
@@ -103,7 +243,7 @@ export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
       key: 'vhdx_path',
       render: (value: string) => (
         <Tooltip title={value}>
-          <Typography.Text type="secondary" ellipsis style={{ maxWidth: 320 }}>
+          <Typography.Text type="secondary" ellipsis style={{ maxWidth: 300 }}>
             {value}
           </Typography.Text>
         </Tooltip>
@@ -112,60 +252,151 @@ export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
     {
       title: t('common.size'),
       key: 'size',
-      width: 180,
+      width: 170,
       render: (_value, disk) => `${formatBytes(disk.physical_bytes)} / ${formatBytes(disk.size_bytes)}`
     },
     {
       title: t('common.status'),
       dataIndex: 'state',
       key: 'state',
-      width: 110,
+      width: 100,
       render: (value: string) => <StatusTag group="disk" value={value} />
     },
     {
-      title: t('repo.mount.title'),
-      dataIndex: 'mounted',
-      key: 'mounted',
+      // 谁在用这块盘（差异盘即"谁挂载了"）：列出该盘上的分配用户。
+      title: t('field.user'),
+      key: 'user',
+      width: 180,
+      render: (_value, disk) => {
+        const allocs = allocationsByDisk.get(disk.id) ?? []
+        if (allocs.length === 0) return '-'
+        return (
+          <Space direction="vertical" size={0}>
+            {allocs.map((alloc) => (
+              <Typography.Text key={alloc.id} ellipsis style={{ maxWidth: 160, display: 'block' }}>
+                {userName.get(alloc.user_id) ?? alloc.user_id}
+              </Typography.Text>
+            ))}
+          </Space>
+        )
+      }
+    },
+    {
+      title: t('repo.mount.state'),
+      key: 'mount_state',
       width: 110,
-      render: (value: boolean) => (value ? t('repo.mount.mounted') : t('repo.mount.notMounted'))
+      render: (_value, disk) => {
+        const state = diskMountState(allocationsByDisk.get(disk.id) ?? [])
+        if (!state) return '-'
+        const meta = MOUNT_STATE_META[state]
+        return (
+          <Tag bordered={false} color={meta.color}>
+            {t(meta.labelKey)}
+          </Tag>
+        )
+      }
+    },
+    {
+      title: t('field.mountPoint'),
+      key: 'mount_path',
+      width: 180,
+      render: (_value, disk) => {
+        const mine = (allocationsByDisk.get(disk.id) ?? []).find((alloc) => alloc.user_id === currentUserId)
+        const path = mine ? mountByAllocation.get(mine.id)?.mount_path : undefined
+        if (!path) return '-'
+        return (
+          <Tooltip title={path}>
+            <Typography.Text ellipsis style={{ maxWidth: 160 }}>
+              {path}
+            </Typography.Text>
+          </Tooltip>
+        )
+      }
     },
     {
       title: t('common.createdAt'),
       dataIndex: 'created_at',
       key: 'created_at',
-      width: 170,
+      width: 160,
       render: (value: number) => formatTime(value)
     },
     {
       title: t('common.actions'),
       key: 'actions',
-      width: 220,
-      render: (_value, disk) => (
-        <Space size={0}>
-          {disk.kind === 'parent' ? (
-            <Button type="link" size="small" onClick={() => openCopy(disk)}>
-              {t('disk.copyToLocal')}
+      width: 320,
+      render: (_value, disk) => {
+        const allocs = allocationsByDisk.get(disk.id) ?? []
+        const mine = allocs.find((alloc) => alloc.user_id === currentUserId)
+        const mount = mine ? mountByAllocation.get(mine.id) : undefined
+        return (
+          <Space size={0} wrap>
+            <MountActionButtons
+              mount={mount}
+              canMount={mine !== undefined}
+              available={agent.available}
+              busy={mine !== undefined && busyId === mine.id}
+              onMount={() => mine && openMountDialog(mine)}
+              onUnmount={() => mount && setPendingUnmount(mount)}
+              onRemount={() => mine && void runAgentAction(mine.id, () => agent.remount({ allocation_id: mine.id }))}
+              onOpenPath={(path) => void agentApi.openPath(path).catch((err: unknown) => setError(err))}
+            />
+            {allocs
+              .filter((alloc) => isSuperAdmin || alloc.user_id === currentUserId)
+              .map((alloc) => (
+                <Button key={alloc.id} type="link" size="small" danger onClick={() => setPendingRelease(alloc)}>
+                  {t('action.release')}
+                </Button>
+              ))}
+            {disk.kind === 'parent' && mine === undefined ? (
+              <Button type="link" size="small" onClick={() => openCopy(disk)}>
+                {t('disk.copyToLocal')}
+              </Button>
+            ) : null}
+            <Button
+              type="link"
+              size="small"
+              onClick={() => compactMutation.mutate(disk.id)}
+              loading={compactMutation.isPending && compactMutation.variables === disk.id}
+            >
+              {t('action.compact')}
             </Button>
-          ) : null}
-          <Button
-            type="link"
-            size="small"
-            onClick={() => compactMutation.mutate(disk.id)}
-            loading={compactMutation.isPending && compactMutation.variables === disk.id}
-          >
-            {t('action.compact')}
-          </Button>
-          <Button type="link" size="small" danger onClick={() => setPendingDelete(disk)}>
-            {t('common.delete')}
-          </Button>
-        </Space>
-      )
+            <Button type="link" size="small" danger onClick={() => setPendingDelete(disk)}>
+              {t('common.delete')}
+            </Button>
+          </Space>
+        )
+      }
     }
   ]
 
   return (
     <SectionCard title={t('repo.detail.disks')}>
-      {error ? <ErrorNotice error={error} /> : null}
+      {error || allocationsQuery.error ? <ErrorNotice error={error ?? allocationsQuery.error} /> : null}
+      {!agent.available ? (
+        <Alert type="warning" showIcon message={t('agent.hostMissing')} style={{ marginBottom: spacing.md }} />
+      ) : null}
+      {isSuperAdmin ? (
+        <Space style={{ marginBottom: spacing.md }} wrap>
+          <Select
+            showSearch
+            value={selectedUser}
+            placeholder={t('repo.assign.user')}
+            style={{ width: 260 }}
+            loading={usersQuery.isLoading}
+            onChange={setSelectedUser}
+            optionFilterProp="label"
+            options={(usersQuery.data?.items ?? []).map((user) => ({ value: user.id, label: user.username }))}
+          />
+          <Button
+            type="primary"
+            disabled={!selectedUser}
+            loading={allocateMutation.isPending}
+            onClick={() => selectedUser && allocateMutation.mutate(selectedUser)}
+          >
+            {t('action.assign')}
+          </Button>
+        </Space>
+      ) : null}
       {downloads.length > 0 ? (
         <DownloadList
           downloads={downloads}
@@ -181,7 +412,7 @@ export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
         loading={disksQuery.isLoading}
         empty={t('common.empty')}
         pagination={false}
-        scroll={{ x: 900 }}
+        scroll={{ x: 1500 }}
       />
       <ConfirmDialog
         open={pendingDelete !== null}
@@ -191,6 +422,38 @@ export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
         loading={deleteMutation.isPending}
         onConfirm={() => pendingDelete && deleteMutation.mutate(pendingDelete.id)}
         onCancel={() => setPendingDelete(null)}
+      />
+      <ConfirmDialog
+        open={pendingRelease !== null}
+        danger
+        title={t('action.release')}
+        content={t('repo.release.confirm')}
+        loading={releaseMutation.isPending}
+        onConfirm={() => pendingRelease && releaseMutation.mutate(pendingRelease.id)}
+        onCancel={() => setPendingRelease(null)}
+      />
+      <ConfirmDialog
+        open={pendingUnmount !== null}
+        danger
+        title={t('action.unmount')}
+        content={t('agent.unmount.confirm')}
+        loading={busyId !== null}
+        onConfirm={() => {
+          if (pendingUnmount) void runUnmount(pendingUnmount)
+        }}
+        onCancel={() => setPendingUnmount(null)}
+      />
+      {/* 强制卸载：普通卸载失败后的兜底出口（代理跳过失败的清理步骤并删除记录）。 */}
+      <ConfirmDialog
+        open={pendingForce !== null}
+        danger
+        title={t('agent.unmount.forceTitle')}
+        content={t('agent.unmount.forceConfirm')}
+        loading={busyId !== null}
+        onConfirm={() => {
+          if (pendingForce) void runUnmount(pendingForce, true)
+        }}
+        onCancel={() => setPendingForce(null)}
       />
       <Modal
         open={copyDisk !== null}
@@ -226,6 +489,28 @@ export function RepoDisks({ repoId }: RepoDisksProps): JSX.Element {
           </Form.Item>
         </Form>
       </Modal>
+
+      <MountDialog
+        open={mountTarget !== null}
+        mode={mountMode}
+        path={mountPath}
+        submitting={mountTarget !== null && busyId === mountTarget.id}
+        onModeChange={setMountMode}
+        onPathChange={setMountPath}
+        onConfirm={() => {
+          if (!mountTarget) return
+          const target = mountTarget
+          void runAgentAction(target.id, () =>
+            agent.mount({
+              allocation_id: target.id,
+              repo_id: repoId,
+              mount_mode: mountMode,
+              mount_path: mountMode === 'directory' ? mountPath.trim() : undefined
+            })
+          ).then(() => setMountTarget(null))
+        }}
+        onCancel={() => setMountTarget(null)}
+      />
     </SectionCard>
   )
 }

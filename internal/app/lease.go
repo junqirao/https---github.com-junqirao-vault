@@ -26,7 +26,10 @@ const defaultIQNPrefix = "iqn.2026-01.com.vault"
 type MountSpec struct {
 	ServerInstanceID string `json:"server_instance_id"`
 	ServerName       string `json:"server_name"`
-	TargetIQN        string `json:"target_iqn"`
+	// RepoName 存储库名称：客户端用它命名挂载点（盘符模式的卷标、目录模式的目录名，
+	// 见 docs 3.4.5 与客户端 mountAt）。服务端是库名的权威来源，随参数一并下发。
+	RepoName  string `json:"repo_name,omitempty"`
+	TargetIQN string `json:"target_iqn"`
 	PortalAddress    string `json:"portal_address"`
 	PortalPort       int    `json:"portal_port"`
 	AuthMode         string `json:"auth_mode"`
@@ -159,6 +162,7 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 	spec := &MountSpec{
 		ServerInstanceID: raw.Server.InstanceID,
 		ServerName:       raw.Server.Name,
+		RepoName:         repo.Name,
 		// 必须是**平台实际存储**的目标名：推导出来的 IQN 若与平台不一致，
 		// 客户端就是"TCP 3260 可达、但登录失败"（见 IscsiService.targetIQN 的说明）。
 		TargetIQN:        s.Iscsi.targetIQN(target),
@@ -188,6 +192,10 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 }
 
 // Heartbeat 续期租约。
+//
+// 只有 revoked / released（终态）与 clientID 不匹配才返回 lease_revoked —— 客户端据此主动卸载。
+// expired（离线）**不是**终态：本次心跳把它续回 active，挂载与目标保持原状。
+// 这条路径就是"短暂断网/服务端重启不该毁掉挂载"的恢复通道（见 ReapExpired 与 store.TouchLease）。
 func (s *LeaseService) Heartbeat(ctx context.Context, leaseID, clientID string) (ttlSeconds int, expiresAt int64, err error) {
 	lease, err := s.Store.GetLease(ctx, leaseID)
 	if err != nil {
@@ -197,16 +205,19 @@ func (s *LeaseService) Heartbeat(ctx context.Context, leaseID, clientID string) 
 	if lease.ClientID != clientID {
 		return 0, 0, apperr.LeaseRevoked()
 	}
+	// 终态（revoked / released）不可复活：只有管理员踢下线与客户端主动卸载会走到这里。
 	if lease.State.IsTerminal() {
 		return 0, 0, apperr.LeaseRevoked()
 	}
 
 	d := s.securityDefaults()
 	expires := time.Now().Add(d.LeaseTTL).UnixMilli()
+	// TouchLease 接受 active 与 expired 两种状态；其它状态（含终态）返回 lease_revoked。
 	if err := s.Store.TouchLease(ctx, leaseID, expires); err != nil {
 		return 0, 0, err
 	}
 	lease.ExpiresAt = expires
+	// 客户端回来了：把"离线"标记复位为在线（过期只表示"一段时间没听到心跳"）。
 	if lease.State == domain.LeaseStateExpired {
 		if err := s.Store.UpdateLeaseState(ctx, leaseID, domain.LeaseStateActive); err != nil {
 			return 0, 0, err
@@ -308,13 +319,22 @@ func (s *LeaseService) Revoke(ctx context.Context, leaseID, operatorID string) e
 	return nil
 }
 
-// ReapExpired 由定时任务调用：把过期租约标记为 revoked（仅反映"客户端离线"）。
+// ReapExpired 由定时任务调用：把过期租约标记为 expired（仅反映"客户端离线"）。
 //
 // ⚠️ 绝不在这里停用目标：租约/心跳只用于"知道客户端是否还在"，绝不能反过来
 // 停用目标、影响挂载（真实诉求："续期、过期这些行为不该影响我的挂载"）。
 // 目标的启用/停用只由两个显式动作驱动：挂载（启用）、卸载（停用）。
-// 过期只是把租约状态置为 revoked —— 客户端下次心跳会得知"已撤销"并自行断开；
-// 目标保持原状，直到显式卸载或管理员 Revoke 才被停用。
+//
+// ⚠️ 过期**必须**是 expired 而不是 revoked（真实事故："挂载成功后隔一两分钟盘符就没了，
+// 但服务端目标还在"）：
+//   - revoked / released 是终态（见 domain.LeaseState.IsTerminal），心跳再也续不上；
+//     TouchLease 只接受 active/expired，客户端下一次心跳会拿到 lease_revoked，
+//     于是**主动卸载**一个其实完好的挂载 —— 这正是"盘符消失、目标仍在"的现象；
+//   - expired 是**可恢复**的中间态：客户端心跳一回来就回到 active（见 Heartbeat），
+//     挂载与目标全程不受影响。短暂断网/服务端重启/客户端卡顿都不该毁掉用户的挂载。
+//
+// 另注：在线列表（ListActiveLeasesByRepo）只统计 active，因此"离线"的租约不会
+// 被误算作"正在使用"；一旦客户端心跳恢复，租约回到 active 即重新出现在线列表。
 //
 // 返回处理的租约数量。
 func (s *LeaseService) ReapExpired(ctx context.Context) (int, error) {
@@ -325,7 +345,7 @@ func (s *LeaseService) ReapExpired(ctx context.Context) (int, error) {
 	reaped := 0
 	for i := range leases {
 		lease := &leases[i]
-		if err := s.Store.UpdateLeaseState(ctx, lease.ID, domain.LeaseStateRevoked); err != nil {
+		if err := s.Store.UpdateLeaseState(ctx, lease.ID, domain.LeaseStateExpired); err != nil {
 			s.Log.Error("标记过期租约失败", "lease_id", lease.ID, "error", err)
 			continue
 		}
@@ -337,7 +357,7 @@ func (s *LeaseService) ReapExpired(ctx context.Context) (int, error) {
 			"allocation_id": lease.AllocationID,
 			"user_id":       lease.UserID,
 			"target_name":   lease.TargetName,
-			"state":         string(domain.LeaseStateRevoked),
+			"state":         string(domain.LeaseStateExpired),
 		})
 		reaped++
 	}

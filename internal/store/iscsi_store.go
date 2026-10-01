@@ -409,15 +409,24 @@ func (s *Store) UpdateLeaseState(ctx context.Context, id string, st domain.Lease
 }
 
 // TouchLease 续期租约（心跳）。
+//
+// 允许续期的状态：active（在线）与 expired（离线，见 app.LeaseService.ReapExpired）——
+// 后者续期后由调用方复位为 active，这是"断网/重启后自动恢复"的关键：
+// 若这里只认 active，任何一次过期都会让此后所有心跳永久返回 lease_revoked，
+// 客户端随即主动卸载一个完好的挂载（真实事故：盘符消失、服务端目标仍在）。
+//
+// revoked / released 是终态，不属于允许续期的状态：命中 0 行即返回 lease_revoked，
+// 客户端据此主动卸载。
 func (s *Store) TouchLease(ctx context.Context, id string, expiresAt int64) error {
 	res, err := s.q.ExecContext(ctx,
-		s.q.Rebind(`UPDATE leases SET expires_at = ?, last_seen_at = ? WHERE id = ? AND state = ?`),
-		expiresAt, nowMillis(), id, string(domain.LeaseStateActive))
+		s.q.Rebind(`UPDATE leases SET expires_at = ?, last_seen_at = ? WHERE id = ? AND state IN (?, ?)`),
+		expiresAt, nowMillis(), id,
+		string(domain.LeaseStateActive), string(domain.LeaseStateExpired))
 	if err != nil {
 		return fmt.Errorf("store: 续期租约失败: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		// 租约不存在或已被吊销：明确返回业务错误，避免客户端继续认为在线。
+		// 租约不存在、已过期又被清理、或已被吊销：明确返回业务错误，避免客户端继续认为在线。
 		return apperr.LeaseRevoked()
 	}
 	return nil

@@ -274,9 +274,17 @@ function applyEvent(event: AgentEvent): void {
       //
       // 否则一次挂载会刷出一串"已挂载"提示 —— 而它可能最终根本没成功
       // （真实反馈："客户端挂载时会出现一大批已挂载的提示，但并未挂载成功"）。
+      //
+      // 同理，`unmounting` 收到 mounted 是**卸载失败后的状态恢复**（磁盘其实还挂着，只是
+      // 移除挂载点这一步失败，见 docs/implementation.md 5.5），不是"刚挂上"，也不能弹提示 ——
+      // 真实反馈："点了卸载，然后提示挂载成功？"
       const previous = current?.mounts.find((item) => item.allocation_id === event.mount.allocation_id)
       if (current) setSnapshot({ state: { ...current, mounts: upsertMount(current.mounts, event.mount) } })
-      if (event.mount.state === 'mounted' && previous?.state !== 'mounted') {
+      if (
+        event.mount.state === 'mounted' &&
+        previous?.state !== 'mounted' &&
+        previous?.state !== 'unmounting'
+      ) {
         notify(t('agent.event.mounted', { name: event.mount.repo_name || event.mount.allocation_id }))
       }
       return

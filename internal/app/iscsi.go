@@ -1010,7 +1010,7 @@ func targetInfoMatches(spec platform.TargetSpec, info *platform.TargetInfo) bool
 	if spec.Enabled != info.Enabled {
 		return false
 	}
-	if !sameStringsFold(spec.Initiators, info.Initiators) {
+	if !initiatorsMatch(spec.Initiators, info.Initiators) {
 		return false
 	}
 	if spec.BackingRef == "" {
@@ -1018,6 +1018,34 @@ func targetInfoMatches(spec platform.TargetSpec, info *platform.TargetInfo) bool
 		return len(info.Devices) == 0
 	}
 	return containsFold(info.Devices, spec.BackingRef)
+}
+
+// initiatorsMatch 比较期望的白名单与平台读回的白名单是否等价。
+//
+// 必须先把通配项 `IQN:*` 归一掉：平台脚本在"白名单为空"时会下发通配（Windows 上
+// 空列表 == 拒绝所有，必须显式放开，见 iscsi_set_target.ps1），因此读回的是 `["IQN:*"]`，
+// 而我们期望的是空列表 `[]`。若直接用 sameStringsFold 比较，二者永远不等 →
+// targetInfoMatches 永远 false → targetUnchanged 的跳过优化彻底失效 →
+// **每次挂载都重付一次约 15 秒的全量下发**（真实工单：挂载慢十几秒）。
+// `IQN:*` 与"空"语义相同（都是"不限制发起端"），故视为等价。
+func initiatorsMatch(expected, actual []string) bool {
+	return sameStringsFold(stripWildcardInitiators(expected), stripWildcardInitiators(actual))
+}
+
+// stripWildcardInitiators 去掉表示"不限制"的通配项，其余原样保留。
+func stripWildcardInitiators(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, raw := range values {
+		value := strings.TrimSpace(raw)
+		if idx := strings.Index(value, ":"); idx >= 0 {
+			idType := strings.ToUpper(strings.TrimSpace(value[:idx]))
+			if idType == "IQN" && strings.TrimSpace(value[idx+1:]) == "*" {
+				continue
+			}
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 // sameStringsFold 比较两个字符串列表是否等价（集合语义：忽略顺序、大小写与空项）。

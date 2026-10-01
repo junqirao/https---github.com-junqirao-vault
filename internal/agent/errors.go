@@ -172,9 +172,16 @@ func errMountFailedWith(stage string, cause error, extra map[string]any) *apperr
 	return err
 }
 
-// errUnmountFailed 卸载失败。
-func errUnmountFailed(cause error) *apperr.Error {
-	return apperr.New(CodeUnmountFailed, http.StatusInternalServerError).WithCause(cause)
+// errUnmountFailed 卸载失败；stage 指明失败的阶段（mount_point / disk_offline / disconnect）。
+//
+// 为什么要带 stage：卸载失败只有一句"卸载失败"时，用户看到的是"盘符没了、状态还写着已挂载、
+// iSCSI 里会话还在"，完全无从判断卡在哪一步（真实反馈）。阶段名会随 args 一起回到界面。
+func errUnmountFailed(stage string, cause error) *apperr.Error {
+	err := apperr.New(CodeUnmountFailed, http.StatusInternalServerError).WithCause(cause)
+	if strings.TrimSpace(stage) != "" {
+		err = err.WithArg("stage", stage)
+	}
+	return err
 }
 
 // errServerUnreachable 无法连接服务端。

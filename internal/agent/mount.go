@@ -29,6 +29,18 @@ const (
 	connectWaitTimeout = 60 * time.Second
 	// postScriptTimeout 挂载后置脚本执行超时（60s）。
 	postScriptTimeout = 60 * time.Second
+	// labelTimeout 写入卷标的超时。卷标只是"好看"（资源管理器里显示库名），
+	// 失败或超时都不影响挂载本身。
+	labelTimeout = 30 * time.Second
+	// volumeLabelMaxRunes NTFS 卷标最长 32 个字符（超出会被系统截断，这里主动截断以保持一致）。
+	volumeLabelMaxRunes = 32
+	// unmountDisconnectRetries 卸载时断开 iSCSI 会话的重试次数（仅在 0xefff0040 时重试）。
+	unmountDisconnectRetries = 3
+	// unmountDisconnectBackoff 每次重试前的等待。
+	//
+	// 0xefff0040 的含义是"会话上仍有在线设备"，最常见的成因是 Set-Disk -IsOffline 还没真正
+	// 生效 —— 立刻重试会拿到同一个错误，所以要留一点时间给它生效。
+	unmountDisconnectBackoff = 2 * time.Second
 )
 
 // MountRequest 是本地挂载请求（POST /agent/mount）。
@@ -116,8 +128,10 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 
 	mode := e.resolveMode(req, spec)
 	ms := &MountState{
-		RepoID:       strings.TrimSpace(req.RepoID),
-		RepoName:     strings.TrimSpace(req.RepoName),
+		RepoID: strings.TrimSpace(req.RepoID),
+		// 库名同时决定盘符模式的卷标与目录模式的目录名（见 mountAt）。
+		// 请求里没有时用服务端下发值兜底：自动重挂/重装后恢复也能拿到库名。
+		RepoName:     repoNameOf(req, spec),
 		AllocationID: allocationID,
 		LeaseID:      spec.LeaseID,
 		TargetIQN:    spec.TargetIQN,
@@ -383,9 +397,19 @@ func cleanupFailureDetail(err error) string {
 	return "cleanup_failed:" + apperr.CodeOf(err)
 }
 
-// unmount 执行卸载流程（严格逆序，不可颠倒）。
+// unmount 执行卸载流程。
 //
-// 顺序：SetOffline(true) → Unmount(移除挂载点) → Disconnect → Unregister → 回写 release。
+// 顺序：Unmount(移除挂载点) → SetOffline(true) → Disconnect(必要时重试) → Unregister → 回写 release。
+//
+// ⚠️ "先移除挂载点、再下线磁盘"是刻意的，**不要颠倒回去**（真实事故）：
+// Set-Disk -IsOffline 一旦生效，盘符/目录会立刻从系统里消失，此时再执行
+// Remove-PartitionAccessPath 只会失败 —— 卸载就此中断，而磁盘其实已经下线。
+// 用户看到的正是这个组合：点了卸载 → 盘符不见了 → 卸载却报错、状态还回到"已挂载"、
+// iSCSI 发起程序里会话仍在（后面的 Disconnect 压根没执行到）。
+//
+// 唯一必须保持的强序是 **SetOffline 早于 Disconnect**：否则 Disconnect-IscsiTarget
+// 返回 0xefff0040（会话上仍有在线设备），见 docs/implementation.md 5.5。
+//
 // force=true 时忽略各阶段错误继续推进（用于清理残留与踢下线）。
 func (e *mountEngine) unmount(ctx context.Context, allocationID string, force bool) error {
 	allocationID = strings.TrimSpace(allocationID)
@@ -409,7 +433,7 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, fo
 		return errNotMounted(allocationID)
 	}
 
-	// 记住卸载前的状态：卸载失败时必须恢复它。
+	// 记住卸载前的状态：卸载失败、且**什么都没拆掉**时要恢复它。
 	//
 	// 为什么必须：状态一旦写成 unmounting 而后续步骤失败，若不回写，记录就**永远冻结在
 	// "卸载中"**（真实事故：目标/磁盘早已不存在，下线或移除挂载点报错，非 force 直接
@@ -424,54 +448,98 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, fo
 	})
 	e.a.publishMount(&unmounting)
 
-	// fail 恢复卸载前的状态并返回错误（只用于"什么都没拆掉"的非 force 失败路径）。
-	fail := func(err error) error {
+	// teardown 记录"本机是否已经有东西被真的拆掉"（挂载点被移除 / 磁盘被下线）。
+	//
+	// 它决定卸载失败后的状态语义：
+	//   - false：什么都没动 → 回滚成卸载前的状态（磁盘确实还挂着，状态如实）；
+	//   - true：已经拆掉一部分 → **绝不回滚**。回滚等于向界面谎报"还挂着"，而且前端收到
+	//     mounted 事件会弹出"已挂载"提示（真实反馈："点了卸载，然后提示挂载成功？磁盘状态
+	//     还是已挂载，但我看已经卸载成功了、盘符不见了"）。此时保留记录并标为 error，
+	//     用户可再点一次卸载（幂等重试）或走强制卸载。
+	teardown := false
+
+	// fail 上报某一阶段失败，并按 teardown 决定回滚还是保留错误记录。
+	fail := func(stage string, cause error) error {
+		target := unmountFailureState(teardown, prevState)
+
 		var out *MountState
 		e.a.store.UpdateMount(allocationID, func(m *MountState, _ *mountRuntime) {
-			m.State = prevState
+			m.State = target
+			if target != MountStateError {
+				cp := *m
+				out = &cp
+				return
+			}
+			m.Phase = ""
+			// 稳定码形如 unmount_disconnect:platform.iscsi_device_in_use，界面可直接翻译。
+			m.LastError = describeError("unmount_"+stage, cause)
+			m.LastErrorDetail = joinDetail(mountErrorDetailOf(cause))
 			cp := *m
 			out = &cp
 		})
 		if out != nil {
 			e.a.publishMount(out)
 		}
-		return err
+		if target == MountStateError {
+			e.a.logger.Error("卸载未完成，保留记录供重试",
+				"allocation_id", allocationID, "stage", stage, "error", cause)
+		}
+		return errUnmountFailed(stage, cause)
 	}
 
-	// ① 先把磁盘 Offline，否则 Disconnect 会返回 0xefff0040。
-	if rt.DiskKnown {
-		if err := e.a.vol.SetOffline(ctx, rt.DiskNumber, true); err != nil {
-			if !force {
-				return fail(errUnmountFailed(err))
+	// ① 移除挂载点（盘符或目录）。必须在磁盘下线之前做：盘一旦 Offline，盘符就没了。
+	if path := strings.TrimSpace(ms.MountPath); path != "" {
+		if err := e.a.vol.Unmount(ctx, path); err != nil {
+			// 幂等兜底：报错但挂载点其实已经不在了（磁盘早已下线、路径被系统摘除）时视为已完成 ——
+			// 否则会为了一个不存在的挂载点中断整次卸载，把后面的断开会话一起拖没。
+			if e.mountPointGone(ctx, ms, rt) {
+				e.a.logger.Info("挂载点已不存在，视为已移除",
+					"allocation_id", allocationID, "mount_path", path)
+			} else if !force {
+				return fail("mount_point", err)
+			} else {
+				e.a.logger.Warn("移除挂载点失败（force 继续卸载）", "allocation_id", allocationID, "error", err)
 			}
-			e.a.logger.Warn("下线磁盘失败（force 继续卸载）", "allocation_id", allocationID, "error", err)
+		}
+	}
+	// 从这一步起，本机已经"看不出还挂着东西"了 —— 后续失败一律不回滚状态。
+	teardown = true
+
+	// ② 磁盘 Offline —— Disconnect 的前置条件（否则 Disconnect-IscsiTarget 报 0xefff0040）。
+	//
+	// 磁盘号优先取运行时值，回退到挂载记录里的值：运行时信息只在内存中，进程重启后为空，
+	// 若因此跳过下线，下一步的断开必然因"设备在线"失败。
+	var diskOfflineErr error
+	if diskNumber, known := teardownDiskNumber(ms, rt); known {
+		if err := e.a.vol.SetOffline(ctx, diskNumber, true); err != nil {
+			// 不在这里中断：会话断开才是卸载的关键（磁盘会随会话断开一并消失）。
+			// 若断开也失败，错误会以更贴近真因的阶段上报（见下）。
+			diskOfflineErr = err
+			e.a.logger.Warn("下线磁盘失败（继续尝试断开会话）",
+				"allocation_id", allocationID, "disk_number", diskNumber, "error", err)
 		}
 	}
 
-	// ② 移除挂载点（盘符或目录）。
-	if strings.TrimSpace(ms.MountPath) != "" {
-		if err := e.a.vol.Unmount(ctx, ms.MountPath); err != nil {
-			if !force {
-				return fail(errUnmountFailed(err))
+	// ③ 断开 iSCSI 会话（device_in_use 时补下线并重试）。
+	if targetIQN := strings.TrimSpace(ms.TargetIQN); targetIQN != "" {
+		if err := e.disconnectSession(ctx, targetIQN, ms, rt); err != nil {
+			// 阶段归因：下线失败才是真因时别报成 disconnect，否则用户按"会话占用"去排查，
+			// 而真正没做到的是磁盘下线（两者的处置方式完全不同）。
+			stage := "disconnect"
+			if diskOfflineErr != nil && isDeviceInUse(err) {
+				stage = "disk_offline"
+				err = diskOfflineErr
 			}
-			e.a.logger.Warn("移除挂载点失败（force 继续卸载）", "allocation_id", allocationID, "error", err)
-		}
-	}
-
-	// ③ 断开 iSCSI 会话。
-	if strings.TrimSpace(ms.TargetIQN) != "" {
-		if err := e.a.iscsi.Disconnect(ctx, ms.TargetIQN); err != nil {
-			// 0xefff0040 说明仍有用例占用磁盘：非 force 时明确上报，force 时继续。
 			if !force {
-				return fail(errUnmountFailed(err))
+				return fail(stage, err)
 			}
 			e.a.logger.Warn("断开 iSCSI 会话失败（force 继续卸载）",
-				"allocation_id", allocationID, "target_iqn", ms.TargetIQN, "error", err)
+				"allocation_id", allocationID, "target_iqn", targetIQN, "error", err)
 		}
 		// ④ 取消会话持久化，避免重启后自动重连。
-		if err := e.a.iscsi.Unregister(ctx, ms.TargetIQN); err != nil {
+		if err := e.a.iscsi.Unregister(ctx, targetIQN); err != nil {
 			e.a.logger.Warn("取消 iSCSI 会话持久化失败（继续）",
-				"allocation_id", allocationID, "target_iqn", ms.TargetIQN, "error", err)
+				"allocation_id", allocationID, "target_iqn", targetIQN, "error", err)
 		}
 	}
 
@@ -488,6 +556,103 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, fo
 	e.a.hub.Publish(Event{Type: "unmount", Data: map[string]any{"allocation_id": allocationID}})
 	e.a.logger.Info("卸载完成", "allocation_id", allocationID, "mount_path", ms.MountPath)
 	return nil
+}
+
+// disconnectSession 断开 iSCSI 会话；遇到 0xefff0040（会话上仍有在线设备）时补一次磁盘
+// 下线并重试若干次。
+//
+// 为什么要重试（真实反馈："点了卸载，盘符不见了，但 iSCSI 发起程序里还是显示的连接中"）：
+// 卸载失败留在本机的会话会持续重连，用户看到的磁盘状态与真实状态就此分叉。该错误绝大多数
+// 情况下只是磁盘离线尚未生效，等一两秒再试即可断开。
+func (e *mountEngine) disconnectSession(ctx context.Context, targetIQN string, ms MountState, rt mountRuntime) error {
+	err := e.a.iscsi.Disconnect(ctx, targetIQN)
+	if err == nil || !isDeviceInUse(err) {
+		return err
+	}
+
+	if diskNumber, known := teardownDiskNumber(ms, rt); known {
+		if offlineErr := e.a.vol.SetOffline(ctx, diskNumber, true); offlineErr != nil {
+			e.a.logger.Warn("重试断开前下线磁盘失败",
+				"target_iqn", targetIQN, "disk_number", diskNumber, "error", offlineErr)
+		}
+	}
+	for attempt := 1; attempt <= unmountDisconnectRetries; attempt++ {
+		if !sleepOrDone(ctx, unmountDisconnectBackoff) {
+			return err
+		}
+		retryErr := e.a.iscsi.Disconnect(ctx, targetIQN)
+		if retryErr == nil {
+			e.a.logger.Info("断开 iSCSI 会话成功（重试后）",
+				"target_iqn", targetIQN, "attempt", attempt)
+			return nil
+		}
+		err = retryErr
+		if !isDeviceInUse(retryErr) {
+			return err
+		}
+	}
+	return err
+}
+
+// mountPointGone 判断挂载点是否确实已经不存在（移除报错后的幂等兜底）。
+//
+// 需要磁盘号才能查询（CurrentMountPath 按磁盘号取当前挂载点）；拿不到磁盘号时返回 false ——
+// 保守起见按"移除失败"处理，宁可让用户重试，也不要谎报卸载完成。
+func (e *mountEngine) mountPointGone(ctx context.Context, ms MountState, rt mountRuntime) bool {
+	diskNumber, known := teardownDiskNumber(ms, rt)
+	if !known {
+		return false
+	}
+	current, err := e.a.vol.CurrentMountPath(ctx, diskNumber)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(current) == ""
+}
+
+// unmountFailureState 返回卸载阶段失败后，那条记录应该处于什么状态。
+//
+//   - 什么都没拆掉（teardown=false）→ 回滚到卸载前的状态：磁盘确实还挂着，状态如实；
+//   - 已经拆掉一部分（teardown=true）→ error。**不能回滚成 mounted**：回滚等于向界面谎报
+//     "还挂着"，前端收到 mounted 事件还会弹一条"已挂载"提示（真实反馈："点了卸载，然后提示
+//     挂载成功？磁盘状态还是已挂载，但盘符已经不见了"）。
+func unmountFailureState(teardown bool, prevState string) string {
+	if teardown {
+		return MountStateError
+	}
+	return prevState
+}
+
+// teardownDiskNumber 返回卸载时要下线的磁盘号。
+//
+// 运行时信息（rt）只在内存里，进程重启后为空；此时回退到挂载记录里的磁盘号 ——
+// 拿不到磁盘号就会跳过下线，而 Disconnect-IscsiTarget 会因为"设备在线"而失败，
+// 于是卸载卡在最后一步（盘符已消失、会话还在）。
+func teardownDiskNumber(ms MountState, rt mountRuntime) (int, bool) {
+	if rt.DiskKnown && rt.DiskNumber >= 0 {
+		return rt.DiskNumber, true
+	}
+	if ms.DiskNumber > 0 {
+		return ms.DiskNumber, true
+	}
+	return 0, false
+}
+
+// isDeviceInUse 判断错误是否为「会话上仍有在线设备，无法断开」（HRESULT 0xefff0040）。
+func isDeviceInUse(err error) bool {
+	return apperr.CodeOf(err) == iscsiinitiator.CodeDeviceInUse
+}
+
+// sleepOrDone 等待 d；ctx 已结束时立刻返回 false（不阻塞调用方退出）。
+func sleepOrDone(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 // remount 先卸载再按原参数重新挂载。
@@ -528,9 +693,19 @@ func (e *mountEngine) restore(ctx context.Context, req MountRequest) (*MountStat
 }
 
 // mountAt 按模式完成挂载点分配，返回最终挂载路径。
+//
+// 命名的诉求（真实反馈："盘符或者是目录名应该等于存储库的名称"）：
+//   - 盘符模式：Windows 只肯给一个盘符（E:、F:…），没有"用库名做盘符"这回事，
+//     于是把库名写到**卷标**上 —— 资源管理器里该盘就显示存储库名称；
+//   - 目录模式：目录名就是库名（<挂载根>\<服务端别名>\<库名>，见 resolveMountDir 与 3.4.5）。
 func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, req MountRequest, spec *MountSpec) (string, error) {
 	if mode != mountModeDirectory {
-		return e.a.vol.MountToDriveLetter(ctx, diskNumber)
+		letter, err := e.a.vol.MountToDriveLetter(ctx, diskNumber)
+		if err != nil {
+			return "", err
+		}
+		e.labelVolume(ctx, diskNumber, repoNameOf(req, spec))
+		return letter, nil
 	}
 	dir, err := e.resolveMountDir(req, spec)
 	if err != nil {
@@ -544,6 +719,64 @@ func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, 
 		return "", err
 	}
 	return dir, nil
+}
+
+// labelVolume 把存储库名称写进卷标。
+//
+// best effort：卷标只是给人看的，失败（不支持、权限、卷刚上线还没就绪）只告警，
+// 绝不因此判定挂载失败 —— 磁盘已经可用，为了一个名字把整次挂载标成错误得不偿失。
+func (e *mountEngine) labelVolume(ctx context.Context, diskNumber int, repoName string) {
+	label := volumeLabelOf(repoName)
+	if label == "" {
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, labelTimeout)
+	defer cancel()
+	if err := e.a.vol.SetLabel(callCtx, diskNumber, label); err != nil {
+		e.a.logger.Warn("设置卷标失败（不影响挂载）",
+			"disk_number", diskNumber, "label", label, "error", err)
+		return
+	}
+	e.a.logger.Info("已把存储库名称写入卷标", "disk_number", diskNumber, "label", label)
+}
+
+// volumeLabelOf 把存储库名称规整成合法的卷标；无法规整出内容时返回空串（调用方跳过）。
+func volumeLabelOf(repoName string) string {
+	trimmed := strings.TrimSpace(repoName)
+	if trimmed == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range trimmed {
+		if r < 0x20 || strings.ContainsRune(volumeLabelInvalidChars, r) {
+			b.WriteRune('-')
+			continue
+		}
+		b.WriteRune(r)
+	}
+	// Windows 不允许卷标以空格或点结尾（资源管理器会静默改写）。
+	out := strings.Trim(b.String(), " .")
+	if out == "" {
+		return ""
+	}
+	if runes := []rune(out); len(runes) > volumeLabelMaxRunes {
+		out = strings.TrimSpace(string(runes[:volumeLabelMaxRunes]))
+	}
+	return out
+}
+
+// volumeLabelInvalidChars 是 Windows 卷标不允许包含的字符（Set-Volume 会直接报错）。
+const volumeLabelInvalidChars = `\/:*?"<>|,;+=[]`
+
+// repoNameOf 解析存储库名称：本地请求优先，其次服务端下发值。
+func repoNameOf(req MountRequest, spec *MountSpec) string {
+	if name := strings.TrimSpace(req.RepoName); name != "" {
+		return name
+	}
+	if spec != nil {
+		return strings.TrimSpace(spec.RepoName)
+	}
+	return ""
 }
 
 // resolveMountDir 计算目录模式的绝对挂载路径。
@@ -562,10 +795,33 @@ func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec) (string
 	}
 	rel := raw
 	if rel == "" {
-		// 服务端未下发目录时退化为 <别名>\<allocation_id>，避免所有分配挤进同一个目录。
-		rel = filepath.Join(e.serverAlias(spec), req.AllocationID)
+		// 服务端未下发目录时退化为 <别名>\<库名>：目录名与存储库保持一致（真实诉求），
+		// 同时仍然分目录，避免所有分配挤进同一个目录。库名缺失才退到 allocation_id。
+		leaf := sanitizePathSegment(repoNameOf(req, spec))
+		if leaf == "" {
+			leaf = req.AllocationID
+		}
+		rel = filepath.Join(e.serverAlias(spec), leaf)
 	}
 	return filepath.Clean(filepath.Join(base, rel)), nil
+}
+
+// sanitizePathSegment 把库名这类用户输入规整为可安全用作**单层**目录名的片段。
+//
+// 必要性：库名里出现 \ / : 等字符时，filepath.Join 会让目录跑到挂载根之外
+// （路径穿越）；纯展示名字换成短横线即可，不改变可读性。
+func sanitizePathSegment(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	replaced := strings.Map(func(r rune) rune {
+		if r < 0x20 || strings.ContainsRune(`/\:*?"<>|`, r) {
+			return '-'
+		}
+		return r
+	}, trimmed)
+	return strings.Trim(replaced, " .")
 }
 
 // serverAlias 返回目录模式使用的服务端别名（本地配置优先，其次服务端名称）。

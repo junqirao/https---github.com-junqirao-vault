@@ -110,6 +110,12 @@ MountState = {
   # 正在创建 iSCSI 目标"）。阶段**只前进不回退**（迟到的服务端事件不会让界面倒着走）。
   phase,
   mounted_at, last_heartbeat_at, last_error,
+  # ⚠️ last_error / last_error_detail 只在**真失败**时有值：state="error"（挂载失败，或
+  #    心跳连续失败超过租约 TTL）与 state="revoked"（被服务端撤销）。
+  #    state="mounted" 的挂载**永远不带错误**：心跳偶发失败只进日志与 server.last_error，
+  #    绝不往挂载上贴（真实反馈："挂载成功时就不要展示最后错误了" —— 否则每个挂好的库
+  #    旁边都挂着一个红色感叹号）。心跳恢复后代理会把这类 error 复位回 mounted
+  #    （磁盘全程没被卸载），因此 error 不是单向门。
   # last_error_detail：最近一次失败的**原始报错文本**（如 PowerShell 自报的 .NET 异常）。
   # 与 last_error（稳定码，如 `connect:platform.ps_failed`）的区别：这个才是"为什么"。
   # ⚠️ 对"原始报错只进日志"的**刻意例外**，范围严格受限：只出现在挂载状态里（本机界面
@@ -173,9 +179,12 @@ POST /agent/mount
 POST /agent/unmount
   ↓ {allocation_id, force?:bool}
   ↑ {ok:true}
-  # 代理内部：磁盘 Offline（必须先做，否则断开报 0xefff0040）
-  #          → 移除挂载点 → Disconnect-IscsiTarget → Unregister-IscsiSession
-  #          → POST /v1/leases/{id}/release
+  # 代理内部：移除挂载点（必须先做，盘 Offline 后盘符就没了）
+  #          → 磁盘 Offline（必须先于断开，否则报告 0xefff0040）
+  #          → Disconnect-IscsiTarget（device_in_use 时补下线并重试）
+  #          → Unregister-IscsiSession → POST /v1/leases/{id}/release
+  # 失败时带 stage（mount_point/disk_offline/disconnect）；已拆掉一部分则保留 error 记录，
+  # 不回滚成 mounted（否则界面谎报"已挂载"并弹"挂载成功"提示）。
 
 POST /agent/remount
   ↓ {allocation_id}

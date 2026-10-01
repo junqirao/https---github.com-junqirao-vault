@@ -58,6 +58,8 @@ const (
 	ScriptVolumeUnmount = "volume_unmount.ps1"
 	// ScriptVolumeCurrentMount 查询磁盘当前挂载点（盘符优先，其次目录）。
 	ScriptVolumeCurrentMount = "volume_current_mount.ps1"
+	// ScriptVolumeSetLabel 设置磁盘所在卷的卷标（盘符模式下用存储库名称命名该盘）。
+	ScriptVolumeSetLabel = "volume_set_label.ps1"
 	// ScriptInitiatorAvailable 探测 iSCSI 发起端（Initiator）能力。
 	ScriptInitiatorAvailable = "initiator_available.ps1"
 	// ScriptInitiatorEnsureService 确保 iSCSI 发起端服务（MSiSCSI）处于运行状态。

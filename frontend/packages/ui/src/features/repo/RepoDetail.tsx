@@ -14,7 +14,6 @@ import type { ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
 import { useI18n } from '../../i18n'
 import { formatBytes, formatTime } from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
-import { RepoAllocations } from './RepoAllocations'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
 
@@ -22,7 +21,8 @@ export interface RepoDetailProps {
   repoId: string
   isSuperAdmin: boolean
   currentUserId: string
-  clientId: string
+  /** 当前用户的显示名：非管理员无法拉取用户列表，用于自己的分配列回退显示。 */
+  currentUserName: string
   onBack: () => void
 }
 
@@ -42,8 +42,8 @@ const PARENT_ACTIONS: ParentAction[] = [
   'cleanup_diffs'
 ]
 
-/** 存储库详情：概览 + 成员 + 磁盘 + 分配，以及编辑/删除/母盘操作/复制。 */
-export function RepoDetail({ repoId, isSuperAdmin, currentUserId, clientId, onBack }: RepoDetailProps): JSX.Element {
+/** 存储库详情：概览 + 成员 + 磁盘（含分配与挂载），以及编辑/删除/母盘操作/复制。 */
+export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserName, onBack }: RepoDetailProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const queryClient = useQueryClient()
@@ -187,17 +187,12 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, clientId, onBa
           {
             key: 'disks',
             label: t('repo.detail.disks'),
-            children: <RepoDisks repoId={repoId} />
-          },
-          {
-            key: 'allocations',
-            label: t('repo.detail.allocations'),
             children: (
-              <RepoAllocations
+              <RepoDisks
                 repoId={repoId}
                 isSuperAdmin={isSuperAdmin}
                 currentUserId={currentUserId}
-                clientId={clientId}
+                currentUserName={currentUserName}
               />
             )
           }

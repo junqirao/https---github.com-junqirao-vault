@@ -100,7 +100,9 @@ var errProbeHTTP400 = errors.New("agent: 服务端要求 TLS（明文 HTTP 请�
 type MountSpec struct {
 	ServerInstanceID string `json:"server_instance_id"`
 	ServerName       string `json:"server_name"`
-	TargetIQN        string `json:"target_iqn"`
+	// RepoName 存储库名称：用于卷标（盘符模式）与目录名（目录模式），见 mountEngine.mountAt。
+	RepoName  string `json:"repo_name"`
+	TargetIQN string `json:"target_iqn"`
 	PortalAddress    string `json:"portal_address"`
 	PortalPort       int    `json:"portal_port"`
 	AuthMode         string `json:"auth_mode"`

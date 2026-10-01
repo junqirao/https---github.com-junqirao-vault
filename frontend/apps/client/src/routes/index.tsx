@@ -7,7 +7,6 @@ import {
   JobList,
   LeaseList,
   LogViewer,
-  MountList,
   MyRepos,
   PageShell,
   RepoCreateForm,
@@ -51,14 +50,13 @@ function RepoDetailRoute(): JSX.Element {
   const { repoId } = useParams<{ repoId: string }>()
   const navigate = useNavigate()
   const { isSuperAdmin, user } = useAuth()
-  const clientId = useAppStore((state) => state.clientId)
   if (!repoId) return <Navigate to="/my-repos" replace />
   return (
     <RepoDetail
       repoId={repoId}
       isSuperAdmin={isSuperAdmin}
       currentUserId={user?.id ?? ''}
-      clientId={clientId}
+      currentUserName={user?.username ?? ''}
       onBack={() => navigate(-1)}
     />
   )
@@ -119,7 +117,6 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
             />
           }
         />
-        <Route path="mounts" element={<MountList />} />
         <Route path="logs" element={<LogViewer />} />
         <Route path="repos/:repoId" element={<RepoDetailRoute />} />
         <Route path="settings" element={<ClientSettingsRoute />} />

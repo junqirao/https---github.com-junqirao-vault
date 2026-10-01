@@ -93,6 +93,38 @@ func (m *Manager) MountToDriveLetter(ctx context.Context, diskNumber int) (strin
 	return result.DriveLetter, nil
 }
 
+// SetLabel 设置磁盘所在卷的卷标（如把"存储库名称"写到盘符上）。
+//
+// 前置条件：该卷已有盘符（Windows 只能用盘符或挂载路径定位卷）。
+// label 建议由调用方先做字符清洗与长度截断（NTFS 上限 32 字符），见 agent 的 volumeLabelOf。
+func (m *Manager) SetLabel(ctx context.Context, diskNumber int, label string) error {
+	if diskNumber < 0 {
+		return apperr.InvalidParam("disk_number")
+	}
+	if strings.TrimSpace(label) == "" {
+		return apperr.InvalidParam("label")
+	}
+	params := []winps.Param{
+		winps.String("DiskNumber", strconv.Itoa(diskNumber)),
+		winps.String("Label", label),
+	}
+	var result struct {
+		DriveLetter string `json:"drive_letter"`
+		Label       string `json:"file_system_label"`
+	}
+	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeSetLabel, params, &result); err != nil {
+		if mapped := mappedReasonError(err, map[string]*apperr.Error{
+			"no_partition": ErrNoPartition(),
+		}); mapped != nil {
+			return mapped
+		}
+		return err
+	}
+	m.logger.Info("已设置卷标",
+		"disk_number", diskNumber, "drive_letter", result.DriveLetter, "label", result.Label)
+	return nil
+}
+
 // MountToDirectory 把分区挂载到指定目录。
 //
 // 目录必须已存在且为空，且其所在卷为 NTFS；不满足时返回明确错误

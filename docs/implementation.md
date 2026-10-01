@@ -399,7 +399,7 @@ client_compat:
 | 挂载形态 | 规则 |
 | --- | --- |
 | **目录模式** | 路径强制为 `<root>\<server-alias>\<repo-name>`，用服务端别名作命名空间隔离 |
-| **盘符模式** | 客户端统一维护盘符分配表，检测冲突；冲突时按"服务端配置顺序 + 库名"确定性分配，或让用户指定 |
+| **盘符模式** | 客户端统一维护盘符分配表，检测冲突；冲突时按"服务端配置顺序 + 库名"确定性分配，或让用户指定。**盘符本身没法用库名命名**，于是把存储库名称写到**卷标**上（`Set-Volume -NewFileSystemLabel`；超过 NTFS 上限 32 字符截断、非法字符替换为 `-`），资源管理器里该盘就显示库名（真实诉求："盘符或目录名应该等于存储库的名称"） |
 
 **服务端别名（alias）规则**
 - 添加服务端时生成（默认取服务端主机名或 `server_name`），用户可改；
@@ -819,9 +819,17 @@ creating → ready → published → (attached 仅出现在 TEMP_SHARED / MAINTE
 **Lease**
 
 ```
-active ──(心跳超时)──► expired ──(reaper 停用 target)──► revoked
-   └──(客户端正常卸载)──► released
+active ──(心跳超时)──► expired ──(心跳恢复)──► active
+   │                      │
+   │                      └──(管理员 Revoke)──► revoked（终态）
+   └──(客户端正常卸载)──► released（终态）
 ```
+
+> `expired` 是**可恢复**的"离线"标记，不是终点：reaper 只标记离线，**不停用 target、不通知客户端卸载**。
+> `revoked` / `released` 是终态，只有管理员强制下线与客户端主动卸载会走到；
+> 客户端心跳一旦拿到 `lease_revoked` 就主动卸载（见 5.8）。
+> 早期实现把过期写成 `revoked`，导致任何一次心跳中断都会在 TTL 过后演变为"客户端自己把完好的挂载卸掉"
+> （真实事故：挂载成功一两分钟后盘符消失，而服务端目标仍在）。
 
 ---
 
@@ -1036,24 +1044,39 @@ IQN         = iqn.2026-01.com.vault:{target_name}
    f. Set-Disk -Number N -IsOffline $false; Set-Disk -Number N -IsReadOnly $false
    g. 挂载：
       - letter 模式：Add-PartitionAccessPath -AssignDriveLetter（若盘已有盘符则复用）
+        → 随后 Set-Volume -NewFileSystemLabel '<repo-name>' 把库名写到卷标（best effort：
+          失败/超时只记警告，绝不因此判定挂载失败）
       - directory 模式：确认为空目录 → Add-PartitionAccessPath -AccessPath 'C:\Vault\<server-alias>\<repo>'
-      - ★ 目录路径必须带服务端别名命名空间，避免多服务端同名库冲突（见 3.4.5）
+        - ★ 目录路径必须带服务端别名命名空间，避免多服务端同名库冲突（见 3.4.5）
+        - 库名缺失时的退化路径同样用库名做最后一级目录（见 agent 的 resolveMountDir）
    h. 执行 post_script（如存在），超时 60s，失败不阻塞挂载但记录警告
       - ★ 脚本中的路径必须用注入变量（{MOUNT_PATH}/{REPO_NAME}/{SERVER_ALIAS}），不得硬编码（见 3.4.5）
 ④ 回写 POST /v1/leases/{id}/mounted { mount_point }
 ⑤ 进入心跳循环
 ```
 
-**卸载流程（严格逆序）**
+**卸载流程**
 
 ```
-① 若要断开：先把盘 Offline（否则 Disconnect-IscsiTarget 报 0xefff0040）
+① 移除挂载点：Remove-PartitionAccessPath（必须在盘 Offline 之前做，见下）
+② 若要断开：先把盘 Offline（否则 Disconnect-IscsiTarget 报 0xefff0040）
    Set-Disk -Number N -IsOffline $true
-② 移除挂载点：Remove-PartitionAccessPath
 ③ Disconnect-IscsiTarget -NodeAddress <iqn>
+   └ device_in_use（0xefff0040）时补一次 Offline 后**重试**（最多 3 次、间隔 2s）
 ④ Unregister-IscsiSession（可选，去除持久化）
 ⑤ POST /v1/leases/{id}/release → 服务端标记 released
 ```
+
+> **① 必须在 ② 之前（真实事故）**：`Set-Disk -IsOffline $true` 一生效，盘符/目录就立刻从系统里
+> 消失，此时再 `Remove-PartitionAccessPath` 只会失败，卸载中断在第 ① 步。用户看到的现象是
+> 自相矛盾的一组："盘符不见了、卸载却报错、状态还是已挂载、iSCSI 发起程序里会话仍在重连"。
+> 唯一必须保持的强序是 **② 早于 ③**（会话上有在线设备时 `Disconnect-IscsiTarget` 拒绝执行）。
+>
+> **卸载失败的状态语义**：只有"什么都没拆掉"时才回滚成卸载前的状态；**已经拆掉一部分
+> （挂载点已移除 / 磁盘已下线）时绝不回滚**，改为把记录置为 `error` 并写入
+> `unmount_<阶段>:<错误码>`。回滚等于向界面谎报"还挂着"（真实反馈："点了卸载，然后提示
+> 挂载成功？磁盘状态还是已挂载"）——前端收到 `mounted` 事件还会弹一条"已挂载"提示。
+> 保留 error 记录同时给了用户一个可重试（幂等）的入口。
 
 > **目录挂载的坑**：`Add-PartitionAccessPath -AccessPath` 要求目标目录**已存在且为空**，且其父路径所在卷为 NTFS。客户端启动时需预检并给出明确错误提示。
 >
@@ -1132,8 +1155,8 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 > 目标不存在，卸载时下线磁盘/移除挂载点报错，非 force 直接 return —— 记录永远停在
 > "卸载中"，重装服务端也清不掉，因为记录在本机状态文件里，且每次启动还会被自动重挂、
 > 无限刷新失败）。因此：
->   - `unmountLocked` 失败时**恢复卸载前的状态**（mounted/error）再返回错误，
->     绝不把记录留在 unmounting；
+>   - `unmountLocked` 失败时**恢复到"卸载前状态"或 `error`**（见 5.5 的状态语义：什么都没
+>     拆掉才回滚，已拆掉一部分改置 `error`），绝不把记录留在 unmounting；
 >   - 启动恢复只处理 state=mounted/mounting 的记录；state=unmounting（代理死在卸载中途）
 >     视作用户最后意图是卸载，**补完卸载（force）后删除记录**；state=error/revoked 是
 >     诊断残留，**不自动重挂**（自动重挂只会每次启动都失败一遍），留给用户手动处理。
@@ -1189,11 +1212,12 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 | 项目 | 方案 |
 | --- | --- |
 | 租约 TTL | 120s |
-| 心跳间隔 | 30s（客户端定时器，即使 UI 关闭也由 Go agent 维持） |
-| 过期策略 | 超过 TTL 未续期 → `expired` |
-| Reaper | 每 60s 扫描：`expired` 的 lease → 执行"踢下线"（5.8）→ `revoked` |
-| 在线列表 | **来自 leases 表**（权威）；`netstat :3260` 结果作为 `cross_check` 字段展示（说明差异） |
-| 强制释放 | 管理员可在管理页对某 lease 执行"强制下线"，立即置 `revoked` 并触发清理 |
+| 心跳间隔 | 30s（客户端定时器，即使 UI 关闭也由 Go agent 维持）；**`mounting` 期间照常心跳**（服务端下发目标 + 本机建会话是重活，几十秒内不续期会在挂载完成前过期） |
+| 过期策略 | 超过 TTL 未续期 → `expired`（**仅标记"离线"**：不停用目标、不推送 revoke、不影响已有挂载） |
+| Reaper | 每 60s 扫描：active 且已到期 → 置 `expired`。**不执行"踢下线"**（5.8 只由管理员 Revoke 触发）；客户端下一次心跳成功续期即回到 `active` |
+| 在线列表 | **来自 leases 表**（权威，只统计 `active`）；`netstat :3260` 结果作为 `cross_check` 字段展示（说明差异） |
+| 强制释放 | 管理员可在管理页对某 lease 执行"强制下线"：停用目标 + 置 `revoked`（**终态**）+ SSE 通知客户端自行卸载 |
+| 客户端处理 | ① 心跳**偶发失败只进日志与 `server.last_error`**，不写挂载的 `last_error`（否则每个挂好的库旁边都挂个红色感叹号）；② 连续失败超过 TTL → 本地置 `error` 但**继续心跳**，服务端一恢复自动复位为 `mounted`（磁盘全程没被卸载，error 不是单向门）；③ 只有 `lease.revoked` 才主动卸载（管理员踢下线/租约已释放）；④ **无会话时跳过心跳且不算失败**（等前端推送会话）——代价是该租约会在 TTL 后变 `expired`，而 `expired` 可恢复，所以会话回来后自动复活，**不会**反过来毁掉已挂好的盘 |
 | **多服务端（新增）** | `client_id` 由客户端生成并**全局唯一且稳定**（基于设备 + 安装实例，不用 MAC/IP）；**每台服务端各自独立记账**，互不可见。同一客户端可同时持有 N 条互相独立的租约（每服务端一条），心跳与过期判定**按服务端分别计算**，B 的心跳失败不得影响 A 的租约 |
 
 **遥测指标（可采集部分）**
@@ -1218,7 +1242,9 @@ IQN         = iqn.2026-01.com.vault:{target_name}
      （⚠️ 不要用 `-InitiatorIds @()` 来"清空白名单防重连"：空列表在 Windows 上 = 拒绝所有
        initiator，下发脚本会把空列表转成通配 `IQN:*`（= 任意 initiator，开放），
        见 iscsi_set_target.ps1；防重连的正解就是 Enabled=$false）
-  2. SSE 推送 {type:'revoke', reason:'admin'|'lease_expired'} 给该客户端
+  2. SSE 推送 {type:'revoke', reason:'admin'} 给该客户端
+     （⚠️ 租约过期**不**走这里：过期只是"客户端离线"的标记，见 5.7；只有管理员
+       强制下线与客户端主动卸载才会撤销租约）
   3. 客户端收到指令后：执行 5.5 卸载流程 → 随后 Delete-IscsiTarget（清理发现缓存）
   4. 客户端重连前需重新走 POST /mount，若授权已撤销则被拒
 ```
@@ -2047,7 +2073,7 @@ Vault-Agent (Go)
 | 连接 | `Connect-IscsiTarget`（含 CHAP） |
 | 会话检查 | `Get-IscsiSession` / `Get-IscsiConnection` |
 | 磁盘上线 | `Set-Disk -IsOffline $false -IsReadOnly $false` |
-| 盘符挂载 | `Add-PartitionAccessPath -AssignDriveLetter` |
+| 盘符挂载 | `Add-PartitionAccessPath -AssignDriveLetter`；随后 `Set-Volume -NewFileSystemLabel` 写卷标 = 库名 |
 | 目录挂载 | `Add-PartitionAccessPath -AccessPath <dir>` |
 | 卸载 | `Remove-PartitionAccessPath` → `Disconnect-IscsiTarget` |
 | 快捷驱动器 | `WScript.Shell` / `IShellLink` 创建 Shell Link |
@@ -3164,7 +3190,7 @@ design.md 新增的「多服务端」方向没问题，但原表述有 **3 处�
 | R4 | 大量差异盘叠加导致母盘 IO 瓶颈 | 中 | 高 | 限制单母盘差异盘数；母盘放 SSD；监控母盘 IO |
 | R5 | 服务端崩溃造成孤儿 target/盘/staging | 高 | 中 | Reconciler + GC + 全幂等清理 |
 | R6 | 上传大目录时磁盘暂存空间耗尽 | 中 | 高 | staging 独立配额 + 上传前预检空间 + 保留水位 |
-| R7 | 客户端网络抖动导致误判离线（租约过期） | 中 | 中 | 租约过期**只标记租约 revoked，不停用目标、不影响挂载**（真实诉求："续期、过期不该影响挂载"）；目标的启用/停用只由挂载/卸载驱动，残留由启动对账清理孤儿 |
+| R7 | 客户端网络抖动导致误判离线（租约过期） | 中 | 中 | 租约过期**只把租约标记为 `expired`（离线），不停用目标、不影响挂载**（真实诉求："续期、过期不该影响挂载"），且**必须可复活**：客户端心跳一回来就回 `active`（若过期被判成 `revoked` 终态，客户端下次心跳会拿到 `lease_revoked` 而卸载一个完好的挂载 —— 真实事故："挂载成功后隔一两分钟盘符就没了，但服务端目标还在"）；目标的启用/停用只由挂载/卸载（与管理员 Revoke）驱动，残留由启动对账清理孤儿 |
 | R8 | PowerShell 版本/语言差异导致输出解析失败 | 中 | 中 | 统一 JSON 输出；`-NoProfile -NonInteractive`；CI 覆盖多版本 |
 | R9 | NTFS 下复制母盘耗时过长/空间不足（无块克隆） | **高** | 中 | UI 明确预估耗时与占用；复制前空间预检；引导用户改用差异盘 |
 | R10 | 复制后未重置 DiskIdentifier → Event ID 158 / VSS 失败 | 中 | 中 | 复制流程强制 `ResetDiskIdentifier`；Reconciler 抽检 DiskIdentifier 唯一性 |

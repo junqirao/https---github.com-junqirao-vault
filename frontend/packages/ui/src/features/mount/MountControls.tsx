@@ -49,11 +49,30 @@ function MountErrorMarker({ lines }: { lines: string[] }): JSX.Element {
 }
 
 /**
+ * 把挂载记录里的 `last_error` 转成可读文案。
+ *
+ * `last_error` 是稳定码（如 `lease.revoked`、`connect:platform.ps_failed`）：有对应文案
+ * 就翻译，没有就原样展示（稳定码至少是可搜索的英文词，也比空白强）。
+ * 典型场景：被服务端强制下线时挂载状态是 `revoked` + `lease.revoked`，用户最需要
+ * 一眼看懂"盘为什么没了"。
+ */
+function mountLastErrorLine(code: string, t: (key: string) => string): string {
+  const key = `err.${code}`
+  return hasKey(key) ? t(key) : code
+}
+
+/**
  * 汇总要展示的错误行（**一个标记、多行信息**）。
  *
  * 顺序：本次操作错误在最前（最新、最相关），随后是挂载状态里的稳定码、连接信息与原始报错。
  * 连接信息里 portal / target_iqn 在失败状态中一直存在（代理在 connect 之前就写入），
  * 以前界面不显示 —— 用户只能看到"挂载失败（阶段：connect）"，无从定位（真实反馈）。
+ *
+ * ⚠️ 只有**真的失败**才产出错误行（真实反馈："挂载成功时就不要展示最后错误了"）：
+ * 挂载成功（mounted）时 portal / target_iqn / 阶段详情本来就是正常信息，以前它们也被
+ * 当错误行塞进标记里，于是每个挂好的存储库旁边都永久挂着一个红色感叹号。
+ * 保留 error 与 revoked：前者是本机/挂载失败，后者是被服务端撤销（代理会写 last_error，
+ * 用户正需要知道"盘为什么没了"）。
  */
 function mountErrorLines(
   mount: AgentMountState | undefined,
@@ -71,8 +90,10 @@ function mountErrorLines(
       lines.push(`${t(`mount.info.${item.key}`)}: ${item.value}`)
     }
   }
+  const failed = Boolean(requestError) || mount?.state === 'error' || mount?.state === 'revoked'
+  if (!failed) return lines
   if (mount) {
-    if (mount.last_error) lines.push(mount.last_error)
+    if (mount.last_error) lines.push(mountLastErrorLine(mount.last_error, t))
     const connection = [
       { key: 'portal', value: mount.portal },
       { key: 'target_iqn', value: mount.target_iqn },

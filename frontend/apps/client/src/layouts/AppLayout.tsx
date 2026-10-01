@@ -9,7 +9,6 @@ import {
   DesktopOutlined,
   DownOutlined,
   FileTextOutlined,
-  FolderOutlined,
   HddOutlined,
   SettingOutlined,
   TeamOutlined,
@@ -66,7 +65,6 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
 
   const appMenuItems: MenuProps['items'] = [
     { key: '/my-repos', icon: <CloudOutlined />, label: t('nav.myRepos') },
-    { key: '/mounts', icon: <FolderOutlined />, label: t('nav.mounts') },
     { key: '/logs', icon: <FileTextOutlined />, label: t('nav.logs') },
     { key: '/settings', icon: <SettingOutlined />, label: t('nav.settings') }
   ]

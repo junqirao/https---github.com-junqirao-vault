@@ -17,6 +17,15 @@
       CHAP 也正确），极易被误判成服务端故障（真实工单：反复排查 20+ 次都卡在这里）。
       设计文档 7.2 本就要求客户端具备 "New-IscsiTargetPortal / Update-IscsiTarget" 两项能力。
 
+    ⚠️⚠️ 因此本脚本有**两层**发现保障，都请勿删除：
+      ① TrySyncDiscovery（Update-IscsiTarget）：先刷新"发起端已知目标"；
+      ② Invoke-PortalReregister（删门户 → 重建门户）：①之后仍匹配不到时执行，靠重建门户
+         触发一次**真正的 SendTargets**。真实工单证明 ① 并不足以刷新 —— 它只更新已知目标的
+         属性，不保证重新向门户发起 SendTargets；而门户已存在时我们不会重建门户
+         （见下方 `if ($portal.Count -eq 0)`），于是新目标永远进不了发现列表。
+         症状：刷新"成功"、发现列表恒为空、登录报 not found，而服务端 enabled/已映射/门户可达。
+         ② 只在 ① 失败路径上跑，不影响正常挂载速度。
+
     ⚠️ 登录用**发现列表里的名字**，不用逐字拼出来的名字：平台会把我们下发的 TargetName
     改写成 TargetIqn（iqn.1991-05.com.microsoft:<主机名>-<我方 IQN>-target），形态或大小写
     一旦不一致，登录同样报 not found。以发现列表为准可同时兼容两种形态。
@@ -26,8 +35,9 @@
       - -IsPersistent 是开关（SwitchParameter）还是布尔值；
       - -ChapSecret 的参数类型（SecureString 或 string）；
       - 门户相关参数名（TargetPortalAddress / TargetPortalPortNumber）；
-      - Get-IscsiTarget 的 NodeAddress 属性名（已发现目标列表）；
-      - Update-IscsiTarget 的刷新形态（三种形态自动逐个尝试，见 TrySyncDiscovery）。
+      - Get-IscsiTarget 的目标名属性名（NodeAddress / TargetIqn / TargetName，见 Get-DiscoveredTargets）；
+      - Update-IscsiTarget 的刷新形态（三种形态自动逐个尝试，见 TrySyncDiscovery）；
+      - Remove-IscsiTargetPortal 的参数名是否与 New-IscsiTargetPortal 一致（见 Invoke-PortalReregister）。
     本脚本按运行时探测到的参数类型自适应，与 iscsi_set_target.ps1 的处理方式保持一致。
 #>
 
@@ -74,10 +84,21 @@ function Test-SameTarget {
 }
 
 # Get-DiscoveredTargets 读取发起端「已发现目标」的名字列表（Get-IscsiTarget）。
+#
+# ⚠️ 名字取多个候选属性：实测属性名随模块版本而异（NodeAddress / TargetIqn / TargetName），
+# 只认 NodeAddress 会在某些版本上把所有目标读成空串 —— 于是一边"已发现目标: (空)"，
+# 一边登录报 not found，真因（属性名不对）反而被这行日志掩盖。取第一个非空者。
 function Get-DiscoveredTargets {
     try {
-        return @(Get-IscsiTarget -ErrorAction SilentlyContinue |
-            ForEach-Object { [string]$_.NodeAddress } | Where-Object { $_ })
+        return @(Get-IscsiTarget -ErrorAction SilentlyContinue | ForEach-Object {
+            $name = ''
+            foreach ($property in @('NodeAddress', 'TargetIqn', 'TargetName')) {
+                $value = ''
+                try { $value = [string]$_.$property } catch { }
+                if ($value) { $name = $value; break }
+            }
+            $name
+        } | Where-Object { $_ })
     } catch {
         return @()
     }
@@ -104,6 +125,36 @@ function TrySyncDiscovery {
         }
     }
     return [pscustomobject]@{ ok = $false; form = ''; errors = $errors }
+}
+
+# Invoke-PortalReregister 删除门户后重建，强制一次**真正的 SendTargets** 发现。
+#
+# 为什么必须保留（真实工单）：Update-IscsiTarget 只更新"发起端已知目标"的属性，不保证重新
+# 向门户发起 SendTargets；调用方在门户已存在时又不会重建门户，于是新目标（本系统
+# 「1 分配 = 1 target」，每次都是全新 IQN）永远进不了「已发现目标」列表。症状是：
+# 刷新报成功、发现列表恒为空、Connect-IscsiTarget 报
+# "The target name is not found or is marked as hidden from login"，
+# 而服务端其实是 enabled + 已映射 + 门户 TCP 可达 —— 极易被误判成服务端故障。
+# Remove + New 是确定能触发 SendTargets 的动作。失败不抛错：由调用方回读列表判定，
+# 并把错误原样带进挂载失败的诊断信息（否则真因又只剩一句 not found）。
+function Invoke-PortalReregister {
+    param([string]$Address, [int]$Port)
+    # 非交互进程里任何确认提示都会把挂载卡死，故显式关掉（这两个 cmdlet 都被 ConfirmImpact 管辖）。
+    $ConfirmPreference = 'None'
+    $errors = @()
+    try {
+        Remove-IscsiTargetPortal -TargetPortalAddress $Address -TargetPortalPortNumber $Port -ErrorAction Stop | Out-Null
+    } catch {
+        # 门户上仍有活动会话时删除可能失败：门户还在，下面的 New 仍值得跑一次。
+        $errors += ('remove_portal: ' + $_.Exception.Message)
+    }
+    try {
+        New-IscsiTargetPortal -TargetPortalAddress $Address -TargetPortalPortNumber $Port -ErrorAction Stop | Out-Null
+    } catch {
+        $errors += ('add_portal: ' + $_.Exception.Message)
+        return [pscustomobject]@{ ok = $false; errors = $errors }
+    }
+    return [pscustomobject]@{ ok = $true; errors = $errors }
 }
 
 # 先声明，保证异常发生在流程早期时 catch 里也有完整信息。
@@ -162,6 +213,22 @@ try {
         $discovered = @(Get-DiscoveredTargets)
         $matched = @($discovered | Where-Object { Test-SameTarget -Left $_ -Right $TargetIQN })
     }
+
+    # 第二层兜底：第一层之后仍匹配不到 → 删门户再重建，强制一次真正的 SendTargets。
+    # 只跑失败路径，正常挂载不会为此多花时间（理由见 Invoke-PortalReregister 与文件头）。
+    if ($matched.Count -eq 0) {
+        $rereg = Invoke-PortalReregister -Address $PortalAddress -Port $PortalPort
+        $discovery = if ($rereg.ok) { 'portal_reregistered' } else { 'portal_reregister_failed' }
+        $discoveryErrors = @($rereg.errors)
+        # SendTargets 不保证瞬时完成：有界重试再判定，避免"再等 200ms 就好了"的假失败。
+        # 仅在失败路径上，总计最多多花 1 秒。
+        for ($attempt = 0; $attempt -lt 6 -and $matched.Count -eq 0; $attempt++) {
+            if ($attempt -gt 0) { Start-Sleep -Milliseconds 200 }
+            $discovered = @(Get-DiscoveredTargets)
+            $matched = @($discovered | Where-Object { Test-SameTarget -Left $_ -Right $TargetIQN })
+        }
+    }
+
     if ($matched.Count -gt 0) {
         # 用平台实际发现到的名字登录：大小写 / 改写形态都以它为准。
         $loginIQN = [string]$matched[0]
@@ -224,10 +291,14 @@ try {
     } elseif ($discovered.Count -gt 0) {
         $hint = '发起端已发现的目标: ' + ($discovered -join ' , ')
     } else {
-        $hint = '发起端已发现的目标: (空) —— 服务端目标未启用/未授权该发起程序，或门户未刷新'
+        $hint = '发起端已发现的目标: (空) —— 已尝试 Update-IscsiTarget 与重建门户后的 SendTargets；' +
+            '仍为空说明服务端未向本源广播该目标（未启用 / initiator 白名单未放开 / 门户地址不对）'
     }
+    # 必须带上 $discovery（刷新究竟走到哪一步、用的哪种调用形态）：只看"(空)"无法区分
+    # "刷新压根没成功"与"刷新成功了但服务端就是没广播"——后者要查服务端，前者是客户端问题。
+    $hint = $hint + ' ｜ 发现刷新: ' + $discovery
     if ($discoveryErrors.Count -gt 0) {
-        $hint = $hint + ' ｜ 刷新发现列表失败: ' + ($discoveryErrors -join ' ; ')
+        $hint = $hint + ' ｜ 刷新/重建门户报错: ' + ($discoveryErrors -join ' ; ')
     }
     [pscustomobject]@{
         ok         = $false

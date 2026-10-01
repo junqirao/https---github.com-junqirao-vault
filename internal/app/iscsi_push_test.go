@@ -271,3 +271,33 @@ func TestTargetInfoMatches(t *testing.T) {
 		})
 	}
 }
+
+// TestTargetInfoMatchesWildcardInitiators 锁定"挂载不再每次白等 15 秒"的第二个修复点：
+//
+// 无白名单的目标，平台脚本会把空列表下发成通配 `IQN:*`（Windows 上空列表 = 拒绝所有），
+// 于是读回的是 `["IQN:*"]` 而期望是 `[]`。若二者不被判为一致，targetInfoMatches 永远
+// 为 false → targetUnchanged 的跳过优化彻底失效 → 每次挂载都重付一次全量下发。
+func TestTargetInfoMatchesWildcardInitiators(t *testing.T) {
+	spec := platform.TargetSpec{
+		Name:       "vault-aaaa-bbbb",
+		Enabled:    true,
+		BackingRef: `C:\Vault\disks\disk.vhdx`,
+		Initiators: nil, // 未配置白名单 = 不限制
+	}
+	info := platform.TargetInfo{
+		Name:       spec.Name,
+		Enabled:    true,
+		Initiators: []string{"IQN:*"}, // 平台把"不限制"落成了通配
+		Devices:    []string{`C:\Vault\disks\disk.vhdx`},
+	}
+	if !targetInfoMatches(spec, &info) {
+		t.Fatal("通配 IQN:* 与空白名单语义相同，必须判为一致（否则每次挂载都重下发）")
+	}
+
+	// 反向：期望"不限制"，实际却挂着具体白名单 → 必须重新下发去纠正。
+	stale := info
+	stale.Initiators = []string{"IQN:iqn.stale"}
+	if targetInfoMatches(spec, &stale) {
+		t.Fatal("实际挂着具体白名单与期望的\"不限制\"不一致，必须重新下发")
+	}
+}

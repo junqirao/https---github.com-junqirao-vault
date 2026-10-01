@@ -118,7 +118,6 @@ export {
   type SourceDirValue
 } from './features/repo/SourceDirPicker'
 export { RepoDetail, type RepoDetailProps } from './features/repo/RepoDetail'
-export { MountList } from './features/mount/MountList'
 export { LogViewer } from './features/logs/LogViewer'
 export { UserList } from './features/user/UserList'
 export { UserForm, type UserFormProps } from './features/user/UserForm'

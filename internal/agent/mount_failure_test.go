@@ -2,7 +2,12 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"testing"
+
+	"vault/internal/apperr"
+	"vault/internal/platform/iscsiinitiator"
 )
 
 // TestMountStageLeavesResidue 锁定"哪些阶段的失败可能在本机留下残留"。
@@ -74,5 +79,68 @@ func TestCleanupFailedMountReportsIncomplete(t *testing.T) {
 	}
 	if cleaned {
 		t.Fatal("清理失败必须返回 false（否则残留会变成看不见）")
+	}
+}
+
+// TestUnmountFailureStateNeverRollsBackAfterTeardown 锁定卸载失败的**状态语义**。
+//
+// 真实反馈："点了卸载，然后提示挂载成功？磁盘状态还是已挂载，我看已经卸载成功了、盘符
+// 不见了" —— 根因是卸载失败后一律回滚成 mounted：盘符其实已经被拆掉，界面却收到 mounted
+// 事件（前端据此弹"已挂载"提示）并继续显示"已挂载"。
+func TestUnmountFailureStateNeverRollsBackAfterTeardown(t *testing.T) {
+	if got := unmountFailureState(false, MountStateMounted); got != MountStateMounted {
+		t.Fatalf("什么都没拆掉时应回滚到卸载前状态，实际 %q", got)
+	}
+	if got := unmountFailureState(true, MountStateMounted); got != MountStateError {
+		t.Fatalf("已拆掉一部分时不得回滚成 mounted（界面会谎报已挂载并弹提示），实际 %q", got)
+	}
+}
+
+// TestTeardownDiskNumberFallsBackToRecord 锁定"卸载时磁盘号从哪来"。
+//
+// 运行时信息（mountRuntime）只在内存里，进程重启后为空；若因此拿不到磁盘号就会跳过
+// Set-Disk -IsOffline，随后 Disconnect-IscsiTarget 必然以 0xefff0040（设备在线）失败 ——
+// 卸载卡在最后一步，盘符已消失、会话却还在重连。
+func TestTeardownDiskNumberFallsBackToRecord(t *testing.T) {
+	if n, ok := teardownDiskNumber(MountState{DiskNumber: 3}, mountRuntime{}); !ok || n != 3 {
+		t.Fatalf("运行时信息缺失时应回退到记录里的磁盘号，实际 n=%d ok=%v", n, ok)
+	}
+	if n, ok := teardownDiskNumber(MountState{DiskNumber: 3}, mountRuntime{DiskKnown: true, DiskNumber: 7}); !ok || n != 7 {
+		t.Fatalf("运行时信息存在时应优先使用它，实际 n=%d ok=%v", n, ok)
+	}
+	// 磁盘 0 是合法磁盘号，不能因为零值被当成"未知"。
+	if n, ok := teardownDiskNumber(MountState{}, mountRuntime{DiskKnown: true}); !ok || n != 0 {
+		t.Fatalf("磁盘 0 必须被视为已知磁盘号，实际 n=%d ok=%v", n, ok)
+	}
+	if _, ok := teardownDiskNumber(MountState{}, mountRuntime{}); ok {
+		t.Fatal("两处都拿不到磁盘号时应返回 false（调用方跳过下线，由断开重试兜底）")
+	}
+}
+
+// TestIsDeviceInUseMatchesPlatformCode 锁定 device_in_use（HRESULT 0xefff0040）的识别。
+//
+// 卸载时的断开重试完全依赖它：认不出来就会立刻失败，留给用户一个"盘符没了、iSCSI 里
+// 会话还在重连"的残留会话。
+func TestIsDeviceInUseMatchesPlatformCode(t *testing.T) {
+	if !isDeviceInUse(iscsiinitiator.ErrDeviceInUse()) {
+		t.Fatal("platform.iscsi_device_in_use 应被识别为设备占用")
+	}
+	if isDeviceInUse(apperr.New(CodeUnmountFailed, http.StatusInternalServerError)) {
+		t.Fatal("其它错误不应被误判为设备占用")
+	}
+	if isDeviceInUse(nil) {
+		t.Fatal("nil 不应被判为设备占用")
+	}
+}
+
+// TestErrUnmountFailedCarriesStage 卸载失败必须带上失败阶段（界面文案用它插值，
+// 否则用户只有一个"卸载失败"，无从判断卡在挂载点/下线/断开哪一步）。
+func TestErrUnmountFailedCarriesStage(t *testing.T) {
+	err := errUnmountFailed("disconnect", errors.New("boom"))
+	if err.Code != CodeUnmountFailed {
+		t.Fatalf("错误码 = %q，期望 %q", err.Code, CodeUnmountFailed)
+	}
+	if got, _ := err.Args["stage"].(string); got != "disconnect" {
+		t.Fatalf("stage 参数 = %v，期望 disconnect", err.Args["stage"])
 	}
 }

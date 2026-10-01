@@ -199,6 +199,11 @@ type mountRuntime struct {
 	HeartbeatFailCount int
 	HeartbeatFailSince int64
 	NextHeartbeatAt    int64
+	// HeartbeatError 表示当前 state=error 是"心跳连续失败超过 TTL"造成的（磁盘其实还挂着）。
+	//
+	// 它把这类 error 与"挂载失败后保留的 error 记录"区分开：前者要继续发心跳（服务端恢复后
+	// 自动回到 mounted），后者不该被心跳误复位。
+	HeartbeatError bool
 
 	DiskNumber int
 	DiskKnown  bool
