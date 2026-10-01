@@ -825,9 +825,12 @@ func checkWindowsVolume(r *report, sb *sandbox, vhdx string) bool {
 				sb.script("volume_unmount.ps1"), "-AccessPath", mountDir)
 		}
 
-		// 盘符模式的卸载也必须覆盖：D11 只走目录模式，而盘符分支曾把
-		// -DiskNumber/-PartitionNumber 与 -DriveLetter 混传（不同参数集）→ 参数绑定即失败，
-		// 盘符挂载永远卸不掉，界面还误报"盘正被程序占用"（见 volume_unmount.ps1 的 .NOTES）。
+		// 盘符模式的卸载也必须覆盖：D11 只走目录模式，而盘符分支曾是脚本里的"第二套写法" ——
+		// 先是 -DiskNumber/-PartitionNumber 与 -DriveLetter 混传（不同参数集）→ 参数绑定即失败；
+		// 改成只传 -DriveLetter 后绑定通过，但 WMI 拒绝它自行推算的 AccessPath。两种写法下盘符
+		// 挂载都永远卸不掉，界面还误报"盘正被程序占用"（根本没有占用）。
+		// 现在盘符与目录共用同一行 Remove-PartitionAccessPath（见 volume_unmount.ps1 的 .NOTES），
+		// 这里仍然要守住：两条分支都必须在沙箱里真跑通。
 		if letter != "" {
 			r.script("D11b volume_unmount.ps1（卸载盘符挂载点）", "& .\\scripts\\volume_unmount.ps1",
 				sb.script("volume_unmount.ps1"), "-AccessPath", letter)

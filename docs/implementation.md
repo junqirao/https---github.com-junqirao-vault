@@ -1063,7 +1063,8 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 **卸载流程**
 
 ```
-① 移除挂载点：Remove-PartitionAccessPath（必须在盘 Offline 之前做，见下）
+① 移除挂载点：Get-Partition 定位分区 → Remove-PartitionAccessPath -DiskNumber -PartitionNumber
+   -AccessPath（盘符写 "H:\"、目录写绝对路径；**只有这一种写法**，见下；必须在盘 Offline 之前做）
 ② 若要断开：先把盘 Offline（否则 Disconnect-IscsiTarget 报 0xefff0040）
    Set-Disk -Number N -IsOffline $true
 ③ Disconnect-IscsiTarget -NodeAddress <iqn>
@@ -1076,6 +1077,15 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 > 消失，此时再 `Remove-PartitionAccessPath` 只会失败，卸载中断在第 ① 步。用户看到的现象是
 > 自相矛盾的一组："盘符不见了、卸载却报错、状态还是已挂载、iSCSI 发起程序里会话仍在重连"。
 > 唯一必须保持的强序是 **② 早于 ③**（会话上有在线设备时 `Disconnect-IscsiTarget` 拒绝执行）。
+>
+> **① 只有一种写法（真实事故，2026-10-01）**：`Remove-PartitionAccessPath` 的参数集互斥，两个
+> "省事"的写法实测都不可用 —— `-DriveLetter` 与 `-DiskNumber/-PartitionNumber` 混传会在参数绑定
+> 阶段直接失败（「无法使用指定的命名参数解析参数集。」，命令压根没执行）；只传 `-DriveLetter` 则
+> 绑定通过、但 WMI 的 `MSFT_Partition.RemoveAccessPath` 拒绝它自行推算出的 AccessPath
+> （「传递给方法的一个或多个参数值无效。」）。两者后果完全相同：盘符模式卸载永远卡在
+> `mount_point`，而界面按阶段套的文案显示"这块盘正被程序占用"，用户怎么找都找不到占用进程
+> （根本没有占用）。统一为「分区定位 + 显式 `-AccessPath`」（盘符 `"H:\"`、目录绝对路径），
+> 盘符与目录共用**同一行**命令 —— 不再有第二套写法。
 >
 > **只有一种卸载，没有"普通 / 强制"之分**（真实反馈："不都是执行一次断开 iSCSI 就好了么，
 > 不要又是普通卸载又是强制卸载的"）：

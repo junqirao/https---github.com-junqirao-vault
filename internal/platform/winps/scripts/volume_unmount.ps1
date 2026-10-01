@@ -6,16 +6,16 @@
     由 Go 侧以 `-AccessPath <"E:" 或 "C:\Vault\...">` 调用，参数不做字符串拼接。
     幂等：找不到对应挂载点时返回 action=none 并成功。
 
-    ⚠️ 已实测确认（2026-10-01，Windows PowerShell 5.1）：
+    ⚠️ 已实测确认（2026-10-01，Windows PowerShell 5.1）：移除挂载点**只有一种写法**，
+    盘符与目录共用同一行命令 —— Get-Partition 定位分区 + 显式 -AccessPath。
 
-      - Remove-PartitionAccessPath 的参数集是**互斥**的：-DriveLetter 自成一套；
-        -DiskNumber/-PartitionNumber 属于另一套，而**那一套里没有 -DriveLetter**。
-        三者混着传会在**参数绑定阶段**直接失败，报
-        「无法使用指定的命名参数解析参数集。」—— 命令根本没执行。
-        真实事故：盘符模式卸载永远卡在 mount_point，而界面按阶段套的文案却显示
+      - Remove-PartitionAccessPath 的参数集**互斥**，而两个"省事"的写法都实测不可用：
+          · -DriveLetter 与 -DiskNumber/-PartitionNumber 混传 → 在**参数绑定阶段**直接失败，
+            报「无法使用指定的命名参数解析参数集。」，命令根本没执行；
+          · 只传 -DriveLetter → 绑定通过，但该参数集自行推算出的 AccessPath 被 WMI 的
+            MSFT_Partition.RemoveAccessPath 拒绝，报「传递给方法的一个或多个参数值无效。」
+        两种写法后果完全一样：盘符模式卸载永远卡在 mount_point，而界面按阶段套的文案显示
         "这块盘正被程序占用"，用户怎么找都找不到占用进程（根本没有占用）。
-      - 因此：盘符模式只传 -DriveLetter；目录模式用 -DiskNumber/-PartitionNumber + -AccessPath
-        （该参数集里 -AccessPath 为必填）。
       - Get-Partition 返回对象的 AccessPaths 属性包含已挂载的目录路径（本脚本据此反查分区）。
 #>
 
@@ -42,10 +42,11 @@ try {
             } | ConvertTo-Json -Compress -Depth 5
             exit 0
         }
-        # ⚠️ 只能传 -DriveLetter：它与 -DiskNumber/-PartitionNumber 属于**不同参数集**，
-        # 混传会在参数绑定阶段就失败（「无法使用指定的命名参数解析参数集。」），命令压根没执行，
-        # 于是卸载永远卡在这一步（真实事故，详见文件头 .NOTES）。
-        Remove-PartitionAccessPath -DriveLetter $letter -ErrorAction Stop
+        # ⚠️ 与目录模式**同一种写法**，别改回 -DriveLetter（两种写法都实测不可用，详见文件头 .NOTES）：
+        #   混传 -DriveLetter/-DiskNumber → 参数绑定即失败；只传 -DriveLetter → WMI 拒绝它
+        #   自行推算的 AccessPath（「传递给方法的一个或多个参数值无效。」）。盘符必须显式写全
+        #   "H:\"（Get-Partition 的 AccessPaths 里就是这个形式）。
+        Remove-PartitionAccessPath -DiskNumber $partition.DiskNumber -PartitionNumber $partition.PartitionNumber -AccessPath ($letter + ':\') -ErrorAction Stop
 
         [pscustomobject]@{
             ok          = $true
