@@ -24,11 +24,33 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 # 0xEFFF0040 视为有符号 32 位整数时的取值。
 $deviceInUseHResult = -268505024
 
+# ⚠️ 与 initiator_connect.ps1 中的同名函数必须保持一致：平台会改写目标名，会话上的
+# TargetNodeAddress 与我们下发的名字并不逐字相等，用 -eq 会"看不见"自己的会话 ——
+# 卸载时既不报错也不断开（action=none），残留会话会挡住下一次挂载。
+function Get-TargetShortName {
+    param([string]$Iqn)
+    $text = [string]$Iqn
+    $idx = $text.LastIndexOf(':')
+    if ($idx -ge 0 -and $idx -lt ($text.Length - 1)) { return $text.Substring($idx + 1) }
+    return $text
+}
+
+function Test-SameTarget {
+    param([string]$Left, [string]$Right)
+    if (-not $Left -or -not $Right) { return $false }
+    if ($Left -eq $Right) { return $true }
+    $ls = Get-TargetShortName -Iqn $Left
+    if ($ls -and $Right.IndexOf($ls, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    $rs = Get-TargetShortName -Iqn $Right
+    if ($rs -and $Left.IndexOf($rs, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    return $false
+}
+
 try {
     if (-not $TargetIQN) { throw 'TargetIQN 参数不能为空' }
 
     $before = @(Get-IscsiSession -ErrorAction SilentlyContinue | Where-Object {
-        $_.TargetNodeAddress -eq $TargetIQN
+        Test-SameTarget -Left ([string]$_.TargetNodeAddress) -Right $TargetIQN
     })
     if ($before.Count -eq 0) {
         [pscustomobject]@{
@@ -42,12 +64,16 @@ try {
     $attempt = 0
     while ($attempt -lt 20) {
         $sessions = @(Get-IscsiSession -ErrorAction SilentlyContinue | Where-Object {
-            $_.TargetNodeAddress -eq $TargetIQN
+            Test-SameTarget -Left ([string]$_.TargetNodeAddress) -Right $TargetIQN
         })
         if ($sessions.Count -eq 0) { break }
 
         try {
-            Disconnect-IscsiTarget -NodeAddress $TargetIQN -ErrorAction Stop | Out-Null
+            # 用**会话自己的** TargetNodeAddress 断开：平台改写后的名字与我们下发的
+            # 名字不逐字相等，拿下发的名字去 Disconnect 会找不到会话。
+            foreach ($session in $sessions) {
+                Disconnect-IscsiTarget -NodeAddress ([string]$session.TargetNodeAddress) -ErrorAction Stop | Out-Null
+            }
         } catch {
             $message = $_.Exception.Message
             $hresult = 0
@@ -67,7 +93,7 @@ try {
     }
 
     $remaining = @(Get-IscsiSession -ErrorAction SilentlyContinue | Where-Object {
-        $_.TargetNodeAddress -eq $TargetIQN
+        Test-SameTarget -Left ([string]$_.TargetNodeAddress) -Right $TargetIQN
     })
 
     [pscustomobject]@{

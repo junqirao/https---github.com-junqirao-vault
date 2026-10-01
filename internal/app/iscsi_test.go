@@ -14,16 +14,22 @@ import (
 	"vault/internal/store"
 )
 
-// fakeDiskBackend 只实现本测试用到的 Exists；其余方法由嵌入的接口兜底。
+// fakeDiskBackend 只实现本测试用到的 Exists / PhysicalSize / Delete；其余方法由嵌入的接口兜底。
 //
 // 嵌入接口（而非实现全部方法）是刻意的：本测试只关心"底层盘文件在不在"，
 // 多写十几个空实现只会让测试更难读。
 type fakeDiskBackend struct {
 	platform.DiskBackend
 	exists bool
+	// physicalSize 是 PhysicalSize 的返回值（0 = 未配置，按"未测出"处理）。
+	physicalSize int64
 }
 
 func (f fakeDiskBackend) Exists(string) bool { return f.exists }
+
+func (f fakeDiskBackend) PhysicalSize(string) (int64, error) { return f.physicalSize, nil }
+
+func (f fakeDiskBackend) Delete(context.Context, string) error { return nil }
 
 // openAppTestStore 在临时目录打开一个 SQLite 库并建表（与 store 包测试同样的做法）。
 func openAppTestStore(t *testing.T) *store.Store {

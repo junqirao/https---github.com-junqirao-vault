@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -280,7 +281,24 @@ func (s *RepoService) Update(ctx context.Context, id string, in UpdateRepoInput)
 	return out, nil
 }
 
-// Delete 删除存储库：先校验无活跃租约，再异步回收（磁盘 / 目标 / 分配 / 记录）。
+// Delete 删除存储库：**先把记录删干净，再把慢的资源回收丢给后台任务**。
+//
+// 为什么必须拆开（真实反馈："删除存储库要等很久"）：
+//
+//	资源回收要逐块盘解除 LUN 映射 → 停用目标 → 删除目标 → 删除 VHDX 文件，全是秒级的
+//	平台调用。原先的做法是"记录留到最后一并删除"，于是回收期间库里一直挂着
+//	state=deleting 停在列表上，用户看到的就是长时间的「删除中」。
+//
+// 现在请求内只做三件快事：
+//  1. 校验无活跃租约（有人在用就拒绝，见 409 repo.has_active_lease）；
+//  2. 在一个事务里清掉库 / 分配 / 磁盘 / 目标 / 成员记录，并按 disks 表重算用户用量；
+//  3. 把"盘路径 + 目标名"快照提交给回收任务（Finalize=artifacts）。
+//
+// 记录一删，界面立刻不再显示该库；后台任务只回收平台侧资源，且失败可以安全重试
+// （记录已经不存在，重试没有任何副作用）。
+//
+// 已知取舍：回收完成前"库里已无记录、但 VHDX 仍在盘上"。这段时间用户的配额**已经**退回
+// （按 disks 表重算），比"记录留着但空间迟迟不释放"更符合用户直觉。
 func (s *RepoService) Delete(ctx context.Context, id string) error {
 	repo, err := s.Get(ctx, id)
 	if err != nil {
@@ -294,25 +312,118 @@ func (s *RepoService) Delete(ctx context.Context, id string) error {
 		return apperr.RepoHasActiveLease(active)
 	}
 
-	repo.State = domain.RepoStateDeleting
-	if err := s.Store.UpdateRepository(ctx, repo); err != nil {
-		return err
-	}
+	var payload reclaimPayload
+	var userIDs []string
+	err = s.Store.Tx(ctx, func(tx *store.Store) error {
+		if _, err := tx.LockRepository(ctx, id); err != nil {
+			return err
+		}
+		disks, err := tx.ListDisksByRepo(ctx, id)
+		if err != nil {
+			return err
+		}
+		// 仍挂在客户端上的盘不能删：文件删不掉，事后还会留下一个"看不见的占用"。
+		// 在删记录之前判定，用户拿到明确的 disk.busy（409），而不是等半天换来一个失败任务。
+		for i := range disks {
+			if disks[i].Mounted {
+				return apperr.DiskBusy().WithArg("disk_id", disks[i].ID)
+			}
+		}
 
-	disks, err := s.Store.ListDisksByRepo(ctx, id)
+		// 目标只从**本库的磁盘**上取：全量目标列表里还有别的库的目标，无差别删除会误伤
+		// （真实事故：删一个库导致另一个库的挂载失败，见 purgeRepository 的注释）。
+		// 同时把"盘路径 + 目标名"记进快照 —— 记录删掉后就再也查不到了。
+		for i := range disks {
+			targets, tErr := tx.ListIscsiTargetsByDisk(ctx, disks[i].ID)
+			if tErr != nil {
+				return tErr
+			}
+			payload.Artifacts = append(payload.Artifacts, diskArtifact{
+				DiskPath: disks[i].VHDXPath,
+				Targets:  targetNamesOf(targets),
+			})
+			for j := range targets {
+				if err := tx.DeleteIscsiTarget(ctx, targets[j].ID); err != nil && !isNotFound(err) {
+					return err
+				}
+			}
+		}
+
+		allocations, err := tx.ListAllocationsByRepo(ctx, id)
+		if err != nil {
+			return err
+		}
+		// 用户 ID 要在这里收全：分配行马上就要删掉，删完就找不到"该给谁退用量"了。
+		// 临时共享的占位分配（domain.TempAllocationUserID）不计入任何用户配额。
+		seen := make(map[string]bool, len(allocations))
+		for i := range allocations {
+			u := allocations[i].UserID
+			if u == "" || u == domain.TempAllocationUserID || seen[u] {
+				continue
+			}
+			seen[u] = true
+			userIDs = append(userIDs, u)
+		}
+
+		// ⚠️ 删除顺序受外键约束（SQLite 开了 foreign_keys=ON）：
+		// allocations 引用 disks 与 repositories，disks 引用 repositories，
+		// 所以只能是 分配 → 磁盘 → 成员 → 库；反过来会被外键拒绝。
+		for i := range allocations {
+			if err := tx.DeleteAllocation(ctx, allocations[i].ID); err != nil && !isNotFound(err) {
+				return err
+			}
+		}
+		for i := range disks {
+			if err := tx.DeleteDisk(ctx, disks[i].ID); err != nil && !isNotFound(err) {
+				return err
+			}
+		}
+		if err := tx.ReplaceRepoMembers(ctx, id, nil); err != nil {
+			return err
+		}
+		if err := tx.DeleteRepository(ctx, id); err != nil && !isNotFound(err) {
+			return err
+		}
+
+		// 用户用量必须在这里就重算：库没了，之后不会再有"删某块盘 → 顺手重算用量"的
+		// 时机，漏掉这一步用户的已用量就永久挂账。在事务内做还能读到本事务刚删掉的行，
+		// 账目与记录的删除是同一个原子动作。重算失败不回滚删除（记录该删还是要删），只记日志。
+		// 存储库自身的用量随记录一起消失，无需重算。
+		for _, userID := range userIDs {
+			if _, err := tx.RecomputeUserUsage(ctx, userID); err != nil {
+				s.Log.Warn("重算用户用量失败", "user_id", userID, "error", err)
+			}
+		}
+
+		// 回收任务与记录删除放在**同一个事务**：保证"记录删掉了 ⇒ 回收任务一定存在"。
+		// 若拆成"先提交事务、再入队任务"，中间进程被杀就会留下永远没人回收的 VHDX 与
+		// iSCSI 目标（DB 里连一条痕迹都没有）。这里刻意不走 Jobs.EnqueueWith ——
+		// 那条路径绑定的是根连接池，不在本事务内。
+		payload.RepoID = id
+		payload.Finalize = reclaimFinalizeArtifacts
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, _, err := tx.CreateJob(ctx, &domain.Job{
+			Type:    domain.JobReclaim,
+			RefID:   id,
+			IdemKey: "reclaim_repo:" + id,
+			LockKey: lock.RepoKey(id),
+			Payload: string(raw),
+			State:   domain.JobStatePending,
+		}); err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
-	ids := make([]string, 0, len(disks))
-	for _, d := range disks {
-		ids = append(ids, d.ID)
-	}
 
-	payload := reclaimPayload{RepoID: id, DiskIDs: ids, Finalize: reclaimFinalizeRepo}
-	if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobReclaim, id, "reclaim_repo:"+id, lock.RepoKey(id), payload); err != nil {
-		return err
-	}
 	s.audit(ctx, "", "repo.delete", "repo:"+id, repo.Name, domain.AuditResultOK)
+	s.Log.Info("已删除存储库记录，资源回收转入后台",
+		"repo_id", id, "name", repo.Name, "disk_count", len(payload.Artifacts))
 	return nil
 }
 

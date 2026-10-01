@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -243,6 +244,94 @@ func TestDiscoverActualTargetNamePrefersTargetIqn(t *testing.T) {
 
 	if got := svc.discoverActualTargetName(context.Background(), fullIQN, "vault-aaaa-bbbb"); got != transformed {
 		t.Fatalf("应返回平台实际 IQN %q，实际 %q", transformed, got)
+	}
+}
+
+// rewritingTargetBackend 复刻 Windows 目标服务器的**真实**读回语义：按 TargetName 能查到
+// 目标，但对外暴露的名字是 TargetIqn（TargetInfo.IQN），即我们下发的 IQN 被平台套进了
+// 自己的命名里（实测形态 iqn.1991-05.com.microsoft:<host>-<我方 IQN>-target）。
+type rewritingTargetBackend struct {
+	platform.IscsiBackend
+
+	mu     sync.Mutex
+	actual map[string]platform.TargetInfo
+}
+
+func newRewritingTargetBackend() *rewritingTargetBackend {
+	return &rewritingTargetBackend{actual: make(map[string]platform.TargetInfo)}
+}
+
+func (f *rewritingTargetBackend) EnsureTarget(_ context.Context, spec platform.TargetSpec) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.actual[spec.Name] = platform.TargetInfo{
+		Name:       spec.Name,
+		IQN:        legacyWinIQNPrefix + "win-host-" + spec.Name + "-target",
+		Enabled:    spec.Enabled,
+		Initiators: append([]string(nil), spec.Initiators...),
+	}
+	return nil
+}
+
+func (f *rewritingTargetBackend) GetTarget(_ context.Context, name string) (*platform.TargetInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	info, ok := f.actual[name]
+	if !ok {
+		return nil, nil
+	}
+	return &info, nil
+}
+
+func (f *rewritingTargetBackend) ListTargets(context.Context) ([]platform.TargetInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]platform.TargetInfo, 0, len(f.actual))
+	for _, info := range f.actual {
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+func (f *rewritingTargetBackend) RemoveTarget(_ context.Context, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.actual, name)
+	return nil
+}
+
+// TestPublishDoesNotWarnOnPlatformRewrittenIQN 锁住"平台改写目标名是常态、不该刷 WARN"。
+//
+// 背景（真实工单）：Windows 每次挂载都会把下发的 TargetName 改写成 TargetIqn，
+// 于是"expected != actual"恒成立，每次挂载都在 WARN 级别刷一条无解释力的日志。
+// 消除噪音的正确做法是**降低这条日志的级别**，而不是放弃"以平台实际值为准"——
+// 所以这里同时断言：客户端拿到的 IQN 仍是平台实际名字（否则就是"端口通、登录失败"）。
+func TestPublishDoesNotWarnOnPlatformRewrittenIQN(t *testing.T) {
+	ctx := context.Background()
+	const short = "vault-gggg-hhhh"
+	backend := newRewritingTargetBackend()
+	svc := newIqnTestService(t, backend)
+
+	// Debug 级别捕获全部日志：既证明"没有 WARN"，也证明降级后的记录确实存在。
+	var buf bytes.Buffer
+	svc.Log = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	target, allocID := seedPublishFixture(t, svc, short)
+	if _, err := svc.Publish(ctx, allocID); err != nil {
+		t.Fatalf("Publish 失败：%v", err)
+	}
+
+	logs := buf.String()
+	if strings.Contains(logs, "level=WARN") {
+		t.Fatalf("平台改写目标名是常态，不该产生 WARN，实际日志：\n%s", logs)
+	}
+
+	want := legacyWinIQNPrefix + "win-host-" + "iqn.2026-01.com.vault:" + short + "-target"
+	if got := svc.targetIQN(target); got != want {
+		t.Fatalf("改写后仍必须以平台实际名字下发，got=%q want=%q", got, want)
+	}
+	if info, err := backend.GetTarget(ctx, "iqn.2026-01.com.vault:"+short); err != nil || info == nil {
+		t.Fatalf("下发的目标名必须能在平台上查到：err=%v", err)
 	}
 }
 

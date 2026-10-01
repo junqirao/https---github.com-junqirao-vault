@@ -62,42 +62,10 @@ func createDiffDisk(t *testing.T, st *store.Store, repoID, userID string, size, 
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-// TestUsageReserveCorrectReleaseBalances 覆盖一次完整生命周期的账目闭环：
-// 分配预留（逻辑大小）→ 建盘校正（实测物理占用）→ 删除回退。
-//
-// 关键回归：回退必须与"账上实际记的金额"一致。历史实现在回退时用了逻辑大小，
-// 而账上记的是物理大小，于是每删一个差异盘就多退差额，最终把用户配额退成负数
-// （真实工单：-7.98 GB / 3.91 TB）。
-func TestUsageReserveCorrectReleaseBalances(t *testing.T) {
+// assertUsage 断言存储库与用户的已用量都等于 want，且**永不为负**。
+func assertUsage(t *testing.T, st *store.Store, repoID, userID string, want int64) {
+	t.Helper()
 	ctx := context.Background()
-	st := openAppTestStore(t)
-	repoID, userID := seedRepoWithOwner(t, st)
-
-	const size int64 = 2 << 30     // 逻辑 2GB（分配时的预留）
-	const physical int64 = 8 << 20 // 实测物理 8MB（差异盘是稀疏的）
-
-	// 1) 分配：按逻辑大小预留（对应 repo.go 的 Allocate）。
-	if _, err := st.AddRepoUsedBytes(ctx, repoID, size); err != nil {
-		t.Fatalf("预留存储库用量失败：%v", err)
-	}
-	if _, err := st.AddUserUsedBytes(ctx, userID, size); err != nil {
-		t.Fatalf("预留用户用量失败：%v", err)
-	}
-
-	// 2) 建盘完成：按实测物理占用校正（对应 runCreateDiff）。
-	disk := createDiffDisk(t, st, repoID, userID, size, physical)
-	correction := physical - size
-	if _, err := st.AddRepoUsedBytes(ctx, repoID, correction); err != nil {
-		t.Fatalf("校正存储库用量失败：%v", err)
-	}
-	if _, err := st.AddUserUsedBytes(ctx, userID, correction); err != nil {
-		t.Fatalf("校正用户用量失败：%v", err)
-	}
-
-	// 3) 删除差异盘：回退（对应 DiskService.releaseUsage）。
-	svc := &DiskService{Deps: Deps{Store: st, Log: testLogger()}}
-	svc.releaseUsage(ctx, disk, &domain.Allocation{UserID: userID, DiskID: disk.ID})
-
 	repo, err := st.GetRepository(ctx, repoID)
 	if err != nil {
 		t.Fatalf("回查存储库失败：%v", err)
@@ -106,11 +74,101 @@ func TestUsageReserveCorrectReleaseBalances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("回查用户失败：%v", err)
 	}
-	if repo.UsedBytes != 0 {
-		t.Fatalf("存储库用量应回到 0，实际=%d", repo.UsedBytes)
+	if repo.UsedBytes != want {
+		t.Fatalf("存储库已用 = %d，期望 %d（负数即为历史缺陷）", repo.UsedBytes, want)
 	}
-	if user.UsedBytes != 0 {
-		t.Fatalf("用户用量应回到 0（负数即为历史缺陷），实际=%d", user.UsedBytes)
+	if user.UsedBytes != want {
+		t.Fatalf("用户已用 = %d，期望 %d（负数即为历史缺陷）", user.UsedBytes, want)
+	}
+}
+
+// TestUsageReserveCorrectReleaseBalances 覆盖一次完整生命周期的账目闭环：
+// 分配预留（逻辑大小）→ 建盘校正（实测物理）→ 采样（盘长大了）→ 删除（归零）。
+//
+// 关键回归（真实工单）：**删掉一个差异盘后存储库已用变成 -100M**。
+// 根因是删除时按"记忆的金额"做减法，而账上记的是建盘那一刻的物理占用，
+// 差异盘之后被写入撑大（采样只改 physical_bytes，不动账），于是减掉了从未计入的增量。
+// 因此这里要求：账目在每一步都等于 disks 表的派生值，并且删除后必须是 0 而不是负数。
+func TestUsageReserveCorrectReleaseBalances(t *testing.T) {
+	ctx := context.Background()
+	st := openAppTestStore(t)
+	repoID, userID := seedRepoWithOwner(t, st)
+
+	const size int64 = 2 << 30      // 逻辑 2GB（分配时的预留）
+	const atCreate int64 = 20 << 20 // 建盘那一刻的物理占用
+	const grown int64 = 100 << 20   // 之后被写入撑到 100M（正是 -100M 的来路）
+
+	// 1) 分配：按逻辑大小预留（对应 repo.go 的 Allocate）。
+	disk := createPendingDiffDisk(t, st, repoID, userID, size)
+	if _, err := st.AddRepoUsedBytes(ctx, repoID, size); err != nil {
+		t.Fatalf("预留存储库用量失败：%v", err)
+	}
+	if _, err := st.AddUserUsedBytes(ctx, userID, size); err != nil {
+		t.Fatalf("预留用户用量失败：%v", err)
+	}
+
+	svc := &DiskService{Deps: Deps{
+		Store: st,
+		Log:   testLogger(),
+		Disk:  fakeDiskBackend{exists: true, physicalSize: grown},
+	}}
+
+	// 2) 建盘完成：实测物理占用落库 → 账目校正为实测值（对应 runCreateDiff）。
+	disk.PhysicalBytes = atCreate
+	disk.State = domain.DiskStateReady
+	if err := st.UpdateDisk(ctx, disk); err != nil {
+		t.Fatalf("写回磁盘失败：%v", err)
+	}
+	svc.resyncUsage(ctx, repoID, userID)
+	assertUsage(t, st, repoID, userID, atCreate)
+
+	// 3) 差异盘随写入变大：采样把 physical_bytes 改成 100M，账目必须跟着走到实际占用。
+	if err := svc.SamplePhysicalUsage(ctx); err != nil {
+		t.Fatalf("采样失败：%v", err)
+	}
+	assertUsage(t, st, repoID, userID, grown)
+
+	// 4) 删除该差异盘：账目必须归零，不得出现 -100M。
+	if err := svc.deleteDiskArtifacts(ctx, disk.ID, "alloc-"+disk.ID); err != nil {
+		t.Fatalf("删除磁盘失败：%v", err)
+	}
+	assertUsage(t, st, repoID, userID, 0)
+}
+
+// TestRecomputeRepoUsageIsIdempotent 定向重算必须幂等，且以 disks 表为准。
+func TestRecomputeRepoUsageIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	st := openAppTestStore(t)
+	repoID, userID := seedRepoWithOwner(t, st)
+
+	const physical int64 = 5 << 20
+	disk := createDiffDisk(t, st, repoID, userID, 2<<30, physical)
+
+	used, err := st.RecomputeRepoUsage(ctx, repoID)
+	if err != nil {
+		t.Fatalf("重算存储库用量失败：%v", err)
+	}
+	if used != physical {
+		t.Fatalf("重算结果 = %d，期望实际占用 %d", used, physical)
+	}
+	used, err = st.RecomputeRepoUsage(ctx, repoID)
+	if err != nil {
+		t.Fatalf("二次重算失败：%v", err)
+	}
+	if used != physical {
+		t.Fatalf("二次重算结果 = %d，期望 %d（重算必须幂等）", used, physical)
+	}
+
+	// 盘记录消失后重算必须归零 —— 删除路径正是靠这一点把占用退干净。
+	// 顺序与真实删除路径一致：先删分配（外键指向磁盘），再删磁盘。
+	if err := st.DeleteAllocation(ctx, "alloc-"+disk.ID); err != nil {
+		t.Fatalf("删除分配失败：%v", err)
+	}
+	if err := st.DeleteDisk(ctx, disk.ID); err != nil {
+		t.Fatalf("删除磁盘失败：%v", err)
+	}
+	if used, err = st.RecomputeRepoUsage(ctx, repoID); err != nil || used != 0 {
+		t.Fatalf("盘已删除后重算 = %d（err=%v），期望 0", used, err)
 	}
 }
 

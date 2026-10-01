@@ -16,7 +16,19 @@ import (
 // 回收任务的收尾动作。
 const (
 	// reclaimFinalizeRepo 回收后删除存储库记录本身。
+	//
+	// ⚠️ 这是**历史动作**：删除存储库已改为"先删记录、再回收资源"（见 RepoService.Delete），
+	// 记录在 API 请求内就删掉了，因此不会再产生这种任务。保留它只为兼容升级前
+	// 还留在 jobs 表里没执行完的任务。
 	reclaimFinalizeRepo = "repo"
+	// reclaimFinalizeArtifacts 记录已删，任务只按快照回收平台侧资源（iSCSI 目标 + VHDX 文件）。
+	//
+	// 为什么把"删记录"和"回收资源"拆成两件事（真实反馈："删除存储库要等很久"）：
+	// 回收要逐块盘解除 LUN 映射 → 停用目标 → 删除目标 → 删 VHDX 文件，全是秒级的平台
+	// 调用；把它挡在删除请求前面，界面上的库就会长时间停在「删除中」。
+	// 拆开后：请求内只删记录（毫秒级，界面立刻不再显示该库），慢的留给后台任务，
+	// 而且任务失败可以安全重试 —— 记录已经不存在，重试没有任何副作用。
+	reclaimFinalizeArtifacts = "artifacts"
 	// reclaimFinalizeParentIdle 回收差异盘后把母盘置回 idle。
 	reclaimFinalizeParentIdle = "parent_idle"
 )
@@ -45,11 +57,22 @@ type deleteDiskPayload struct {
 	AllocationID string `json:"allocation_id,omitempty"`
 }
 
+// diskArtifact 是"DB 记录已删、只剩平台侧资源待回收"的一块盘的快照。
+//
+// 记录先删，就必须在这里带上回收所需的全部信息：盘路径 + 它上面的 iSCSI 目标名。
+// 任务执行时**不能**再回查 DB —— 那时候这些行（disks / iscsi_targets）已经不存在了。
+type diskArtifact struct {
+	DiskPath string   `json:"disk_path"`
+	Targets  []string `json:"targets,omitempty"`
+}
+
 type reclaimPayload struct {
 	RepoID       string   `json:"repo_id"`
 	ParentDiskID string   `json:"parent_disk_id,omitempty"`
 	DiskIDs      []string `json:"disk_ids,omitempty"`
-	Finalize     string   `json:"finalize,omitempty"`
+	// Artifacts 仅在 Finalize=artifacts（记录已删）时使用，见 diskArtifact。
+	Artifacts []diskArtifact `json:"artifacts,omitempty"`
+	Finalize  string         `json:"finalize,omitempty"`
 }
 
 type compactPayload struct {
@@ -121,17 +144,14 @@ func (s *DiskService) MarkCreateFailed(ctx context.Context, diskID string, cause
 	// 预留用量，差异盘建完后才按实测物理占用校正（见 runCreateDiff）。建盘彻底失败时
 	// 校正永远不会发生，那份预留就成了**永久挂账** —— 每个失败的分配 1GB 起。
 	//
-	// releaseUsage 自身会跳过母盘（只有差异盘计费）与没有分配的情况，因此不会出现负账。
-	if alloc, aErr := s.Store.GetAllocationByDisk(ctx, disk.ID); aErr == nil {
-		s.releaseUsage(ctx, disk, alloc)
-	} else if !isNotFound(aErr) {
-		s.Log.Warn("查询分配失败，未能回退预留用量", "disk_id", disk.ID, "error", aErr)
-	}
+	// 先落库状态再重算：计费口径里"error 且没测到物理占用"计 0，正是这条预留的出口。
+	userID := s.allocatedUserID(ctx, disk.ID)
 	disk.State = domain.DiskStateError
 	if err := s.Store.UpdateDisk(ctx, disk); err != nil {
 		return err
 	}
-	s.Log.Error("建盘任务彻底失败，磁盘已置为异常并回退预留用量",
+	s.resyncUsage(ctx, disk.RepoID, userID)
+	s.Log.Error("建盘任务彻底失败，磁盘已置为异常并按实际占用重算用量",
 		"disk_id", disk.ID, "repo_id", disk.RepoID, "path", disk.VHDXPath, "error", cause)
 	return nil
 }
@@ -263,6 +283,13 @@ func (s *DiskService) SamplePhysicalUsage(ctx context.Context) error {
 			}
 		}
 	}
+	// 采样刚把 physical_bytes 改成了**当前**实际占用，账目必须跟着走：
+	// 否则账停在建盘那一刻的金额，删除时就会退掉从未计入过的增量（见 resyncUsage）。
+	if drift, err := s.Store.RecomputeUsage(ctx); err != nil {
+		s.Log.Warn("按实际占用重算已用量失败", "error", err)
+	} else if drift.Repos > 0 || drift.Users > 0 {
+		s.Log.Info("已按实际磁盘占用校正已用量", "repos", drift.Repos, "users", drift.Users)
+	}
 	return nil
 }
 
@@ -389,21 +416,15 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 		}
 	}
 	if size, err := s.Disk.PhysicalSize(disk.VHDXPath); err == nil {
-		// 用实际物理占用校正分配时的逻辑预留。
-		delta := size - disk.SizeBytes
 		disk.PhysicalBytes = size
-		if delta != 0 {
-			if _, err := s.Store.AddRepoUsedBytes(ctx, disk.RepoID, delta); err == nil {
-				if alloc, aErr := s.Store.GetAllocationByDisk(ctx, disk.ID); aErr == nil && alloc.UserID != "" {
-					_, _ = s.Store.AddUserUsedBytes(ctx, alloc.UserID, delta)
-				}
-			}
-		}
 	}
 	disk.State = domain.DiskStateReady
 	if err := s.Store.UpdateDisk(ctx, disk); err != nil {
 		return err
 	}
+	// 实测物理占用落库后，按实际占用重算用量（分配时是按逻辑大小预留的）。
+	userID := s.allocatedUserID(ctx, disk.ID)
+	s.resyncUsage(ctx, disk.RepoID, userID)
 	rep.Progress(100)
 	s.audit(ctx, "", "disk.create_diff.done", "disk:"+disk.ID, "parent="+parent.ID, domain.AuditResultOK)
 	return nil
@@ -525,12 +546,34 @@ func (s *DiskService) runDeleteDisk(ctx context.Context, j *domain.Job, rep job.
 	return nil
 }
 
-// runReclaim 批量回收磁盘集合，并按 Finalize 收尾（置母盘 idle 或删除存储库）。
+// runReclaim 批量回收磁盘集合，并按 Finalize 收尾。
+//
+// 两条路径：
+//   - Finalize=artifacts（当前删除存储库走的路径）：DB 记录在 API 请求内已删除，
+//     这里只按 payload 快照回收平台侧资源，不回查 DB；
+//   - 其它（历史路径 / 清理差异盘）：按 DiskIDs 逐块"回收资源 + 记录"，最后收尾。
 func (s *DiskService) runReclaim(ctx context.Context, j *domain.Job, rep job.Reporter) error {
 	var p reclaimPayload
 	if err := decodePayload(j.Payload, &p); err != nil {
 		return apperr.InvalidParam("payload").WithCause(err)
 	}
+
+	if p.Finalize == reclaimFinalizeArtifacts {
+		total := len(p.Artifacts)
+		for i := range p.Artifacts {
+			if err := s.deleteDiskPhysical(ctx, p.Artifacts[i].DiskPath, p.Artifacts[i].Targets); err != nil {
+				return err
+			}
+			if total > 0 {
+				rep.Progress((i + 1) * 80 / total)
+			}
+		}
+		rep.Progress(100)
+		s.Log.Info("已完成存储库资源回收（记录此前已删除）",
+			"repo_id", p.RepoID, "disk_count", total)
+		return nil
+	}
+
 	total := len(p.DiskIDs)
 	for i, id := range p.DiskIDs {
 		if err := s.deleteDiskArtifacts(ctx, id, ""); err != nil {
@@ -640,6 +683,66 @@ func (s *DiskService) runCompact(ctx context.Context, j *domain.Job, rep job.Rep
 
 // ---- 内部辅助 ----
 
+// deleteDiskPhysical 只回收磁盘的**平台侧资源**：目标映射与目标、虚拟盘登记、VHDX 文件。
+//
+// 完全不碰 DB —— 调用方（记录已删的存储库回收任务，见 reclaimFinalizeArtifacts）已经
+// 把 disks / iscsi_targets 记录删掉了，那时候回查 DB 只会读到"不存在"。
+// 幂等：目标不存在、文件不存在都视为成功，因此任务重试是安全的。
+func (s *DiskService) deleteDiskPhysical(ctx context.Context, path string, targetNames []string) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	s.detachTargets(ctx, path, targetNames)
+	return s.removeDiskFile(ctx, path)
+}
+
+// detachTargets 在平台上拆除该盘的目标：解除映射 → 停用 → 删除目标 → 移除虚拟盘登记。
+//
+// 全部尽力而为（只记日志、不返回错误）：目标可能已经被人工删掉，这里失败不该让整个回收
+// 任务卡死（会连带重试整批盘）。真正的失败点 —— 文件删不掉 —— 由 removeDiskFile 判定。
+func (s *DiskService) detachTargets(ctx context.Context, path string, targetNames []string) {
+	if s.Iscsi == nil {
+		return
+	}
+	for _, name := range targetNames {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		if err := s.Iscsi.DetachLun(ctx, name, path); err != nil {
+			s.Log.Warn("解除目标映射失败", "target", name, "error", err)
+		}
+		// 只停用（不带 BackingRef）：保持映射不动，随后由 RemoveTarget 一并拆除。
+		if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: name, Enabled: false}); err != nil {
+			s.Log.Warn("停用目标失败", "target", name, "error", err)
+		}
+		if err := s.Iscsi.RemoveTarget(ctx, name); err != nil {
+			s.Log.Warn("删除目标失败", "target", name, "error", err)
+		}
+	}
+	if err := s.Iscsi.RemoveVirtualDisk(ctx, path); err != nil {
+		s.Log.Warn("移除 iSCSI 虚拟盘登记失败", "path", path, "error", err)
+	}
+}
+
+// removeDiskFile 删除底层虚拟盘文件（后端实现幂等：文件不存在视为成功）。
+func (s *DiskService) removeDiskFile(ctx context.Context, path string) error {
+	if s.Disk == nil {
+		return nil
+	}
+	return s.Disk.Delete(ctx, path)
+}
+
+// targetNamesOf 取出目标名列表（跳过空名，避免往平台侧传非法目标名）。
+func targetNamesOf(targets []domain.IscsiTarget) []string {
+	names := make([]string, 0, len(targets))
+	for i := range targets {
+		if targets[i].TargetName != "" {
+			names = append(names, targets[i].TargetName)
+		}
+	}
+	return names
+}
+
 // deleteDiskArtifacts 删除磁盘的全部外部痕迹：目标映射与目标、虚拟盘登记、文件、
 // 分配记录与磁盘记录，并回退配额用量。对已不存在的磁盘是幂等的。
 func (s *DiskService) deleteDiskArtifacts(ctx context.Context, diskID, allocationID string) error {
@@ -672,24 +775,8 @@ func (s *DiskService) deleteDiskArtifacts(ctx context.Context, diskID, allocatio
 	if err != nil {
 		return err
 	}
-	if s.Iscsi != nil {
-		for i := range targets {
-			name := targets[i].TargetName
-			if err := s.Iscsi.DetachLun(ctx, name, disk.VHDXPath); err != nil {
-				s.Log.Warn("解除目标映射失败", "target", name, "error", err)
-			}
-			// 只停用（不带 BackingRef）：保持映射不动，随后由 RemoveTarget 一并拆除。
-			if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: name, Enabled: false}); err != nil {
-				s.Log.Warn("停用目标失败", "target", name, "error", err)
-			}
-			if err := s.Iscsi.RemoveTarget(ctx, name); err != nil {
-				s.Log.Warn("删除目标失败", "target", name, "error", err)
-			}
-		}
-		if err := s.Iscsi.RemoveVirtualDisk(ctx, disk.VHDXPath); err != nil {
-			s.Log.Warn("移除 iSCSI 虚拟盘登记失败", "path", disk.VHDXPath, "error", err)
-		}
-	}
+	// 平台侧：解映射 → 停用 → 删除目标 → 移除虚拟盘登记。
+	s.detachTargets(ctx, disk.VHDXPath, targetNamesOf(targets))
 	for i := range targets {
 		if err := s.Store.DeleteIscsiTarget(ctx, targets[i].ID); err != nil {
 			s.Log.Warn("删除目标记录失败", "target", targets[i].TargetName, "error", err)
@@ -698,13 +785,14 @@ func (s *DiskService) deleteDiskArtifacts(ctx context.Context, diskID, allocatio
 
 	// ⚠️ 必须先完成上面的 LUN 下线与 backstore 回收，再删除底层磁盘：
 	// Linux 上 LV 若仍被 LIO(iblock) 打开，lvremove 会被内核拒绝。
-	if s.Disk != nil {
-		if err := s.Disk.Delete(ctx, disk.VHDXPath); err != nil {
-			return err
-		}
+	if err := s.removeDiskFile(ctx, disk.VHDXPath); err != nil {
+		return err
 	}
 
+	// 用户 ID 要在删除分配行之前取到。
+	userID := ""
 	if alloc != nil {
+		userID = alloc.UserID
 		if err := s.removeAllocation(ctx, alloc.ID); err != nil {
 			return err
 		}
@@ -712,7 +800,8 @@ func (s *DiskService) deleteDiskArtifacts(ctx context.Context, diskID, allocatio
 	if err := s.Store.DeleteDisk(ctx, disk.ID); err != nil && !isNotFound(err) {
 		return err
 	}
-	s.releaseUsage(ctx, disk, alloc)
+	// 盘记录已经不在表里了，此时按 disks 表重算就等于"把这块盘的占用退干净"。
+	s.resyncUsage(ctx, disk.RepoID, userID)
 
 	// 差异盘清理完毕后，若已无兄弟子盘则母盘回到 idle。
 	if disk.Kind == domain.DiskKindDiff && disk.ParentID != nil {
@@ -727,38 +816,44 @@ func (s *DiskService) deleteDiskArtifacts(ctx context.Context, diskID, allocatio
 	return nil
 }
 
-// accountedUsage 返回某个差异盘**当前计入配额**的量。
+// resyncUsage 把"该盘所在存储库 / 所属用户"的已用量**按 disks 表的实际占用重算**。
 //
-// 口径：分配时按逻辑大小（SizeBytes）预留 → 建盘完成后按实测物理占用校正
-// （见 runCreateDiff），因此账上记的是"实测物理占用"。删除回退必须用同一个口径。
+// ⚠️ 不要再改回"删除时按记忆的金额做减法"。真实工单：删掉一个差异盘后存储库已用
+// 变成 **-100M** —— 账上记的是**建盘那一刻**的实测物理占用，而差异盘会随写入持续
+// 变大（physical_bytes 由采样更新，账目并不跟着变），于是删除时拿**删除那一刻**的
+// 物理占用去减，就减掉了从未计入过的增量。
 //
-// ⚠️ 这正是"用户配额变成负数"的根因所在：原实现在删除时按**逻辑大小**回退
-// （`-disk.SizeBytes`），而账上按**物理大小**记，每删一个差异盘就多退
-// （逻辑 − 物理）的差额。例如 2GB 的差异盘物理只有几十 MB 时，删 4 个就出现
-// 截图里的 -7.98 GB。
+// 以 disks 表（唯一真源）重算是幂等的：多算一次、少算一次都能自愈。
 //
-// 物理占用尚未测出（0，如建盘失败或尚未测量）时退回逻辑大小，与预留金额一致。
-func accountedUsage(disk *domain.Disk) int64 {
-	if disk.PhysicalBytes > 0 {
-		return disk.PhysicalBytes
-	}
-	return disk.SizeBytes
-}
-
-// releaseUsage 回退该差异盘此前计入的用量（金额必须与计入时一致，见 accountedUsage）。
-func (s *DiskService) releaseUsage(ctx context.Context, disk *domain.Disk, alloc *domain.Allocation) {
-	if disk.Kind != domain.DiskKindDiff || alloc == nil {
-		return
-	}
-	delta := -accountedUsage(disk)
-	if _, err := s.Store.AddRepoUsedBytes(ctx, disk.RepoID, delta); err != nil {
-		s.Log.Warn("回退存储库用量失败", "repo_id", disk.RepoID, "error", err)
-	}
-	if alloc.UserID != "" && alloc.UserID != domain.TempAllocationUserID {
-		if _, err := s.Store.AddUserUsedBytes(ctx, alloc.UserID, delta); err != nil {
-			s.Log.Warn("回退用户用量失败", "user_id", alloc.UserID, "error", err)
+// 计费口径见 store.accountedUsageSQL（物理优先 → error 且无占用计 0 → 否则退回逻辑大小）。
+func (s *DiskService) resyncUsage(ctx context.Context, repoID, userID string) {
+	if strings.TrimSpace(repoID) != "" {
+		if _, err := s.Store.RecomputeRepoUsage(ctx, repoID); err != nil {
+			s.Log.Warn("按实际占用重算存储库用量失败", "repo_id", repoID, "error", err)
 		}
 	}
+	if strings.TrimSpace(userID) != "" && userID != domain.TempAllocationUserID {
+		if _, err := s.Store.RecomputeUserUsage(ctx, userID); err != nil {
+			s.Log.Warn("按实际占用重算用户用量失败", "user_id", userID, "error", err)
+		}
+	}
+}
+
+// allocatedUserID 返回该盘分配记录上的用户 ID；没有分配或查询失败时返回空串。
+//
+// 分配行一旦被删除就查不到了，所以需要用户 ID 的调用方要在删除前拿。
+func (s *DiskService) allocatedUserID(ctx context.Context, diskID string) string {
+	alloc, err := s.Store.GetAllocationByDisk(ctx, diskID)
+	if err != nil {
+		if !isNotFound(err) {
+			s.Log.Warn("查询分配失败，无法按用户重算用量", "disk_id", diskID, "error", err)
+		}
+		return ""
+	}
+	if alloc == nil {
+		return ""
+	}
+	return alloc.UserID
 }
 
 // removeAllocation 删除分配记录；不存在视为成功。

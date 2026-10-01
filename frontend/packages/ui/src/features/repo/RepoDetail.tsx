@@ -77,7 +77,10 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, clientId, onBa
     mutationFn: () => api.deleteRepo(repoId),
     onSuccess: () => {
       setDeleteOpen(false)
-      refresh()
+      // 删除是"先删记录、后台回收资源"：记录此刻已经不存在，只刷新列表。
+      // 这里**不能**再 refresh() 详情 —— 会立刻 refetch 一个已删除的库并闪出 404 错误。
+      queryClient.removeQueries({ queryKey: ['repo', repoId] })
+      void queryClient.invalidateQueries({ queryKey: ['repos'] })
       onBack()
     },
     onError: (err) => setError(err)

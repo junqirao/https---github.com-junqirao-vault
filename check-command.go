@@ -1174,7 +1174,24 @@ func checkWindowsInitiatorReadonly(r *report, sb *sandbox) {
 		`$p=@(Get-IscsiTargetPortal -ErrorAction SilentlyContinue);"portal 数量: $($p.Count)"`, opts.timeout)
 	r.inline("F3 当前会话（Get-IscsiSession）", "Get-IscsiSession",
 		`$s=@(Get-IscsiSession -ErrorAction SilentlyContinue);"会话数量: $($s.Count)"`, opts.timeout)
-	r.skip("F4 连接/断开/门户增删类脚本",
+	// F4 已发现目标：Connect-IscsiTarget 只能连**发起端已发现**的目标，而发现列表只在
+	// New-IscsiTargetPortal 那一刻刷新过一次。本系统「1 分配 = 1 target」，每次挂载都是
+	// 全新 IQN —— 列表陈旧就是 "The target name is not found or is marked as hidden from login"
+	// 的头号原因（真实工单：服务端 enabled + IQN:* + 已映射、TCP 可达，却反复挂载失败）。
+	// 挂载链路现在会在连接前自动 Update-IscsiTarget（见 initiator_connect.ps1），
+	// 这里把它变成一条可自证的检查。
+	discovered := r.inline("F4 已发现目标（Get-IscsiTarget）", "Get-IscsiTarget",
+		`$t=@(Get-IscsiTarget -ErrorAction SilentlyContinue);`+
+			`"已发现目标数量: $($t.Count)";`+
+			`$t | ForEach-Object { " - " + [string]$_.NodeAddress }`,
+		opts.timeout)
+	if !discovered.failed() && strings.Contains(discovered.stdout, "已发现目标数量: 0") {
+		r.fail("F4-2 已发现目标为空",
+			"发起端一个目标都没发现：挂载必然在 connect 阶段报 target name is not found。"+
+				"先确认门户可达，再执行 Update-IscsiTarget 刷新（挂载链路现在会自动刷新）",
+			"Update-IscsiTarget")
+	}
+	r.skip("F5 连接/断开/门户增删类脚本",
 		"刻意不执行：属客户端侧能力，需要真实对端；本机 loopback iSCSI 可能把服务器挂死（见报告末尾）")
 }
 

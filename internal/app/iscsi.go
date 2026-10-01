@@ -21,10 +21,12 @@ import (
 
 // defaultChapSecretChars 是自动生成的 CHAP 密钥的**字符数**（纯字母数字）。
 //
-// 取 16：Windows（12–16 字符）与 Linux LIO（内核硬限制 12–16 字节纯 ASCII）两侧的
-// 合法区间上限。secret.RandomSecret 现在直接产出 n 个纯字母数字字符（不再 base64），
-// 因此这里的 n 就是最终字符数（16），不存在"编码膨胀超长"的问题。
-const defaultChapSecretChars = 16
+// ⚠️ 取 15 而非 16：16 是 Windows CHAP 密钥的**上限边界**，实测会触发"目标侧与发起
+// 程序侧对密钥的截断/校验不一致"，表现为 connect 阶段报
+// "target name is not found or is marked as hidden from login"（真实事故：手动用
+// 15 字符密钥连接即成功，16 字符即失败）。15 落在 12–16 的安全区间内，
+// 15×log2(62)≈89 bit 熵仍足够。
+const defaultChapSecretChars = 15
 
 // IscsiService 负责 iSCSI 目标的发布、授权、鉴权与收敛。
 //
@@ -149,6 +151,37 @@ func (s *IscsiService) discoverActualTargetName(ctx context.Context, iqn, shortN
 		}
 	}
 	return ""
+}
+
+// isRewrittenIQN 判断平台读回的**实际**目标名是否只是"我们下发的 IQN 被套进了平台自己的命名"。
+//
+// Windows 目标服务器就是这么干的（实测形态）：下发的 TargetName
+// `iqn.2026-01.com.vault:vault-xxx` 会被改写成 TargetIqn
+// `iqn.1991-05.com.microsoft:<host>-iqn.2026-01.com.vault:vault-xxx-target` ——
+// **我们下发的那段 IQN 被完整保留在内**。LIO 只认短名时则表现为
+// `iqn.1991-05.com.microsoft:<短名>`（同样保留了目标标识）。
+//
+// 这类"改写"是每次挂载都会发生的**常态**，不是故障：正确做法就是按读回值下发
+// （见 rememberActualIQN / targetIQN），所以不该当作异常刷 WARN。
+// 只有读回值与下发的目标**毫无关联**（外部改动 / 串目标）时才值得告警。
+func isRewrittenIQN(actual, iqn string) bool {
+	a := strings.ToLower(strings.TrimSpace(actual))
+	e := strings.ToLower(strings.TrimSpace(iqn))
+	if a == "" || e == "" {
+		return false
+	}
+	if a == e || strings.Contains(a, e) {
+		return true
+	}
+	// 退一步：平台用自己的默认命名权 + 短名（短名取自 IQN 冒号之后的部分）。
+	short := e
+	if i := strings.LastIndex(e, ":"); i >= 0 {
+		short = e[i+1:]
+	}
+	if short == "" {
+		return false
+	}
+	return strings.HasPrefix(a, legacyWinIQNPrefix) && strings.Contains(a, short)
 }
 
 // migrateLegacyTargetName 清理"旧命名"目标（一次性迁移），避免同一个 VHDX 被两个目标映射。
@@ -487,8 +520,18 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	// 读不到时回退到推导值并告警（不阻塞挂载，让排障有据）。
 	actual := iqn
 	if found := s.discoverActualTargetName(ctx, iqn, target.TargetName); found != "" {
-		if !strings.EqualFold(found, iqn) {
-			s.Log.Warn("平台侧实际目标名与下发的 IQN 不一致，以实际值为准",
+		switch {
+		case strings.EqualFold(found, iqn):
+			// 平台原样保留，无需任何日志。
+		case isRewrittenIQN(found, iqn):
+			// 平台把我们的 IQN 套进了自己的命名里（Windows 的常态形态，见 isRewrittenIQN）。
+			// **每次挂载都会走到这里**，故只记 Debug：它对"能不能连上"没有任何解释力，
+			// 却在 WARN 级别刷屏（真实工单：每次挂载都看到这条）。
+			s.Log.Debug("平台改写了目标名，以实际值为准",
+				"target", target.TargetName, "expected", iqn, "actual", found)
+		default:
+			// 真异常：读回的名字与下发的目标毫无关联（外部改动 / 串到别的目标）。
+			s.Log.Warn("平台侧实际目标名与下发的 IQN 无关，以实际值为准",
 				"target", target.TargetName, "expected", iqn, "actual", found)
 		}
 		actual = found

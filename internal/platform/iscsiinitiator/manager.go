@@ -244,12 +244,21 @@ func (m *Manager) Connect(ctx context.Context, opt ConnectOptions) error {
 
 	m.logger.Info("连接 iSCSI 目标", logArgs...)
 	var result struct {
-		Action string `json:"action"`
+		Action    string `json:"action"`
+		LoginIQN  string `json:"login_iqn"`
+		Discovery string `json:"discovery"`
+		// DiscoveredCount 是发起端「已发现目标」的数量（0 且连接失败 = 发现列表里没有这个新目标）。
+		DiscoveredCount int `json:"discovered_count"`
 	}
 	if err := m.ps.RunScriptJSON(ctx, winps.ScriptInitiatorConnect, params, &result); err != nil {
 		return err
 	}
-	m.logger.Info("iSCSI 目标连接完成", "target_iqn", opt.TargetIQN, "action", result.Action)
+	// login_iqn / discovery 是排查 "target name is not found" 的关键证据：
+	// 服务端日志此时一切正常，只有发起端的发现列表能说明问题（见 initiator_connect.ps1 的 .NOTES）。
+	m.logger.Info("iSCSI 目标连接完成",
+		"target_iqn", opt.TargetIQN, "action", result.Action,
+		"login_iqn", result.LoginIQN, "discovery", result.Discovery,
+		"discovered_count", result.DiscoveredCount)
 	return nil
 }
 
