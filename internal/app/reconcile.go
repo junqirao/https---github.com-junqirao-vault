@@ -151,7 +151,7 @@ func (a *App) runReconcile(parent context.Context, budget time.Duration) error {
 	return nil
 }
 
-// reconcileIscsi 检查孤儿目标与映射差异。
+// reconcileIscsi 检查并清理孤儿 iSCSI 目标。
 func (a *App) reconcileIscsi(ctx context.Context, rep *ReconcileReport,
 	report func(kind, ref, detail string, fixed bool), log *slog.Logger) {
 	targets, err := a.Store.ListIscsiTargets(ctx, "")
@@ -159,9 +159,13 @@ func (a *App) reconcileIscsi(ctx context.Context, rep *ReconcileReport,
 		log.Error("查询 iSCSI 目标列表失败", "error", err)
 		return
 	}
-	byName := make(map[string]domain.IscsiTarget, len(targets))
+	// byName 同时收录短名与完整 IQN：Windows 侧读回的 name 是完整 IQN，而 DB 存的是
+	// 短名，二者都要能命中（真实事故：只比对短名导致新命名目标永远识别不出来）。
+	prefix := a.iqnPrefix()
+	byName := make(map[string]struct{}, len(targets)*2)
 	for i := range targets {
-		byName[targets[i].TargetName] = targets[i]
+		byName[targets[i].TargetName] = struct{}{}
+		byName[targets[i].IQN(prefix)] = struct{}{}
 		rep.Checked++
 	}
 
@@ -175,19 +179,43 @@ func (a *App) reconcileIscsi(ctx context.Context, rep *ReconcileReport,
 		rep.NotChecked = append(rep.NotChecked, "iscsi_orphans: iSCSI 目标服务不可用，已跳过")
 		return
 	}
+	// 孤儿目标：DB 无记录 → 自动删除（真实诉求："磁盘已删但 iSCSI 目标还挂着的，
+	// 启动时自动清理"，避免资源泄漏）。删除只解映射+删目标，不删底层 VHDX 文件。
+	//
+	// ⚠️ 分批删除：每个 RemoveTarget 都要跑一次 PowerShell（本机实测 15-20 秒），而整个
+	// 对账受 reconcileBudget（60s）约束，一次删太多必然 context deadline exceeded
+	// （真实事故：大量孤儿时日志刷屏超时）。故每轮最多删 maxOrphanDelete 个，剩余留到
+	// 下一轮对账（对账定期运行，慢慢清完即可）。
+	const maxOrphanDelete = 2
+	deleted := 0
 	for i := range winTargets {
 		w := &winTargets[i]
 		rep.Checked++
-		if !strings.HasPrefix(strings.ToLower(w.Name), orphanTargetPrefix) {
+		// 只处理本服务端创建的目标：短名形态 "vault-..." 或完整 IQN 形态
+		// "<iqn_prefix>:vault-..."；第三方/手动创建的绝不碰。
+		lower := strings.ToLower(w.Name)
+		if !strings.HasPrefix(lower, orphanTargetPrefix) && !strings.Contains(lower, ":vault-") {
 			continue
 		}
 		if _, ok := byName[w.Name]; ok {
 			continue
 		}
-		// 孤儿目标：只报告，绝不自动删除（见 5.11）。
-		report("iscsi.orphan_target", w.Name, "Windows 侧存在目标但数据库无记录（未自动删除）", false)
-		log.Warn("发现孤儿 iSCSI 目标（仅报告，未删除）", "target", w.Name)
-		a.audit(ctx, "system", "reconcile.orphan_target", "target:"+w.Name, "report_only", domain.AuditResultOK)
+		if ctx.Err() != nil {
+			// 对账预算已耗尽，剩余孤儿留下轮，避免刷超时日志。
+			break
+		}
+		if deleted >= maxOrphanDelete {
+			continue
+		}
+		if err := a.Deps.Iscsi.RemoveTarget(ctx, w.Name); err != nil {
+			report("iscsi.orphan_target", w.Name, "删除孤儿目标失败", false)
+			log.Warn("删除孤儿 iSCSI 目标失败", "target", w.Name, "error", err)
+			continue
+		}
+		deleted++
+		report("iscsi.orphan_target", w.Name, "已删除孤儿目标", true)
+		log.Warn("已删除孤儿 iSCSI 目标", "target", w.Name)
+		a.audit(ctx, "system", "reconcile.orphan_target", "target:"+w.Name, "removed", domain.AuditResultOK)
 	}
 }
 

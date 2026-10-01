@@ -308,7 +308,13 @@ func (s *LeaseService) Revoke(ctx context.Context, leaseID, operatorID string) e
 	return nil
 }
 
-// ReapExpired 由定时任务调用：过期租约 → 停用目标 → 标记 revoked。
+// ReapExpired 由定时任务调用：把过期租约标记为 revoked（仅反映"客户端离线"）。
+//
+// ⚠️ 绝不在这里停用目标：租约/心跳只用于"知道客户端是否还在"，绝不能反过来
+// 停用目标、影响挂载（真实诉求："续期、过期这些行为不该影响我的挂载"）。
+// 目标的启用/停用只由两个显式动作驱动：挂载（启用）、卸载（停用）。
+// 过期只是把租约状态置为 revoked —— 客户端下次心跳会得知"已撤销"并自行断开；
+// 目标保持原状，直到显式卸载或管理员 Revoke 才被停用。
 //
 // 返回处理的租约数量。
 func (s *LeaseService) ReapExpired(ctx context.Context) (int, error) {
@@ -319,11 +325,6 @@ func (s *LeaseService) ReapExpired(ctx context.Context) (int, error) {
 	reaped := 0
 	for i := range leases {
 		lease := &leases[i]
-		if lease.TargetName != "" {
-			if err := s.Iscsi.DisableTarget(ctx, lease.TargetName); err != nil {
-				s.Log.Warn("停用过期租约目标失败", "target", lease.TargetName, "error", err)
-			}
-		}
 		if err := s.Store.UpdateLeaseState(ctx, lease.ID, domain.LeaseStateRevoked); err != nil {
 			s.Log.Error("标记过期租约失败", "lease_id", lease.ID, "error", err)
 			continue

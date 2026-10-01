@@ -19,13 +19,12 @@ import (
 	"vault/internal/secret"
 )
 
-// defaultChapSecretBytes 是自动生成的 CHAP 密钥的**原始随机字节数**。
+// defaultChapSecretChars 是自动生成的 CHAP 密钥的**字符数**（纯字母数字）。
 //
-// 取 12 而非 16：secret.RandomSecret 返回 URL 安全 base64（无 padding），
-// 12 字节 → 恰好 16 个字符，同时落在 Windows（12–16 字符）与
-// Linux LIO（内核硬限制 12–16 字节纯 ASCII）两侧的合法区间内。
-// 若取 16 字节，base64 后为 24 字符，LIO 侧会直接拒绝（见 liotarget.validateChapSecret）。
-const defaultChapSecretBytes = 12
+// 取 16：Windows（12–16 字符）与 Linux LIO（内核硬限制 12–16 字节纯 ASCII）两侧的
+// 合法区间上限。secret.RandomSecret 现在直接产出 n 个纯字母数字字符（不再 base64），
+// 因此这里的 n 就是最终字符数（16），不存在"编码膨胀超长"的问题。
+const defaultChapSecretChars = 16
 
 // IscsiService 负责 iSCSI 目标的发布、授权、鉴权与收敛。
 //
@@ -429,7 +428,7 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 			return nil, apperr.New(apperr.CodeInternal, 500).WithArg("reason", "cipher_unavailable")
 		}
 		// 默认使用 CHAP：Windows 侧无会话枚举能力，租约 + CHAP 是唯一的访问控制手段。
-		plainSecret, err := secret.RandomSecret(defaultChapSecretBytes)
+		plainSecret, err := secret.RandomSecret(defaultChapSecretChars)
 		if err != nil {
 			return nil, err
 		}
@@ -681,7 +680,7 @@ func (s *IscsiService) SetAuth(ctx context.Context, targetID string, in SetAuthI
 		}
 		plainSecret = in.ChapSecret
 		if plainSecret == "" {
-			if plainSecret, err = secret.RandomSecret(defaultChapSecretBytes); err != nil {
+			if plainSecret, err = secret.RandomSecret(defaultChapSecretChars); err != nil {
 				return nil, err
 			}
 		}
