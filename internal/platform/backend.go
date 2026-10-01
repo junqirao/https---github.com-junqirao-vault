@@ -236,7 +236,10 @@ type TargetSpec struct {
 
 // TargetInfo 是目标的实际状态快照。
 type TargetInfo struct {
-	Name    string
+	Name string
+	// IQN 平台侧**实际对外**的 IQN（Windows 会改写目标名，客户端登录必须用它）；
+	// 与 Name（`-TargetName` 寻址用的名字）不同。可能为空（Linux LIO 二者一致）。
+	IQN     string
 	Enabled bool
 	// Initiators 已授权的 initiator（Windows 形如 "IQN:iqn.xxx"，Linux 为纯 IQN）。
 	Initiators []string

@@ -172,15 +172,20 @@ export function MountActionButtons({
   const { t } = useI18n()
   if (!canMount) return <Typography.Text type="secondary">-</Typography.Text>
 
-  const pending = mount?.state === 'mounting' || mount?.state === 'unmounting'
+  // mounting/unmounting 都是"转场中"，重新挂载在两者期间都不可点。
+  const transitioning = mount?.state === 'mounting' || mount?.state === 'unmounting'
+  // 卸载：只在 mounting 中禁用；unmounting（含卡死的脏记录）**必须可点**——
+  // 否则用户永远触发不了"普通卸载失败 → 强制卸载"的兜底（真实反馈：
+  // "卡在卸载中，也没有强制卸载的选项"——因为卸载按钮是灰的）。
+  const unmountDisabled = !available || mount?.state === 'mounting'
   const buttons = (
     <Space size={0}>
       {mount ? (
         <>
-          <Button type="link" size="small" disabled={!available || pending} loading={busy} onClick={onUnmount}>
+          <Button type="link" size="small" disabled={unmountDisabled} loading={busy} onClick={onUnmount}>
             {t('action.unmount')}
           </Button>
-          <Button type="link" size="small" disabled={!available || pending} loading={busy} onClick={onRemount}>
+          <Button type="link" size="small" disabled={!available || transitioning} loading={busy} onClick={onRemount}>
             {t('agent.action.remount')}
           </Button>
           <Button

@@ -21,7 +21,7 @@ import (
 
 // defaultChapSecretBytes 是自动生成的 CHAP 密钥的**原始随机字节数**。
 //
-// 取 12 而非 16：secret.RandomSecret 返回 base64 标准编码，
+// 取 12 而非 16：secret.RandomSecret 返回 URL 安全 base64（无 padding），
 // 12 字节 → 恰好 16 个字符，同时落在 Windows（12–16 字符）与
 // Linux LIO（内核硬限制 12–16 字节纯 ASCII）两侧的合法区间内。
 // 若取 16 字节，base64 后为 24 字符，LIO 侧会直接拒绝（见 liotarget.validateChapSecret）。
@@ -109,16 +109,23 @@ func legacyTargetNameMatches(name, shortName string) bool {
 	return strings.EqualFold(name, legacyWinIQNPrefix+shortName)
 }
 
-// discoverActualTargetName 定位目标在平台上**实际**的名字，找不到时返回空串。
+// discoverActualTargetName 定位目标**客户端登录时必须用的实际 IQN**，找不到时返回空串。
+//
+// Windows 会改写目标名：我们按 TargetName（如 iqn.2026-01.com.vault:vault-xxx）下发，
+// 但平台真正暴露给 initiator 的是 TargetIqn（形如
+// iqn.1991-05.com.microsoft:<host>-<name>-target）。客户端拿 TargetName 去连必然
+// "target name is not found or is marked as hidden from login"（真实事故）。
+// 故这里优先读回 TargetIqn，其次回退到 Name（Linux LIO 二者一致）。
 //
 // 两条查找路径：
 //
 //	① 按我们下发的 IQN 精确查（正常情况）；
-//	② 查不到时按"短名后缀"在全部目标里找 —— 平台可能按自己的命名权改写目标名
-//	   （如 iqn.1991-05.com.microsoft:<短名>），此时按 IQN 精确查会落空，
-//	   而客户端只能连平台实际给出的名字。
+//	② 查不到时按"短名后缀"在全部目标里找。
 func (s *IscsiService) discoverActualTargetName(ctx context.Context, iqn, shortName string) string {
 	if info, err := s.Iscsi.GetTarget(ctx, iqn); err == nil && info != nil {
+		if actual := strings.TrimSpace(info.IQN); actual != "" {
+			return actual
+		}
 		if name := strings.TrimSpace(info.Name); name != "" {
 			return name
 		}
@@ -136,6 +143,9 @@ func (s *IscsiService) discoverActualTargetName(ctx context.Context, iqn, shortN
 		}
 		lower := strings.ToLower(name)
 		if lower == short || strings.HasSuffix(lower, suffix) {
+			if actual := strings.TrimSpace(targets[i].IQN); actual != "" {
+				return actual
+			}
 			return name
 		}
 	}
@@ -268,8 +278,9 @@ func (s *IscsiService) buildSummary(ctx context.Context, t *domain.IscsiTarget, 
 		sum.AllocationID = *t.AllocationID
 	}
 	if withWindows && s.Iscsi != nil {
-		// 按**实际 IQN** 查询（平台上存储的名字可能不是我们推导的那个，见 targetIQN）。
-		if info, wErr := s.Iscsi.GetTarget(ctx, s.targetIQN(t)); wErr == nil {
+		// 按**寻址名**（下发的完整 IQN = Windows TargetName）查询，不是客户端连接用的
+		// TargetIqn（后者见 targetIQN / discoverActualTargetName）。
+		if info, wErr := s.Iscsi.GetTarget(ctx, t.IQN(s.iqnPrefix())); wErr == nil {
 			sum.WindowsEnabled = info.Enabled
 			sum.WindowsMappedDevices = info.Devices
 		}
@@ -342,8 +353,9 @@ func (s *IscsiService) ReconcileTargets(ctx context.Context) error {
 	}
 	for i := range targets {
 		t := &targets[i]
-		// 同上：查询用平台实际的目标名（IQN），短名在平台上可能根本不存在。
-		iqn := s.targetIQN(t)
+		// 查询/重建用**寻址名**（下发的完整 IQN = Windows TargetName）。
+		// 不能用 targetIQN：那是客户端连接用的 TargetIqn（Windows 改写后的名字）。
+		iqn := t.IQN(s.iqnPrefix())
 		info, getErr := s.Iscsi.GetTarget(ctx, iqn)
 		if getErr != nil {
 			// ⚠️ 只有"确实不存在"（404）才重建。其它错误——脚本超时、权限不足、
@@ -487,6 +499,24 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	}
 	s.rememberActualIQN(target.TargetName, actual)
 
+	// 诊断：把平台侧读回的实际状态记下来（名字 / 启用 / initiator 授权 / 映射）。
+	//
+	// connect 阶段失败报 "target name is not found or is marked as hidden from login" 时，
+	// 只有这几项能定案：到底是被 Windows 改了名、没启用、还是 initiator 白名单拒绝
+	// （真实事故：目标明明 created+enabled+mapped，客户端仍连不上）。挂载失败时请贴这行。
+	if s.Iscsi != nil {
+		// 按寻址名（iqn）读回——TargetIqn 是连接名，`-TargetName` 查不到它。
+		if info, err := s.Iscsi.GetTarget(ctx, iqn); err == nil && info != nil {
+			s.Log.Info("iSCSI 目标实际状态",
+				"target", actual,
+				"enabled", info.Enabled,
+				"initiators", strings.Join(info.Initiators, ","),
+				"mapped_devices", len(info.Devices))
+		} else {
+			s.Log.Warn("读回 iSCSI 目标状态失败", "target", iqn, "error", err)
+		}
+	}
+
 	if err := s.Store.SetIscsiTargetEnabled(ctx, target.ID, true); err != nil {
 		return nil, err
 	}
@@ -519,8 +549,9 @@ func (s *IscsiService) Unpublish(ctx context.Context, targetID string) error {
 		}
 	}
 	if s.Iscsi != nil {
-		// 平台侧一律按**实际 IQN** 寻址（短名在平台上可能根本不存在，见 targetIQN）。
-		iqn := s.targetIQN(target)
+		// 按**寻址名**（下发的完整 IQN = Windows TargetName）操作。
+		// 不能用 targetIQN：那是客户端连接用的 TargetIqn（Windows 改写后的名字）。
+		iqn := target.IQN(s.iqnPrefix())
 		if diskPath != "" {
 			if err := s.Iscsi.DetachLun(ctx, iqn, diskPath); err != nil {
 				s.Log.Warn("解除映射失败", "target", target.TargetName, "error", err)
@@ -741,14 +772,12 @@ func (s *IscsiService) DisableTarget(ctx context.Context, targetName string) err
 //
 // CHAP 明文只在本方法内解密，绝不写入日志。
 func (s *IscsiService) buildTargetSpec(ctx context.Context, target *domain.IscsiTarget, enabled bool) (platform.TargetSpec, error) {
-	// Name 必须是**完整 IQN**，不能是短名（platform.TargetSpec.Name 的注释即"目标名（IQN）"）。
+	// Name 用**完整 IQN**（= Windows 的 TargetName，寻址用），不能是短名。
 	//
-	// 这是"TCP 3260 可达、但 Connect-IscsiTarget 登录失败"的根因：以前下发用的是短名
-	// （如 vault-0939b129-fd3ce655），而 Windows 目标服务器会按自己的命名权给目标起名
-	// （iscsi_set_target.ps1 里实测到 iqn.1991-05.com.microsoft:<短名> 这种形态），
-	// 于是客户端拿到的 IQN（我们按前缀拼的那个）在平台上根本不存在 —— 服务在监听、
-	// 端口也通，唯独登录的目标名对不上。统一下发完整 IQN 后，平台侧存储的名字就是
-	// 客户端要连的名字（IQN 形态的名字平台会原样保留）。
+	// 注意：Name 只是**寻址名**，不是客户端登录要用的名字。Windows 目标服务器会**改写**
+	// 目标名——TargetName 保持我们下发的值，但真正暴露给 initiator 的是 TargetIqn
+	// （形如 iqn.1991-05.com.microsoft:<host>-<name>-target）。客户端登录名以读回的
+	// TargetIqn 为准（见 discoverActualTargetName / targetIQN），这里只管寻址名。
 	spec := platform.TargetSpec{
 		Name:     target.IQN(s.iqnPrefix()),
 		Enabled:  enabled,

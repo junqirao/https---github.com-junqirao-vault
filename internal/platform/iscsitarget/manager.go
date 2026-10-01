@@ -261,8 +261,10 @@ func (m *Manager) listVirtualDisks(ctx context.Context, path string) ([]string, 
 
 // TargetInfo 描述一个 iSCSI 目标。
 type TargetInfo struct {
-	// Name 目标名。
+	// Name 目标名（下发给 Windows 的 TargetName，用于 `-TargetName` 寻址）。
 	Name string
+	// IQN 平台侧**实际对外**的 IQN（Windows 会改写目标名；客户端登录必须用它）。
+	IQN string
 	// Enabled 目标是否启用。
 	Enabled bool
 	// InitiatorIDs 已授权的 initiator 列表（形如 "IQN:iqn.xxx"）。
@@ -274,6 +276,7 @@ type TargetInfo struct {
 // targetDTO 是 iscsi_get_targets.ps1 中单条目标的 JSON 结构。
 type targetDTO struct {
 	Name          string     `json:"name"`
+	IQN           string     `json:"iqn"`
 	Enabled       bool       `json:"enabled"`
 	InitiatorIDs  stringList `json:"initiator_ids"`
 	MappedDevices stringList `json:"mapped_devices"`
@@ -313,6 +316,7 @@ func (m *Manager) listTargets(ctx context.Context, name string) ([]TargetInfo, e
 	for _, target := range result.Targets {
 		targets = append(targets, TargetInfo{
 			Name:          target.Name,
+			IQN:           target.IQN,
 			Enabled:       target.Enabled,
 			InitiatorIDs:  target.InitiatorIDs,
 			MappedDevices: target.MappedDevices,
@@ -369,7 +373,11 @@ type SetTargetOptions struct {
 	// ⚠️ 关键语义：IscsiTarget 模块没有 Add-InitiatorId / Remove-InitiatorId 这类增量 cmdlet，
 	// `-InitiatorIds` 是整体覆盖。要"追加一个授权"，调用方必须先 GetTarget 读出
 	// 现有列表、合并后整体回写（并自行加锁，避免并发覆盖）。
-	// 指向空切片表示清空全部授权；nil 表示不改动授权。
+	// 指向**空**切片表示"不限制（open）"——脚本会把空列表转成通配 `IQN:*`（任意 initiator）
+	// 下发。**绝不能**真的下发成 `-InitiatorIds @()`：Windows 上空的授权列表 = 拒绝所有
+	// initiator，客户端登录报 "target name is not found or is marked as hidden from login"
+	// （真实事故：目标已启用、已映射、名字也读回正确，唯独列表为空 → 连不上）。
+	// nil 表示不改动授权。
 	InitiatorIDs *[]string
 
 	// Enabled 非 nil 时启用/停用目标。停用后 initiator 无法继续访问。

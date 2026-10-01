@@ -535,13 +535,14 @@ func (sb *sandbox) remove() {
 	_ = os.RemoveAll(sb.dir)
 }
 
-// randomSecret 生成 12 字节随机数的 base64（16 字符），与 app.defaultChapSecretBytes 一致。
+// randomSecret 生成 12 字节随机数的 URL 安全 base64（16 字符），与 app.defaultChapSecretBytes
+// 及 secret.RandomSecret 保持一致（无 `+`/`/`/`=`，避免命令行传参被破坏）。
 func randomSecret() string {
 	buf := make([]byte, 12)
 	if _, err := rand.Read(buf); err != nil {
 		return "vaultcheck-secret"
 	}
-	return base64.StdEncoding.EncodeToString(buf)
+	return base64.RawURLEncoding.EncodeToString(buf)
 }
 
 func psQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }

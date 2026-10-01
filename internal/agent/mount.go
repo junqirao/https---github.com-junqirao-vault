@@ -239,7 +239,11 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		AuthMode:      clientAuthMode(spec.AuthMode),
 		ChapUser:      spec.ChapUser,
 		ChapSecret:    spec.ChapSecret,
-		Persistent:    true,
+		// 不用 Windows 持久化目标（-IsPersistent）：它与 OneWayCHAP 明文密钥叠加时会把
+		// 目标连成 "hidden from login"（真实事故：手动 Connect 去掉 -IsPersistent 后
+		// 立即连上）。重启后的重连由本代理的 restoreMounts 自动重挂负责，无需依赖
+		// Windows 的持久目标。
+		Persistent: false,
 	}); err != nil {
 		return failConnect("connect", err)
 	}

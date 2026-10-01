@@ -274,7 +274,10 @@ func (a *Agent) resolveUpdateKind(ctx context.Context, kind updatepkg.ArtifactKi
 	// 这里改为按序尝试并在结果中返回真正生效的更新源。
 	session, ok := a.store.Session()
 	if !ok || strings.TrimSpace(session.ServerURL) == "" {
-		a.noteUpdateError("update_source", errNoSession())
+		// 无会话是"尚未登录 / 会话已过期"的**预期状态**，不是更新源故障：不要把它写成
+		// 服务端的"最后错误"（否则界面上会挂一条 `update_source:agent.no_session`，
+		// 看着像"连接服务器失败"，实为误导 —— 真实反馈）。更新结果仍带 reason=no_session，
+		// 设置页可据此显示"未登录"。
 		return nil, a.unavailable("no_session"), nil
 	}
 	client, err := newServerClient(session.ServerURL, session.Token, session.CertSHA256, a.logger)

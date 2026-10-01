@@ -207,6 +207,45 @@ func TestPublishUsesPlatformActualNameAsIQN(t *testing.T) {
 	}
 }
 
+// iqnOnlyBackend 模拟 Windows 的**真实**改写形态：TargetName 保持不变，真正对外暴露的
+// 名字放在 TargetIqn（即 TargetInfo.IQN）里。
+type iqnOnlyBackend struct {
+	platform.IscsiBackend
+	actual map[string]platform.TargetInfo
+}
+
+func (f *iqnOnlyBackend) GetTarget(_ context.Context, name string) (*platform.TargetInfo, error) {
+	info, ok := f.actual[name]
+	if !ok {
+		return nil, nil
+	}
+	return &info, nil
+}
+
+func (f *iqnOnlyBackend) ListTargets(context.Context) ([]platform.TargetInfo, error) {
+	out := make([]platform.TargetInfo, 0, len(f.actual))
+	for _, info := range f.actual {
+		out = append(out, info)
+	}
+	return out, nil
+}
+
+// TestDiscoverActualTargetNamePrefersTargetIqn 平台改写目标名时，下发给客户端的必须是
+// **TargetIqn**（Windows 真正对外暴露的名字），而不是我们下发的 TargetName ——
+// 否则客户端拿 TargetName 去连会 "target name is not found"（真实事故）。
+func TestDiscoverActualTargetNamePrefersTargetIqn(t *testing.T) {
+	const fullIQN = "iqn.2026-01.com.vault:vault-aaaa-bbbb"
+	const transformed = "iqn.1991-05.com.microsoft:win-0e595h11jss-iqn.2026-01.com.vault:vault-aaaa-bbbb-target"
+	backend := &iqnOnlyBackend{actual: map[string]platform.TargetInfo{
+		fullIQN: {Name: fullIQN, IQN: transformed, Enabled: true},
+	}}
+	svc := newIqnTestService(t, backend)
+
+	if got := svc.discoverActualTargetName(context.Background(), fullIQN, "vault-aaaa-bbbb"); got != transformed {
+		t.Fatalf("应返回平台实际 IQN %q，实际 %q", transformed, got)
+	}
+}
+
 // TestPublishMigratesLegacyTargetName 旧命名的目标（短名 / Windows 默认命名权形态）必须被
 // 清理并按完整 IQN 重建：否则同一个 VHDX 会被两个目标争抢映射。
 func TestPublishMigratesLegacyTargetName(t *testing.T) {

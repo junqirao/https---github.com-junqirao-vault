@@ -449,6 +449,7 @@ const hyperVProbeScript = `$cmd = Get-Command -Name Set-VHD -ErrorAction Silentl
 func toTargetInfo(info *iscsitarget.TargetInfo) *platform.TargetInfo {
 	return &platform.TargetInfo{
 		Name:       info.Name,
+		IQN:        info.IQN,
 		Enabled:    info.Enabled,
 		Initiators: info.InitiatorIDs,
 		Devices:    info.MappedDevices,

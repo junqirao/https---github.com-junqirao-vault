@@ -1214,12 +1214,13 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 ```
 服务端（唯一可行路径）：
   1. Set-IscsiServerTarget -TargetName T -Enable $false
-     → 目标停用，已建立的连接会被中断（时延待实测）
-  2. [可选] Set-IscsiServerTarget -TargetName T -InitiatorIds @()
-     → 清空白名单，防止重连
-  3. SSE 推送 {type:'revoke', reason:'admin'|'lease_expired'} 给该客户端
-  4. 客户端收到指令后：执行 5.5 卸载流程 → 随后 Delete-IscsiTarget（清理发现缓存）
-  5. 客户端重连前需重新走 POST /mount，若授权已撤销则被拒
+     → 目标停用，已建立的连接会被中断（时延待实测）；**保持停用即防重连**
+     （⚠️ 不要用 `-InitiatorIds @()` 来"清空白名单防重连"：空列表在 Windows 上 = 拒绝所有
+       initiator，下发脚本会把空列表转成通配 `IQN:*`（= 任意 initiator，开放），
+       见 iscsi_set_target.ps1；防重连的正解就是 Enabled=$false）
+  2. SSE 推送 {type:'revoke', reason:'admin'|'lease_expired'} 给该客户端
+  3. 客户端收到指令后：执行 5.5 卸载流程 → 随后 Delete-IscsiTarget（清理发现缓存）
+  4. 客户端重连前需重新走 POST /mount，若授权已撤销则被拒
 ```
 
 **必须向业务方说明的语义降级**

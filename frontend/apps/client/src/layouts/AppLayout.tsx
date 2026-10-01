@@ -31,6 +31,7 @@ import {
   spacing,
   translateError,
   useAgent,
+  useAgentEventNotifier,
   useAgentVersion,
   useAuth,
   useI18n,
@@ -54,6 +55,9 @@ export interface AppLayoutProps {
 export function AppLayout({ mode, language, onLanguageChange, onManageServers, autoMount }: AppLayoutProps): JSX.Element {
   const { t } = useI18n()
   const navigate = useNavigate()
+  // 代理事件的全局通知出口：整个应用只注册一次（放外壳里）。
+  // 之前每个 useAgent 组件都注册一个，同一条事件会弹出 2-3 条重复提示。
+  useAgentEventNotifier()
   const location = useLocation()
   const { user, isSuperAdmin, logout } = useAuth()
   const { servers, activeKey, active, setActive } = useServerConfig()

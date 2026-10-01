@@ -670,6 +670,8 @@
   "agent.action.selected": "{count} selected",
   "agent.action.mountDebug": "Debug: fetch mount parameters",
   "agent.unmount.confirm": "Unmount this mount point?",
+  "agent.unmount.forceTitle": "Force unmount",
+  "agent.unmount.forceConfirm": "The normal unmount failed (the disk, session, or mount point may no longer exist on this machine). Force unmount skips the failed cleanup steps, removes local residue as best it can, and deletes this record. Data is stored on the server and will not be lost.",
   "agent.unmount.batchConfirm": "Unmount the {count} selected mount points?",
   "agent.mount.dialog.title": "Mount repository",
   "agent.mount.dialog.mode": "Mount mode",

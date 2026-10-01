@@ -260,11 +260,22 @@ try {
         }
     }
 
-    # 授权列表：全量替换（[] 表示清空全部授权）
+    # 授权列表：**始终**下发（整体覆盖）。
+    #
+    # ⚠️ 空列表/不带 -InitiatorIds 在 Windows 目标服务器上都等于**拒绝所有 initiator**，
+    # 客户端登录报 "The target name is not found or is marked as hidden from login"
+    # （真实事故：目标已启用、已映射、名字也读回正确，唯独 initiator 列表为空 → 连不上）。
+    # 空的真实语义应是"不限制（open）"，在 Windows 上要用通配 `IQN:*` 表达"任意 initiator"。
+    # 访问控制由单向 CHAP 负责。
     $bindMode = 'unchanged'
     if ($InitiatorIdsJson -ne '') {
-        $step = 'set_initiators'
         $ids = @(ConvertFrom-Json -InputObject $InitiatorIdsJson | Where-Object { $_ })
+        if ($ids.Count -eq 0) {
+            # 空 = open：下发通配"任意 initiator"，而不是留一个拒绝所有的空列表。
+            $ids = @('IQN:*')
+        }
+
+        $step = 'set_initiators'
 
         # 参数名与元素类型按运行时探测：
         #   - 若存在"接受字符串"的参数（部分版本把 -InitiatorId 做成 string[]），优先用它；
@@ -298,9 +309,32 @@ try {
     #
     # ⚠️ 顺序约束（Windows 侧实测语义）：目标必须**先有已映射的虚拟盘**才能被启用，
     # 因此调用方（winbackend.EnsureTarget）把 AddMapping 放在启用之前。
+    #
+    # ⚠️ 必须用 -Enable:$true 冒号语法：同一个 cmdlet 上 -EnableChap:$true（冒号）实测生效，
+    # 而 -Enable $true（空格）**不报错但不生效**，目标停留在 Disabled，客户端登录报
+    # "target name is not found or is marked as hidden from login"（真实事故）。
+    # 冒号语法对 switch 与 bool 两种参数形态都正确绑定。
     if ($Enabled -ne '') {
         $step = 'set_enabled'
-        Set-IscsiServerTarget -TargetName $TargetName -Enable ([System.Boolean]::Parse($Enabled)) -ErrorAction Stop
+        $enableFlag = [System.Boolean]::Parse($Enabled)
+        if ($enableFlag) {
+            Set-IscsiServerTarget -TargetName $TargetName -Enable:$true -ErrorAction Stop
+        } else {
+            Set-IscsiServerTarget -TargetName $TargetName -Enable:$false -ErrorAction Stop
+        }
+
+        # 回读验证：启用/停用必须真的生效。静默失败曾让目标停留在 Disabled，
+        # 而上层日志只看到 action=updated，无从排查（真实事故）。
+        $verify = Get-IscsiServerTarget -TargetName $TargetName -ErrorAction Stop
+        $verifyStatus = ''
+        try { $verifyStatus = [string]$verify.Status } catch { }
+        $looksDisabled = $verifyStatus -match '^(Disabled|Stopped|Offline|Inactive)$'
+        if ($enableFlag -and $looksDisabled) {
+            throw ("目标启用未生效（Status=$verifyStatus）。已尝试 -Enable:`$true，请检查 Set-IscsiServerTarget 的参数形态")
+        }
+        if (-not $enableFlag -and -not $looksDisabled) {
+            throw ("目标停用未生效（Status=$verifyStatus）")
+        }
     }
 
     # 单向 CHAP

@@ -667,6 +667,8 @@
   "agent.action.selected": "{count} 件を選択中",
   "agent.action.mountDebug": "デバッグ：マウントパラメータを取得",
   "agent.unmount.confirm": "このマウントポイントをアンマウントしますか？",
+  "agent.unmount.forceTitle": "強制アンマウント",
+  "agent.unmount.forceConfirm": "通常のアンマウントに失敗しました（ディスク・セッション・マウントポイントが既に存在しない可能性があります）。強制アンマウントは失敗したクリーンアップ手順をスキップし、可能な範囲で残存を解除してこのレコードを削除します。データはサーバー側に保存されるため失われません。",
   "agent.unmount.batchConfirm": "選択した {count} 個のマウントポイントをアンマウントしますか？",
   "agent.mount.dialog.title": "リポジトリのマウント",
   "agent.mount.dialog.mode": "マウント形態",

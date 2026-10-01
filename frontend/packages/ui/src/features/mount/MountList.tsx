@@ -33,6 +33,7 @@ export function MountList(): JSX.Element {
   const [error, setError] = useState<unknown>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [pendingUnmount, setPendingUnmount] = useState<AgentMountState[] | null>(null)
+  const [pendingForce, setPendingForce] = useState<AgentMountState[] | null>(null)
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -62,16 +63,21 @@ export function MountList(): JSX.Element {
     return t('agent.mount.leaseEstimate', { seconds: String(estimate) })
   }
 
-  const runUnmount = async (targets: AgentMountState[]): Promise<void> => {
+  const runUnmount = async (targets: AgentMountState[], force = false): Promise<void> => {
     setError(null)
     try {
       for (const mount of targets) {
         setBusyId(mount.allocation_id)
-        await agent.unmount({ allocation_id: mount.allocation_id })
+        await agent.unmount({ allocation_id: mount.allocation_id, force })
       }
       setSelected([])
+      setPendingForce(null)
     } catch (err) {
       setError(err)
+      // 普通卸载失败（磁盘/会话/挂载点在本机早已不存在等）时给出**强制卸载**出口：
+      // 代理会跳过失败的清理步骤、尽力拆除残留并删除记录。没有这个出口，脏记录
+      // （如"卡在卸载中"）永远无法从界面删除（真实反馈："一直卡在卸载中，也无法删除"）。
+      if (!force) setPendingForce(targets)
     } finally {
       setBusyId(null)
       setPendingUnmount(null)
@@ -200,6 +206,19 @@ export function MountList(): JSX.Element {
           if (pendingUnmount) void runUnmount(pendingUnmount)
         }}
         onCancel={() => setPendingUnmount(null)}
+      />
+
+      {/* 强制卸载：普通卸载失败后的兜底出口（代理跳过失败的清理步骤并删除记录）。 */}
+      <ConfirmDialog
+        open={pendingForce !== null}
+        danger
+        title={t('agent.unmount.forceTitle')}
+        content={t('agent.unmount.forceConfirm')}
+        loading={busyId !== null}
+        onConfirm={() => {
+          if (pendingForce) void runUnmount(pendingForce, true)
+        }}
+        onCancel={() => setPendingForce(null)}
       />
     </PageShell>
   )

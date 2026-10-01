@@ -667,6 +667,8 @@
   "agent.action.selected": "{count}개 선택됨",
   "agent.action.mountDebug": "디버그: 마운트 매개변수 가져오기",
   "agent.unmount.confirm": "이 마운트 지점을 마운트 해제하시겠습니까?",
+  "agent.unmount.forceTitle": "강제 마운트 해제",
+  "agent.unmount.forceConfirm": "일반 마운트 해제에 실패했습니다(디스크, 세션 또는 마운트 지점이 이미 존재하지 않을 수 있습니다). 강제 마운트 해제는 실패한 정리 단계를 건너뛰고, 가능한 범위에서 로컬 잔여를 제거하며 이 레코드를 삭제합니다. 데이터는 서버에 저장되므로 손실되지 않습니다.",
   "agent.unmount.batchConfirm": "선택한 {count}개 마운트 지점을 마운트 해제하시겠습니까?",
   "agent.mount.dialog.title": "저장소 마운트",
   "agent.mount.dialog.mode": "마운트 형태",

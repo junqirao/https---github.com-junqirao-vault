@@ -57,6 +57,7 @@ export {
 export {
   subscribeAgentSession,
   useAgent,
+  useAgentEventNotifier,
   useAgentVersion,
   type AgentMountInput,
   type AgentUnmountInput,

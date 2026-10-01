@@ -38,6 +38,12 @@ try {
     $items = @()
     foreach ($target in $targets) {
         $name = [string]$target.TargetName
+        # 实际对外 IQN（客户端必须用它登录）：Windows 目标服务器会**改写**目标名——
+        # 传给 New-IscsiServerTarget 的 TargetName 保持不变，但真正暴露给 initiator 的
+        # 名字是 TargetIqn（形如 iqn.1991-05.com.microsoft:<host>-<name>-target）。
+        # 若不读它、继续拿 TargetName 下发，客户端就会 "target not found"（真实事故）。
+        $targetIqn = ''
+        try { $targetIqn = [string]$target.TargetIqn } catch { }
 
         # 授权列表：归一为 "类型:值" 字符串（Method 是枚举，[string] 转换得到名称）。
         #
@@ -99,6 +105,7 @@ try {
 
         $items += [pscustomobject]@{
             name           = $name
+            iqn            = $targetIqn
             enabled        = $enabled
             enabled_source = $enabledSource
             status         = $status

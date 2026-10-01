@@ -566,6 +566,16 @@ func (s *DiskService) purgeRepository(ctx context.Context, repoID string) error 
 	if err != nil {
 		return err
 	}
+	// 先记下**本库**的分配 ID：下面的目标清理只允许命中这些分配。
+	//
+	// ⚠️ 全量目标列表里还有**其他库**的目标。无差别删除会把别的库的目标 DB 记录也删掉，
+	// 而它们的 Windows 目标还在——正在进行的挂载随后 SetIscsiTargetEnabled 0 行受影响，
+	// 直接 404 iscsi.target_not_found；后续挂载重建 DB 记录还会换新 CHAP 密钥
+	// （真实事故：删一个库导致另一个库的挂载失败）。
+	ownAllocations := make(map[string]bool, len(allocations))
+	for i := range allocations {
+		ownAllocations[allocations[i].ID] = true
+	}
 	for i := range allocations {
 		if err := s.removeAllocation(ctx, allocations[i].ID); err != nil {
 			return err
@@ -577,7 +587,7 @@ func (s *DiskService) purgeRepository(ctx context.Context, repoID string) error 
 	}
 	for i := range targets {
 		t := &targets[i]
-		if t.AllocationID == nil {
+		if t.AllocationID == nil || !ownAllocations[*t.AllocationID] {
 			continue
 		}
 		if err := s.Store.DeleteIscsiTarget(ctx, t.ID); err != nil {

@@ -93,6 +93,9 @@ let snapshot: {
 }
 
 const snapshotListeners = new Set<() => void>()
+// 事件通知出口。⚠️ 全局只应注册**一个**（见 useAgentEventNotifier）：
+// 每个出口都会把一条事件弹成一条提示，注册 N 个就弹 N 条重复提示（真实反馈：
+// "不管什么事件都会弹出来两个或者三个"——因为每个 useAgent 组件都注册了一个）。
 const notifiers = new Set<(text: string) => void>()
 /** 会话更新订阅者：宿主应用据此把新令牌同步到自己的会话存储与 API 客户端。 */
 const sessionListeners = new Set<(session: AgentSessionState) => void>()
@@ -462,9 +465,13 @@ function start(): void {
   })()
 }
 
-/** 本地代理状态与挂载操作（单例订阅 + SSE 实时更新）。 */
-export function useAgent(): UseAgentResult {
-  const current = useSyncExternalStore(subscribeSnapshot, getSnapshot, getSnapshot)
+/**
+ * 注册代理事件的**全局通知出口**（整个应用只调用一次，放应用外壳里）。
+ *
+ * 为什么不放进 useAgent()：通知是全局唯一的，而 useAgent 会被多个组件调用——
+ * 每个组件注册一个出口，同一条事件就会弹出 N 条重复提示（真实反馈）。
+ */
+export function useAgentEventNotifier(): void {
   const { message } = App.useApp()
 
   useEffect(() => {
@@ -472,11 +479,19 @@ export function useAgent(): UseAgentResult {
       message.info(text)
     }
     notifiers.add(notifier)
-    start()
     return () => {
       notifiers.delete(notifier)
     }
   }, [message])
+}
+
+/** 本地代理状态与挂载操作（单例订阅 + SSE 实时更新）。 */
+export function useAgent(): UseAgentResult {
+  const current = useSyncExternalStore(subscribeSnapshot, getSnapshot, getSnapshot)
+
+  useEffect(() => {
+    start()
+  }, [])
 
   const refresh = useCallback(async (): Promise<void> => {
     await probe()

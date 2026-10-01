@@ -1,6 +1,6 @@
 {
   "name": "@vault/client",
-  "version": "0.1.44",
+  "version": "0.1.52",
   "private": true,
   "description": "Vault",
   "main": "dist-electron/main.js",

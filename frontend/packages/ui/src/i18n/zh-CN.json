@@ -670,6 +670,8 @@
   "agent.action.selected": "已选择 {count} 项",
   "agent.action.mountDebug": "调试：获取挂载参数",
   "agent.unmount.confirm": "确定卸载该挂载点吗？",
+  "agent.unmount.forceTitle": "强制卸载",
+  "agent.unmount.forceConfirm": "普通卸载失败（本机可能已没有对应的磁盘、会话或挂载点）。强制卸载会跳过失败的清理步骤、尽力移除本机残留并删除这条记录。数据保存在服务端，不会因此丢失。",
   "agent.unmount.batchConfirm": "确定卸载所选的 {count} 个挂载点吗？",
   "agent.mount.dialog.title": "挂载存储库",
   "agent.mount.dialog.mode": "挂载形态",
