@@ -49,3 +49,4 @@ pki/
 .idea/
 .DS_Store
 Thumbs.db
+release-*/

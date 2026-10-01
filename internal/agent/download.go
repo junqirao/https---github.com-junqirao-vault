@@ -768,7 +768,6 @@ func (a *Agent) copySegment(ctx context.Context, client *serverClient, diskID st
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return err
 	}
 }
 
