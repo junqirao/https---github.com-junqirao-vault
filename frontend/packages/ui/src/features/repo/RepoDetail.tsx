@@ -16,6 +16,7 @@ import { formatBytes, formatTime } from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
+import { RepoMountActions, useRepoMount } from './RepoMount'
 
 export interface RepoDetailProps {
   repoId: string
@@ -128,6 +129,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       title={repo?.name ?? t('repo.detail.title')}
       extra={
         <>
+          {/* 与列表卡片同一套"挂载/卸载"联动按钮：进了详情也不必退回列表才能挂载。
+              库记录可能还没查回来（加载中/出错），此时不渲染。 */}
+          {repo ? <RepoDetailMountActions repo={repo} currentUserId={currentUserId} /> : null}
           <Button onClick={onBack}>{t('common.back')}</Button>
           <Button onClick={() => repo && openEdit(repo)} disabled={!repo}>
             {t('common.edit')}
@@ -261,4 +265,16 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       />
     </PageShell>
   )
+}
+
+/**
+ * 详情页标题栏的挂载/卸载按钮：直接复用列表卡片的控制器与组件，行为完全一致
+ * （无分配时由库主按需自建分配，再交给本机代理挂载）。
+ *
+ * 单独抽成一个组件，是因为 `useRepoMount` 需要一份完整的库记录，而详情页的库是异步查出来的
+ * ——在父组件里调用会踩到 "hooks 必须在提前 return 之前" 的限制。
+ */
+function RepoDetailMountActions({ repo, currentUserId }: { repo: RepoDTO; currentUserId: string }): JSX.Element {
+  const controller = useRepoMount(repo, currentUserId)
+  return <RepoMountActions controller={controller} />
 }

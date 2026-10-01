@@ -19,11 +19,21 @@ type createRepoRequest struct {
 	// Mode shared | exclusive。
 	Mode string `json:"mode"`
 	// OwnerID 仅超级管理员可指定；普通用户只能为自己建库。
-	OwnerID      string `json:"owner_id"`
-	SourceDir    string `json:"source_dir"`
-	SizeBytes    int64  `json:"size_bytes"`
-	MaxDiffDisks int    `json:"max_diff_disks"`
-	QuotaBytes   int64  `json:"quota_bytes"`
+	OwnerID   string `json:"owner_id"`
+	SourceDir string `json:"source_dir"`
+	SizeBytes int64  `json:"size_bytes"`
+	// ShareCount 共享数量：建库时预创建的差异盘（池位）数量，同时也是差异盘上限 ——
+	// 预创建几个就能分给几个用户。填 0（或留空）表示不预创建，差异盘在分配时按需派生。
+	//
+	// 填了它之后建库会变成异步：库先进入 creating，母盘、池位盘与 iSCSI 目标全部就绪后
+	// 才转为 active；在此期间分配与挂载都会被拒绝（前端会显示当前步骤）。
+	ShareCount int `json:"share_count"`
+	// MaxDiffDisks 是 ShareCount 改名前的字段，两者等价。
+	//
+	// 用指针是为了区分"显式传 0"和"没传"：老客户端不传时按 ShareCount 处理，
+	// 显式传 0 表示明确不要预创建。
+	MaxDiffDisks *int  `json:"max_diff_disks"`
+	QuotaBytes   int64 `json:"quota_bytes"`
 	Group        string `json:"group"`
 	// StorageID 可选的目标存储 ID（留空则在所有启用存储中自动选根）。
 	StorageID string `json:"storage_id"`
@@ -79,13 +89,19 @@ func (r *Router) handleCreateRepo(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// share_count 优先；老字段 max_diff_disks 只在没给新字段时兜底。
+	share := in.ShareCount
+	if in.MaxDiffDisks != nil && in.ShareCount == 0 {
+		share = *in.MaxDiffDisks
+	}
+
 	repo, disk, err := r.deps.App.Repos().Create(req.Context(), app.CreateRepoInput{
 		Name:         in.Name,
 		Mode:         domain.RepoMode(in.Mode),
 		OwnerID:      owner,
 		SourceDir:    in.SourceDir,
 		SizeBytes:    in.SizeBytes,
-		MaxDiffDisks: in.MaxDiffDisks,
+		MaxDiffDisks: share,
 		QuotaBytes:   in.QuotaBytes,
 		Group:        in.Group,
 		StorageID:    in.StorageID,

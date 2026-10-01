@@ -198,6 +198,24 @@ func (s *Store) SetIscsiTargetEnabled(ctx context.Context, id string, enabled bo
 	return mustAffect(res, apperr.IscsiTargetNotFound().WithArg("id", id))
 }
 
+// SetIscsiTargetAllocation 把目标绑到某个分配上；allocationID 为空表示解绑（回到池中）。
+//
+// 池化库在**分配**时才建立这个关联：建库预创建时还没有分配，目标只按 disk 关联；
+// 而挂载、卸载、按分配查目标这些路径都是按 allocation 找目标的（见 IscsiService.Publish）。
+func (s *Store) SetIscsiTargetAllocation(ctx context.Context, targetID, allocationID string) error {
+	var alloc any
+	if allocationID != "" {
+		alloc = allocationID
+	}
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE iscsi_targets SET allocation_id = ?, updated_at = ? WHERE id = ?`),
+		alloc, nowMillis(), targetID)
+	if err != nil {
+		return fmt.Errorf("store: 绑定 iSCSI 目标到分配失败: %w", err)
+	}
+	return mustAffect(res, apperr.IscsiTargetNotFound().WithArg("id", targetID))
+}
+
 // DeleteIscsiTarget 删除目标及其 initiator 白名单。
 func (s *Store) DeleteIscsiTarget(ctx context.Context, id string) error {
 	if _, err := s.q.ExecContext(ctx, s.q.Rebind(`DELETE FROM iscsi_initiator_ids WHERE target_id = ?`), id); err != nil {

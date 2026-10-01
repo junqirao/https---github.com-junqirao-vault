@@ -36,9 +36,9 @@ export interface AgentMountInput {
   repo_name?: string
 }
 
+/** 卸载入参。没有 force：代理侧只剩一种卸载语义（一次尽力清理干净）。 */
 export interface AgentUnmountInput {
   allocation_id: string
-  force?: boolean
 }
 
 export interface UseAgentResult {

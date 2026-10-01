@@ -196,8 +196,9 @@ export function MountActionButtons({
   // mounting/unmounting 都是"转场中"，重新挂载在两者期间都不可点。
   const transitioning = mount?.state === 'mounting' || mount?.state === 'unmounting'
   // 卸载：只在 mounting 中禁用；unmounting（含卡死的脏记录）**必须可点**——
-  // 否则用户永远触发不了"普通卸载失败 → 强制卸载"的兜底（真实反馈：
-  // "卡在卸载中，也没有强制卸载的选项"——因为卸载按钮是灰的）。
+  // 记录卡在"卸载中"时，重试卸载是唯一的出口；按钮一旦是灰的，用户就再也点不动了
+  // （真实反馈："卡在卸载中，也没有卸载的选项"）。
+  // 现在代理侧只有一种卸载语义（尽力清理干净并删除记录），重试永远有意义。
   const unmountDisabled = !available || mount?.state === 'mounting'
   const buttons = (
     <Space size={0}>

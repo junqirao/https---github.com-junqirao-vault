@@ -249,9 +249,11 @@ func (a *Agent) handleMount(w http.ResponseWriter, r *http.Request) {
 }
 
 // unmountRequest 是卸载请求。
+//
+// 没有 force 字段：卸载只有一种语义（见 mountEngine.unmount 的注释），
+// 客户端旧版本带上的 force 会被忽略（decodeJSON 不做未知字段报错）。
 type unmountRequest struct {
 	AllocationID string `json:"allocation_id"`
-	Force        bool   `json:"force"`
 }
 
 // handleUnmount 卸载指定分配。
@@ -261,7 +263,7 @@ func (a *Agent) handleUnmount(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, err)
 		return
 	}
-	if err := a.engine.unmount(r.Context(), req.AllocationID, req.Force); err != nil {
+	if err := a.engine.unmount(r.Context(), req.AllocationID); err != nil {
 		a.writeError(w, err)
 		return
 	}

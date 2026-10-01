@@ -177,14 +177,18 @@ POST /agent/mount
   #     抹掉它等于以后再也不自动挂回。
 
 POST /agent/unmount
-  ↓ {allocation_id, force?:bool}
+  ↓ {allocation_id}            # 没有 force：只有一种卸载语义
   ↑ {ok:true}
   # 代理内部：移除挂载点（必须先做，盘 Offline 后盘符就没了）
   #          → 磁盘 Offline（必须先于断开，否则报告 0xefff0040）
   #          → Disconnect-IscsiTarget（device_in_use 时补下线并重试）
   #          → Unregister-IscsiSession → POST /v1/leases/{id}/release
-  # 失败时带 stage（mount_point/disk_offline/disconnect）；已拆掉一部分则保留 error 记录，
-  # 不回滚成 mounted（否则界面谎报"已挂载"并弹"挂载成功"提示）。
+  # 只有一种失败：**挂载点还在**（盘符/目录仍属于该卷，Windows 认为卷被占用）→ 带
+  # stage="mount_point" 返回 500，记录回滚成卸载前的状态（盘确实还挂着，界面如实显示）。
+  # 用户关掉占用它的程序再点一次即可，不需要"强制卸载"这种第二入口。
+  # 挂载点一旦移除（含报错但实际已不存在），后面几步都只是清残留：任一步失败只记日志、
+  # 不中断，记录照样删除（服务端 release 会停用目标把残留会话踢掉）—— 因此不会留下
+  # "盘符没了、状态还写着已挂载、还得再点一次强制卸载"的记录。
 
 POST /agent/remount
   ↓ {allocation_id}
@@ -526,7 +530,7 @@ POST /agent/shutdown       ↑ {ok:true}   # 托盘"退出"使用；代理会先
 | `agent.no_session` | 尚未推送服务端会话（409） |
 | `agent.admin_required` | 代理未以管理员权限运行（403） |
 | `agent.mount_failed` | 挂载失败（500，args.stage 指明阶段）。**connect / wait_connected 阶段**还会带诊断参数：`args.portal`（门户地址:端口）、`args.target_iqn`、`args.auth_mode`、`args.tcp`（门户 TCP 可达性探测结论：reachable/timeout/refused/unreachable），以及 `args.detail`（**原始报错**，如 Connect-IscsiTarget 的 .NET 异常 —— 失败记录会被抹掉，这是界面唯一能看到的真因）。**绝不含 CHAP 密钥** |
-| `agent.unmount_failed` | 卸载失败（500） |
+| `agent.unmount_failed` | 卸载失败（500，args.stage 指明阶段；统一卸载后只剩 `mount_point`：该盘仍被程序占用，界面会附"关掉占用它的程序再重试"的提示） |
 | `agent.busy_mounts` | 有活跃挂载，操作被拒（409） |
 | `agent.not_mounted` | 指定分配当前未挂载（404） |
 | `agent.server_unreachable` | 无法连接服务端（502） |

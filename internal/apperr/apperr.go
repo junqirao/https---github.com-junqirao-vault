@@ -171,6 +171,12 @@ func RepoDiffLimitExceeded(limit int) *Error {
 	return New("repo.diff_limit_exceeded", http.StatusConflict).WithArg("limit", limit)
 }
 
+// RepoCreating 存储库仍在建库中（母盘与"共享数量"个差异盘正在异步预创建）。
+//
+// 与 repo.state_invalid 分开：那是一个笼统的"状态不对"，而这里必须让用户看懂
+// "库还没建好，等它建完就能分配/挂载了"，前端也好据此把按钮置灰并显示当前步骤。
+func RepoCreating() *Error { return New("repo.creating", http.StatusConflict) }
+
 // RepoHasActiveLease 仍有客户端在线，禁止进入维护/清理。
 func RepoHasActiveLease(count int) *Error {
 	return New("repo.has_active_lease", http.StatusConflict).WithArg("count", count)

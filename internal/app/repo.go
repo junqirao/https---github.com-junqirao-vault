@@ -20,7 +20,21 @@ import (
 //
 // 事务边界约定：配额校验与"读-校验-写"必须在 Store.Tx + LockRepository 内完成，
 // 否则会出现配额超卖（见 docs/implementation.md 5.13）。
+// maxPreparedDisks 是建库时允许预创建的池位（= 共享数量）上限。
+//
+// 每个池位都要真派生一次 VHDX 并下发一次 iSCSI 目标（Windows 上单个目标约 15-20 秒），
+// 不设上限的话一次误填就能把服务端占住几十分钟。需要更多并发用户就建多个库。
+const maxPreparedDisks = 32
+
 type RepoService struct{ Deps }
+
+// parentIDOf 取库的母盘 ID；没有母盘（独享库或数据异常）时返回空串。
+func parentIDOf(repo *domain.Repository) string {
+	if repo == nil || repo.ParentDiskID == nil {
+		return ""
+	}
+	return *repo.ParentDiskID
+}
 
 // ParentAction 是母盘用途迁移动作（对外由 API 的 parent/actions 路由暴露）。
 type ParentAction string
@@ -96,6 +110,28 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 		return nil, nil, apperr.InvalidParam("owner_id")
 	}
 
+	// share 是"共享数量"：共享模式下建库时就按这个数量把差异盘池建好
+	// （每个池位 = 一块差异盘 + 一个 iSCSI 目标），之后每次分配占用一格。
+	//
+	// 它同时就是差异盘上限（见 domain.Repository.MaxDiffDisks 注释）：预创建多少，
+	// 就最多能分给多少个用户 —— 避免"预创建 5 个但上限 3 个"这类自相矛盾的配置。
+	share := in.MaxDiffDisks
+	if share < 0 {
+		return nil, nil, apperr.InvalidParam("max_diff_disks")
+	}
+	if share > maxPreparedDisks {
+		// 每个池位都要真派生一次 VHDX 并下发一次 iSCSI 目标（Windows 上单个目标约 15-20 秒），
+		// 不设上限的话一次误填就能把服务端占住几十分钟。
+		return nil, nil, apperr.InvalidParam("max_diff_disks")
+	}
+	if in.Mode != domain.RepoModeShared {
+		// 独享模式没有差异盘，"共享数量"无意义；静默归零而不是报错（老客户端仍会带这个字段）。
+		share = 0
+	}
+	// preparing：这次建库要不要顺手把差异盘池建好（共享模式 + 填了共享数量）。
+	// 后面的事务与任务派发都要用它，因此在事务外先算好。
+	preparing := in.Mode == domain.RepoModeShared && share > 0
+
 	raw := s.raw()
 	srcDir := strings.TrimSpace(in.SourceDir)
 	if srcDir != "" {
@@ -153,12 +189,26 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 			return apperr.RepoQuotaExceeded(owner.QuotaBytes, owner.UsedBytes, size)
 		}
 
-		maxDiff := in.MaxDiffDisks
+		// maxDiff 既是"共享数量"也是差异盘上限（见 domain.Repository.MaxDiffDisks）。
+		// 显式填了数字就用它（这些池位会被预创建）；没填才回退配置默认值 ——
+		// 默认值只当上限用、不做预创建，免得默认配置下每建一个库就派生几十块盘、建几十个 iSCSI 目标。
+		maxDiff := share
 		if maxDiff <= 0 {
 			maxDiff = raw.Storage.DefaultMaxDiffDisks
 		}
 		if maxDiff <= 0 {
 			maxDiff = 50
+		}
+
+		// 预创建（池化）：填了共享数量就必须先把池建好，再让库进入可用状态。
+		// 否则用户要么分配到"还没建的池位"，要么挂载时又退回等建盘的老路径 ——
+		// 那正是共享数量想消除的东西。
+		state := domain.RepoStateActive
+		meta := domain.RepoMeta{Group: strings.TrimSpace(in.Group)}
+		if preparing {
+			state = domain.RepoStateCreating
+			meta.Pool = true
+			meta.Prepare = &domain.RepoPrepare{Phase: domain.RepoPhaseParent, Total: 1}
 		}
 
 		r := &domain.Repository{
@@ -167,8 +217,8 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 			OwnerID:      ownerID,
 			MaxDiffDisks: maxDiff,
 			QuotaBytes:   in.QuotaBytes,
-			State:        domain.RepoStateActive,
-			Meta:         domain.RepoMeta{Group: strings.TrimSpace(in.Group)},
+			State:        state,
+			Meta:         meta,
 		}
 		if in.Mode == domain.RepoModeShared {
 			cond := domain.ParentIdle
@@ -215,13 +265,23 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 		return nil, nil, err
 	}
 
-	jobType := domain.JobCreateVHDX
-	if srcDir != "" {
-		jobType = domain.JobCreateVHDXFromDir
-	}
-	payload := createDiskPayload{DiskID: disk.ID, SourceDir: srcDir}
-	if _, _, err := s.Jobs.EnqueueWith(ctx, jobType, disk.ID, "create_vhdx:"+disk.ID, lock.DiskKey(disk.ID), payload); err != nil {
-		return repo, disk, err
+	if preparing {
+		// 预创建：母盘 → 共享数量个差异盘 → 同数量的 iSCSI 目标（见 DiskService.runPrepareRepo）。
+		// 锁用库级 Key：整库（母盘 + 池）在这期间必须独占，否则会有人分配到一块还在派生的盘。
+		payload := prepareRepoPayload{DiskID: disk.ID, RepoID: repo.ID, SourceDir: srcDir, Count: share}
+		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobPrepareRepo, disk.ID,
+			"prepare_repo:"+repo.ID, lock.RepoKey(repo.ID), payload); err != nil {
+			return repo, disk, err
+		}
+	} else {
+		jobType := domain.JobCreateVHDX
+		if srcDir != "" {
+			jobType = domain.JobCreateVHDXFromDir
+		}
+		payload := createDiskPayload{DiskID: disk.ID, SourceDir: srcDir}
+		if _, _, err := s.Jobs.EnqueueWith(ctx, jobType, disk.ID, "create_vhdx:"+disk.ID, lock.DiskKey(disk.ID), payload); err != nil {
+			return repo, disk, err
+		}
 	}
 
 	s.audit(ctx, in.OwnerID, "repo.create", "repo:"+repo.ID, string(in.Mode)+" name="+name, domain.AuditResultOK)
@@ -520,6 +580,9 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 	var alloc *domain.Allocation
 	var diffDiskID string
 	var parentDiskID string
+	// poolDiskID 非空表示这次分配用的是池中**已建好并已发布**的差异盘（池化库的常态路径）：
+	// 不需要派发建盘任务，只需在事务外把该盘上预建的 iSCSI 目标绑到这次分配上。
+	var poolDiskID string
 	// staleAllocID/staleDiskID 记录"母盘版本已更新、必须作废重建"的旧分配与旧差异盘。
 	var staleAllocID string
 	var staleDiskID string
@@ -552,6 +615,11 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 		repo, err := tx.LockRepository(ctx, in.RepoID)
 		if err != nil {
 			return err
+		}
+		if repo.State == domain.RepoStateCreating {
+			// 建库还没完成（母盘 / 池位盘 / iSCSI 目标还在建）：此刻分配只会拿到一块
+			// 还没派生好的池位盘，用户点挂载又得等 —— 等建完再分配，体验才是"分完即挂"。
+			return apperr.RepoCreating()
 		}
 		if repo.State != domain.RepoStateActive {
 			return apperr.New("repo.state_invalid", 409).WithArg("state", string(repo.State))
@@ -641,7 +709,7 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			return nil
 		}
 
-		// 共享模式：派生差异盘。
+		// 共享模式：先用池里的差异盘，池里没有才派生。
 		if repo.ParentDiskID == nil {
 			return apperr.New("repo.disk_missing", 500)
 		}
@@ -649,6 +717,49 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 		if err != nil {
 			return err
 		}
+
+		// 池化库的常态路径：取一块**建库时就派生好、并已发布**的空闲池位盘。
+		//
+		// 这是"共享数量"真正的收益点：分配在这里只写几行记录，
+		// 用户点挂载时既不用等派生差异盘（JobCreateDiff），也不用等目标的首次
+		// 全量下发（Windows 上一次 pushTarget 实测约 15 秒）。
+		if repo.Meta.Pool {
+			idle, pickErr := tx.PickIdleDiffDisk(ctx, repo.ID)
+			if pickErr != nil && !isNotFound(pickErr) {
+				return pickErr
+			}
+			// 版本必须与母盘一致：母盘做过维护（版本 +1）后，旧版本的池位盘不能复用。
+			if idle != nil && idle.ParentVersion == repo.ParentVersion {
+				need := parent.SizeBytes
+				if err := checkQuota(repo.QuotaBytes, repo.UsedBytes, need); err != nil {
+					return err
+				}
+				if err := checkQuota(target.QuotaBytes, target.UsedBytes, need); err != nil {
+					return err
+				}
+				a := &domain.Allocation{
+					ID:     uuid.NewString(),
+					RepoID: repo.ID,
+					DiskID: idle.ID,
+					UserID: userID,
+					State:  domain.AllocationStateAllocated,
+				}
+				if err := tx.CreateAllocation(ctx, a); err != nil {
+					return err
+				}
+				// 用量预留口径与派生路径完全一致（按母盘容量预留，随后由对账按实际占用校正）。
+				if _, err := tx.AddRepoUsedBytes(ctx, repo.ID, need); err != nil {
+					return err
+				}
+				if _, err := tx.AddUserUsedBytes(ctx, userID, need); err != nil {
+					return err
+				}
+				alloc = a
+				poolDiskID = idle.ID
+				return nil
+			}
+		}
+
 		diffCount, err := tx.CountDiffDisks(ctx, parent.ID)
 		if err != nil {
 			return err
@@ -657,7 +768,15 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 		if staleDiskID != "" && diffCount > 0 {
 			diffCount--
 		}
-		if err := domain.CanDerive(repo.Condition(), diffCount, repo.MaxDiffDisks); err != nil {
+		if repo.Meta.Pool {
+			// 池化库的上限判据只用计数：它的母盘在预创建时就已经置为 derived，
+			// 再让 CanDerive 校验"母盘是否 idle"只会把"池已满"报成状态机违规。
+			//
+			// 走到这里说明池位已全部被占用（或版本作废），也就是"共享数量"用满了。
+			if repo.MaxDiffDisks > 0 && diffCount >= repo.MaxDiffDisks {
+				return apperr.RepoDiffLimitExceeded(repo.MaxDiffDisks)
+			}
+		} else if err := domain.CanDerive(repo.Condition(), diffCount, repo.MaxDiffDisks); err != nil {
 			return err
 		}
 
@@ -738,6 +857,21 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 		return nil, err
 	}
 
+	if poolDiskID != "" {
+		// 把池位盘上预建的 iSCSI 目标认领给这次分配。
+		//
+		// 只改一行关联，完全不碰平台侧：目标与映射在建库阶段就下发好了，
+		// 这正是"分配完立刻能挂"的来源。
+		//
+		// 失败也不回滚分配：盘已经绑好，挂载路径（Publish）还会再认领一次，用户无感 ——
+		// 为一次可自愈的绑定失败去回滚已提交的分配，反而会留下"盘占了但没分配"的脏状态。
+		if err := s.bindPoolTarget(ctx, poolDiskID, alloc.ID); err != nil {
+			s.Log.Warn("绑定池位盘的 iSCSI 目标失败（挂载时会再次认领）",
+				"repo_id", alloc.RepoID, "disk_id", poolDiskID,
+				"allocation_id", alloc.ID, "error", err)
+		}
+	}
+
 	if diffDiskID != "" {
 		payload := diffPayload{DiskID: diffDiskID, RepoID: alloc.RepoID, ParentDiskID: parentDiskID}
 		// 锁用 **RepoKey** 而不是 DiskKey：派生差异盘要独占打开母盘 VHDX，而同一个库的
@@ -772,6 +906,85 @@ func (s *RepoService) ListAllocations(ctx context.Context, repoID string) ([]dom
 	return s.Store.ListAllocationsByRepo(ctx, repoID)
 }
 
+// bindPoolTarget 把池位盘上预建好的 user 目标绑到这次分配上。
+//
+// 盘上没有目标时静默返回（预创建时 iSCSI 后端未装配、或目标阶段失败）：
+// 挂载路径会按分配新建一个，功能不受影响 —— 只是那一次挂载会比较慢。
+func (s *RepoService) bindPoolTarget(ctx context.Context, diskID, allocationID string) error {
+	targets, err := s.Store.ListIscsiTargetsByDisk(ctx, diskID)
+	if err != nil {
+		return err
+	}
+	for i := range targets {
+		t := &targets[i]
+		if t.Purpose != domain.PurposeUser {
+			continue
+		}
+		if t.AllocationID != nil && *t.AllocationID == allocationID {
+			return nil
+		}
+		return s.Store.SetIscsiTargetAllocation(ctx, t.ID, allocationID)
+	}
+	return nil
+}
+
+// setRepoPrepare 写入建库预创建的进度快照（meta.prepare），供卡片显示"创建到第几步"。
+//
+// 进度是**展示用**的易变数据，写失败不返回错误：任务真正的结果（磁盘的物理状态 +
+// 库的 state）才是真源，为了刷新一个进度数字让整个建库任务失败是本末倒置。
+func (s *RepoService) setRepoPrepare(ctx context.Context, repoID string, p *domain.RepoPrepare) {
+	repo, err := s.Store.GetRepository(ctx, repoID)
+	if err != nil {
+		return
+	}
+	if p == nil {
+		repo.Meta.Prepare = nil
+	} else {
+		cp := *p
+		repo.Meta.Prepare = &cp
+	}
+	if err := s.Store.UpdateRepository(ctx, repo); err != nil {
+		s.Log.Warn("写入建库进度失败", "repo_id", repoID, "error", err)
+	}
+}
+
+// FinishRepoPrepare 把预创建完成的存储库置为 active，并清掉进度快照。
+//
+// 清掉而不是留一个 100%：建完之后卡片该显示正常的库状态，
+// 而不是长期挂着一句"上次创建走到第 3/5 步"的历史痕迹。
+func (s *RepoService) FinishRepoPrepare(ctx context.Context, repoID string) error {
+	repo, err := s.Store.GetRepository(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	repo.Meta.Prepare = nil
+	repo.State = domain.RepoStateActive
+	return s.Store.UpdateRepository(ctx, repo)
+}
+
+// MarkRepoPrepareFailed 把预创建失败的存储库置为 error，留下可本地化的失败码。
+//
+// 必须落库：任务失败后不会有人再来改库状态，库就永远停在 creating ——
+// 前端一直显示"创建中"，用户既分配不了也挂载不了，还看不出卡在哪一步。
+func (s *RepoService) MarkRepoPrepareFailed(ctx context.Context, repoID string, cause error) error {
+	repo, err := s.Store.GetRepository(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	if repo.State != domain.RepoStateCreating {
+		// 已经建成 active（或已被删除）：不能用一次迟到的失败回调覆盖它。
+		return nil
+	}
+	if repo.Meta.Prepare == nil {
+		repo.Meta.Prepare = &domain.RepoPrepare{}
+	}
+	// 只落**错误码**，由前端按当前语言渲染文案：底层原始报错可能带服务端路径与命令原文，
+	// 不能进前端；而服务端也不该替用户猜语言（有中英日韩四套文案）。
+	repo.Meta.Prepare.Error = apperr.CodeOf(cause)
+	repo.State = domain.RepoStateError
+	return s.Store.UpdateRepository(ctx, repo)
+}
+
 // ReleaseAllocation 释放分配：校验无活跃租约后异步删除差异盘与分配记录。
 func (s *RepoService) ReleaseAllocation(ctx context.Context, allocationID string) error {
 	alloc, err := s.Store.GetAllocation(ctx, allocationID)
@@ -791,6 +1004,47 @@ func (s *RepoService) ReleaseAllocation(ctx context.Context, allocationID string
 
 	if err := s.Store.UpdateAllocationState(ctx, allocationID, domain.AllocationStateReleasing); err != nil {
 		return err
+	}
+
+	// 池化库：回池，而不是删盘。
+	//
+	// 为什么必须回池（见 5.14）：共享数量就是"随时可用的差异盘数"。释放即删的话
+	// 池子越用越小，下次分配又回到"分完还要等建盘"，这个特性就白做了。
+	//
+	// 但池位盘里还留着上一个用户的数据，不能直接交给下一个用户 —— 回池必须
+	// **原地重建**（删文件、重新派生），见 DiskService.runResetDiff。
+	if repo, rErr := s.Store.GetRepository(ctx, alloc.RepoID); rErr == nil && repo.Meta.Pool && alloc.DiskID != "" {
+		payload := resetDiffPayload{
+			DiskID:       alloc.DiskID,
+			RepoID:       alloc.RepoID,
+			ParentDiskID: parentIDOf(repo),
+			AllocationID: allocationID,
+		}
+		// 立刻把盘挡在分配之外：它马上就要被重建，而在此之前盘里还躺着上一个用户的
+		// 数据、平台侧映射也已经被拆掉 —— 这时候被分配出去就是数据泄漏 + 挂载即坏。
+		//
+		// 只置状态、不删记录：池位盘的记录是"池的一格"，重建后会复用同一块盘
+		// （同一个目标名与 CHAP 凭据，挂载因此不需要重新下发）。
+		switch d, dErr := s.Store.GetDisk(ctx, alloc.DiskID); {
+		case dErr == nil:
+			d.State = domain.DiskStateCreating
+			if err := s.Store.UpdateDisk(ctx, d); err != nil {
+				return err
+			}
+		case !isNotFound(dErr):
+			return dErr
+		}
+
+		// 幂等键带 allocationID 而不是 diskID：同一块池位盘会被反复分配/释放，
+		// 用 diskID 作键的话第二次释放会命中第一次留下的历史任务、被"幂等"掉
+		// （表现为：分配释放都成功，但盘里的旧数据没被清掉）。
+		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobResetDiff, alloc.DiskID,
+			"reset_diff:"+allocationID, lock.RepoKey(alloc.RepoID), payload); err != nil {
+			return err
+		}
+		s.audit(ctx, "", "repo.release_allocation", "allocation:"+allocationID,
+			"pool=reset disk="+alloc.DiskID, domain.AuditResultOK)
+		return nil
 	}
 
 	payload := deleteDiskPayload{DiskID: alloc.DiskID, AllocationID: alloc.ID}

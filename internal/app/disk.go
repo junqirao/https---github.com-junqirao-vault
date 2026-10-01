@@ -84,10 +84,40 @@ type publishPayload struct {
 	AllocationID string `json:"allocation_id"`
 }
 
+// prepareRepoPayload 是建库预创建任务（JobPrepareRepo）的入参。
+//
+// 只带"建几个池位"这种最小信息：池位对应的磁盘记录由任务自己建 ——
+// 建库请求的事务里为 N 个池位各插一行，既拖慢请求，又会在一半失败时留下一堆半成品记录。
+type prepareRepoPayload struct {
+	// DiskID 母盘磁盘 ID。
+	DiskID string `json:"disk_id"`
+	// RepoID 存储库 ID。
+	RepoID string `json:"repo_id"`
+	// SourceDir 可选的源目录（语义同 JobCreateVHDXFromDir 的源）。
+	SourceDir string `json:"source_dir,omitempty"`
+	// Count 要预创建的池位数量（= 库的"共享数量"）。
+	Count int `json:"count"`
+}
+
+// resetDiffPayload 是"释放后回池"任务（JobResetDiff）的入参。
+type resetDiffPayload struct {
+	DiskID       string `json:"disk_id"`
+	RepoID       string `json:"repo_id"`
+	ParentDiskID string `json:"parent_disk_id"`
+	// AllocationID 触发本次回池的分配：只用于日志与审计，
+	// 分配记录本身是同步删除的（用户点完释放就该立刻看到槽位空出来）。
+	AllocationID string `json:"allocation_id,omitempty"`
+}
+
 // DiskService 负责 VHDX 的同步查询与异步生命周期任务。
 type DiskService struct {
 	Deps
 	Repos *RepoService
+	// IscsiSvc 用于建库预创建与"回池"时下发 iSCSI 目标；在 App 装配时回填（两者互为依赖）。
+	//
+	// ⚠️ 不能叫 Iscsi：Deps 里已经嵌了一个同名的平台后端字段（platform.IscsiBackend），
+	// 同名会把它遮蔽掉，本层所有 s.Iscsi.DetachLun 之类的调用都会编译不过。
+	IscsiSvc *IscsiService
 }
 
 // RegisterHandlers 把磁盘相关任务注册到 worker。
@@ -100,6 +130,8 @@ func (s *DiskService) RegisterHandlers(w *job.Worker) {
 	w.Register(job.HandlerFunc{T: domain.JobCreateVHDX, F: s.runCreateVHDX})
 	w.Register(job.HandlerFunc{T: domain.JobCreateVHDXFromDir, F: s.runCreateVHDX})
 	w.Register(job.HandlerFunc{T: domain.JobCreateDiff, F: s.runCreateDiff})
+	w.Register(job.HandlerFunc{T: domain.JobPrepareRepo, F: s.runPrepareRepo})
+	w.Register(job.HandlerFunc{T: domain.JobResetDiff, F: s.runResetDiff})
 	w.Register(job.HandlerFunc{T: domain.JobCopyVHDX, F: s.runCopyVHDX})
 	w.Register(job.HandlerFunc{T: domain.JobDeleteDisk, F: s.runDeleteDisk})
 	w.Register(job.HandlerFunc{T: domain.JobReclaim, F: s.runReclaim})
@@ -424,6 +456,25 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 			return nil
 		}
 		return err
+	}
+	return s.ensureDiffDisk(ctx, disk, parent, repo, rep)
+}
+
+// ensureDiffDisk 保证一块差异盘物理存在且状态为 ready（幂等）。
+//
+// 两个调用方共用：
+//   - JobCreateDiff：分配时按需派生（非池化库，或池化库的池位被事后调大的那部分）；
+//   - JobPrepareRepo：建库时把"共享数量"个池位一次性派生好（见 5.14）。
+//
+// 文件已存在时只补状态与版本，不重复派生：任务重试、以及"释放回池"重建后的复检
+// 都会走到这里，重复派生会把用户数据抹掉。
+func (s *DiskService) ensureDiffDisk(ctx context.Context, disk, parent *domain.Disk,
+	repo *domain.Repository, rep job.Reporter) error {
+	if disk.State == domain.DiskStateReady && s.Disk != nil && s.Disk.Exists(disk.VHDXPath) {
+		return nil
+	}
+	if s.Disk == nil {
+		return errNotImplemented
 	}
 	rep.Progress(20)
 

@@ -137,18 +137,26 @@ export function errorCodeOf(error: unknown): string | undefined {
 }
 
 /**
- * 挂载失败的**阶段提示** key（无对应阶段时返回 undefined）。
+ * 挂载/卸载失败的**阶段提示** key（无对应阶段时返回 undefined）。
  *
- * 为什么需要：代理返回的 `agent.mount_failed` 只带 `args.stage`（原始报错按项目约定
- * 只进日志），界面只显示"挂载失败（阶段：connect）"时用户完全无从下手。而 connect /
- * portal 阶段绝大多数就是"本机 iSCSI 发起程序服务（MSiSCSI）没运行"或"门户地址不可达"
+ * 为什么需要：代理返回的 `agent.mount_failed` / `agent.unmount_failed` 只带 `args.stage`
+ * （原始报错按项目约定只进日志），界面只显示"挂载失败（阶段：connect）"时用户完全无从下手。
+ * 而 connect / portal 阶段绝大多数就是"本机 iSCSI 发起程序服务（MSiSCSI）没运行"或
+ * "门户地址不可达"，卸载失败的 mount_point 阶段则是"这块盘还被别的程序打开着"
  * —— 把这条可执行建议直接贴到界面上（真实工单）。
  */
 export function errorHintKeyOf(error: unknown): string | undefined {
-  if (!isApiError(error) || error.kind !== 'business' || error.code !== 'agent.mount_failed') {
-    return undefined
-  }
+  if (!isApiError(error) || error.kind !== 'business') return undefined
   const stage = typeof error.args.stage === 'string' ? error.args.stage : ''
+
+  // 卸载只有一种语义（见代理 mountEngine.unmount），也就只剩一种失败：挂载点还在，
+  // 即这块盘正被别的程序打开着。用户看到"卸载失败"时必须知道该去关掉占用，而不是
+  // 找"强制卸载"按钮（那个按钮已经取消）。
+  if (error.code === 'agent.unmount_failed') {
+    return stage === 'mount_point' ? 'err.agent.unmount_failed.hint.in_use' : undefined
+  }
+
+  if (error.code !== 'agent.mount_failed') return undefined
   switch (stage) {
     case 'initiator_service':
     case 'connect':

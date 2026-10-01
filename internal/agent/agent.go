@@ -330,7 +330,7 @@ func (a *Agent) ActiveMountCount() int {
 // UnmountAll 逐个卸载全部挂载（用于退出流程）；单个失败只记录日志。
 func (a *Agent) UnmountAll(ctx context.Context) {
 	for _, ms := range a.store.ListMounts() {
-		if err := a.engine.unmount(ctx, ms.AllocationID, true); err != nil {
+		if err := a.engine.unmount(ctx, ms.AllocationID); err != nil {
 			a.logger.Warn("退出时卸载失败", "allocation_id", ms.AllocationID, "error", err)
 		}
 	}

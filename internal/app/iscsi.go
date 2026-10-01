@@ -434,6 +434,130 @@ func (s *IscsiService) ReconcileTargets(ctx context.Context) error {
 // Publish 把一个分配对应的 VHDX 通过 iSCSI 暴露出去。
 //
 // 幂等：目标记录与 Windows 侧配置都会"先查后建/先查后改"。
+// createUserTarget 新建一个面向该磁盘的 user 目标（默认 CHAP）。
+//
+// allocationID 允许为空：建库预创建时还没有任何分配（池位目标就是这样建的），
+// 之后分配/挂载时再由 adoptDiskTarget 把关联补上。
+func (s *IscsiService) createUserTarget(ctx context.Context, repo *domain.Repository,
+	disk *domain.Disk, allocationID *string) (*domain.IscsiTarget, error) {
+	if s.Cipher == nil {
+		return nil, apperr.New(apperr.CodeInternal, 500).WithArg("reason", "cipher_unavailable")
+	}
+	// 默认使用 CHAP：Windows 侧无会话枚举能力，租约 + CHAP 是唯一的访问控制手段。
+	plainSecret, err := secret.RandomSecret(defaultChapSecretChars)
+	if err != nil {
+		return nil, err
+	}
+	encSecret, err := s.Cipher.EncryptString(plainSecret)
+	if err != nil {
+		return nil, err
+	}
+	diskID := disk.ID
+	target := &domain.IscsiTarget{
+		TargetName: targetNameForDisk(repo.ID, disk.ID),
+		DiskID:     &diskID,
+		Purpose:    domain.PurposeUser,
+		// CHAP 用户名按**磁盘**派生（与目标名同源）：池化库在建库预创建时就把凭据定好了，
+		// 分配与挂载都不再碰它，客户端拿到的用户名与平台侧始终对得上。
+		AllocationID:   allocationID,
+		AuthMode:       domain.AuthModeCHAP,
+		ChapUser:       "vault-" + shortID(disk.ID),
+		ChapSecretEnc:  encSecret,
+		Enabled:        false,
+		DesiredEnabled: true,
+	}
+	if err := s.Store.CreateIscsiTarget(ctx, target); err != nil {
+		return nil, err
+	}
+	return target, nil
+}
+
+// adoptDiskTarget 认领一块盘上**已经预建好**的 user 目标，并把它绑到这次分配上。
+//
+// 池化库的常态路径：目标与映射在建库阶段就建好并发布了，分配/挂载只是补一行关联，
+// 之后按 allocation 查目标（Unpublish、摘要、会话管理）都能查到。
+//
+// 盘上没有 user 目标时返回 (nil, nil)：调用方按"现建"的老路径处理。
+func (s *IscsiService) adoptDiskTarget(ctx context.Context, diskID, allocationID string) (*domain.IscsiTarget, error) {
+	targets, err := s.Store.ListIscsiTargetsByDisk(ctx, diskID)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	for i := range targets {
+		t := &targets[i]
+		if t.Purpose != domain.PurposeUser {
+			continue
+		}
+		if t.AllocationID == nil || *t.AllocationID != allocationID {
+			if err := s.Store.SetIscsiTargetAllocation(ctx, t.ID, allocationID); err != nil {
+				return nil, err
+			}
+			allocID := allocationID
+			t.AllocationID = &allocID
+		}
+		return t, nil
+	}
+	return nil, nil
+}
+
+// EnsurePoolTarget 保证池位盘有一个已启用的 user 目标（建库预创建阶段三反复调用）。
+//
+// 与 Publish 的区别是**不依赖分配**：建库时还没有任何分配，目标先建好、启用，
+// 客户端什么都不用做；之后的分配与挂载只是把它认领过去（adoptDiskTarget）。
+//
+// 幂等：先查后建、先查后改，任务重试不会多出第二个映射同一块盘的目标。
+func (s *IscsiService) EnsurePoolTarget(ctx context.Context, repo *domain.Repository, disk *domain.Disk) error {
+	if s.Iscsi == nil {
+		// 平台没装配 iSCSI 后端（Linux/测试环境）：池位只建盘，发布留给挂载路径。
+		return nil
+	}
+	target, err := s.adoptDiskTarget(ctx, disk.ID, "")
+	if err != nil {
+		return err
+	}
+	if target == nil {
+		target, err = s.createUserTarget(ctx, repo, disk, nil)
+		if err != nil {
+			return err
+		}
+	}
+	if target == nil {
+		return nil
+	}
+
+	unlock := s.Locks.Acquire(lock.TargetKey(target.TargetName))
+	defer unlock()
+
+	iqn := target.IQN(s.iqnPrefix())
+	// 一次性迁移：清掉"旧命名"（短名）的目标，否则同一个 VHDX 会被两个目标同时映射。
+	s.migrateLegacyTargetName(ctx, target.TargetName, iqn)
+
+	// 这里是整条建库链路最慢的一步（Windows 上一次全量下发实测约 15 秒，见 pushedMu 说明）。
+	if err := s.pushTarget(ctx, target, true); err != nil {
+		return err
+	}
+	if found := s.discoverActualTargetName(ctx, iqn, target.TargetName); found != "" {
+		s.rememberActualIQN(target.TargetName, found)
+	}
+	if err := s.Store.SetIscsiTargetEnabled(ctx, target.ID, true); err != nil {
+		return err
+	}
+	target.Enabled = true
+	target.DesiredEnabled = true
+
+	if disk.State != domain.DiskStatePublished {
+		disk.State = domain.DiskStatePublished
+		if err := s.Store.UpdateDisk(ctx, disk); err != nil {
+			return err
+		}
+	}
+	s.audit(ctx, "", "iscsi.publish", "target:"+target.TargetName, "pool disk="+disk.ID, domain.AuditResultOK)
+	return nil
+}
+
 func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domain.IscsiTarget, error) {
 	alloc, err := s.Store.GetAllocation(ctx, allocationID)
 	if err != nil {
@@ -457,32 +581,17 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	}
 
 	if target == nil {
-		if s.Cipher == nil {
-			return nil, apperr.New(apperr.CodeInternal, 500).WithArg("reason", "cipher_unavailable")
-		}
-		// 默认使用 CHAP：Windows 侧无会话枚举能力，租约 + CHAP 是唯一的访问控制手段。
-		plainSecret, err := secret.RandomSecret(defaultChapSecretChars)
+		// 池化库：目标在建库时就按"共享数量"预建好了（那时还没有分配，所以只按 disk 关联）。
+		// 先认领它，而不是再建一个 —— 两个目标映射同一个 VHDX 会在平台侧互相抢映射，
+		// 客户端连上哪个都是薛定谔的盘。
+		target, err = s.adoptDiskTarget(ctx, disk.ID, allocationID)
 		if err != nil {
 			return nil, err
 		}
-		encSecret, err := s.Cipher.EncryptString(plainSecret)
+	}
+	if target == nil {
+		target, err = s.createUserTarget(ctx, repo, disk, &alloc.ID)
 		if err != nil {
-			return nil, err
-		}
-		diskID := disk.ID
-		allocID := alloc.ID
-		target = &domain.IscsiTarget{
-			TargetName:     targetNameFor(repo.ID, alloc.ID),
-			DiskID:         &diskID,
-			Purpose:        domain.PurposeUser,
-			AllocationID:   &allocID,
-			AuthMode:       domain.AuthModeCHAP,
-			ChapUser:       "vault-" + shortID(alloc.ID),
-			ChapSecretEnc:  encSecret,
-			Enabled:        false,
-			DesiredEnabled: true,
-		}
-		if err := s.Store.CreateIscsiTarget(ctx, target); err != nil {
 			return nil, err
 		}
 	} else if target.DiskID == nil || *target.DiskID != disk.ID {
@@ -1149,14 +1258,18 @@ func shortID(id string) string {
 	return id[:8]
 }
 
-// targetNameFor 生成面向用户的分配目标名：vault-<repoID前8位>-<allocationID前8位>。
+// targetNameForDisk 生成面向用户的分配目标名：vault-<repoID前8位>-<diskID前8位>。
+//
+// 按**磁盘**而不是按分配命名：池化库在建库时就为每块池位盘建好了目标（那时还没有分配），
+// 分配只是把目标绑上去；名字跟着盘走，释放回池后原地重建同一块盘也不需要换名字
+// （换名字意味着 Windows 侧要多一次"删旧目标 + 建新目标"的全量下发）。
 //
 // ⚠️ 分隔符**只能**用 '-'，不能用 '_'：目标名会被 Windows 当作 IQN 后缀校验，
 // 而 IQN 语法（RFC 3720）只允许字母、数字、'.'、'-'、':'，下划线非法——
 // 用 '_' 命名时 New-IscsiServerTarget 会直接以"无法创建 iSCSI 目标。"失败
 // （日志 reason=set_target_failed step=create_target）。
-func targetNameFor(repoID, allocationID string) string {
-	return "vault-" + shortID(repoID) + "-" + shortID(allocationID)
+func targetNameForDisk(repoID, diskID string) string {
+	return "vault-" + shortID(repoID) + "-" + shortID(diskID)
 }
 
 // tempTargetName 生成母盘临时共享的固定目标名：vault-<repoID前8位>-temp。

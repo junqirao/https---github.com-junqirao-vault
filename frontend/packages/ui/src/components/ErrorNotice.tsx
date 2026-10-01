@@ -1,6 +1,7 @@
 import { Alert, Space, Typography } from 'antd'
 
-import { errorCodeOf, translateError } from '../api/errors'
+import { errorCodeOf, errorHintKeyOf, translateError } from '../api/errors'
+import { useI18n } from '../i18n'
 
 export interface ErrorNoticeProps {
   error: unknown
@@ -8,10 +9,17 @@ export interface ErrorNoticeProps {
   showCode?: boolean
 }
 
-/** 错误提示：业务错误按 code 本地化，网络/超时使用本地文案。 */
+/**
+ * 错误提示：业务错误按 code 本地化，网络/超时使用本地文案。
+ *
+ * 业务错误若有对应的**可执行建议**（errorHintKeyOf，如"卷被占用请关掉占用程序"），
+ * 一并贴出来 —— 只有一句"卸载失败（阶段：mount_point）"用户根本不知道该做什么。
+ */
 export function ErrorNotice({ error, showCode }: ErrorNoticeProps): JSX.Element | null {
+  const { t } = useI18n()
   if (!error) return null
   const code = showCode === false ? undefined : errorCodeOf(error)
+  const hintKey = errorHintKeyOf(error)
   return (
     <Alert
       type="error"
@@ -20,6 +28,11 @@ export function ErrorNotice({ error, showCode }: ErrorNoticeProps): JSX.Element 
       message={
         <Space direction="vertical" size={0}>
           <Typography.Text>{translateError(error)}</Typography.Text>
+          {hintKey ? (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {t(hintKey)}
+            </Typography.Text>
+          ) : null}
           {code ? (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
               {code}

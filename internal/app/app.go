@@ -98,6 +98,9 @@ func New(d Deps) *App {
 	a.repo = &RepoService{Deps: d}
 	a.disk = &DiskService{Deps: d, Repos: a.repo}
 	a.iscsi = &IscsiService{Deps: d, Disks: a.disk}
+	// 建库预创建（JobPrepareRepo）与释放回池（JobResetDiff）要一边建盘一边下发目标，
+	// 两个服务互相引用（Iscsi 已持有 Disks），回填即可，不必再拆一层。
+	a.disk.IscsiSvc = a.iscsi
 	a.lease = &LeaseService{Deps: d, Repos: a.repo, Disks: a.disk, Iscsi: a.iscsi}
 	a.upload = &UploadService{Deps: d, Disks: a.disk, Repos: a.repo}
 	a.storage = &StorageService{Deps: d}

@@ -375,13 +375,14 @@ func mountStageLeavesResidue(stage string) bool {
 
 // cleanupFailedMount 清理一次失败的挂载尝试，返回"是否已清理干净"与清理错误。
 //
-// 无残留阶段直接返回 true（不碰任何东西）；有残留阶段走**严格卸载**（force=false）：
-// 任一阶段失败就停手并如实回报 —— 调用方据此保留一条 error 记录作为人工清理入口。
+// 无残留阶段直接返回 true（不碰任何东西）；有残留阶段调 unmountLocked 清理：
+// 报"卸载失败"（只有挂载点还在、卷被占用时才会）就说明清理没做干净 ——
+// 调用方据此保留一条 error 记录，供用户关掉占用后重试。
 func (e *mountEngine) cleanupFailedMount(ctx context.Context, allocationID, stage string) (bool, error) {
 	if !mountStageLeavesResidue(stage) {
 		return true, nil
 	}
-	if err := e.unmountLocked(ctx, allocationID, false); err != nil {
+	if err := e.unmountLocked(ctx, allocationID); err != nil {
 		e.a.logger.Warn("失败的挂载尝试清理未完成，保留记录供人工卸载",
 			"allocation_id", allocationID, "stage", stage, "error", err)
 		return false, err
@@ -397,7 +398,7 @@ func cleanupFailureDetail(err error) string {
 	return "cleanup_failed:" + apperr.CodeOf(err)
 }
 
-// unmount 执行卸载流程。
+// unmount 执行卸载流程 —— **只有一种卸载，没有"普通/强制"之分**。
 //
 // 顺序：Unmount(移除挂载点) → SetOffline(true) → Disconnect(必要时重试) → Unregister → 回写 release。
 //
@@ -410,8 +411,19 @@ func cleanupFailureDetail(err error) string {
 // 唯一必须保持的强序是 **SetOffline 早于 Disconnect**：否则 Disconnect-IscsiTarget
 // 返回 0xefff0040（会话上仍有在线设备），见 docs/implementation.md 5.5。
 //
-// force=true 时忽略各阶段错误继续推进（用于清理残留与踢下线）。
-func (e *mountEngine) unmount(ctx context.Context, allocationID string, force bool) error {
+// 失败语义也只有一种（这正是"强制卸载"入口被去掉的原因）：
+//
+//   - 挂载点还在（盘符/目录仍属于该卷，Windows 认为卷正被占用）→ 整次卸载失败，
+//     记录回滚成卸载前的状态，界面如实显示"还挂着"。用户关掉占用它的程序再点一次即可，
+//     不需要一个额外的"强制卸载"按钮。
+//   - 挂载点已经移除（含报错但实际已不存在）→ 本机已经"看不出还挂着东西"，
+//     后面每一步（下线、断开会话、取消持久化、回写 release）都只是清残留，**一律尽力而为**：
+//     任一步失败只记日志、不中断，记录照样删除。过去这些情况要靠 force 才能收尾，
+//     结果就是"盘符没了、状态还写着已挂载、还得多点一次强制卸载"（真实反馈）。
+//
+// 断开会话仍然会以 device_in_use 补一次下线+重试，真失败时按 warn 记录：
+// 服务端 release 后会停用目标把会话踢掉，且④已取消持久化，不会重启后重连。
+func (e *mountEngine) unmount(ctx context.Context, allocationID string) error {
 	allocationID = strings.TrimSpace(allocationID)
 	if allocationID == "" {
 		return apperr.InvalidParam("allocation_id")
@@ -420,14 +432,14 @@ func (e *mountEngine) unmount(ctx context.Context, allocationID string, force bo
 	unlock := e.a.locks.Lock("alloc:" + allocationID)
 	defer unlock()
 
-	return e.unmountLocked(ctx, allocationID, force)
+	return e.unmountLocked(ctx, allocationID)
 }
 
 // unmountLocked 是 unmount 的**不加锁**版本：调用方必须已经持有该 allocation 的锁。
 //
 // 存在的原因：挂载失败后的清理发生在 mount 的锁内，直接调 unmount 会在同一把 keyed 锁上
 // 自锁死（挂载失败时永远卡住，比错误本身严重得多）。
-func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, force bool) error {
+func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) error {
 	ms, rt, ok := e.a.store.GetMount(allocationID)
 	if !ok {
 		return errNotMounted(allocationID)
@@ -436,8 +448,8 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, fo
 	// 记住卸载前的状态：卸载失败、且**什么都没拆掉**时要恢复它。
 	//
 	// 为什么必须：状态一旦写成 unmounting 而后续步骤失败，若不回写，记录就**永远冻结在
-	// "卸载中"**（真实事故：目标/磁盘早已不存在，下线或移除挂载点报错，非 force 直接
-	// return —— 界面上永远挂着一条"卸载中"，重装服务端也清不掉，因为记录在本机状态文件里）。
+	// "卸载中"**（真实事故：目标/磁盘早已不存在，下线或移除挂载点报错就直接 return ——
+	// 界面上永远挂着一条"卸载中"，重装服务端也清不掉，因为记录在本机状态文件里）。
 	prevState := ms.State
 
 	var unmounting MountState
@@ -450,12 +462,14 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, fo
 
 	// teardown 记录"本机是否已经有东西被真的拆掉"（挂载点被移除 / 磁盘被下线）。
 	//
-	// 它决定卸载失败后的状态语义：
+	// 它决定卸载失败后的状态语义（见 unmountFailureState）：
 	//   - false：什么都没动 → 回滚成卸载前的状态（磁盘确实还挂着，状态如实）；
 	//   - true：已经拆掉一部分 → **绝不回滚**。回滚等于向界面谎报"还挂着"，而且前端收到
 	//     mounted 事件会弹出"已挂载"提示（真实反馈："点了卸载，然后提示挂载成功？磁盘状态
-	//     还是已挂载，但我看已经卸载成功了、盘符不见了"）。此时保留记录并标为 error，
-	//     用户可再点一次卸载（幂等重试）或走强制卸载。
+	//     还是已挂载，但我看已经卸载成功了、盘符不见了"）。
+	//
+	// 统一卸载语义下，唯一还会失败的阶段（挂载点还在，见 ①）必然在 teardown 置位之前，
+	// 因此 teardown=true 之后不再有失败分支；这里保留判断是给后续改动留的安全网。
 	teardown := false
 
 	// fail 上报某一阶段失败，并按 teardown 决定回滚还是保留错误记录。
@@ -471,7 +485,7 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, fo
 				return
 			}
 			m.Phase = ""
-			// 稳定码形如 unmount_disconnect:platform.iscsi_device_in_use，界面可直接翻译。
+			// 稳定码形如 unmount_mount_point:platform.ps_failed，界面可直接翻译。
 			m.LastError = describeError("unmount_"+stage, cause)
 			m.LastErrorDetail = joinDetail(mountErrorDetailOf(cause))
 			cp := *m
@@ -495,10 +509,11 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, fo
 			if e.mountPointGone(ctx, ms, rt) {
 				e.a.logger.Info("挂载点已不存在，视为已移除",
 					"allocation_id", allocationID, "mount_path", path)
-			} else if !force {
-				return fail("mount_point", err)
 			} else {
-				e.a.logger.Warn("移除挂载点失败（force 继续卸载）", "allocation_id", allocationID, "error", err)
+				// 挂载点真的还在（盘符/目录仍属于该卷，Windows 认为卷正被占用）：
+				// 此时磁盘确实还挂着，如实失败并回滚状态才是对的 —— 继续往下做只会让
+				// 下线、断开跟着一起失败，最后留下"盘还挂着但记录已删"的假象。
+				return fail("mount_point", err)
 			}
 		}
 	}
@@ -530,11 +545,11 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string, fo
 				stage = "disk_offline"
 				err = diskOfflineErr
 			}
-			if !force {
-				return fail(stage, err)
-			}
-			e.a.logger.Warn("断开 iSCSI 会话失败（force 继续卸载）",
-				"allocation_id", allocationID, "target_iqn", targetIQN, "error", err)
+			// 走到这里挂载点已经移除了（用户在资源管理器里已经看不到这块盘），
+			// 断开会话只是清残留：失败不中断、不报错，但必须留下日志。
+			// 残留会话会在服务端 release 停用目标后被踢掉，④也会取消持久化避免重启重连。
+			e.a.logger.Warn("断开 iSCSI 会话失败（继续卸载，残留会话由服务端停用目标后踢掉）",
+				"allocation_id", allocationID, "stage", stage, "target_iqn", targetIQN, "error", err)
 		}
 		// ④ 取消会话持久化，避免重启后自动重连。
 		if err := e.a.iscsi.Unregister(ctx, targetIQN); err != nil {
@@ -665,7 +680,7 @@ func (e *mountEngine) remount(ctx context.Context, allocationID string) (*MountS
 	if !ok {
 		return nil, errNotMounted(allocationID)
 	}
-	if err := e.unmount(ctx, allocationID, true); err != nil {
+	if err := e.unmount(ctx, allocationID); err != nil {
 		return nil, err
 	}
 	return e.mount(ctx, MountRequest{
@@ -684,7 +699,7 @@ func (e *mountEngine) remount(ctx context.Context, allocationID string) (*MountS
 func (e *mountEngine) restore(ctx context.Context, req MountRequest) (*MountState, error) {
 	if ms, _, ok := e.a.store.GetMount(req.AllocationID); ok && ms.State == MountStateMounted {
 		// 上次运行残留的 mounted 状态：真实会话可能已不存在，先尽力清理再重挂。
-		if err := e.unmount(ctx, req.AllocationID, true); err != nil {
+		if err := e.unmount(ctx, req.AllocationID); err != nil {
 			e.a.logger.Warn("清理残留挂载状态失败（继续重挂）", "allocation_id", req.AllocationID, "error", err)
 		}
 	}

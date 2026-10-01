@@ -36,7 +36,7 @@ func (a *Agent) restoreMounts(ctx context.Context) {
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				if err := a.engine.unmount(ctx, item.AllocationID, true); err != nil {
+				if err := a.engine.unmount(ctx, item.AllocationID); err != nil {
 					a.logger.Warn("补完未完成的卸载失败", "allocation_id", item.AllocationID, "error", err)
 				}
 			})

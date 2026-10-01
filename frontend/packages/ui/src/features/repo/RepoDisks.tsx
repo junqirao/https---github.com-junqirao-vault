@@ -71,7 +71,6 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
   const [mountPath, setMountPath] = useState('')
   const [busyId, setBusyId] = useState<string | null>(null)
   const [pendingUnmount, setPendingUnmount] = useState<AgentMountState | null>(null)
-  const [pendingForce, setPendingForce] = useState<AgentMountState | null>(null)
 
   // 刷新页面后恢复进行中/历史下载；属背景恢复，失败不阻断页面（用户主动操作失败时会另行提示）。
   useEffect(() => {
@@ -201,21 +200,20 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
   }
 
   /**
-   * 卸载：普通卸载失败（磁盘/会话/挂载点在本机早已不存在等）时给出**强制卸载**出口。
+   * 卸载：一次调用即尽力清理干净（取消挂载点、下线、断开会话、取消持久化、回写释放），
+   * 不再区分"普通卸载 / 强制卸载"（代理侧只有一个 unmount，见 mountEngine.unmount）。
    *
-   * 代理会跳过失败的清理步骤、尽力拆除残留并删除记录。没有这个出口，脏记录
-   * （如"卡在卸载中"）永远无法从界面删除。
+   * 只有一种失败：卷正被占用（挂载点还在），此时如实报错并保留记录 ——
+   * 用户关掉占用它的程序再点一次即可，界面不再弹"要不要强制卸载"。
    */
-  const runUnmount = async (mount: AgentMountState, force = false): Promise<void> => {
+  const runUnmount = async (mount: AgentMountState): Promise<void> => {
     setError(null)
     setBusyId(mount.allocation_id)
     try {
-      await agent.unmount({ allocation_id: mount.allocation_id, force })
-      setPendingForce(null)
+      await agent.unmount({ allocation_id: mount.allocation_id })
       invalidate()
     } catch (err) {
       setError(err)
-      if (!force) setPendingForce(mount)
     } finally {
       setBusyId(null)
       setPendingUnmount(null)
@@ -442,18 +440,6 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
           if (pendingUnmount) void runUnmount(pendingUnmount)
         }}
         onCancel={() => setPendingUnmount(null)}
-      />
-      {/* 强制卸载：普通卸载失败后的兜底出口（代理跳过失败的清理步骤并删除记录）。 */}
-      <ConfirmDialog
-        open={pendingForce !== null}
-        danger
-        title={t('agent.unmount.forceTitle')}
-        content={t('agent.unmount.forceConfirm')}
-        loading={busyId !== null}
-        onConfirm={() => {
-          if (pendingForce) void runUnmount(pendingForce, true)
-        }}
-        onCancel={() => setPendingForce(null)}
       />
       <Modal
         open={copyDisk !== null}

@@ -98,29 +98,51 @@ func toCertificateDTOs(certs []domain.Certificate) []certificateDTO {
 }
 
 type repoDTO struct {
-	ID              string         `json:"id"`
-	Name            string         `json:"name"`
-	Mode            string         `json:"mode"`
-	OwnerID         string         `json:"owner_id"`
-	ParentDiskID    string         `json:"parent_disk_id,omitempty"`
-	ParentVersion   int            `json:"parent_version"`
-	ParentCondition string         `json:"parent_condition,omitempty"`
-	MaxDiffDisks    int            `json:"max_diff_disks"`
-	QuotaBytes      int64          `json:"quota_bytes"`
-	UsedBytes       int64          `json:"used_bytes"`
-	State           string         `json:"state"`
-	Group           string         `json:"group,omitempty"`
-	ClientConfig    map[string]any `json:"client_config,omitempty"`
-	CreatedAt       int64          `json:"created_at"`
-	UpdatedAt       int64          `json:"updated_at"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Mode            string `json:"mode"`
+	OwnerID         string `json:"owner_id"`
+	ParentDiskID    string `json:"parent_disk_id,omitempty"`
+	ParentVersion   int    `json:"parent_version"`
+	ParentCondition string `json:"parent_condition,omitempty"`
+	// ShareCount 共享数量：建库时预创建了几个差异盘（池位），也就是最多能分给几个用户。
+	//
+	// MaxDiffDisks 是它改名前的字段，两者**永远同值**：老字段保留一段时间，
+	// 免得已发布的前端读不到这个数（差异盘数量是卡片上的关键信息）。
+	ShareCount   int            `json:"share_count"`
+	MaxDiffDisks int            `json:"max_diff_disks"`
+	QuotaBytes   int64          `json:"quota_bytes"`
+	UsedBytes    int64          `json:"used_bytes"`
+	State        string         `json:"state"`
+	Group        string         `json:"group,omitempty"`
+	ClientConfig map[string]any `json:"client_config,omitempty"`
+	// Pool 是否为池化共享库：建库时已把差异盘池建好并发布，分配即用（挂载免等）。
+	Pool bool `json:"pool"`
+	// Prepare 建库进度：state=creating 时前端据此显示"正在派生差异盘 3/5"。
+	Prepare   *repoPrepareDTO `json:"prepare,omitempty"`
+	CreatedAt int64           `json:"created_at"`
+	UpdatedAt int64           `json:"updated_at"`
+}
+
+// repoPrepareDTO 是建库预创建的进度快照。
+//
+// Error 是**错误码**而不是文案：文案要按客户端语言渲染（四套 i18n），
+// 而底层报错可能带服务端路径，不适合直接下发。
+type repoPrepareDTO struct {
+	Phase string `json:"phase"`
+	Done  int    `json:"done"`
+	Total int    `json:"total"`
+	Error string `json:"error,omitempty"`
 }
 
 func toRepoDTO(r *domain.Repository) repoDTO {
 	dto := repoDTO{
 		ID: r.ID, Name: r.Name, Mode: string(r.Mode), OwnerID: r.OwnerID,
-		ParentVersion: r.ParentVersion, MaxDiffDisks: r.MaxDiffDisks,
+		ParentVersion: r.ParentVersion,
+		ShareCount:    r.MaxDiffDisks, MaxDiffDisks: r.MaxDiffDisks,
 		QuotaBytes: r.QuotaBytes, UsedBytes: r.UsedBytes, State: string(r.State),
 		Group: r.Meta.Group, ClientConfig: r.Meta.ClientConfig,
+		Pool:      r.Meta.Pool,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 	}
 	if r.ParentDiskID != nil {
@@ -128,6 +150,11 @@ func toRepoDTO(r *domain.Repository) repoDTO {
 	}
 	if r.ParentCondition != nil {
 		dto.ParentCondition = string(*r.ParentCondition)
+	}
+	if p := r.Meta.Prepare; p != nil {
+		dto.Prepare = &repoPrepareDTO{
+			Phase: string(p.Phase), Done: p.Done, Total: p.Total, Error: p.Error,
+		}
 	}
 	return dto
 }

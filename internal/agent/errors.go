@@ -172,10 +172,13 @@ func errMountFailedWith(stage string, cause error, extra map[string]any) *apperr
 	return err
 }
 
-// errUnmountFailed 卸载失败；stage 指明失败的阶段（mount_point / disk_offline / disconnect）。
+// errUnmountFailed 卸载失败；stage 指明失败的阶段。
 //
 // 为什么要带 stage：卸载失败只有一句"卸载失败"时，用户看到的是"盘符没了、状态还写着已挂载、
 // iSCSI 里会话还在"，完全无从判断卡在哪一步（真实反馈）。阶段名会随 args 一起回到界面。
+//
+// 统一卸载语义（见 mountEngine.unmount）后，唯一还会失败的是 mount_point 阶段 ——
+// 盘符/目录仍属于该卷，Windows 认为卷正被占用，界面据此提示"关掉占用它的程序后重试"。
 func errUnmountFailed(stage string, cause error) *apperr.Error {
 	err := apperr.New(CodeUnmountFailed, http.StatusInternalServerError).WithCause(cause)
 	if strings.TrimSpace(stage) != "" {

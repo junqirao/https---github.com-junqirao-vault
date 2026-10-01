@@ -198,7 +198,7 @@ func (a *Agent) handleRevoke(ctx context.Context, allocationID, reason string) {
 	})
 	a.publishMount(&revoked)
 
-	if err := a.engine.unmount(ctx, allocationID, true); err != nil {
+	if err := a.engine.unmount(ctx, allocationID); err != nil {
 		a.logger.Error("响应踢下线时卸载失败", "allocation_id", allocationID, "error", err)
 	}
 

@@ -486,6 +486,30 @@ func (s *Store) CountDiffDisks(ctx context.Context, parentDiskID string) (int, e
 	return n, nil
 }
 
+// PickIdleDiffDisk 从"差异盘池"里取一块空闲差异盘（当前没有未释放的分配）。
+//
+// 池化存储库（RepoMeta.Pool）在分配时优先走这里：盘与 iSCSI 目标都在建库阶段就
+// 建好并发布过了，分配只是把它绑给用户 —— 用户点挂载时不需要再等建盘与首次下发。
+//
+// 只取 ready/published 的盘：creating 还在派生（挂载会退化成等待）、error 已经不可用、
+// deleting 正在消失，交给调用方只会得到一个"要等很久"或"挂上去就坏"的分配。
+// 找不到空闲盘时返回 not_found（调用方据此决定是报"池已满"还是回退到现建差异盘）。
+func (s *Store) PickIdleDiffDisk(ctx context.Context, repoID string) (*domain.Disk, error) {
+	d, err := s.scanDisk(ctx, `SELECT `+diskCols+` FROM disks
+		 WHERE repo_id = ? AND kind = ? AND state IN (?, ?)
+		   AND id NOT IN (SELECT disk_id FROM allocations WHERE state <> ?)
+		 ORDER BY created_at LIMIT 1`,
+		repoID, string(domain.DiskKindDiff),
+		string(domain.DiskStateReady), string(domain.DiskStatePublished),
+		string(domain.AllocationStateReleased))
+	if err != nil {
+		return nil, notFound(err, func() *apperr.Error {
+			return apperr.New("repo.no_idle_diff_disk", 404).WithArg("repo_id", repoID)
+		})
+	}
+	return d, nil
+}
+
 // UpdateDiskState 更新磁盘状态与观测值。
 func (s *Store) UpdateDiskState(ctx context.Context, id string, state domain.DiskState, observed string) error {
 	res, err := s.q.ExecContext(ctx,

@@ -57,7 +57,9 @@ function RepoDetailRoute(): JSX.Element {
       isSuperAdmin={isSuperAdmin}
       currentUserId={user?.id ?? ''}
       currentUserName={user?.username ?? ''}
-      onBack={() => navigate(-1)}
+      // 详情的「返回」一律回到存储库列表，不做 navigate(-1)：从新建页跳进详情时，
+      // 历史里那张已经提交过的表单还在，后退会把用户送回去（表单已重置，看着像白填了）。
+      onBack={() => navigate(isSuperAdmin ? '/admin/repos' : '/my-repos', { replace: true })}
     />
   )
 }
@@ -111,8 +113,10 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
           element={
             <RepoCreateForm
               isSuperAdmin={false}
-              onCreated={(repo) => navigate(`/repos/${repo.id}`)}
-              onOpenRepo={(repoId) => navigate(`/repos/${repoId}`)}
+              // 建库成功即离开新建页：用 replace 把新建页从历史里顶掉，
+              // 否则以后在任何地方按浏览器后退都会回到那张已提交过的空表单。
+              onCreated={(repo) => navigate(`/repos/${repo.id}`, { replace: true })}
+              onOpenRepo={(repoId) => navigate(`/repos/${repoId}`, { replace: true })}
               onCancel={() => navigate('/my-repos')}
             />
           }
@@ -155,8 +159,9 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
           element={
             <RepoCreateForm
               isSuperAdmin
-              onCreated={(repo) => navigate(`/repos/${repo.id}`)}
-              onOpenRepo={(repoId) => navigate(`/repos/${repoId}`)}
+              // 同应用端：建库成功后新建页不再留在历史里，详情页返回只回存储库列表。
+              onCreated={(repo) => navigate(`/repos/${repo.id}`, { replace: true })}
+              onOpenRepo={(repoId) => navigate(`/repos/${repoId}`, { replace: true })}
               onCancel={() => navigate('/admin/repos')}
             />
           }

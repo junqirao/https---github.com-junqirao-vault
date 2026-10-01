@@ -530,7 +530,7 @@ export const agentApi = {
     return request({ method: 'POST', path: '/agent/mount', body: input, timeoutMs: MOUNT_TIMEOUT_MS })
   },
 
-  unmount(input: { allocation_id: string; force?: boolean }): Promise<{ ok: true }> {
+  unmount(input: { allocation_id: string }): Promise<{ ok: true }> {
     return request({ method: 'POST', path: '/agent/unmount', body: input, timeoutMs: MOUNT_TIMEOUT_MS })
   },
 

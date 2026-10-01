@@ -118,6 +118,51 @@ type RepoMeta struct {
 	Group string `json:"group,omitempty"`
 	// ClientConfig 面向客户端的附加配置。
 	ClientConfig map[string]any `json:"client_config,omitempty"`
+
+	// Pool 标记该库是"池化共享库"：建库时已按 MaxDiffDisks（共享数量）预创建了差异盘池。
+	//
+	// 只有池化库在释放分配时把差异盘**原地重建回池**（JobResetDiff），
+	// 而不是删除（老的非池化库保持"释放即删"）。
+	Pool bool `json:"pool,omitempty"`
+	// Prepare 建库预创建的进度快照（state=creating 期间存在，供卡片展示"创建到哪一步"）。
+	Prepare *RepoPrepare `json:"prepare,omitempty"`
+}
+
+// RepoPhase 建库预创建的阶段。
+type RepoPhase string
+
+const (
+	// RepoPhaseParent 阶段一：创建（或拷入）母盘。
+	RepoPhaseParent RepoPhase = "parent"
+	// RepoPhaseDiffs 阶段二：逐个派生差异盘。
+	RepoPhaseDiffs RepoPhase = "diffs"
+	// RepoPhaseTargets 阶段三：逐个创建并启用 iSCSI 目标。
+	RepoPhaseTargets RepoPhase = "targets"
+)
+
+// Valid 校验阶段取值。
+func (p RepoPhase) Valid() bool {
+	return p == RepoPhaseParent || p == RepoPhaseDiffs || p == RepoPhaseTargets
+}
+
+// RepoPrepare 是建库预创建任务的进度快照。
+//
+// 为什么要落库而不是只靠 jobs.progress：卡片上要显示的是**人话的步骤**
+// （"正在派生差异盘 3/5"），而任务进度只是一个 0-100 的数字，
+// 且任务恢复/重试后数字会来回跳。阶段与计数写在这里，前端一次查询即可渲染。
+type RepoPrepare struct {
+	// Phase 当前阶段。
+	Phase RepoPhase `json:"phase"`
+	// Done 当前阶段内已完成的个数（如已派生 3 块差异盘）。
+	Done int `json:"done"`
+	// Total 当前阶段需要完成的总数（如共 5 块差异盘）。
+	Total int `json:"total"`
+	// Error 预创建失败的**错误码**（如 "disk.create_failed"）；非空表示该库已进入 error，
+	// 需要人工处理后重试。
+	//
+	// 存码不存文案：文案要按客户端语言渲染（有四套 i18n），而底层原始报错
+	// 可能带服务端路径与命令原文，不适合直接给用户看。
+	Error string `json:"error,omitempty"`
 }
 
 // Repository 是面向用户的"存储库"，封装磁盘 + iSCSI + 授权 + 密钥。
@@ -133,7 +178,12 @@ type Repository struct {
 	ParentVersion int `db:"parent_version" json:"parent_version"`
 	// ParentCondition 母盘用途条件，仅共享模式有效。
 	ParentCondition *ParentCondition `db:"parent_condition" json:"parent_condition,omitempty"`
-	// MaxDiffDisks 单母盘差异盘上限，创建时由 owner 配置。
+	// MaxDiffDisks 差异盘上限，创建时由 owner 配置。
+	//
+	// ⚠️ 它同时是"共享数量"（界面文案）：建库时按这个数量**预创建**差异盘池
+	// （>0 且共享模式 → 库先进入 creating，见 RepoService.Create），
+	// 之后每个分配占用池中的一块。两者合并成一个字段，避免"预创建 5 个但上限 3 个"
+	// 这类自相矛盾的配置。
 	MaxDiffDisks int `db:"max_diff_disks" json:"max_diff_disks"`
 	// QuotaBytes 应用层配额（母盘占用由 owner 独担，见 docs/implementation.md 13.2-⑧）。
 	QuotaBytes int64 `db:"quota_bytes" json:"quota_bytes"`

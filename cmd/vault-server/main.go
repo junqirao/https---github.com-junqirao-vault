@@ -635,6 +635,15 @@ func runServe(configPath *string, migrateOnly *bool) int {
 		if err := application.Disks().MarkCreateFailed(ctx, j.RefID, cause); err != nil {
 			log.Warn("回滚磁盘状态失败", "job_id", j.ID, "ref_id", j.RefID, "error", err)
 		}
+		// 建库预创建（JobPrepareRepo）失败时，除了上面把母盘回滚为 error，
+		// 还必须把**存储库**从 creating 回滚为 error：库停在 creating 的表现是
+		// 前端永远显示"创建中"、既分配不了也挂载不了，而错误码没有落到任何地方。
+		// 库 ID 在 payload 里（ref_id 是母盘 ID），解析交给 app 层。
+		if j != nil && j.Type == domain.JobPrepareRepo {
+			if err := application.Repos().MarkPrepareFailedByJob(ctx, j.Payload, cause); err != nil {
+				log.Warn("回滚存储库状态失败", "job_id", j.ID, "error", err)
+			}
+		}
 	})
 
 	// 任务 handler panic：除日志（worker 内已写带栈 ERROR）外再落一条审计，

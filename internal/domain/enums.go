@@ -42,6 +42,11 @@ func (m RepoMode) Valid() bool {
 type RepoState string
 
 const (
+	// RepoStateCreating 建库中：母盘与"共享数量"个差异盘（含 iSCSI 目标）正在异步预创建。
+	//
+	// 该状态下拒绝分配与挂载：池还没建好，让用户分配只会得到"没盘可用"，
+	// 而挂载会退回到"边挂边等建盘"的慢路径（那正是本状态想消除的体验）。
+	RepoStateCreating RepoState = "creating"
 	RepoStateActive   RepoState = "active"
 	RepoStateSealing  RepoState = "sealing"
 	RepoStateDeleting RepoState = "deleting"
@@ -243,6 +248,16 @@ const (
 	JobReconcile         JobType = "reconcile"
 	JobDeleteDisk        JobType = "delete_disk"
 	JobUploadComplete    JobType = "upload_complete"
+	// JobPrepareRepo 建库预创建：母盘 → "共享数量"个差异盘 → 同数量的 iSCSI 目标（见 5.14）。
+	//
+	// 与 JobCreateVHDX 的区别：它不只建母盘，还要把整个"差异盘池"建好并发布，
+	// 建完才把存储库置为 active。
+	JobPrepareRepo JobType = "prepare_repo"
+	// JobResetDiff 释放分配后的"回池"：原地重建该差异盘（清空上一个用户的数据）并重新发布。
+	//
+	// 池化存储库（见 RepoMeta.Pool）不用 JobDeleteDisk：把盘删掉池子就少一格，
+	// 下一次分配又要现建（用户重新回到"挂载要等很久"）。
+	JobResetDiff JobType = "reset_diff"
 )
 
 // JobState 任务状态。
