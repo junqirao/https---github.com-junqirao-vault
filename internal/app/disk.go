@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"vault/internal/apperr"
 	"vault/internal/domain"
@@ -222,7 +223,14 @@ func (s *DiskService) StartDelete(ctx context.Context, diskID, operatorID string
 		return nil, apperr.DiskBusy()
 	}
 	payload := deleteDiskPayload{DiskID: diskID}
-	j, _, err := s.Jobs.EnqueueWith(ctx, domain.JobDeleteDisk, diskID, "delete_disk:"+diskID, lock.DiskKey(diskID), payload)
+	// 删母盘用 RepoKey：派生差异盘会独占打开母盘，回收存储库的任务也用 RepoKey 删它，
+	// 三者必须串行，否则撞 platform.sharing_violation（同 runCreateDiff 的说明）。
+	// 差异盘之间互不影响，继续按盘加锁，保持并发删除。
+	lockKey := lock.DiskKey(diskID)
+	if disk.Kind == domain.DiskKindParent {
+		lockKey = lock.RepoKey(disk.RepoID)
+	}
+	j, _, err := s.Jobs.EnqueueWith(ctx, domain.JobDeleteDisk, diskID, "delete_disk:"+diskID, lockKey, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -375,6 +383,9 @@ func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk
 }
 
 // runCreateDiff 从母盘派生差异盘。
+//
+// 与"回收存储库"共用 lock.RepoKey（见 Allocate 里入队处的说明）：派生差异盘要
+// **独占打开母盘 VHDX**，必须与同库的其它派生、以及删母盘的回收任务串行。
 func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.Reporter) error {
 	var p diffPayload
 	if err := decodePayload(j.Payload, &p); err != nil {
@@ -382,6 +393,13 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 	}
 	disk, err := s.Store.GetDisk(ctx, p.DiskID)
 	if err != nil {
+		if isNotFound(err) {
+			// 存储库删除会把库/盘/分配记录一次性清掉，这个建盘任务随后就没有意义了。
+			// 不能当失败：worker 会立刻重试，最后还会把"已经不存在的盘"标成异常，
+			// 在日志里留下一串误导性的错误。
+			s.Log.Info("差异盘记录已不存在（存储库可能刚被删除），跳过建盘", "disk_id", p.DiskID)
+			return nil
+		}
 		return err
 	}
 	if disk.State == domain.DiskStateReady && s.Disk != nil && s.Disk.Exists(disk.VHDXPath) {
@@ -392,20 +410,42 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 	}
 	parent, err := s.Store.GetDisk(ctx, p.ParentDiskID)
 	if err != nil {
+		if isNotFound(err) {
+			s.Log.Info("母盘记录已不存在（存储库可能刚被删除），跳过建盘",
+				"disk_id", p.DiskID, "parent_disk_id", p.ParentDiskID)
+			return nil
+		}
 		return err
 	}
 	repo, err := s.Store.GetRepository(ctx, p.RepoID)
 	if err != nil {
+		if isNotFound(err) {
+			s.Log.Info("存储库记录已不存在，跳过建盘", "disk_id", p.DiskID, "repo_id", p.RepoID)
+			return nil
+		}
 		return err
 	}
 	rep.Progress(20)
 
 	if !s.Disk.Exists(disk.VHDXPath) {
-		if err := s.Disk.CreateDiff(ctx, disk.VHDXPath, parent.VHDXPath); err != nil {
+		if err := s.createDiffWithRetry(ctx, disk.VHDXPath, parent.VHDXPath); err != nil {
 			return err
 		}
 	}
 	rep.Progress(60)
+
+	// 建盘期间记录可能被删除（删除存储库会把记录一次性清掉，而它不等这把锁）。
+	// 这时候刚建出来的文件就是孤儿，必须在这里删掉：如果回收任务抢在本次建盘**之前**
+	// 跑完了（两者共用 lock.RepoKey，先后不确定），它的快照里已经"处理过"这个路径，
+	// 不会再来删第二次，留下就是永久孤儿文件。
+	if _, err := s.Store.GetDisk(ctx, disk.ID); err != nil {
+		if isNotFound(err) {
+			s.Log.Warn("建盘期间磁盘记录已被删除，回滚刚创建的差异盘",
+				"disk_id", disk.ID, "path", disk.VHDXPath)
+			return s.removeDiskFile(ctx, disk.VHDXPath)
+		}
+		return err
+	}
 
 	// 记录差异盘基于的母盘版本；挂载前会与 repositories.parent_version 比对。
 	disk.ParentVersion = repo.ParentVersion
@@ -428,6 +468,55 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 	rep.Progress(100)
 	s.audit(ctx, "", "disk.create_diff.done", "disk:"+disk.ID, "parent="+parent.ID, domain.AuditResultOK)
 	return nil
+}
+
+// codeSharingViolation 是"文件被占用"的平台错误码（Windows 上由 winvhd 抛出，
+// 对应 ERROR_SHARING_VIOLATION）。
+//
+// 这里刻意重复一份字符串、而不是 import winvhd：那个包带 `//go:build windows`，
+// 而 app 是两端共用的，import 它会让 Linux 构建直接失败
+// （同类说明见 internal/platform/linuxlvm/errors.go）。
+const codeSharingViolation = "platform.sharing_violation"
+
+// createDiffRetryDelays 是"母盘/子盘被占用"时的原地退避间隔。
+//
+// 为什么必须有它：worker 的重试**没有退避**，3 次尝试在 10ms 内就跑完了
+// （真实工单：attempt=3 而 cost_ms=4）；而共享冲突描述的恰恰是"对方**此刻**还开着
+// 这个文件"这种瞬时状态 —— 没有退避等于没有重试，一次瞬时占用就把磁盘永久判死。
+var createDiffRetryDelays = []time.Duration{
+	300 * time.Millisecond,
+	time.Second,
+	2 * time.Second,
+}
+
+// createDiffWithRetry 创建差异盘，只在"文件被占用"时退避重试。
+//
+// 只对共享冲突重试：它是瞬时状态（iSCSI 服务刚解除映射、回收任务刚删完、
+// 杀毒/索引服务正在扫描母盘），等一会儿必然能成；其它错误（母盘损坏、空间不足、
+// 路径非法）重试没有意义，直接失败反而更快暴露问题。
+func (s *DiskService) createDiffWithRetry(ctx context.Context, childPath, parentPath string) error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		if err = s.Disk.CreateDiff(ctx, childPath, parentPath); err == nil {
+			return nil
+		}
+		if apperr.CodeOf(err) != codeSharingViolation || attempt >= len(createDiffRetryDelays) {
+			// 子盘与母盘都记下来：光看错误文本分不清卡在"子盘被占用"还是"母盘被占用"，
+			// 而这两者的处置完全不同。
+			s.Log.Error("创建差异盘失败", "child", childPath, "parent", parentPath,
+				"attempt", attempt+1, "error", err)
+			return err
+		}
+		delay := createDiffRetryDelays[attempt]
+		s.Log.Warn("创建差异盘遇到文件占用，退避后重试",
+			"child", childPath, "parent", parentPath, "attempt", attempt+1,
+			"retry_in_ms", delay.Milliseconds(), "error", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
 }
 
 // runCopyVHDX 全量复制母盘为新库，并重置磁盘标识（见 5.9.3）。

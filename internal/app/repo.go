@@ -740,7 +740,12 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 
 	if diffDiskID != "" {
 		payload := diffPayload{DiskID: diffDiskID, RepoID: alloc.RepoID, ParentDiskID: parentDiskID}
-		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobCreateDiff, diffDiskID, "create_diff:"+diffDiskID, lock.DiskKey(diffDiskID), payload); err != nil {
+		// 锁用 **RepoKey** 而不是 DiskKey：派生差异盘要独占打开母盘 VHDX，而同一个库的
+		// 所有差异盘共用这一个母盘文件，回收存储库的任务（同样持 RepoKey）也在删它。
+		// 用 DiskKey 的话，并发的两次派生、以及"回收"和"派生"之间都互不排斥，
+		// 必然撞出 platform.sharing_violation（真实工单：后台回收时建盘全挂，
+		// "The process cannot access the file because it is being used by another process"）。
+		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobCreateDiff, diffDiskID, "create_diff:"+diffDiskID, lock.RepoKey(alloc.RepoID), payload); err != nil {
 			return alloc, err
 		}
 	}
