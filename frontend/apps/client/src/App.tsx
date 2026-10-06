@@ -233,9 +233,13 @@ export function App(): JSX.Element {
       try {
         const current = selectActiveServer(useAppStore.getState())
         if (!current) return false
-        const identity = await agentApi.getIdentity()
+        // 必须按当前服务端取证书：本机可能同时装了多个服务端的证书（见 getIdentity 的 target）。
+        const identity = await agentApi.getIdentity({ serverUrl: current.baseUrl, instanceId: current.instanceId })
         if (!identity.installed || !identityMatchesServer(identity, current)) return false
-        const response = await agentApi.identityLogin({ server_url: current.baseUrl })
+        const response = await agentApi.identityLogin({
+          server_url: current.baseUrl,
+          instance_id: current.instanceId
+        })
         applyRenewedSession({
           server_url: current.baseUrl,
           token: response.token,
@@ -399,7 +403,9 @@ export function App(): JSX.Element {
 
     let identity: AgentIdentity
     try {
-      identity = await agentApi.getIdentity()
+      // 按当前服务端取证书：多服务端下"活动身份"可能属于另一个服务端，
+      // 不带 target 取回来就会误判成本服务端没装证书（或拿了别人的证书去登录）。
+      identity = await agentApi.getIdentity({ serverUrl: current.baseUrl, instanceId: current.instanceId })
     } catch (error) {
       // 代理不可用（未启动/未推送到渲染进程）：初始化阶段常见，调用方会退避重试。
       const code = isAgentUnavailableError(error) ? 'agent_unavailable' : 'unknown'
@@ -417,7 +423,10 @@ export function App(): JSX.Element {
     setCertLoginAvailable(true)
 
     try {
-      const response = await agentApi.identityLogin({ server_url: current.baseUrl })
+      const response = await agentApi.identityLogin({
+        server_url: current.baseUrl,
+        instance_id: current.instanceId
+      })
       applyLoginSession(response, true)
       setSessionExpired(false)
       setCertLoginFailure(null)

@@ -537,6 +537,8 @@
   "settings.cert.serial": "Serial number",
   "settings.cert.notAfter": "Valid until",
   "settings.cert.serverMismatch": "The current certificate belongs to another server",
+  "settings.cert.others": "Certificates for other servers",
+  "settings.cert.removeOtherConfirm": "Removing this server's client certificate requires signing in to it again with a password. Continue?",
   "settings.cert.autoLogin": "Passwordless sign-in",
 
   "state.repo.creating": "Creating",
@@ -605,6 +607,7 @@
   "err.system.orphan_not_found": "File not found (it may already be deleted)",
   "err.system.orphan_delete_failed": "Delete failed (the file may be in use); close the program using it and retry",
   "err.platform.unsupported": "The current platform backend does not support this capability",
+  "err.platform.pool_missing": "The LVM pool {vg}/{thin_pool} does not exist yet. Initialize it as a super admin under Settings → LVM storage pool before creating storages.",
   "err.platform.ps_failed": "Platform script failed ({reason}); see server logs for details",
   "err.platform.powershell_unavailable": "No usable PowerShell on the server",
   "err.auth.required": "Incorrect username or password",

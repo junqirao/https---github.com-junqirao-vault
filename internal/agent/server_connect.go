@@ -83,7 +83,7 @@ func (a *Agent) maybeAutoReconnectServer(ctx context.Context) {
 }
 
 // needsServerReconnect 判断这次是否该由自动重连循环出手：
-// 无会话、当前未连接、失败次数没用完，且本机已装好客户端证书身份。
+// 无会话、当前未连接、失败次数没用完，且本机装好了**这个服务端**的客户端证书身份。
 func (a *Agent) needsServerReconnect() bool {
 	if _, ok := a.store.Session(); ok {
 		// 有会话：连接状态归事件订阅与心跳负责，不在这里抢活（抢了会重复登录）。
@@ -93,21 +93,20 @@ func (a *Agent) needsServerReconnect() bool {
 	if server.Connected || server.FailCount >= maxServerConnectAttempts {
 		return false
 	}
-	id, ok := a.identity.Get()
-	if !ok || strings.TrimSpace(id.ServerURL) == "" {
-		// 还没装身份（用户从未免密登录过）：连目标地址都没有，重试没有意义。
+	// 按服务端挑身份：多服务端下别的服务端的证书不能用来连它。
+	id, ok := a.resolveIdentity(server.InstanceID, server.URL)
+	if !ok {
+		// 还没装这个服务端的身份（用户从未在此服务端免密登录过）：重试没有意义。
 		return false
 	}
-	return true
+	// 连目标地址都没有（服务端状态为空且身份里也没记地址）：重试同样没有意义。
+	return strings.TrimSpace(server.URL) != "" || strings.TrimSpace(id.ServerURL) != ""
 }
 
 // reconnectServer 用本地证书身份换一个新会话并写回本地状态（语义等价于客户端推会话）。
 func (a *Agent) reconnectServer(ctx context.Context) error {
-	id, ok := a.identity.Get()
-	if !ok {
-		return errIdentityNotInstalled()
-	}
-	session, _, err := a.certLogin(ctx, id.ServerURL)
+	server := a.store.Server()
+	session, _, err := a.certLogin(ctx, server.URL, server.InstanceID)
 	if err != nil {
 		return err
 	}
@@ -132,7 +131,7 @@ func (a *Agent) handleServerReconnect(w http.ResponseWriter, r *http.Request) {
 		a.writeJSON(w, http.StatusOK, a.store.Server())
 		return
 	}
-	if _, ok := a.identity.Get(); !ok {
+	if _, ok := a.resolveIdentity(a.store.Server().InstanceID, a.store.Server().URL); !ok {
 		a.writeError(w, errIdentityNotInstalled())
 		return
 	}

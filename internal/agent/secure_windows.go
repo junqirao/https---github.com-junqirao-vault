@@ -19,7 +19,7 @@ import (
 //
 // 用 SID 而不是账户名，避免非英文系统上 "SYSTEM"/"Administrators" 名称本地化的问题。
 // 客户端本身以管理员权限运行，收紧后仍可正常读写。
-func restrictFileToAdmins(path string) error {
+func restrictFileToAdminsImpl(path string) error {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		abs = path

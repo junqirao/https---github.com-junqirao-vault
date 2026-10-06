@@ -56,8 +56,9 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/uploads", a.handleListUploads)
 	mux.HandleFunc("DELETE /agent/uploads/{upload_id}", a.handleCancelUpload)
 
-	// 客户端证书身份（免密登录）。
+	// 客户端证书身份（免密登录）；一台机器可同时保存多个服务端的证书。
 	mux.HandleFunc("GET /agent/identity", a.handleGetIdentity)
+	mux.HandleFunc("GET /agent/identities", a.handleListIdentities)
 	mux.HandleFunc("POST /agent/identity/install", a.handleInstallIdentity)
 	mux.HandleFunc("DELETE /agent/identity", a.handleDeleteIdentity)
 	mux.HandleFunc("POST /agent/identity/login", a.handleIdentityLogin)

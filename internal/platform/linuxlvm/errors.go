@@ -19,4 +19,10 @@ const (
 	CodeAccessDenied = "platform.access_denied"
 	// CodeCommandFailed 外部命令（LVM/dm 工具）执行失败。
 	CodeCommandFailed = "platform.command_failed"
+	// CodePoolMissing 配置的卷组或 thin pool 不存在（尚未初始化）。
+	//
+	// 独立于 CodeCommandFailed：它说的是一件**运维能照做**的事（先去初始化存储池），
+	// 而裸命令失败只会把 LVM 的 "Volume group \"vg0\" not found" 甩给用户 ——
+	// 真机上就是这样让人对着"创建存储失败"完全无从下手。
+	CodePoolMissing = "platform.pool_missing"
 )

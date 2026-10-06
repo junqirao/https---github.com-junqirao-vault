@@ -8,18 +8,37 @@ import (
 // newServerConnectTestAgent 构造一个只带状态存储、事件总线与身份存储的代理。
 //
 // 不启 HTTP、不碰网络：自动重连的"该不该试、试完怎么记"是纯状态机 + 事件广播，
-// 测试只需要这三样。id 为 nil 表示"本机从未免密登录过"（未安装身份）。
-func newServerConnectTestAgent(t *testing.T, id *Identity) *Agent {
+// 测试只需要这三样。传 nil 或空身份表示"本机从未免密登录过"（未安装身份）。
+func newServerConnectTestAgent(t *testing.T, ids ...*Identity) *Agent {
 	t.Helper()
 	store, err := NewStateStore(filepath.Join(t.TempDir(), "state.json"), testLogger())
 	if err != nil {
 		t.Fatalf("构造状态存储失败：%v", err)
 	}
-	identity := &identityStore{logger: testLogger()}
-	if id != nil {
-		identity.current = id
+	return &Agent{logger: testLogger(), store: store, hub: NewEventHub(), identity: newTestIdentityStore(t, ids...)}
+}
+
+// newTestIdentityStore 构造只含给定身份的身份存储（完全不碰磁盘）。
+//
+// 入册规则与 identityStore 的加载一致：没有服务端标识的身份会被忽略 ——
+// 真实启动时它同样会被丢弃，测试若把它当成"已装身份"就会与线上行为不一致。
+func newTestIdentityStore(t *testing.T, ids ...*Identity) *identityStore {
+	t.Helper()
+	store := &identityStore{logger: testLogger(), entries: map[string]Identity{}}
+	for _, id := range ids {
+		if id == nil {
+			continue
+		}
+		key := serverKeyOf(id.ServerInstanceID, id.ServerURL)
+		if key == "" {
+			continue
+		}
+		store.entries[key] = *id
 	}
-	return &Agent{logger: testLogger(), store: store, hub: NewEventHub(), identity: identity}
+	if len(store.entries) > 0 {
+		store.activeKey = store.firstKey()
+	}
+	return store
 }
 
 // takeServerEvent 非阻塞取出一条事件（Publish 同步写入带缓冲通道，调用返回后即可读到）。

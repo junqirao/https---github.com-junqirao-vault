@@ -230,12 +230,7 @@ func (m *Manager) vgExists(ctx context.Context, vg string) bool {
 	if err != nil {
 		return false
 	}
-	for _, r := range rows {
-		if strings.TrimSpace(rowStr(r, "vg_name")) == vg {
-			return true
-		}
-	}
-	return false
+	return rowsHaveValue(rows, "vg_name", vg)
 }
 
 // poolExists 判断 thin pool 是否存在。
@@ -244,8 +239,36 @@ func (m *Manager) poolExists(ctx context.Context, vg, pool string) bool {
 	if err != nil {
 		return false
 	}
+	return rowsHaveValue(rows, "lv_name", pool)
+}
+
+// poolMissingKind 判定存储池缺失的部位："vg" / "pool"；两者都在、或**判不出来**时返回 ""。
+//
+// 只在读水位失败之后调用（失败路径才多一次只读探测，正常路径零开销）。
+// 判不出来（vgs 自己也失败，例如服务账号权限不足）刻意返回 ""：
+// 那种情况下报"池不存在"会把运维引向错误的方向，不如保留原有的兜底行为。
+func (m *Manager) poolMissingKind(ctx context.Context, vg, pool string) string {
+	rows, err := m.vgsRows(ctx)
+	if err != nil {
+		return ""
+	}
+	if !rowsHaveValue(rows, "vg_name", vg) {
+		return "vg"
+	}
+	lvs, err := m.lvsRows(ctx, "-o", "lv_name", vg)
+	if err != nil {
+		return ""
+	}
+	if !rowsHaveValue(lvs, "lv_name", pool) {
+		return "pool"
+	}
+	return ""
+}
+
+// rowsHaveValue 判断行集中是否存在某字段等于 v 的行（比较前 TrimSpace）。
+func rowsHaveValue(rows []lvsRow, field, v string) bool {
 	for _, r := range rows {
-		if strings.TrimSpace(rowStr(r, "lv_name")) == pool {
+		if strings.TrimSpace(rowStr(r, field)) == v {
 			return true
 		}
 	}

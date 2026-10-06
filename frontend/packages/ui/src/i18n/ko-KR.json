@@ -537,6 +537,8 @@
   "settings.cert.serial": "일련번호",
   "settings.cert.notAfter": "유효 기간",
   "settings.cert.serverMismatch": "현재 인증서는 다른 서버에 속해 있습니다",
+  "settings.cert.others": "다른 서버의 인증서",
+  "settings.cert.removeOtherConfirm": "이 서버의 클라이언트 인증서를 제거하면 다음 로그인 시 비밀번호를 다시 입력해야 합니다. 계속하시겠습니까?",
   "settings.cert.autoLogin": "비밀번호 없는 로그인",
 
   "state.repo.creating": "생성 중",
@@ -605,6 +607,7 @@
   "err.system.orphan_not_found": "파일이 존재하지 않습니다(이미 삭제되었을 수 있습니다)",
   "err.system.orphan_delete_failed": "삭제 실패(파일이 사용 중일 수 있습니다). 사용 중인 프로그램을 종료한 뒤 다시 시도하세요",
   "err.platform.unsupported": "현재 플랫폼 백엔드는 이 기능을 지원하지 않습니다",
+  "err.platform.pool_missing": "LVM 스토리지 풀 {vg}/{thin_pool}이(가) 아직 없습니다. 스토리지를 만들기 전에 최고 관리자로 「시스템 설정 → LVM 스토리지 풀」에서 초기화하세요.",
   "err.auth.required": "사용자 이름 또는 비밀번호가 올바르지 않습니다",
   "err.auth.forbidden": "이 작업을 수행할 권한이 없습니다",
   "err.auth.locked": "로그인 실패가 너무 많습니다. {retry_after_seconds}초 후 다시 시도하세요",

@@ -537,6 +537,8 @@
   "settings.cert.serial": "序列号",
   "settings.cert.notAfter": "有效期至",
   "settings.cert.serverMismatch": "当前证书属于其他服务端",
+  "settings.cert.others": "其他服务端的证书",
+  "settings.cert.removeOtherConfirm": "移除该服务端的客户端证书后，登录该服务端需重新输入密码，继续？",
   "settings.cert.autoLogin": "免密登录",
 
   "state.repo.creating": "建库中",
@@ -605,6 +607,7 @@
   "err.system.orphan_not_found": "文件不存在（可能已被删除）",
   "err.system.orphan_delete_failed": "删除失败（文件可能正被程序占用），请关闭占用它的程序后重试",
   "err.platform.unsupported": "当前平台后端不支持该能力",
+  "err.platform.pool_missing": "LVM 存储池 {vg}/{thin_pool} 尚不存在：请先到「系统设置 → LVM 存储池」用超级管理员完成初始化，再创建存储。",
   "err.platform.ps_failed": "平台脚本执行失败（{reason}）；详细原因见服务端日志",
   "err.platform.powershell_unavailable": "服务端未找到可用的 PowerShell",
   "err.auth.required": "用户名或密码错误",

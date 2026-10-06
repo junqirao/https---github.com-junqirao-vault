@@ -38,7 +38,8 @@ Go 默认的证书链校验。渲染进程侧的同名信任由 Electron 主进�
 
 代理**常驻进程**负责续期（界面关掉也能续），渲染进程只是消费方：
 
-- **前置条件**：已安装客户端证书身份（`GET /agent/identity` 的 `installed=true`）且当前有会话；
+- **前置条件**：已安装**该服务端**的客户端证书身份（`GET /agent/identity?server_url=…` 的
+  `installed=true`）且当前有会话；
 - **检查频率**：每 60s 检查一次；**续期窗口** = 剩余时间 < `max(5min, 观测寿命 * 25%)`，
   寿命 = `expires_at - 收到该会话的时刻`；
 - **最小间隔**：两次续期尝试之间至少 5 分钟（避免短 TTL 下反复续期）；
@@ -53,7 +54,7 @@ Go 默认的证书链校验。渲染进程侧的同名信任由 Electron 主进�
 ### 无会话时的自动重连与手动重试
 
 代理重启后客户端**不会**重新推会话（客户端只在自身启动/登录时推一次），此时没有会话可用。
-为此代理内建一条自动重连循环：**无会话 + 未连接 + 已装身份**时用客户端证书身份
+为此代理内建一条自动重连循环：**无会话 + 未连接 + 已装该服务端的身份**时用该服务端的客户端证书
 （`POST {server}/v1/auth/cert-login`）换一个新会话回来，效果与 `POST /agent/session` 一致。
 
 - **首次等待**：启动后 20s 才试第一次（给客户端推会话留出时间，避免抢先后白多一次证书登录）；
@@ -66,6 +67,44 @@ Go 默认的证书链校验。渲染进程侧的同名信任由 Electron 主进�
 ```
 POST /agent/server/reconnect      # 界面"重试"按钮：清零失败计数 + 立即重连一次
   ↑ AgentServerState              # 成功时的最新服务端状态（连接状态另经 server 事件广播）
+```
+
+### 客户端证书身份（一台机器可装多个服务端）
+
+服务端校验 `POST {server}/v1/auth/cert-login` 的证书必须由**本实例**签发，因此代理把身份
+**按服务端**保存：同时连多个服务端时每个服务端各有一份证书/私钥，**互不覆盖**。
+定位规则：**服务端实例 ID 优先，其次规范化地址**（小写、去首尾空白与末尾斜杠）。
+
+登录、自动续期、断线重连都**先按目标服务端定位身份**，绝不拿别的服务端的证书去试探
+（盲试会消耗服务端防爆破计数，见 implementation.md 9.1/R22）。
+
+```
+GET /agent/identity                  # 不带参数：返回"活动"身份（最近安装的那份）
+GET /agent/identity?server_url=<url>&instance_id=<id>
+  ↑ AgentIdentity                    # 指定服务端：该服务端没装证书时 installed=false
+GET /agent/identities                # 本机保存的全部身份（设置页列"其他服务端的证书"用）
+  ↑ {active?:<server_key>, identities:[AgentIdentity...]}
+POST /agent/identity/install         # 用当前会话向服务端换取证书并落盘（按服务端归属）
+  ↓ {server_url, token, user_id, username, cert_sha256}
+  ↑ AgentIdentity
+DELETE /agent/identity?server_url=<url>&instance_id=<id>   # 只删该服务端的证书
+DELETE /agent/identity?all=true                            # 删全部
+DELETE /agent/identity                                     # 都不带：删"活动"身份
+  ↑ {ok:true}
+POST /agent/identity/login           # 用本地证书免密登录
+  ↓ {server_url?, instance_id?}      # 都省略时用"活动"身份
+  ↑ {token, expires_at, user:{id, username}, ...}
+
+AgentIdentity = {
+  installed:bool,
+  server_key,                        # 身份归属的服务端标识（实例 ID 优先，其次规范化地址）
+  server_url, server_instance_id, server_cert_sha256,
+  user_id, username, serial, fingerprint_sha256, spki_sha256,
+  not_before, not_after, installed_at
+}
+# 永不含私钥与证书原文；落盘文件（identity.json，v2 结构）写后收紧 ACL（仅 SYSTEM 与 Administrators）。
+# 兼容：老版本的"整份文件就是一个身份"（v1）会被自动读入并在下次写入时升级为 v2；
+# 本机只有一份身份时，连接路径允许按它兜底（老客户端只能装一份，地址/实例 ID 可能变过）。
 ```
 
 ## 状态查询

@@ -537,6 +537,8 @@
   "settings.cert.serial": "シリアル番号",
   "settings.cert.notAfter": "有効期限",
   "settings.cert.serverMismatch": "現在の証明書は別のサーバーに属しています",
+  "settings.cert.others": "他のサーバーの証明書",
+  "settings.cert.removeOtherConfirm": "このサーバーのクライアント証明書を削除すると、次回はパスワードでのログインが必要になります。続行しますか？",
   "settings.cert.autoLogin": "パスワードレスログイン",
 
   "state.repo.creating": "作成中",
@@ -605,6 +607,7 @@
   "err.system.orphan_not_found": "ファイルが存在しません（既に削除された可能性があります）",
   "err.system.orphan_delete_failed": "削除に失敗しました（ファイルが使用中の可能性があります）。使用しているプログラムを終了して再試行してください",
   "err.platform.unsupported": "現在のプラットフォームバックエンドはこの機能に対応していません",
+  "err.platform.pool_missing": "LVM ストレージプール {vg}/{thin_pool} がまだ存在しません。ストレージを作成する前に、スーパー管理者として「システム設定 → LVM ストレージプール」で初期化してください。",
   "err.auth.required": "ユーザー名またはパスワードが正しくありません",
   "err.auth.forbidden": "この操作を実行する権限がありません",
   "err.auth.locked": "ログイン失敗が多すぎます。{retry_after_seconds} 秒後に再試行してください",

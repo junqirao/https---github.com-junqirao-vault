@@ -266,6 +266,12 @@ export interface AgentConfig {
 /** GET /agent/identity 与 POST /agent/identity/install 的响应（永不含私钥与证书原文）。 */
 export interface AgentIdentity {
   installed: boolean
+  /**
+   * 身份归属的服务端标识：实例 ID 优先，其次规范化地址（与 ServerEntry.key 同源）。
+   *
+   * 一台机器可同时保存多个服务端的证书，靠它区分"这份证书是谁的"。
+   */
+  server_key?: string
   server_url?: string
   server_instance_id?: string
   server_cert_sha256?: string
@@ -286,6 +292,17 @@ export interface AgentIdentityInstallInput {
   user_id: string
   username: string
   cert_sha256: string
+}
+
+/**
+ * GET /agent/identities 的响应：本机保存的**全部**服务端身份。
+ *
+ * 多服务端下一个服务端一份证书，用于在设置里列出"哪些服务端装了证书"并单独撤销某一个。
+ */
+export interface AgentIdentityList {
+  /** "未指定服务端"时使用的身份键；无身份时缺省。 */
+  active?: string
+  identities: AgentIdentity[]
 }
 
 /** POST /agent/identity/login 的响应（与口令登录一致，由代理原样透出）。 */

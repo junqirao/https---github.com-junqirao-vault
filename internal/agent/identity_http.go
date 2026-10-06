@@ -10,8 +10,38 @@ import (
 )
 
 // handleGetIdentity 返回本地身份元数据（**不含私钥**）。
-func (a *Agent) handleGetIdentity(w http.ResponseWriter, _ *http.Request) {
-	a.writeJSON(w, http.StatusOK, a.identity.Meta())
+//
+// 带 server_url / instance_id 查询参数时返回**该服务端**的身份（没装就是 installed=false），
+// 便于前端在多个服务端之间切换时判断"这个服务端能不能用证书免密登录"；
+// 不带参数时返回"活动"身份（旧版语义）。
+func (a *Agent) handleGetIdentity(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	serverURL := strings.TrimSpace(query.Get("server_url"))
+	instanceID := strings.TrimSpace(query.Get("instance_id"))
+	if serverURL == "" && instanceID == "" {
+		a.writeJSON(w, http.StatusOK, a.identity.Meta())
+		return
+	}
+	a.writeJSON(w, http.StatusOK, a.identity.MetaFor(instanceID, serverURL))
+}
+
+// identityListResponse 是本机全部客户端身份的元数据（按服务端区分）。
+type identityListResponse struct {
+	// Active 是"未指定服务端"时使用的身份键（见 serverKeyOf）；无身份时为空。
+	Active string `json:"active,omitempty"`
+	// Identities 各服务端的身份元数据（**不含私钥**）。
+	Identities []identityMeta `json:"identities"`
+}
+
+// handleListIdentities 列出本机保存的全部客户端身份（GET /agent/identities）。
+//
+// 多服务端下用户需要看到"哪几个服务端装了证书"并单独撤销某一个，
+// 因此这里返回全部条目而不是当前那一条。
+func (a *Agent) handleListIdentities(w http.ResponseWriter, _ *http.Request) {
+	a.writeJSON(w, http.StatusOK, identityListResponse{
+		Active:     a.identity.ActiveKey(),
+		Identities: a.identity.Metas(),
+	})
 }
 
 // identityInstallRequest 是安装本地身份的请求。
@@ -125,17 +155,33 @@ func (a *Agent) handleInstallIdentity(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleDeleteIdentity 删除本地身份（幂等）。
-func (a *Agent) handleDeleteIdentity(w http.ResponseWriter, _ *http.Request) {
-	if err := a.identity.Remove(); err != nil {
+//
+// 不带参数时删除"活动"身份（旧版语义）；带 server_url / instance_id 时只删该服务端的身份；
+// all=true 删除全部。**只删指定服务端**是多服务端下的关键语义：撤销 A 的证书不能顺手把 B 的也删掉。
+func (a *Agent) handleDeleteIdentity(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	if strings.EqualFold(strings.TrimSpace(query.Get("all")), "true") {
+		if err := a.identity.RemoveAll(); err != nil {
+			a.writeError(w, err)
+			return
+		}
+		a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	if err := a.identity.Remove(query.Get("instance_id"), query.Get("server_url")); err != nil {
 		a.writeError(w, err)
 		return
 	}
 	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// identityLoginRequest 是证书登录请求；server_url 可选。
+// identityLoginRequest 是证书登录请求；server_url 与 instance_id 都可选。
+//
+// 两者都为空时用"活动"身份；给了任意一个就按该服务端挑证书（多服务端下必须给，
+// 否则可能拿另一个服务端的证书去登录）。instance_id 比地址更准：同一实例换地址后依然能命中。
 type identityLoginRequest struct {
-	ServerURL string `json:"server_url"`
+	ServerURL  string `json:"server_url"`
+	InstanceID string `json:"instance_id"`
 }
 
 // certLoginHTTPResponse 是服务端 POST /v1/auth/cert-login 的响应（与口令登录结构一致）。
@@ -166,7 +212,7 @@ func (a *Agent) handleIdentityLogin(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, serverRequestTimeout)
 	defer cancel()
 
-	session, out, err := a.certLogin(ctx, in.ServerURL)
+	session, out, err := a.certLogin(ctx, in.ServerURL, in.InstanceID)
 	if err != nil {
 		a.writeError(w, err)
 		return
@@ -181,11 +227,17 @@ func (a *Agent) handleIdentityLogin(w http.ResponseWriter, r *http.Request) {
 
 // certLogin 用本地客户端证书向服务端换取新会话（mTLS），返回可直接写回本地状态的 Session。
 //
-// 供 handleIdentityLogin（用户点击/自动免密登录）与后台自动续期循环共用，避免复制粘贴。
-// 失败返回服务端结构化错误（如 auth.cert_invalid / auth.forbidden / agent.server_unreachable）。
-func (a *Agent) certLogin(ctx context.Context, serverURL string) (*Session, *certLoginHTTPResponse, error) {
-	id, ok := a.identity.Get()
+// serverURL / instanceID 为空时用"活动"身份；给了任意一个就挑该服务端的证书
+// （见 resolveIdentity）——多服务端下这一步是"用对了证书"的前提。
+//
+// 供 handleIdentityLogin（用户点击/自动免密登录）、自动重连与后台自动续期循环共用，
+// 避免复制粘贴。失败返回服务端结构化错误（如 auth.cert_invalid / auth.forbidden /
+// agent.server_unreachable）。
+func (a *Agent) certLogin(ctx context.Context, serverURL, instanceID string) (*Session, *certLoginHTTPResponse, error) {
+	id, ok := a.resolveIdentity(instanceID, serverURL)
 	if !ok {
+		a.logger.Warn("本机没有该服务端的客户端证书身份，无法免密登录",
+			"server_url", strings.TrimSpace(serverURL), "server_instance_id", strings.TrimSpace(instanceID))
 		return nil, nil, errIdentityNotInstalled()
 	}
 	url := strings.TrimSpace(serverURL)
@@ -215,9 +267,15 @@ func (a *Agent) certLogin(ctx context.Context, serverURL string) (*Session, *cer
 		return nil, nil, errBadResponse(nil)
 	}
 
+	// 实例 ID 以身份记录的为准（安装时落盘），缺失时退回调用方给的（例如前端已知的实例 ID）。
+	serverInstanceID := strings.TrimSpace(id.ServerInstanceID)
+	if serverInstanceID == "" {
+		serverInstanceID = strings.TrimSpace(instanceID)
+	}
+
 	return &Session{
 		ServerURL:        client.base,
-		ServerInstanceID: id.ServerInstanceID,
+		ServerInstanceID: serverInstanceID,
 		Token:            out.Token,
 		CertSHA256:       pin,
 		UserID:           out.User.ID,
@@ -226,14 +284,51 @@ func (a *Agent) certLogin(ctx context.Context, serverURL string) (*Session, *cer
 	}, &out, nil
 }
 
+// resolveIdentity 为"要连某个服务端"挑选本地身份。
+//
+// 先按服务端严格匹配（实例 ID 优先，其次规范化地址，见 identityStore.GetForServer）；
+// 作为兼容，本机**只有一份**身份时也接受它 —— 老版本客户端只能装一份证书，用户此时
+// 传给我们的地址/实例 ID 可能与安装时不同（改过地址、实例 ID 是后来才补上的），
+// 直接判定"未安装"会让升级后的老用户突然失去免密登录能力。
+func (a *Agent) resolveIdentity(instanceID, serverURL string) (Identity, bool) {
+	if strings.TrimSpace(instanceID) == "" && strings.TrimSpace(serverURL) == "" {
+		return a.identity.Get()
+	}
+	if id, ok := a.identity.GetForServer(instanceID, serverURL); ok {
+		return id, true
+	}
+	if a.identity.Len() == 1 {
+		return a.identity.Get()
+	}
+	return Identity{}, false
+}
+
 // pinForIdentity 选择用于固定服务端证书的指纹：
-// 身份文件记录的 server_cert_sha256 优先；否则退回与身份同一服务端的已存会话指纹。
+// 身份文件记录的 server_cert_sha256 优先；否则退回**同一服务端**已存会话的指纹。
+//
+// 多服务端下这里必须核对"是不是同一个服务端"：否则会把 A 服务端的指纹拿去固定
+// B 服务端的证书，握手阶段就被拒（表现为 TLS handshake error 反复刷屏）。
 func (a *Agent) pinForIdentity(id Identity) string {
 	if p := strings.ToLower(strings.TrimSpace(id.ServerCertSHA256)); p != "" {
 		return p
 	}
-	if sess, ok := a.store.Session(); ok && sess.ServerURL == id.ServerURL {
-		return strings.ToLower(strings.TrimSpace(sess.CertSHA256))
+	sess, ok := a.store.Session()
+	if !ok || !sameServer(id, sess.ServerInstanceID, sess.ServerURL) {
+		return ""
 	}
-	return ""
+	return strings.ToLower(strings.TrimSpace(sess.CertSHA256))
+}
+
+// sameServer 判断身份与给定服务端（实例 ID + 地址）是否指向同一个服务端实例。
+//
+// 两边都有实例 ID 时以实例 ID 为准（服务端重装后实例 ID 会变，此时旧证书/旧指纹不应再沿用）；
+// 否则退回规范化地址比较。
+func sameServer(id Identity, instanceID, serverURL string) bool {
+	idInstance := strings.ToLower(strings.TrimSpace(id.ServerInstanceID))
+	other := strings.ToLower(strings.TrimSpace(instanceID))
+	if idInstance != "" && other != "" {
+		return idInstance == other
+	}
+	url := normalizeServerURL(serverURL)
+	return url != "" && normalizeServerURL(id.ServerURL) == url
 }

@@ -50,9 +50,15 @@ func errCertRenewBlocked() error {
 //   - 节流：两次重登录至少间隔 authRetryMinInterval，服务端持续 401 时不会被打爆；
 //   - 确定性错误（证书被吊销/过期等）走 handleRenewFailure 停止后续自动续期。
 //
-// 前置条件：必须已安装本地证书身份；否则直接返回"未安装身份"（调用方回落为要求登录）。
+// 前置条件：本机必须装有**当前会话所属服务端**的客户端证书身份；否则直接返回"未安装身份"
+// （调用方回落为要求登录）。
 func (a *Agent) refreshSessionToken(ctx context.Context) (string, error) {
-	if _, ok := a.identity.Get(); !ok {
+	// 按服务端挑证书：多服务端下"活动身份"可能属于另一个服务端，用它去重登录必然失败。
+	authURL, authInstanceID := "", ""
+	if current, ok := a.store.Session(); ok {
+		authURL, authInstanceID = current.ServerURL, current.ServerInstanceID
+	}
+	if _, ok := a.resolveIdentity(authInstanceID, authURL); !ok {
 		return "", errIdentityNotInstalled()
 	}
 
@@ -81,7 +87,7 @@ func (a *Agent) refreshSessionToken(ctx context.Context) (string, error) {
 	a.authRetryInFlight = call
 	a.renewMu.Unlock()
 
-	session, _, err := a.certLogin(ctx, "")
+	session, _, err := a.certLogin(ctx, authURL, authInstanceID)
 	if err != nil {
 		a.noteAuthRetryFailure(err)
 		call.err = err
@@ -164,11 +170,13 @@ func (a *Agent) runSessionRenewalLoop(ctx context.Context) {
 // 续期时机：剩余时间 < max(5min, 观测到的会话寿命 * 25%)；两次尝试之间至少间隔 5 分钟。
 // 失败绝不清除现有会话、绝不影响挂载：确定性错误停止自动续期并要求重新登录，其余退避重试。
 func (a *Agent) maybeRenewSession(ctx context.Context) {
-	if _, ok := a.identity.Get(); !ok {
-		return // 未安装客户端证书身份：不自动续期
-	}
 	session, ok := a.store.Session()
 	if !ok || strings.TrimSpace(session.ServerURL) == "" || session.ExpiresAt <= 0 {
+		return
+	}
+	// 只有**当前会话所属服务端**装了客户端证书身份才自动续期：
+	// 多服务端下"活动身份"可能属于另一个服务端，拿它去续期只会白失败一轮。
+	if _, ok := a.resolveIdentity(session.ServerInstanceID, session.ServerURL); !ok {
 		return
 	}
 
@@ -205,7 +213,7 @@ func (a *Agent) maybeRenewSession(ctx context.Context) {
 	callCtx, cancel := context.WithTimeout(ctx, sessionProbeTimeout)
 	defer cancel()
 
-	renewed, _, err := a.certLogin(callCtx, session.ServerURL)
+	renewed, _, err := a.certLogin(callCtx, session.ServerURL, session.ServerInstanceID)
 	if err != nil {
 		a.handleRenewFailure(session, err)
 		return

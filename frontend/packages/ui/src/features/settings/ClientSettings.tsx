@@ -7,7 +7,7 @@ import { CopyableText } from '../../components/CopyableText'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
-import { agentApi, identityMatchesServer, relaunchClient } from '../../api/agentClient'
+import { agentApi, identityMatchesServer, relaunchClient, serverKeyOf } from '../../api/agentClient'
 import type { AgentConfig, AgentIdentity, UpdateInfo } from '../../api/agentTypes'
 import { ApiError } from '../../api/errors'
 import { useAgent } from '../../hooks/useAgent'
@@ -26,7 +26,7 @@ export interface ClientSettingsProps {
 export function ClientSettings({ language, onLanguageChange }: ClientSettingsProps): JSX.Element {
   const { t } = useI18n()
   const agent = useAgent()
-  const { active } = useServerConfig()
+  const { active, servers } = useServerConfig()
   const { user } = useAuth()
   const [config, setConfig] = useState<AgentConfig | null>(null)
   const [error, setError] = useState<unknown>(null)
@@ -36,10 +36,14 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
   const [checking, setChecking] = useState(false)
   const [applying, setApplying] = useState(false)
   const [identity, setIdentity] = useState<AgentIdentity | null>(null)
+  // 本机保存的**全部**服务端身份：一个服务端一份证书（见 /agent/identities）。
+  const [identities, setIdentities] = useState<AgentIdentity[]>([])
   const [identityError, setIdentityError] = useState<unknown>(null)
   const [identityBusy, setIdentityBusy] = useState(false)
   const [autoLoginSaving, setAutoLoginSaving] = useState(false)
   const [removeOpen, setRemoveOpen] = useState(false)
+  // 待撤销的"其他服务端"证书；null 表示没有待确认的撤销。
+  const [removeOther, setRemoveOther] = useState<AgentIdentity | null>(null)
 
   const disabled = !agent.available
 
@@ -96,24 +100,30 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
     }
   }, [agent.available])
 
+  // 一次性取回"当前服务端那份证书"与"本机全部证书"：
+  // 前者决定本页显示"已装/未装/属于其他服务端"，后者用于列出其他服务端的证书并单独撤销。
+  const loadIdentity = async (): Promise<void> => {
+    const target = active ? { serverUrl: active.baseUrl, instanceId: active.instanceId } : undefined
+    const [current, list] = await Promise.all([agentApi.getIdentity(target), agentApi.listIdentities()])
+    setIdentity(current)
+    setIdentities(list.identities ?? [])
+  }
+
   useEffect(() => {
     if (!agent.available) {
       setIdentity(null)
+      setIdentities([])
       return
     }
     let cancelled = false
-    agentApi
-      .getIdentity()
-      .then((value) => {
-        if (!cancelled) setIdentity(value)
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) setIdentityError(err)
-      })
+    loadIdentity().catch((err: unknown) => {
+      if (!cancelled) setIdentityError(err)
+    })
     return () => {
       cancelled = true
     }
-  }, [agent.available])
+    // 依赖具体字段而不是 active 对象：切服务端后要重新判断"这个服务端装了证书没有"。
+  }, [agent.available, active?.baseUrl, active?.instanceId])
 
   const patch = (values: Partial<AgentConfig>): void => {
     setConfig((prev) => (prev ? { ...prev, ...values } : prev))
@@ -196,6 +206,16 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
   const installable = Boolean(active?.token && active.certSha256 && user)
   const matched = Boolean(identity?.installed && active && identityMatchesServer(identity, active))
   const mismatched = Boolean(identity?.installed && active && !matched)
+  // 其他服务端的证书：当前服务端那份由上面的区块管理，这里只列"别人的"，
+  // 让用户能在不影响当前服务端的前提下单独撤销。
+  const others = identities.filter((item) => !(active && identityMatchesServer(item, active)))
+
+  /** 证书所属服务端的显示名：能从服务端列表里对上就用列表里的名字，否则退回地址。 */
+  const serverNameOf = (item: AgentIdentity): string => {
+    const key = item.server_key ?? ''
+    const entry = servers.find((server) => serverKeyOf(server) === key)
+    return entry?.serverName || item.server_url || '-'
+  }
 
   const installIdentity = async (): Promise<void> => {
     if (!active?.token || !active.certSha256 || !user) return
@@ -211,6 +231,8 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
         cert_sha256: active.certSha256
       })
       setIdentity(value)
+      // 只刷新列表：其他服务端的证书不受影响，当前服务端那份已由返回值给出。
+      setIdentities((prev) => [...prev.filter((item) => item.server_key !== value.server_key), value])
       setNotice(t('settings.saved'))
       await agent.refresh()
     } catch (err) {
@@ -220,14 +242,22 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
     }
   }
 
-  const removeIdentity = async (): Promise<void> => {
+  // 撤销客户端证书。不传 target 表示撤销当前服务端那份；传 target 撤销该服务端那份
+  // （多服务端下必须按服务端指定：代理里的"活动身份"可能是别的服务端的）。
+  const removeIdentity = async (target?: AgentIdentity): Promise<void> => {
     setIdentityBusy(true)
     setIdentityError(null)
     setNotice(null)
     try {
-      await agentApi.removeIdentity()
-      setIdentity({ installed: false })
+      const scope = target
+        ? { serverUrl: target.server_url, instanceId: target.server_instance_id }
+        : active
+          ? { serverUrl: active.baseUrl, instanceId: active.instanceId }
+          : undefined
+      await agentApi.removeIdentity(scope)
+      await loadIdentity()
       setRemoveOpen(false)
+      setRemoveOther(null)
       setNotice(t('settings.saved'))
       await agent.refresh()
     } catch (err) {
@@ -374,6 +404,32 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
               onChange={(checked) => void toggleAutoLogin(checked)}
             />
           </div>
+          {others.length > 0 ? (
+            <div>
+              <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+                {t('settings.cert.others')}
+              </Typography.Text>
+              <Space direction="vertical" size={spacing.xs} style={{ width: '100%' }}>
+                {others.map((item) => (
+                  <Space
+                    key={item.server_key ?? item.server_url}
+                    style={{ width: '100%', justifyContent: 'space-between' }}
+                    align="center"
+                  >
+                    <Space direction="vertical" size={0}>
+                      <Typography.Text>{serverNameOf(item)}</Typography.Text>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        {[item.server_url, item.username, formatTime(item.not_after)].filter(Boolean).join(' · ')}
+                      </Typography.Text>
+                    </Space>
+                    <Button danger disabled={disabled || identityBusy} onClick={() => setRemoveOther(item)}>
+                      {t('settings.cert.remove')}
+                    </Button>
+                  </Space>
+                ))}
+              </Space>
+            </div>
+          ) : null}
         </Space>
         <ConfirmDialog
           open={removeOpen}
@@ -382,6 +438,14 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
           title={t('settings.cert.removeConfirm')}
           onConfirm={() => void removeIdentity()}
           onCancel={() => setRemoveOpen(false)}
+        />
+        <ConfirmDialog
+          open={removeOther !== null}
+          danger
+          loading={identityBusy}
+          title={t('settings.cert.removeOtherConfirm')}
+          onConfirm={() => void removeIdentity(removeOther ?? undefined)}
+          onCancel={() => setRemoveOther(null)}
         />
       </SectionCard>
 

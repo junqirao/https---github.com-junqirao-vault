@@ -540,7 +540,21 @@ func (m *Manager) checkWatermark(ctx context.Context, vg string) error {
 	}
 	out, err := m.run(ctx, "lvs", "--reportformat", "json", "-o", "data_percent,metadata_percent", pool)
 	if err != nil {
-		// 池不存在时读不到水位：交给后续 lvcreate 报错，不在这里误报"空间不足"。
+		// 读不到水位有两类原因，必须分开处理：
+		//
+		//   1) 配置的卷组/池根本不存在（全新机器、还没在管理端初始化存储池）。
+		//      这时后续 lvcreate 必然失败，而它的原生输出是 "Volume group \"vg0\" not found"
+		//      这种裸文本 —— 用户只看到"创建存储失败"，完全不知道下一步该做什么（真实反馈）。
+		//      所以这里直接给出可执行的错误码与参数。
+		//   2) 其它原因（权限不足、字段不被支持等）：状态未知，保守跳过闸门，
+		//      仍交给 lvcreate 兜底，避免在这里误报"空间不足"。
+		if kind := m.poolMissingKind(ctx, vg, pool); kind != "" {
+			m.logger.Error("存储池不存在，拒绝创建（请先初始化存储池）",
+				"vg", vg, "thin_pool", m.thinPool, "missing", kind)
+			return apperr.New(CodePoolMissing, http.StatusServiceUnavailable).
+				WithArg("vg", vg).
+				WithArg("thin_pool", m.thinPool)
+		}
 		m.logger.Warn("读取 thin pool 水位失败，跳过水位闸门", "pool", pool, "err", err.Error())
 		return nil
 	}

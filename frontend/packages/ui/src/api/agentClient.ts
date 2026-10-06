@@ -14,6 +14,7 @@ import type {
   AgentHealth,
   AgentIdentity,
   AgentIdentityInstallInput,
+  AgentIdentityList,
   AgentIdentityLoginResponse,
   AgentHostState,
   AgentLog,
@@ -486,6 +487,26 @@ function normalizeServerUrl(url: string | undefined): string {
   return (url ?? '').trim().replace(/\/+$/, '').toLowerCase()
 }
 
+/** 服务端标识：实例 ID 优先，其次规范化地址（与代理侧 serverKeyOf 同源）。 */
+export function serverKeyOf(server: { baseUrl: string; instanceId?: string }): string {
+  return (server.instanceId ?? '').trim().toLowerCase() || normalizeServerUrl(server.baseUrl)
+}
+
+/** 身份接口的服务端定位参数。 */
+export interface IdentityTarget {
+  serverUrl?: string
+  instanceId?: string
+}
+
+/** 拼身份接口的服务端定位查询串；两者都为空时返回空串（代理按"活动身份"处理）。 */
+function identityQuery(target?: IdentityTarget): string {
+  const query = new URLSearchParams()
+  if (target?.serverUrl) query.set('server_url', target.serverUrl)
+  if (target?.instanceId) query.set('instance_id', target.instanceId)
+  const suffix = query.toString()
+  return suffix ? `?${suffix}` : ''
+}
+
 /**
  * 本地身份是否绑定到给定服务端。
  *
@@ -633,9 +654,19 @@ export const agentApi = {
     })
   },
 
-  /** 读取本地客户端证书身份（未安装时仅 installed:false；绝不含私钥/证书原文）。 */
-  getIdentity(): Promise<AgentIdentity> {
-    return request<AgentIdentity>({ method: 'GET', path: '/agent/identity' })
+  /**
+   * 读取本地客户端证书身份（未安装时仅 installed:false；绝不含私钥/证书原文）。
+   *
+   * 传 target 时返回**该服务端**的那份证书 —— 一台机器可同时保存多个服务端的证书，
+   * 判断"当前服务端能不能免密登录"必须带上它，否则会读到别的服务端的证书。
+   */
+  getIdentity(target?: IdentityTarget): Promise<AgentIdentity> {
+    return request<AgentIdentity>({ method: 'GET', path: `/agent/identity${identityQuery(target)}` })
+  },
+
+  /** 列出本机保存的全部服务端身份（多服务端：一个服务端一份证书）。 */
+  listIdentities(): Promise<AgentIdentityList> {
+    return request<AgentIdentityList>({ method: 'GET', path: '/agent/identities' })
   },
 
   /** 安装本地客户端身份：代理本地生成密钥对，用当前会话向服务端换取证书并落盘。 */
@@ -643,13 +674,24 @@ export const agentApi = {
     return request<AgentIdentity>({ method: 'POST', path: '/agent/identity/install', body: input })
   },
 
-  /** 移除本地身份（幂等）。 */
-  removeIdentity(): Promise<{ ok: true }> {
-    return request({ method: 'DELETE', path: '/agent/identity' })
+  /**
+   * 移除本地身份（幂等）。
+   *
+   * 传 target 时只删该服务端的证书，其他服务端的证书不受影响；`all: true` 删除全部；
+   * 都不传则删除"活动"身份（旧版语义）。
+   */
+  removeIdentity(target?: IdentityTarget & { all?: boolean }): Promise<{ ok: true }> {
+    const query = target?.all ? '?all=true' : identityQuery(target)
+    return request({ method: 'DELETE', path: `/agent/identity${query}` })
   },
 
-  /** 用本地证书免密登录；代理已把会话写回本地状态，此处只透出服务端响应。 */
-  identityLogin(input?: { server_url?: string }): Promise<AgentIdentityLoginResponse> {
+  /**
+   * 用本地证书免密登录；代理已把会话写回本地状态，此处只透出服务端响应。
+   *
+   * server_url / instance_id 用于挑证书：多服务端下两者至少要给一个，
+   * 否则代理只能按"活动身份"猜（可能属于另一个服务端）。
+   */
+  identityLogin(input?: { server_url?: string; instance_id?: string }): Promise<AgentIdentityLoginResponse> {
     return request({ method: 'POST', path: '/agent/identity/login', body: input ?? {} })
   },
 
