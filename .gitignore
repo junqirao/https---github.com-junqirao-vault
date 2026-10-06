@@ -37,8 +37,11 @@ dist/
 # 本地配置（真实配置含 master_key，绝不入库）
 config.yaml
 data/
-logs/
 pki/
+# 运行期日志目录只忽略**仓库根**的那一个：
+# 写成未锚定的 logs/ 会连 frontend/packages/ui/src/features/logs/（日志模块源码）一起忽略，
+# 导致该模块的所有改动都进不了库。
+/logs/
 
 # Go
 *.test

@@ -18,6 +18,7 @@ import type {
   AgentHealth,
   AgentMountMode,
   AgentMountState,
+  AgentServerState,
   AgentSessionState,
   AgentState,
   DownloadState,
@@ -58,6 +59,13 @@ export interface UseAgentResult {
   mount: (input: AgentMountInput) => Promise<AgentMountState>
   unmount: (input: AgentUnmountInput) => Promise<void>
   remount: (input: { allocation_id: string }) => Promise<AgentMountState>
+  /**
+   * 手动重连服务端（顶栏"未连接"旁的"重试"按钮）。
+   *
+   * 代理会清零自动重连的失败计数并立即重试一次：成功后自动重连循环重新获得
+   * maxServerConnectAttempts 次机会（对应"手动重试会刷新计数"）。
+   */
+  reconnectServer: () => Promise<AgentServerState>
   refresh: () => Promise<void>
   /** 拉取一次下载任务列表（用于页面挂载时恢复进行中/历史状态）。 */
   refreshDownloads: () => Promise<void>
@@ -329,11 +337,24 @@ function applyEvent(event: AgentEvent): void {
         setSnapshot({
           state: {
             ...current,
-            server: { ...current.server, connected: event.connected, last_error: event.last_error }
+            server: {
+              ...current.server,
+              connected: event.connected,
+              // 旧版代理不带这两个字段：缺省时保留原值，别把"连接中"抹成未知状态。
+              phase: event.phase ?? current.server.phase,
+              fail_count: event.fail_count ?? current.server.fail_count,
+              last_error: event.last_error
+            }
           }
         })
       }
-      notify(event.connected ? t('agent.event.serverConnected') : t('agent.event.serverDisconnected'))
+      // 只在"连接状态真的翻转"时提示：phase 变化（connecting → disconnected）本身不是
+      // 用户事件，每次都弹提示会把顶栏的自动重连刷成一串通知。还没有快照时按"未连接"看待
+      // （于是只会在"连上"时提示，不会为一条 connecting → disconnected 弹"已断开"）。
+      const wasConnected = current?.server.connected ?? false
+      if (wasConnected !== event.connected) {
+        notify(event.connected ? t('agent.event.serverConnected') : t('agent.event.serverDisconnected'))
+      }
       return
     }
     case 'session': {
@@ -554,7 +575,33 @@ export function useAgent(): UseAgentResult {
     [refresh]
   )
 
-  return { ...current, mount, unmount, remount, refresh, refreshDownloads, refreshUploads, applyWebUpdate }
+  const reconnectServer = useCallback(async (): Promise<AgentServerState> => {
+    try {
+      // 代理已把失败计数清零并把阶段置回 connecting，这里落一次快照让标签立刻变回"连接中"
+      // （不等下一次 GET /agent/state 轮询）。
+      const server = await agentApi.reconnectServer()
+      const latest = snapshot.state
+      if (latest) setSnapshot({ state: { ...latest, server }, error: null })
+      return server
+    } catch (error) {
+      // 重试本身失败（证书过期、服务端不可达、代理正在退出…）：原因落到 agent.error，
+      // 排障面板里能直接读到，界面只需要把按钮恢复成可点。
+      setSnapshot({ error })
+      throw error
+    }
+  }, [])
+
+  return {
+    ...current,
+    mount,
+    unmount,
+    remount,
+    reconnectServer,
+    refresh,
+    refreshDownloads,
+    refreshUploads,
+    applyWebUpdate
+  }
 }
 
 /**

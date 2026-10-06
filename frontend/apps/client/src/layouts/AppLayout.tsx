@@ -11,12 +11,14 @@ import {
   FileSearchOutlined,
   FileTextOutlined,
   HddOutlined,
+  LoadingOutlined,
   SettingOutlined,
   TeamOutlined,
   UserOutlined
 } from '@ant-design/icons'
 import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Typography } from 'antd'
 import type { MenuProps } from 'antd'
+import { useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 
 // 侧边栏品牌处展示的版本号取自 package.json（构建期注入），与发布包版本同源。
@@ -63,6 +65,8 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   const { servers, activeKey, active, setActive } = useServerConfig()
   const agent = useAgent()
   const agentVersion = useAgentVersion()
+  // 手动重连进行中（按钮转圈）：只影响按钮，不参与任何状态判定。
+  const [serverRetrying, setServerRetrying] = useState(false)
 
   const appMenuItems: MenuProps['items'] = [
     { key: '/my-repos', icon: <CloudOutlined />, label: t('nav.myRepos') },
@@ -120,11 +124,19 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
         ? '/my-repos'
         : location.pathname
 
-  const agentTone = !agent.available
-    ? 'default'
-    : agent.state?.server.connected
-      ? 'green'
-      : 'orange'
+  // 服务端连接阶段：phase 是代理侧的权威取值（connecting / connected / disconnected），
+  // 但**不能让 phase 覆盖掉 connected** —— 旧版代理不带 phase，而心跳恢复连接时会先
+  // 把 connected 置真；这里以 connected 为准做一次归一。
+  const server = agent.state?.server
+  const serverPhase = server?.connected ? 'connected' : server?.phase
+  // "连接中"：代理正在连/自动重连。此时**不显示"未连接"**，改显示转圈的"连接中"
+  // （真实诉求：连接过程中一直挂着"未连接"，用户读到的是"连不上服务端"）。
+  const serverConnecting = agent.available && serverPhase === 'connecting'
+  // "未连接"只在代理**明确**说"自动重连已放弃"（phase=disconnected）时才算数：这样旧版代理
+  // （不带 phase）不会被误判成失败，也就不会挂出一个注定 404 的"重试"按钮。
+  const serverExhausted = agent.available && serverPhase === 'disconnected'
+
+  const agentTone = !agent.available ? 'default' : server?.connected ? 'green' : serverConnecting ? 'processing' : 'orange'
 
   // 本机 iSCSI 发起程序未就绪：挂载必定失败在 connect 阶段，而错误里没有可执行信息。
   // 启动时就挂横幅提示（代理探测到状态变化会推 host 事件，横幅随之出现/消失，无需重启）。
@@ -141,9 +153,26 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
         : 'agent.host.service_stopped'
   const agentText = !agent.available
     ? t('agent.state.notFound')
-    : agent.state?.server.connected
+    : server?.connected
       ? t('agent.state.connected')
-      : t('agent.state.disconnected')
+      : serverConnecting
+        ? t('agent.state.connecting')
+        : t('agent.state.disconnected')
+
+  // 手动重连：代理侧已不再自动重试（连续失败达上限），只能由用户点这里再试一次；
+  // 重试会清零失败计数，代理随后重新获得自动重连机会。
+  const handleServerRetry = (): void => {
+    setServerRetrying(true)
+    void (async () => {
+      try {
+        await agent.reconnectServer()
+      } catch {
+        // 失败原因已由 useAgent 落进 agent.error（排障面板可见），这里只负责恢复按钮。
+      } finally {
+        setServerRetrying(false)
+      }
+    })()
+  }
 
   // 最近一次挂载失败的**原始报错**（代理侧 last_error_detail）。
   //
@@ -275,9 +304,21 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
               {active?.instanceId ? <Tag>{active.instanceId.slice(0, 8)}</Tag> : null}
               <Popover content={agentDetail} title={t('agent.troubleshoot.title')} trigger="click" placement="bottomLeft">
                 <Tag color={agentTone} style={{ cursor: 'pointer' }}>
-                  {agentText}
+                  {serverConnecting ? (
+                    <Space size={4}>
+                      <LoadingOutlined />
+                      {agentText}
+                    </Space>
+                  ) : (
+                    agentText
+                  )}
                 </Tag>
               </Popover>
+              {serverExhausted ? (
+                <Button size="small" type="link" loading={serverRetrying} onClick={handleServerRetry}>
+                  {t('agent.server.retry')}
+                </Button>
+              ) : null}
               {agentVersion.mismatch ? (
                 <Tag color={palette.warning} style={{ cursor: 'pointer' }}>
                   {t('agent.versionMismatch')}

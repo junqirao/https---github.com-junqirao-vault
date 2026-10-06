@@ -95,11 +95,23 @@ export interface DownloadState {
   finished_at?: number
 }
 
+/** 服务端连接阶段（`AgentServerState.phase`）。 */
+export type AgentServerPhase = 'connecting' | 'connected' | 'disconnected'
+
 export interface AgentServerState {
   url: string
   instance_id?: string
   name?: string
   connected: boolean
+  /**
+   * 连接阶段：`connecting` 表示正在连接/重连（界面显示转圈的"连接中"，而不是"未连接"）；
+   * `disconnected` 表示已断开且自动重连次数已用尽，等界面手动重试。
+   *
+   * 旧版代理不带该字段，界面按 `connected` 兜底即可。
+   */
+  phase?: AgentServerPhase
+  /** 连续连接失败次数；达到上限后代理停止自动重连（手动重试会清零）。 */
+  fail_count?: number
   last_error?: string
 }
 
@@ -157,9 +169,13 @@ export interface AgentHostState {
   checked_at?: number
 }
 
-/** GET /agent/log：代理日志尾部（日志模块）。 */
+/** GET /agent/log：代理日志（日志模块）。日志按天切分，一次回一天的文件尾部。 */
 export interface AgentLog {
-  /** 当天日志文件路径（可能为空）。 */
+  /** 本次返回的日期（YYYY-MM-DD）；请求未指定 day 时即当天。 */
+  day: string
+  /** 存在日志文件的日期（YYYY-MM-DD，升序），供界面做按时间切分的选择。 */
+  days: string[]
+  /** 该日期日志文件路径（可能为空）。 */
   path: string
   /** 日志文件末尾的原始文本（JSON Lines，按 level/msg 等字段组织的 slog 输出）。 */
   text: string
@@ -201,7 +217,7 @@ export interface AgentHealth {
 }
 
 /**
- * 单个存储库自己的挂载偏好（GET /agent/config 的 repo_mounts，写用 PUT /agent/repo-mounts/{id}）。
+ * 单个存储库自己的挂载偏好（GET /agent/config 的 repo_mounts，写用 POST /agent/repo-mounts/{id}）。
  *
  * 为什么不放服务端：挂载形态与挂载目录是"这台机器"的事（盘符、D:\vault\xxx 这类本地路径
  * 对别的机器没有意义），自动挂载也由本机代理执行。没有条目的库跟随上面的全局默认值。
@@ -209,7 +225,12 @@ export interface AgentHealth {
 export interface AgentRepoMountPref {
   /** letter | directory；空串表示跟随 default_mount_mode。 */
   mount_mode?: AgentMountMode | ''
-  /** 目录模式的目标目录；空串表示跟随 default_mount_dir。 */
+  /**
+   * 目录模式的**父目录**；空串表示直接用 default_mount_dir。
+   *
+   * 实际挂载点是它下面一层 `<服务端名称>_<存储库名称>` 子目录（代理侧规则，
+   * 与界面提示同一口径：前端预览见 utils/mountPath.ts）。
+   */
   mount_dir?: string
   /**
    * 是否在该库所在客户端启动后自动挂载它（每个库独立）。
@@ -223,6 +244,11 @@ export interface AgentRepoMountPref {
 /** GET /agent/config 与 PATCH /agent/config。 */
 export interface AgentConfig {
   auto_mount: boolean
+  /**
+   * 挂载形态/目录的兜底默认值，**只读**：界面上没有这两项，PATCH 也不接受
+   * （挂载形态与目录一律按库配置，见 AgentRepoMountPref）。它们仍然返回，
+   * 用于给没配过的库**预填**并作为挂载根的兜底。
+   */
   default_mount_mode: AgentMountMode
   default_mount_dir: string
   /** 母盘下载到本地时的默认目标目录（绝对路径）。 */
@@ -405,7 +431,7 @@ export type AgentEvent =
   | { type: 'mount'; mount: AgentMountState }
   | { type: 'unmount'; allocation_id: string }
   | { type: 'revoked'; allocation_id: string; reason?: string }
-  | { type: 'server'; connected: boolean; last_error?: string }
+  | { type: 'server'; connected: boolean; phase?: AgentServerPhase; fail_count?: number; last_error?: string }
   | { type: 'host'; host: AgentHostState }
   | { type: 'session'; session: AgentSessionState }
   | { type: 'update'; available_version?: string; downloading: boolean; received_bytes: number; total_bytes: number }

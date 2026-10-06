@@ -14,6 +14,7 @@ import { ApiError } from '../../api/errors'
 import { useApi } from '../../api/provider'
 import type { AllocationDTO, AllocationState, DiskDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
+import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime } from '../../utils/format'
@@ -59,6 +60,7 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
   const [error, setError] = useState<unknown>(null)
   const [pendingDelete, setPendingDelete] = useState<DiskDTO | null>(null)
   const agent = useAgent()
+  const { active } = useServerConfig()
   const [copyDisk, setCopyDisk] = useState<DiskDTO | null>(null)
   const [copyForm] = Form.useForm<{ target_dir: string; file_name: string }>()
   const { config: agentConfig, downloads, refreshDownloads } = agent
@@ -192,9 +194,16 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
     }
   }
 
+  // 目录名里的服务端名称，与代理侧同一口径：本地别名优先，其次服务端名称，最后 vault。
+  const mountServerAlias = (agentConfig?.server_alias ?? '').trim() || (active?.serverName ?? '').trim() || 'vault'
+
   const openMountDialog = (allocation: AllocationDTO): void => {
-    setMountMode(agentConfig?.default_mount_mode ?? 'letter')
-    setMountPath(agentConfig?.default_mount_dir ?? '')
+    // 先预填**这个库自己的**挂载设置（存储库 → 挂载设置），没配过才落回代理的兜底默认值。
+    // 挂载形态与目录已经只在库那边配置，从卡片点"挂载"时必须按它来 —— 否则用户刚在某库
+    // 配好 D:\vault，点挂载却被这里的默认值顶成 C:\Vault（请求里的 mount_path 优先级更高）。
+    const pref = agentConfig?.repo_mounts?.[repoId]
+    setMountMode(pref?.mount_mode || agentConfig?.default_mount_mode || 'letter')
+    setMountPath(pref?.mount_dir || agentConfig?.default_mount_dir || '')
     setError(null)
     setMountTarget(allocation)
   }
@@ -494,6 +503,7 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
         open={mountTarget !== null}
         mode={mountMode}
         path={mountPath}
+        serverAlias={mountServerAlias}
         submitting={mountTarget !== null && busyId === mountTarget.id}
         onModeChange={setMountMode}
         onPathChange={setMountPath}

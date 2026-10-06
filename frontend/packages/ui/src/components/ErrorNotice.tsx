@@ -26,7 +26,8 @@ export function ErrorNotice({ error, showCode }: ErrorNoticeProps): JSX.Element 
       showIcon
       style={{ marginBottom: 16 }}
       message={
-        <Space direction="vertical" size={0}>
+        // 错误详情是用户要复制给管理员的原文：单独放开文本选择（全局默认禁选）。
+        <Space className="selectable" direction="vertical" size={0}>
           <Typography.Text>{translateError(error)}</Typography.Text>
           {hintKey ? (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>

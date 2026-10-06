@@ -235,14 +235,17 @@ function QuotaOverview({ repos }: { repos: RepoDTO[] }): JSX.Element | null {
     <Card styles={{ body: { padding: spacing.md } }}>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs, flexWrap: 'wrap' }}>
         <Typography.Text strong>{t('repo.quota.title')}</Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-          {t('repo.quota.hint')}
-        </Typography.Text>
         <Typography.Text style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
           {`${t('repo.quota.used')} ${formatBytes(user.used_bytes)} / ${t('repo.quota.total')} ${
             unlimited ? t('common.unlimited') : formatBytes(user.quota_bytes)
           }`}
         </Typography.Text>
+        {/* 不限配额时没有分母，百分比无意义（进度条也不画）。 */}
+        {unlimited ? null : (
+          <Typography.Text strong style={{ fontSize: fontSize.sm }}>
+            {`${percent}%`}
+          </Typography.Text>
+        )}
       </div>
       {unlimited ? null : (
         <Progress

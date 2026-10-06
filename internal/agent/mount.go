@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -746,7 +745,7 @@ func (e *mountEngine) restore(ctx context.Context, req MountRequest) (*MountStat
 // 命名的诉求（真实反馈："盘符或者是目录名应该等于存储库的名称"）：
 //   - 盘符模式：Windows 只肯给一个盘符（E:、F:…），没有"用库名做盘符"这回事，
 //     于是把库名写到**卷标**上 —— 资源管理器里该盘就显示存储库名称；
-//   - 目录模式：目录名就是库名（<挂载根>\<服务端别名>\<库名>，见 resolveMountDir 与 3.4.5）。
+//   - 目录模式：目录名就是 `<服务端名称>_<存储库名称>`（见 resolveMountDir 与 3.4.5）。
 func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, req MountRequest, spec *MountSpec) (string, error) {
 	if mode != mountModeDirectory {
 		letter, err := e.a.vol.MountToDriveLetter(ctx, diskNumber)
@@ -760,10 +759,15 @@ func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, 
 	if err != nil {
 		return "", err
 	}
-	// 目录挂载要求目录已存在且为空；这里按 <挂载根>\<别名>\<库名> 逐级创建。
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", apperr.InvalidParam("mount_path").WithArg("path", dir).WithCause(err)
-	}
+	// 目录不在 Go 侧创建，交给挂载脚本（不存在时它会建，等价 mkdir -p）。
+	//
+	// 为什么必须交给脚本（真实事故：挂载点自指 → 资源管理器无限嵌套）：
+	// 用户填的父目录本身可能是**本磁盘自己的残留挂载点**（老版本把卷直接挂到父目录上，
+	// Remove-PartitionAccessPath 之后 junction 还留在原地，卷于是依旧从该路径可达）。
+	// 此时在 Go 侧建目录，目录会被建进**这个卷的内部**；脚本紧接着把卷挂到这个"卷内路径"上，
+	// 挂载点就指向了自己 —— C:\Vault\lib\lib\lib… 无限递归（用户截图）。
+	// 判定"路径是否落在本磁盘自己的卷里"只有脚本做得到（要读 junction 的 Target 比卷 GUID），
+	// 所以创建也一并交给它：先识别并清掉残留，再在真实目录里建挂载点（见 volume_mount_dir.ps1）。
 	if err := e.a.vol.MountToDirectory(ctx, diskNumber, dir); err != nil {
 		return "", err
 	}
@@ -830,36 +834,74 @@ func repoNameOf(req MountRequest, spec *MountSpec) string {
 
 // resolveMountDir 计算目录模式的绝对挂载路径。
 //
-// 取值顺序与 resolveMode 一致：请求 > 每库配置 > 服务端下发 > 「挂载根\别名\库名」。
+// 规则（界面在挂载设置里如实告知同一条规则，两处必须一致）：
+//  1. **本地指定的目录是父目录**：请求 mount_path（挂载对话框）> 每库配置 mount_dir。
+//     真正的挂载点是它下面一层自动生成的 `<服务端名称>_<存储库名称>` 子目录 ——
+//     多个库共用一个父目录也不会互相挤占，且目录名自解释（哪个服务端的哪个库）。
+//  2. 本地没指定时，落到服务端下发的 mount_path：**绝对路径**是服务端管理员的显式指定，
+//     原样使用；**相对路径**（服务端自动拼的 `<服务端名称>\<库名>`）也归一到上面那条命名
+//     —— 否则同一个库会因为"从哪挂"得到两种目录名（srv\lib 与 srv_lib），
+//     界面按一种口径提示、实际却挂到另一种（真实反馈就是这么来的）。
+//  3. 都没有时退化为 `<挂载根>\<服务端名称>_<存储库名称>`。
+//
+// 幂等：父目录末段已经等于 `<服务端名称>_<存储库名称>` 时原样返回。重挂与恢复
+// （remount / restore）会把**上次的最终挂载点**当请求传回来（见 recordedMountRequest），
+// 没有这条兜底，每重挂一次就会多套一层目录（D:\Vault\a_b\a_b\a_b…）。
 func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec) (string, error) {
-	raw := strings.TrimSpace(req.MountPath)
-	if raw == "" {
+	base := strings.TrimSpace(e.a.cfg.Get().DefaultMountDir)
+	leaf := mountDirLeaf(e.serverAlias(spec), repoNameOf(req, spec), req.AllocationID)
+
+	local := strings.TrimSpace(req.MountPath)
+	if local == "" {
 		if pref, ok := e.repoPref(req.RepoID); ok {
-			raw = strings.TrimSpace(pref.MountDir)
+			local = strings.TrimSpace(pref.MountDir)
 		}
 	}
-	if raw == "" && spec != nil {
-		raw = strings.TrimSpace(spec.MountPath)
-	}
-	if raw != "" && filepath.IsAbs(raw) {
-		return filepath.Clean(raw), nil
+	if local != "" {
+		root := local
+		if !filepath.IsAbs(root) {
+			if base == "" {
+				return "", apperr.InvalidParam("default_mount_dir")
+			}
+			root = filepath.Join(base, root)
+		}
+		root = filepath.Clean(root)
+		// 已经就是最终挂载点（重挂/恢复把上次的结果传回来了）：不再加层。
+		// 比较不区分大小写：Windows 文件系统不区分。
+		if strings.EqualFold(filepath.Base(root), leaf) {
+			return root, nil
+		}
+		return filepath.Join(root, leaf), nil
 	}
 
-	base := strings.TrimSpace(e.a.cfg.Get().DefaultMountDir)
+	if spec != nil {
+		if raw := strings.TrimSpace(spec.MountPath); raw != "" && filepath.IsAbs(raw) {
+			return filepath.Clean(raw), nil
+		}
+	}
 	if base == "" {
 		return "", apperr.InvalidParam("default_mount_dir")
 	}
-	rel := raw
-	if rel == "" {
-		// 服务端未下发目录时退化为 <别名>\<库名>：目录名与存储库保持一致（真实诉求），
-		// 同时仍然分目录，避免所有分配挤进同一个目录。库名缺失才退到 allocation_id。
-		leaf := sanitizePathSegment(repoNameOf(req, spec))
-		if leaf == "" {
-			leaf = req.AllocationID
-		}
-		rel = filepath.Join(e.serverAlias(spec), leaf)
+	return filepath.Join(base, leaf), nil
+}
+
+// mountDirLeaf 返回目录模式下自动生成的那一级目录名：`<服务端名称>_<存储库名称>`。
+//
+// 两段都过 sanitizePathSegment：库名/别名可能含 `\` `/` 等字符，直接拼接会让路径跑到
+// 挂载根之外（路径穿越）。库名缺失时退到分配 ID（至少不会让所有库挤进同一个目录）。
+func mountDirLeaf(serverAlias, repoName, allocationID string) string {
+	server := sanitizePathSegment(serverAlias)
+	if server == "" {
+		server = "vault"
 	}
-	return filepath.Clean(filepath.Join(base, rel)), nil
+	repo := sanitizePathSegment(repoName)
+	if repo == "" {
+		repo = sanitizePathSegment(allocationID)
+	}
+	if repo == "" {
+		return server
+	}
+	return server + "_" + repo
 }
 
 // sanitizePathSegment 把库名这类用户输入规整为可安全用作**单层**目录名的片段。

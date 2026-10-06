@@ -19,6 +19,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# ⚠️ Disconnect-IscsiTarget 是 ShouldProcess cmdlet。代理是以非交互方式起 PowerShell 的，
+# 一旦它想弹确认提示，就会以"Windows PowerShell 处于非交互模式。朗读和提示功能不可用。"
+# 失败（真实日志：iSCSI 断开失败 / disconnect_failed，卸载流程因此中断）。
+# 这里显式关掉确认提示；下面调用点再补 -Confirm:$false 双保险。
+$ConfirmPreference = 'None'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 # 0xEFFF0040 视为有符号 32 位整数时的取值。
@@ -72,7 +77,7 @@ try {
             # 用**会话自己的** TargetNodeAddress 断开：平台改写后的名字与我们下发的
             # 名字不逐字相等，拿下发的名字去 Disconnect 会找不到会话。
             foreach ($session in $sessions) {
-                Disconnect-IscsiTarget -NodeAddress ([string]$session.TargetNodeAddress) -ErrorAction Stop | Out-Null
+                Disconnect-IscsiTarget -NodeAddress ([string]$session.TargetNodeAddress) -Confirm:$false -ErrorAction Stop | Out-Null
             }
         } catch {
             $message = $_.Exception.Message

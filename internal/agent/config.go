@@ -33,7 +33,9 @@ func DefaultStatePath() string { return filepath.Join(DataDir(), "agent-state.js
 type RepoMountPref struct {
 	// MountMode letter | directory；空串表示跟随 DefaultMountMode。
 	MountMode string `json:"mount_mode,omitempty"`
-	// MountDir 目录模式的目标目录；空串表示跟随 DefaultMountDir（<根>\<服务端别名>\<库名>）。
+	// MountDir 目录模式的**父目录**（绝对路径，或相对 DefaultMountDir 的相对路径，由用户
+	// 在「存储库 → 挂载设置」里填）；实际挂载点是它下面一层 `<服务端名称>_<存储库名称>`
+	// 子目录（见 mountDirLeaf）。空串表示直接用默认挂载根。
 	MountDir string `json:"mount_dir,omitempty"`
 	// AutoMount 是否在该库所在客户端启动（拿到会话）后自动挂载它。
 	//
@@ -56,8 +58,15 @@ type Config struct {
 	// 若默认关闭，用户每次重启服务端都要重新输一遍密码——这正是要消除的现象。
 	AutoLogin bool `json:"auto_login"`
 	// DefaultMountMode letter | directory。
+	//
+	// 只作为每库配置缺省时的兜底值（以及从未配过的库的初始形态），**不对用户开放**：
+	// 界面上没有这一项，PATCH /agent/config 也不接受它（见 ConfigPatch）——挂载形态一律
+	// 由「存储库 → 挂载设置」按库单独配置。
 	DefaultMountMode string `json:"default_mount_mode"`
-	// DefaultMountDir 目录模式的挂载根目录。
+	// DefaultMountDir 目录模式的挂载根目录（默认 C:\Vault）。
+	//
+	// 同样不对用户开放（见 DefaultMountMode 的说明）：它只是每库没填目录时的落脚点，
+	// 用户要换目录就在那个库的挂载设置里填（填的是**父目录**，见 mountDirLeaf）。
 	DefaultMountDir string `json:"default_mount_dir"`
 	// DefaultDownloadDir 母盘内容下载的默认目标目录。
 	DefaultDownloadDir string `json:"default_download_dir"`
@@ -102,11 +111,13 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 }
 
 // ConfigPatch 是本地配置的部分更新（字段为 nil 表示不改动）。
+//
+// 刻意**没有** default_mount_mode / default_mount_dir：挂载形态与挂载目录一律按库配置
+// （repo_mounts，见 RepoMountPref），全局默认值只是代码里的兜底，不对用户开放 ——
+// 客户端设置页不再展示它们，API 也不接受（请求里带了就当没带）。
 type ConfigPatch struct {
-	AutoMount        *bool   `json:"auto_mount"`
-	AutoLogin        *bool   `json:"auto_login"`
-	DefaultMountMode *string `json:"default_mount_mode"`
-	DefaultMountDir  *string `json:"default_mount_dir"`
+	AutoMount *bool `json:"auto_mount"`
+	AutoLogin *bool `json:"auto_login"`
 	// DefaultDownloadDir 母盘内容下载的默认目标目录。
 	DefaultDownloadDir *string `json:"default_download_dir"`
 	// DownloadConnections 母盘内容下载的分段并发数（1..8）。
@@ -294,16 +305,6 @@ func (s *ConfigStore) Patch(p ConfigPatch) (Config, error) {
 		s.cfg.AutoLogin = *p.AutoLogin
 		// 用户显式表过态了：此后不再套用"缺省即开启"。
 		s.cfg.autoLoginSet = true
-	}
-	if p.DefaultMountMode != nil {
-		mode := normalizeMountMode(*p.DefaultMountMode)
-		if mode == "" {
-			return s.cfg, apperr.InvalidParam("default_mount_mode")
-		}
-		s.cfg.DefaultMountMode = mode
-	}
-	if p.DefaultMountDir != nil {
-		s.cfg.DefaultMountDir = strings.TrimSpace(*p.DefaultMountDir)
 	}
 	if p.DefaultDownloadDir != nil {
 		dir, err := validateAbsDir(*p.DefaultDownloadDir, "default_download_dir")

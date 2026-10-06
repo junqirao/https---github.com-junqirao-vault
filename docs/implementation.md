@@ -398,7 +398,7 @@ client_compat:
 
 | 挂载形态 | 规则 |
 | --- | --- |
-| **目录模式** | 路径强制为 `<root>\<server-alias>\<repo-name>`，用服务端别名作命名空间隔离 |
+| **目录模式** | 用户填的是**父目录**，实际挂载点是 `<父目录>\<server-alias>_<repo-name>`：一层目录名同时带上服务端与库名，多服务端同名库天然分开且自解释（服务端下发的相对 `mount_path` 也归一到同一命名，绝对路径仍原样使用） |
 | **盘符模式** | 客户端统一维护盘符分配表，检测冲突；冲突时按"服务端配置顺序 + 库名"确定性分配，或让用户指定。**盘符本身没法用库名命名**，于是把存储库名称写到**卷标**上（`Set-Volume -NewFileSystemLabel`；超过 NTFS 上限 32 字符截断、非法字符替换为 `-`），资源管理器里该盘就显示库名（真实诉求："盘符或目录名应该等于存储库的名称"） |
 
 **服务端别名（alias）规则**
@@ -1078,9 +1078,23 @@ IQN         = iqn.2026-01.com.vault:{target_name}
       - letter 模式：Add-PartitionAccessPath -AssignDriveLetter（若盘已有盘符则复用）
         → 随后 Set-Volume -NewFileSystemLabel '<repo-name>' 把库名写到卷标（best effort：
           失败/超时只记警告，绝不因此判定挂载失败）
-      - directory 模式：确认为空目录 → Add-PartitionAccessPath -AccessPath 'C:\Vault\<server-alias>\<repo>'
-        - ★ 目录路径必须带服务端别名命名空间，避免多服务端同名库冲突（见 3.4.5）
-        - 库名缺失时的退化路径同样用库名做最后一级目录（见 agent 的 resolveMountDir）
+      - directory 模式：确认为空目录 → Add-PartitionAccessPath -AccessPath 'C:\Vault\<server-alias>_<repo>'
+        - ★ 目录名必须带服务端别名命名空间（`<server-alias>_<repo-name>`），避免多服务端同名库冲突（见 3.4.5）
+        - 用户配置的目录是**父目录**，代理在它下面自动加这一层；服务端下发的相对 `mount_path`
+          也归一到这一层（绝对路径仍原样使用），同一个库不会有两种目录名
+        - 父目录末段已经是这一层时不再追加（重挂/恢复传回来的是上次的最终挂载点，
+          否则每重挂一次就多套一层目录）
+        - 目录**不存在由挂载脚本创建**（等价 mkdir -p），代理侧不建目录：父目录可能是本磁盘自己的
+          残留挂载点，那样建目录会建进本卷内部（见下面"挂载点自指"）
+        - ★ **挂载点自指 → 资源管理器无限嵌套**（真实事故 2026-10-06）：老版本把卷直接挂到父目录上，
+          `Remove-PartitionAccessPath` 之后 junction 还留在原地（`Get-Partition` 的 `AccessPaths`
+          已空，路径却仍指向 `\??\Volume{...}\`），卷于是依旧从该路径可达；下一轮挂载在它下面建目录
+          再挂载，卷就被挂到自己的卷内路径上 —— `C:\Vault\lib\lib\lib…` 无限递归。
+          挂载脚本因此先判"目标路径的最近 reparse point 祖先是否指向本磁盘的卷"，是则清掉卷内该层
+          残留与僵尸挂载点（只删链接，卷内数据不动）、回真实目录重建后再挂载，事后清一次卷内同名
+          残留；`action=healed` 表示修复过。卸载脚本在"分区已不认领该路径但路径仍是卷挂载点"时也
+          顺手摘掉（`action=cleaned`），避免残留累积
+        - 库名缺失时的退化路径用分配 ID 兜底（见 agent 的 resolveMountDir / mountDirLeaf）
    h. 执行 post_script（如存在），超时 60s，失败不阻塞挂载但记录警告
       - ★ 脚本中的路径必须用注入变量（{MOUNT_PATH}/{REPO_NAME}/{SERVER_ALIAS}），不得硬编码（见 3.4.5）
 ④ 回写 POST /v1/leases/{id}/mounted { mount_point }
@@ -1152,9 +1166,11 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 >   - 记录**不因断线被删**：租约/分配仍按原语义留在服务端（`ReapExpired` 只把租约标成 `expired`，
 >     从不停用目标、也不回收分配），用户点"挂载"或"卸载"各自由既有链路闭环。
 
-> **目录挂载的坑**：`Add-PartitionAccessPath -AccessPath` 要求目标目录**已存在且为空**，且其父路径所在卷为 NTFS。客户端启动时需预检并给出明确错误提示。
+> **目录挂载的坑**：`Add-PartitionAccessPath -AccessPath` 要求目标目录**为空**（不存在则由挂载脚本创建，等价 mkdir -p），且其父路径所在卷为 NTFS。不满足时给出明确错误提示。
 >
-> **多服务端**：目录模式的目标路径为 `<default_mount_dir>\<server-alias>\<repo-name>`（见 3.4.5）；盘符模式由客户端统一分配表管理并检测冲突。
+> **目录挂载的第二个坑：挂载点自指**（真实事故 2026-10-06）。`Remove-PartitionAccessPath` 之后 Windows 可能把 junction 留在原地（`Get-Partition` 的 `AccessPaths` 已空、路径仍指向卷），卷因此依旧可达；此时若在它下面建目录并挂载，卷就挂进了自己的卷内 —— 资源管理器无限嵌套（`C:\Vault\lib\lib\lib…`）。判据是"目标路径的最近 reparse point 祖先（含自身）是否指向本磁盘的卷"，修复动作在 `volume_mount_dir.ps1`（先清残留再建目录再挂载，`action=healed`）与 `volume_unmount.ps1`（摘掉残留挂载点，`action=cleaned`）里。
+>
+> **多服务端**：目录模式下用户填的是父目录，实际挂载点为 `<父目录>\<server-alias>_<repo-name>`（见 3.4.5）；盘符模式由客户端统一分配表管理并检测冲突。
 >
 > **门户地址（portal_address）从哪来**：服务端**从不派发自己的 HTTP 地址**（客户端地址由用户填写并经
 > `POST /agent/session` 推给代理）；唯一由服务端计算的是挂载时的门户地址。优先级为：
@@ -2424,12 +2440,12 @@ Vault-Server sign release -artifact agent=... -artifact client_web=dist.zip
     }
   ],
   "language": "zh-CN",
-  "default_mount_mode": "letter",          // letter | directory
-  "default_mount_dir": "C:\\Vault",        // 目录模式实际路径 = <dir>\<alias>\<repo>
+  "default_mount_mode": "letter",          // 只读兜底值（界面不开放）：目录模式实际路径 = <父目录>\<alias>_<repo>
+  "default_mount_dir": "C:\\Vault",        // 只读兜底值：没配过目录的库用它作父目录
   "group_view": "aggregate",               // aggregate（同名聚合）| by_server
   "auto_mount": true,                      // 全局：恢复上次留下的挂载记录（被重装/手工卸载清空后不再生效）
-  "repo_mounts": {                         // 每库独立：形态/目录/启动后自动挂载（空串=跟随上面的默认值）
-    "8f1c...": { "mount_mode": "directory", "mount_dir": "D:\\vault\\样品库", "auto_mount": true }
+  "repo_mounts": {                         // 每库独立：形态/目录/启动后自动挂载（空串=跟随上面的兜底值）
+    "8f1c...": { "mount_mode": "directory", "mount_dir": "D:\\vault", "auto_mount": true }  // 实际挂到 D:\vault\<alias>_<库名>
   },
   "start_at_login": true,
   "update_channel": "stable",
@@ -3069,7 +3085,7 @@ dist/
 
 #### ⑫ 客户端"挂载到某个本地目录"的实现细节缺失
 - **问题**：design.md 客户端-存储库-3 提到挂载形态支持目录，但没提约束。
-- **改进**：明确 `Add-PartitionAccessPath -AccessPath` 要求目标目录**已存在且为空**、父目录为 NTFS；客户端需预检 + 明确错误提示（本文 5.5）。
+- **改进**：明确 `Add-PartitionAccessPath -AccessPath` 要求目标目录**为空**（不存在则由挂载脚本创建）、父目录为 NTFS；客户端需预检 + 明确错误提示；并额外判"父目录是否为本磁盘残留的挂载点"（否则挂载点自指、资源管理器无限嵌套，见本文 5.5）。
 
 ### 13.3 🟡 安全与健壮性
 
@@ -3224,7 +3240,7 @@ design.md 新增的「多服务端」方向没问题，但原表述有 **3 处�
 
 #### ⓖ 🟠 挂载点/盘符冲突（必然发生）
 - **问题**：两个服务端的存储库同名时，目录模式 `C:\Vault\<repo>` 直接撞车；盘符模式会重复分配。
-- **已定方案**：目录模式强制 `<root>\<server-alias>\<repo>` 命名空间；盘符模式统一分配表 + 冲突检测。**连带影响**：挂载后脚本必须改用注入变量（`{MOUNT_PATH}` 等），不得硬编码路径。见 3.4.5。
+- **已定方案**：目录模式的挂载点固定为 `<父目录>\<server-alias>_<repo>` 一层命名空间（用户填的目录是父目录，界面把最终路径算给用户看）；盘符模式统一分配表 + 冲突检测。**连带影响**：挂载后脚本必须改用注入变量（`{MOUNT_PATH}` 等），不得硬编码路径。见 3.4.5。
 
 #### ⓗ 🟡 客户端架构需从"单服务端"升级为"多服务端聚合器"
 - **影响范围**：§3.2 部署形态、§3.4（新增）、§5.5 挂载路径、§5.7 租约、§7.1 进程架构、§7.4 更新、§7.6 配置、§9.1 证书 —— 均已同步更新。
@@ -3319,7 +3335,7 @@ design.md 新增的「多服务端」方向没问题，但原表述有 **3 处�
 | R15 | 版本区间配错（如 `min` 高于当前客户端）导致所有客户端被判不兼容、资源整体不可见 | 中 | **高** | ① 区间写在 `config.yaml`，模板提供合理默认；② 字段缺失自动按服务端版本推导；③ **显式非法值 fail-fast**（`min > max`、格式错误直接拒绝启动，避免"全部客户端不可见"这种更难查的故障）；④ 热重载时打印变更前后值并写审计；⑤ 保留 `client_compat.enabled: false` 作为应急开关 |
 | R16 | 主服务端离线 → 客户端无法更新；或主服务端被移出配置 → 更新源静默变化 | 中 | 中 | 主服务端 + 失败回退（3.4.3）；删除主服务端强制重选；设置页始终显示当前更新源 |
 | R17 | 误用其他服务端的证书发起连接，报错难定位 | 中 | 中 | 证书按服务端分目录存储（路径即定位）；扩展用于**服务端侧校验**并返回明确错误码"证书不属于本服务端"（9.1） |
-| R18 | 多服务端同名库导致目录挂载点冲突或盘符重复分配 | **高** | 中 | 目录模式强制 `<alias>\<repo>` 命名空间；盘符统一分配表 + 冲突检测；别名生成时规范化与去重（3.4.5） |
+| R18 | 多服务端同名库导致目录挂载点冲突或盘符重复分配 | **高** | 中 | 目录模式固定为 `<父目录>\<alias>_<repo>` 一层命名空间（界面把最终路径算给用户看）；盘符统一分配表 + 冲突检测；别名生成时规范化与去重（3.4.5） |
 | R19 | 被控服务端下发旧版本包实施降级攻击 | 低 | **高** | 版本单调性检查 + 统一发布方签名 + 编译期内置公钥（7.4.2） |
 | R20 | 服务端证书 SAN 与实际访问 URL 不一致导致 TLS 校验失败（换 IP / 换域名） | 中 | 中 | 签发时同时写入域名与固定 IP 两个 SAN；客户端配置校验并在添加服务端时给出明确提示 |
 | R21 | 为排障临时关闭版本检查（`client_compat.enabled: false`）后**忘记恢复**，导致不兼容的旧客户端长期接入 | 中 | 中 | 启动时对 `enabled: false` 打 WARN；管理页顶部常驻告警条；审计记录开启/关闭；可选：关闭超过 N 天后升级为 ERROR 并每日提醒 |

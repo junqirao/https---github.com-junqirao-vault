@@ -143,13 +143,41 @@ type Session struct {
 	receivedAt int64
 }
 
+// 服务端连接的阶段（ServerState.Phase）。
+//
+// 为什么需要它：界面此前只有 connected 这个布尔量，于是"代理正在连/重连"与"真的连不上"
+// 长得一模一样 —— 进程刚起来、会话还没推来、正在重连时，界面都显示"未连接"，用户读到的是
+// "连不上服务端"（真实反馈）。把阶段显式暴露，界面才能在连接中显示转圈的"连接中"。
+const (
+	// ServerPhaseConnecting 正在连接/重连服务端（界面显示"连接中"，不显示"未连接"）。
+	ServerPhaseConnecting = "connecting"
+	// ServerPhaseConnected 已连接。
+	ServerPhaseConnected = "connected"
+	// ServerPhaseDisconnected 未连接，且自动重连次数已用尽（等界面手动重试）。
+	ServerPhaseDisconnected = "disconnected"
+)
+
+// maxServerConnectAttempts 是"无会话时自动重连"的连续失败上限。
+//
+// 达到上限即停手并把 Phase 置为 disconnected（界面显示"未连接" + 手动重试按钮）：
+// 无休止重试只会把日志刷满，用户也永远分不清"还在连"和"连不上"（真实诉求：
+// "连接失败 2 次之后不再重试，边上加一个按钮让用户手动重试，手动重试会刷新计数"）。
+const maxServerConnectAttempts = 2
+
 // ServerState 描述代理当前连接的服务端。
 type ServerState struct {
 	URL        string `json:"url"`
 	InstanceID string `json:"instance_id"`
 	Name       string `json:"name"`
 	Connected  bool   `json:"connected"`
-	LastError  string `json:"last_error,omitempty"`
+	// Phase 是连接阶段（见 ServerPhase*）：connecting / connected / disconnected。
+	Phase string `json:"phase,omitempty"`
+	// FailCount 是**连续**连接失败次数（任意一次成功即归零）。
+	//
+	// 达到 maxServerConnectAttempts 后代理不再自动重连，等界面手动重试
+	// （POST /agent/server/reconnect 会把计数清零并立即重试一次）。
+	FailCount int    `json:"fail_count,omitempty"`
+	LastError string `json:"last_error,omitempty"`
 }
 
 // UserState 描述当前登录用户。
@@ -280,8 +308,11 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 		path = DefaultStatePath()
 	}
 	s := &stateStore{
-		path:    path,
-		logger:  logger,
+		path:   path,
+		logger: logger,
+		// 阶段先按"连接中"起步：首次运行（没有状态文件）或状态文件损坏时也走这条零值路径，
+		// 留空会让界面把它读成"未连接"并挂出手动重试按钮 —— 可进程刚起来一次都没试过。
+		server:  ServerState{Phase: ServerPhaseConnecting},
 		mounts:  make(map[string]*MountState),
 		runtime: make(map[string]*mountRuntime),
 	}
@@ -297,7 +328,12 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 			s.server = loaded.Server
 			s.user = loaded.User
 			// 进程重启后真实会话已不存在：连接状态一律复位。
+			// 阶段复位成"连接中"而不是"未连接"：进程刚起来还没试过，界面该显示转圈的
+			// "连接中"；真试过 2 次都失败才轮到"未连接"（真实诉求）。
 			s.server.Connected = false
+			s.server.Phase = ServerPhaseConnecting
+			s.server.FailCount = 0
+			s.server.LastError = ""
 			for i := range loaded.Mounts {
 				m := loaded.Mounts[i]
 				if m.AllocationID == "" {
@@ -360,12 +396,18 @@ func (s *stateStore) Session() (*Session, bool) {
 }
 
 // ClearSession 清除会话（退出登录），并把连接状态复位。
+//
+// 刻意把失败计数顶到上限：退出登录后本地证书身份**仍在**，若让自动重连循环继续跑，它会
+// 立刻用证书把人"登回来"，用户看到的是"登出没生效"。顶到上限后阶段即为 disconnected，
+// 自动重连停手，只有界面手动重试（POST /agent/server/reconnect）才会重新连接。
 func (s *stateStore) ClearSession() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.session = nil
 	s.server.Connected = false
 	s.server.LastError = ""
+	s.server.FailCount = maxServerConnectAttempts
+	s.server.Phase = ServerPhaseDisconnected
 	_ = s.persistLocked()
 }
 
@@ -385,14 +427,64 @@ func (s *stateStore) SetServer(state ServerState) {
 }
 
 // SetServerConnected 更新连接状态与最近错误（无变化时不写盘）。
+//
+// 连接成功时顺带把阶段置为 connected 并清空失败计数：FailCount 统计的是"连续失败"，
+// 任何一次成功都该让它归零（手动重试、心跳成功、重新推会话都走这里）。
 func (s *stateStore) SetServerConnected(connected bool, lastError string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.server.Connected == connected && s.server.LastError == lastError {
+	phase := s.server.Phase
+	if connected {
+		phase = ServerPhaseConnected
+	}
+	if s.server.Connected == connected && s.server.LastError == lastError &&
+		s.server.Phase == phase && (!connected || s.server.FailCount == 0) {
 		return
 	}
 	s.server.Connected = connected
 	s.server.LastError = lastError
+	s.server.Phase = phase
+	if connected {
+		s.server.FailCount = 0
+	}
+	_ = s.persistLocked()
+}
+
+// SetServerPhase 更新连接阶段（无变化时不写盘）。
+func (s *stateStore) SetServerPhase(phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.server.Phase == phase {
+		return
+	}
+	s.server.Phase = phase
+	_ = s.persistLocked()
+}
+
+// RecordServerConnectFailure 记一次自动重连失败，返回是否已达上限（上限后不再自动重连）。
+func (s *stateStore) RecordServerConnectFailure(lastError string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.server.FailCount++
+	s.server.Connected = false
+	s.server.LastError = lastError
+	exhausted := s.server.FailCount >= maxServerConnectAttempts
+	if exhausted {
+		s.server.Phase = ServerPhaseDisconnected
+	} else {
+		s.server.Phase = ServerPhaseConnecting
+	}
+	_ = s.persistLocked()
+	return exhausted
+}
+
+// ResetServerConnectFailures 清零失败计数并回到"连接中"（界面手动重试时调用）。
+func (s *stateStore) ResetServerConnectFailures() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.server.FailCount = 0
+	s.server.LastError = ""
+	s.server.Phase = ServerPhaseConnecting
 	_ = s.persistLocked()
 }
 

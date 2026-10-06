@@ -13,6 +13,8 @@ export interface DataTableProps<T> {
   pagination?: TableProps<T>['pagination']
   size?: TableProps<T>['size']
   scroll?: TableProps<T>['scroll']
+  /** 行展开内容（如日志的完整结构化字段）。 */
+  expandable?: TableProps<T>['expandable']
 }
 
 /** 表格封装：统一分页默认值、行键与空态文案；管理端外壳下默认更紧凑。 */
@@ -24,7 +26,8 @@ export function DataTable<T extends object>({
   empty,
   pagination,
   size,
-  scroll
+  scroll,
+  expandable
 }: DataTableProps<T>): JSX.Element {
   const defaultSize: TableProps<T>['size'] = useLayoutMode() === 'admin' ? 'small' : 'middle'
   return (
@@ -35,6 +38,7 @@ export function DataTable<T extends object>({
       loading={loading}
       size={size ?? defaultSize}
       scroll={scroll}
+      expandable={expandable}
       pagination={
         pagination === undefined
           ? { pageSize: 20, hideOnSinglePage: true, showSizeChanger: false }

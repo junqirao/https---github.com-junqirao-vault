@@ -5,6 +5,8 @@
 .NOTES
     由 Go 侧以 `-AccessPath <"E:" 或 "C:\Vault\...">` 调用，参数不做字符串拼接。
     幂等：找不到对应挂载点时返回 action=none 并成功。
+    目录模式下若路径已是"残留的卷挂载点"（分区不再认领它、但 junction 还在），返回
+    action=cleaned 表示顺手摘掉了它（见下面目录分支的说明）。
 
     ⚠️ 已实测确认（2026-10-01，Windows PowerShell 5.1）：移除挂载点**只有一种写法**，
     盘符与目录共用同一行命令 —— Get-Partition 定位分区 + 显式 -AccessPath。
@@ -63,6 +65,26 @@ try {
         Where-Object { @($_.AccessPaths) -contains $full } |
         Select-Object -First 1)
     if ($partition.Count -eq 0) {
+        # 分区已经不认领这个路径了，但**目录本身可能还是残留的卷挂载点**：实测（2026-10-06）
+        # Remove-PartitionAccessPath 之后 Windows 会把 junction 留在原地（Get-Partition 的
+        # AccessPaths 已空，路径却仍指向 \??\Volume{...}\），卷于是依旧可达。只报 action=none
+        # 就等于把僵尸留在本机 —— 下一轮挂载会把新目录建进这个卷里、再把卷挂到自己的卷内，
+        # 资源管理器里 C:\Vault\lib\lib\lib… 无限递归（见 volume_mount_dir.ps1 的 .NOTES）。
+        # 悬空的 junction 也读得到 Target，所以这里能识别。
+        $stale = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+        if ($stale -and ($stale.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            $target = @($stale.Target) | Where-Object { $_ } | Select-Object -First 1
+            if ($target -match 'Volume\{[0-9a-fA-F\-]+\}') {
+                # 只删链接（RemoveDirectory 对 junction 只删挂载点本身，卷内数据不受影响）。
+                [System.IO.Directory]::Delete($full, $false)
+                [pscustomobject]@{
+                    ok          = $true
+                    action      = 'cleaned'
+                    access_path = $full
+                } | ConvertTo-Json -Compress -Depth 5
+                exit 0
+            }
+        }
         [pscustomobject]@{
             ok          = $true
             action      = 'none'

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -38,7 +39,11 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/config", a.handleGetConfig)
 	mux.HandleFunc("PATCH /agent/config", a.handlePatchConfig)
 	// 单个存储库的挂载偏好（形态 / 目录 / 启动后自动挂载），每库独立。
-	mux.HandleFunc("PUT /agent/repo-mounts/{repo_id}", a.handleSetRepoMountPref)
+	//
+	// 用 POST 而不是 PUT：界面并不直连本代理，请求由 Electron 主进程代发，而主进程会
+	// **按方法放行**（只接受 GET/POST/PATCH/DELETE，见 apps/client/electron/main.ts 的
+	// parseAgentRequest）—— 用 PUT 会被主进程挡下、在界面上表现为 network.error。
+	mux.HandleFunc("POST /agent/repo-mounts/{repo_id}", a.handleSetRepoMountPref)
 
 	// 母盘内容下载（后台异步，见 docs/agent-api.md「磁盘内容下载」）。
 	mux.HandleFunc("POST /agent/disks/download", a.handleDiskDownload)
@@ -60,6 +65,8 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/events", a.handleEvents)
 
 	mux.HandleFunc("POST /agent/server/test", a.handleServerTest)
+	// 界面"重试"按钮：清零自动重连的失败计数并立即重连一次（见 server_connect.go）。
+	mux.HandleFunc("POST /agent/server/reconnect", a.handleServerReconnect)
 
 	mux.HandleFunc("POST /agent/update/check", a.handleUpdateCheck)
 	mux.HandleFunc("POST /agent/update/apply", a.handleUpdateApply)
@@ -115,31 +122,55 @@ func (a *Agent) tokenMiddleware(next http.Handler) http.Handler {
 
 // ---- 状态查询 ----
 
-// handleLog 返回代理日志的**尾部**（日志模块用）。
+// handleLog 返回代理日志（日志模块用），按天切分，一次回一天的文件尾部。
 //
 // 为什么要有它：挂载失败时原始报错（如 Connect-IscsiTarget 的 .NET 异常）只进代理日志，
 // 界面看不到（真实反馈："在客户端上加一个日志模块……不然什么都看不到"）。这是本机、只读、
-// 令牌校验过的接口，只回最近的日志尾部（默认 256KiB）。
+// 令牌校验过的接口。
 //
-// 可选查询参数 tail=<字节数>。
+// 可选查询参数：
+//   - day=YYYY-MM-DD 指定日期（日志按天切分；省略或非法一律按"当天"处理，避免参数错误
+//     直接打断界面）；
+//   - tail=<字节数>   读取该文件末尾的字节数（默认 256KiB，上限 8MiB）。
+//
+// 响应额外回 days（可查询日期列表）与 day（本次实际返回的日期），供界面做时间切分选择。
 func (a *Agent) handleLog(w http.ResponseWriter, r *http.Request) {
-	const defaultTail = 256 << 10
+	const (
+		defaultTail = 256 << 10
+		maxTail     = 8 << 20
+	)
 	tail := int64(defaultTail)
 	if v := strings.TrimSpace(r.URL.Query().Get("tail")); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			tail = n
+			tail = min(n, maxTail)
 		}
 	}
-	resp := map[string]any{"path": "", "text": ""}
+	day := normalizeLogDay(r.URL.Query().Get("day"))
+	resp := map[string]any{"day": day, "days": []string{}, "path": "", "text": ""}
 	if a.logSource != nil {
-		resp["path"] = a.logSource.CurrentPath()
-		if data, err := a.logSource.ReadTail(tail); err == nil {
+		resp["days"] = a.logSource.Days()
+		resp["path"] = a.logSource.PathForDay(day)
+		// 该日期没有日志文件不算错误（当天刚开始、或该天没写过日志都是正常状态），
+		// 回空文本让界面显示空态；只有真的读不动才回错误码。
+		if data, err := a.logSource.ReadDay(day, tail); err == nil {
 			resp["text"] = string(data)
-		} else {
+		} else if !errors.Is(err, os.ErrNotExist) {
 			resp["error"] = apperr.CodeOf(err)
 		}
 	}
 	a.writeJSON(w, http.StatusOK, resp)
+}
+
+// normalizeLogDay 把 day 参数规范成 YYYY-MM-DD；省略或非法时回退为当天。
+func normalizeLogDay(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Now().Format("2006-01-02")
+	}
+	if _, err := time.ParseInLocation("2006-01-02", raw, time.Local); err != nil {
+		return time.Now().Format("2006-01-02")
+	}
+	return raw
 }
 
 // handleHealth 返回健康信息（含管理员权限与真实连接状态）。
@@ -181,7 +212,11 @@ func (a *Agent) handleState(w http.ResponseWriter, _ *http.Request) {
 			"instance_id": server.InstanceID,
 			"name":        server.Name,
 			"connected":   server.Connected,
-			"last_error":  server.LastError,
+			// phase / fail_count 是"连接阶段与连续失败次数"：界面据此在连接中显示转圈的
+			// "连接中"（而不是"未连接"），并在失败达上限后给出"重试"按钮（见 state.go）。
+			"phase":      server.Phase,
+			"fail_count": server.FailCount,
+			"last_error": server.LastError,
 		},
 		"user":       map[string]any{"id": user.ID, "username": user.Username},
 		"mounts":     a.store.ListMounts(),
@@ -228,7 +263,11 @@ func (a *Agent) handleSetSession(w http.ResponseWriter, r *http.Request) {
 
 // handleClearSession 退出登录：停止心跳并解除订阅（不卸载已有挂载）。
 func (a *Agent) handleClearSession(w http.ResponseWriter, _ *http.Request) {
+	before := a.store.Server()
 	a.store.ClearSession()
+	// 退出后连接状态改成"未连接且不再自动重连"（见 stateStore.ClearSession）：
+	// 这是界面要立刻看到的状态变化，必须主动推一次 server 事件。
+	a.publishServerIfChanged(before)
 	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -300,6 +339,9 @@ func (a *Agent) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handlePatchConfig 部分更新本地配置。
+//
+// 不接受 default_mount_mode / default_mount_dir（见 ConfigPatch）：挂载形态与目录按库
+// 配置（POST /agent/repo-mounts/{repo_id}），请求里带这两个字段就当没带。
 func (a *Agent) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	var patch ConfigPatch
 	if err := decodeJSON(r, &patch); err != nil {
@@ -317,6 +359,8 @@ func (a *Agent) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 // repoMountPrefRequest 是单个存储库挂载偏好的写入请求。
 type repoMountPrefRequest struct {
 	MountMode string `json:"mount_mode"`
+	// MountDir 目录模式的**父目录**：实际挂载点是它下面一层 `<服务端名称>_<存储库名称>`
+	// 子目录（见 mountDirLeaf），界面在挂载设置里如实告知用户这一点。
 	MountDir  string `json:"mount_dir"`
 	AutoMount bool   `json:"auto_mount"`
 }

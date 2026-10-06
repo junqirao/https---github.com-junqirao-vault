@@ -20,6 +20,7 @@ import type {
   AgentMountMode,
   AgentMountState,
   AgentRepoMountPref,
+  AgentServerState,
   AgentSessionState,
   AgentState,
   DownloadState,
@@ -515,10 +516,16 @@ export const agentApi = {
     return request<AgentState>({ method: 'GET', path: '/agent/state' })
   },
 
-  /** 读取代理日志尾部（日志模块）。默认取末尾 256KiB。 */
-  log(tailBytes?: number): Promise<AgentLog> {
-    const query = tailBytes && tailBytes > 0 ? `?tail=${tailBytes}` : ''
-    return request<AgentLog>({ method: 'GET', path: `/agent/log${query}` })
+  /**
+   * 读取代理日志（日志模块）。日志按天切分：`day` 指定日期（省略即当天），
+   * `tailBytes` 限制读取的文件末尾字节数（省略由代理取默认 256KiB）。
+   */
+  log(options?: { day?: string; tailBytes?: number }): Promise<AgentLog> {
+    const query = new URLSearchParams()
+    if (options?.day) query.set('day', options.day)
+    if (options?.tailBytes && options.tailBytes > 0) query.set('tail', String(options.tailBytes))
+    const suffix = query.toString()
+    return request<AgentLog>({ method: 'GET', path: `/agent/log${suffix ? `?${suffix}` : ''}` })
   },
 
   mount(input: {
@@ -591,6 +598,16 @@ export const agentApi = {
     return request({ method: 'POST', path: '/agent/server/test', body: { url } })
   },
 
+  /**
+   * 手动重连服务端（界面上的"重试"按钮）。
+   *
+   * 代理会清零自动重连的失败计数并立即重试一次 —— 即"手动重试会刷新计数"：
+   * 之后自动重连循环重新获得 maxServerConnectAttempts 次机会。
+   */
+  reconnectServer(): Promise<AgentServerState> {
+    return request({ method: 'POST', path: '/agent/server/reconnect' })
+  },
+
   getConfig(): Promise<AgentConfig> {
     return request<AgentConfig>({ method: 'GET', path: '/agent/config' })
   },
@@ -607,7 +624,10 @@ export const agentApi = {
    */
   setRepoMountPref(repoId: string, pref: AgentRepoMountPref): Promise<{ config: AgentConfig }> {
     return request({
-      method: 'PUT',
+      // 必须是 POST 而不是 PUT：Electron 主进程会按方法放行（只接受 GET/POST/PATCH/DELETE，
+      // 见 apps/client/electron/main.ts 的 parseAgentRequest），PUT 会被它挡在代理之外，
+      // 界面上只会看到 network.error（"无法连接服务端"），与实际原因完全不符。
+      method: 'POST',
       path: `/agent/repo-mounts/${encodeURIComponent(repoId)}`,
       body: pref
     })
@@ -717,6 +737,12 @@ export function parseAgentEvent(type: string, data: string): AgentEvent | null {
       return {
         type: 'server',
         connected: value.connected === true,
+        // phase / fail_count 决定顶栏标签显示"连接中"还是"未连接 + 重试"（见 agentTypes.ts）。
+        phase:
+          value.phase === 'connecting' || value.phase === 'connected' || value.phase === 'disconnected'
+            ? value.phase
+            : undefined,
+        fail_count: typeof value.fail_count === 'number' ? value.fail_count : undefined,
         last_error: typeof value.last_error === 'string' ? value.last_error : undefined
       }
     case 'host':

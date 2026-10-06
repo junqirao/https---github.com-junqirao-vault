@@ -1,5 +1,15 @@
 import { useSyncExternalStore } from 'react'
 
+/*
+  注册 dayjs 语言包：antd 的日期组件（DatePicker/RangePicker）按 antd locale 里的
+  lang.locale 去取 dayjs 的月份/星期名（见 rc-picker 的 getShortMonths），
+  语言包没注册时面板会退回英文。这里只"注册"不切换全局 locale，
+  因此不会影响任何按固定格式（YYYY-MM-DD 等）格式化出来的字符串。
+*/
+import 'dayjs/locale/ja'
+import 'dayjs/locale/ko'
+import 'dayjs/locale/zh-cn'
+
 import enUS from './en-US.json'
 import jaJP from './ja-JP.json'
 import koKR from './ko-KR.json'

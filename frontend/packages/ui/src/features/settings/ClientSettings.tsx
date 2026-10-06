@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Descriptions, Input, Progress, Radio, Select, Space, Switch, Typography } from 'antd'
+import { Alert, Button, Descriptions, Input, Progress, Select, Space, Switch, Typography } from 'antd'
 import { CheckCircleOutlined } from '@ant-design/icons'
 
 import { ConfirmDialog } from '../../components/ConfirmDialog'
@@ -8,7 +8,7 @@ import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
 import { agentApi, identityMatchesServer, relaunchClient } from '../../api/agentClient'
-import type { AgentConfig, AgentIdentity, AgentMountMode, UpdateInfo } from '../../api/agentTypes'
+import type { AgentConfig, AgentIdentity, UpdateInfo } from '../../api/agentTypes'
 import { ApiError } from '../../api/errors'
 import { useAgent } from '../../hooks/useAgent'
 import { useAuth } from '../../hooks/useAuth'
@@ -142,7 +142,18 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
     setError(null)
     setNotice(null)
     try {
-      const result = await agentApi.patchConfig({ ...config, language })
+      // 逐项提交本页**真正可改**的字段，不用 { ...config }：那样会把只读字段
+      // （default_mount_mode / default_mount_dir / repo_mounts）一起回写，
+      // 让人误以为挂载默认值也能从这里改（代理侧已不接受它们）。
+      const result = await agentApi.patchConfig({
+        auto_mount: config.auto_mount,
+        auto_login: config.auto_login,
+        default_download_dir: config.default_download_dir,
+        language,
+        start_at_login: config.start_at_login,
+        update_channel: config.update_channel,
+        server_alias: config.server_alias
+      })
       setConfig(result.config)
       setNotice(t('settings.saved'))
       await agent.refresh()
@@ -267,27 +278,8 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
 
       <SectionCard title={t('settings.agent.title')}>
         <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
-          <div>
-            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>{t('settings.mountMode')}</Typography.Text>
-            <Radio.Group
-              value={config?.default_mount_mode ?? 'letter'}
-              disabled={disabled}
-              onChange={(event) => patch({ default_mount_mode: event.target.value as AgentMountMode })}
-            >
-              <Radio.Button value="letter">{t('settings.mountMode.letter')}</Radio.Button>
-              <Radio.Button value="directory">{t('settings.mountMode.directory')}</Radio.Button>
-            </Radio.Group>
-          </div>
-          <div>
-            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>{t('settings.defaultMountDir')}</Typography.Text>
-            <Input
-              value={config?.default_mount_dir ?? ''}
-              disabled={disabled}
-              placeholder={t('agent.mount.dialog.dirHint')}
-              style={{ maxWidth: 420 }}
-              onChange={(event) => patch({ default_mount_dir: event.target.value })}
-            />
-          </div>
+          {/* 挂载形态与挂载目录**不在这里**：那是每个库自己的事（存储库 → 挂载设置），
+              放一份全局默认只会让用户以为改一处就能管所有库。代理仍保留内部默认值兜底。 */}
           <div>
             <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>{t('settings.defaultDownloadDir')}</Typography.Text>
             <Input

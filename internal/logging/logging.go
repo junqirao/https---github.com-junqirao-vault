@@ -49,7 +49,7 @@ type Logger struct {
 
 	closer io.Closer
 	// daily 按天切分的文件写入器（未启用文件日志时为 nil）。
-	// 供 CurrentPath / ReadTail 为日志模块提供只读访问。
+	// 供 Days / PathForDay / ReadDay 为日志模块提供只读访问。
 	daily *dailyRotator
 }
 
@@ -140,20 +140,31 @@ func New(opt Options) (*Logger, error) {
 	return &Logger{Logger: logger, closer: multiCloser(closers), daily: daily}, nil
 }
 
-// CurrentPath 返回当天日志文件的完整路径（未启用按天文件时返回空串）。
-func (l *Logger) CurrentPath() string {
+// Days 返回存在日志文件的日期（YYYY-MM-DD，升序；未启用按天文件时为空切片）。
+//
+// 供日志模块做"按时间切分"：界面据此列出可查询的日期，避免只能看到当天。
+func (l *Logger) Days() []string {
+	if l == nil || l.daily == nil {
+		return []string{}
+	}
+	return l.daily.days()
+}
+
+// PathForDay 返回指定日期日志文件的完整路径；day 为空表示当天。
+// 未启用按天文件、或 day 不是合法日期时返回空串。
+func (l *Logger) PathForDay(day string) string {
 	if l == nil || l.daily == nil {
 		return ""
 	}
-	return l.daily.currentPath()
+	return l.daily.pathForDay(day)
 }
 
-// ReadTail 读取当天日志文件末尾最多 maxBytes 字节（供日志模块 tail 查询）。
-func (l *Logger) ReadTail(maxBytes int64) ([]byte, error) {
+// ReadDay 读取指定日期日志文件末尾最多 maxBytes 字节；day 为空表示当天。
+func (l *Logger) ReadDay(day string, maxBytes int64) ([]byte, error) {
 	if l == nil || l.daily == nil {
 		return nil, os.ErrNotExist
 	}
-	return l.daily.readTail(maxBytes)
+	return l.daily.readDayTail(day, maxBytes)
 }
 
 // multiCloser 把多个 Closer 合成一个（保持关闭顺序）。
@@ -241,17 +252,69 @@ func (r *dailyRotator) Close() error {
 	return err
 }
 
-// currentPath 返回当天日志文件的完整路径。
-func (r *dailyRotator) currentPath() string {
-	return filepath.Join(r.dir, fmt.Sprintf("%s-%s.log", r.prefix, time.Now().Format("2006-01-02")))
+// pathForDay 返回指定日期日志文件的完整路径；day 为空表示当天。
+// day 不是合法日期时返回空串（调用方据此拒绝，避免把参数当路径用）。
+func (r *dailyRotator) pathForDay(day string) string {
+	d, ok := parseDay(day)
+	if !ok {
+		return ""
+	}
+	return filepath.Join(r.dir, fmt.Sprintf("%s-%s.log", r.prefix, d))
 }
 
-// readTail 读取当天日志文件末尾最多 maxBytes 字节（日志模块 tail 查询用，尽力而为）。
-func (r *dailyRotator) readTail(maxBytes int64) ([]byte, error) {
+// days 列出目录中已存在的按天日志文件日期（YYYY-MM-DD，升序）。
+func (r *dailyRotator) days() []string {
+	entries, err := os.ReadDir(r.dir)
+	if err != nil {
+		return []string{}
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if day, ok := r.dayOf(e.Name()); ok {
+			out = append(out, day)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// dayOf 从日志文件名解析日期（YYYY-MM-DD）；命名不匹配返回 false。
+func (r *dailyRotator) dayOf(name string) (string, bool) {
+	if !strings.HasPrefix(name, r.prefix+"-") || !strings.HasSuffix(name, ".log") {
+		return "", false
+	}
+	day := strings.TrimSuffix(strings.TrimPrefix(name, r.prefix+"-"), ".log")
+	if _, err := time.ParseInLocation("2006-01-02", day, time.Local); err != nil {
+		return "", false
+	}
+	return day, true
+}
+
+// parseDay 校验并规范化 YYYY-MM-DD；空串表示当天。
+func parseDay(day string) (string, bool) {
+	day = strings.TrimSpace(day)
+	if day == "" {
+		return time.Now().Format("2006-01-02"), true
+	}
+	if _, err := time.ParseInLocation("2006-01-02", day, time.Local); err != nil {
+		return "", false
+	}
+	return day, true
+}
+
+// readDayTail 读取指定日期日志文件末尾最多 maxBytes 字节（日志模块查询用，尽力而为）。
+func (r *dailyRotator) readDayTail(day string, maxBytes int64) ([]byte, error) {
+	path := r.pathForDay(day)
+	if path == "" {
+		return nil, fmt.Errorf("logging: 非法的日志日期 %q", day)
+	}
 	if maxBytes <= 0 {
 		maxBytes = 256 << 10
 	}
-	f, err := os.Open(r.currentPath())
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -310,10 +373,10 @@ func (r *dailyRotator) cleanupLocked() {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasPrefix(name, r.prefix+"-") || !strings.HasSuffix(name, ".log") {
+		dayStr, ok := r.dayOf(name)
+		if !ok {
 			continue
 		}
-		dayStr := strings.TrimSuffix(strings.TrimPrefix(name, r.prefix+"-"), ".log")
 		d, err := time.ParseInLocation("2006-01-02", dayStr, time.Local)
 		if err != nil {
 			continue

@@ -101,12 +101,12 @@ type MountSpec struct {
 	ServerInstanceID string `json:"server_instance_id"`
 	ServerName       string `json:"server_name"`
 	// RepoName 存储库名称：用于卷标（盘符模式）与目录名（目录模式），见 mountEngine.mountAt。
-	RepoName  string `json:"repo_name"`
-	TargetIQN string `json:"target_iqn"`
-	PortalAddress    string `json:"portal_address"`
-	PortalPort       int    `json:"portal_port"`
-	AuthMode         string `json:"auth_mode"`
-	ChapUser         string `json:"chap_user"`
+	RepoName      string `json:"repo_name"`
+	TargetIQN     string `json:"target_iqn"`
+	PortalAddress string `json:"portal_address"`
+	PortalPort    int    `json:"portal_port"`
+	AuthMode      string `json:"auth_mode"`
+	ChapUser      string `json:"chap_user"`
 	// ChapSecret 仅本次下发；只在内存中保留到卸载。
 	ChapSecret       string `json:"chap_secret"`
 	DiskSizeBytes    int64  `json:"disk_size_bytes"`

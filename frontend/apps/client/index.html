@@ -56,6 +56,32 @@
       }
 
       /*
+        默认**不允许**选择文本：客户端是操作台，不是文档。
+        此前拖动鼠标/双击会把整屏文字划成蓝底高亮，再 Ctrl+C 复制走一段毫无意义的界面文案，
+        既干扰操作也容易误复制（真实反馈："默认不要可以复制内容，除非这个内容需要被复制"）。
+
+        真正需要复制的地方显式加 .selectable（可复制字段、错误详情、日志文本）；
+        输入类控件必须能选中，否则用户没法改字/选择一段替换，单独放开。
+      */
+      body {
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      input,
+      textarea,
+      [contenteditable='true'],
+      .ant-input,
+      .ant-input-affix-wrapper,
+      pre,
+      code,
+      kbd,
+      .selectable,
+      .selectable * {
+        user-select: text;
+        -webkit-user-select: text;
+      }
+
+      /*
         滚动条样式。
         Chromium 默认滚动条（带箭头、方块轨道）与整体简洁风格不搭，这里统一为：
         细窄、圆角、半透明、悬停加深；用透明边框 + background-clip 做出内缩效果，

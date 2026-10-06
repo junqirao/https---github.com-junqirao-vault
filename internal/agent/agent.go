@@ -60,11 +60,16 @@ type Options struct {
 }
 
 // LogSource 是对代理日志文件的只读访问接口（logging.Logger 天然满足）。
+//
+// 日志按天切分（logging 的 dailyRotator），因此查询维度是"日期"而不是行号/偏移：
+// 界面可先列可查日期，再取其中一天的尾部。
 type LogSource interface {
-	// CurrentPath 返回当天日志文件路径（可能为空）。
-	CurrentPath() string
-	// ReadTail 读取日志文件末尾最多 maxBytes 字节。
-	ReadTail(maxBytes int64) ([]byte, error)
+	// Days 返回存在日志文件的日期（YYYY-MM-DD，升序）。
+	Days() []string
+	// PathForDay 返回指定日期日志文件路径（可能为空）；day 为空表示当天。
+	PathForDay(day string) string
+	// ReadDay 读取指定日期日志文件末尾最多 maxBytes 字节；day 为空表示当天。
+	ReadDay(day string, maxBytes int64) ([]byte, error)
 }
 
 // Agent 是 Vault-Agent 的核心：本地 HTTP + 挂载引擎 + 心跳 + 服务端事件订阅。
@@ -264,6 +269,14 @@ func (a *Agent) Start(ctx context.Context) (string, error) {
 		a.runSessionRenewalLoop(a.baseCtx)
 	})
 
+	// 无会话时用本地证书自动重连服务端：代理重启后客户端不会再推会话，缺了这条界面只会
+	// 一直显示"未连接"且永不自愈（见 server_connect.go）。
+	a.wg.Add(1)
+	safeGo(a.logger, "server_connect", func() {
+		defer a.wg.Done()
+		a.runServerConnectLoop(a.baseCtx)
+	})
+
 	// 已挂载记录的会话实测：界面按钮与状态标签以**实际会话**为准，不看记录（见 session_probe.go）。
 	a.wg.Add(1)
 	safeGo(a.logger, "mount_session_probe", func() {
@@ -417,14 +430,22 @@ func (a *Agent) setServerConnected(connected bool, lastError string) {
 	a.publishServerIfChanged(before)
 }
 
-// publishServerIfChanged 比较状态快照，仅在 connected / last_error 变化时广播 server 事件。
+// publishServerIfChanged 比较状态快照，仅在 connected / phase / fail_count / last_error
+// 任一变化时广播 server 事件。
+//
+// 为什么把 phase 与 fail_count 也算进"变化"：界面靠它们区分"正在连"与"连不上"
+// （connecting 显示转圈的"连接中"，fail_count 达上限才显示"未连接 + 重试"）。
+// 只比 connected 的话，一个"没连上、但一直在重连"的代理在界面上永远不动。
 func (a *Agent) publishServerIfChanged(before ServerState) {
 	after := a.store.Server()
-	if before.Connected == after.Connected && before.LastError == after.LastError {
+	if before.Connected == after.Connected && before.LastError == after.LastError &&
+		before.Phase == after.Phase && before.FailCount == after.FailCount {
 		return
 	}
 	a.hub.Publish(Event{Type: "server", Data: map[string]any{
 		"connected":  after.Connected,
+		"phase":      after.Phase,
+		"fail_count": after.FailCount,
 		"last_error": after.LastError,
 	}})
 }

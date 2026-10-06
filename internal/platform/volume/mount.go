@@ -127,8 +127,15 @@ func (m *Manager) SetLabel(ctx context.Context, diskNumber int, label string) er
 
 // MountToDirectory 把分区挂载到指定目录。
 //
-// 目录必须已存在且为空，且其所在卷为 NTFS；不满足时返回明确错误
-// （platform.mount_dir_not_found / platform.mount_dir_not_empty / platform.mount_dir_not_ntfs）。
+// 目录不存在时由脚本创建（等价 mkdir -p），存在则必须为空，且其所在卷为 NTFS；不满足时返回
+// 明确错误（platform.mount_dir_not_found / platform.mount_dir_not_empty /
+// platform.mount_dir_not_ntfs）。
+//
+// ⚠️ "目录由脚本创建"不是分工问题：父目录可能是**本磁盘自己的残留挂载点**（老版本把卷直接挂到
+// 父目录上，卸载后 junction 还在原地），那样建目录会把目录建进本卷内部，卷随即被挂到自己的
+// 卷内路径上 —— 挂载点自指，资源管理器无限嵌套（真实事故）。识别要读 junction 的 Target 比卷
+// GUID，只有脚本做得到；脚本会先清掉残留再在真实目录里建挂载点（见 volume_mount_dir.ps1 的
+// .NOTES）。action=healed 即表示这一步真的修复过。
 func (m *Manager) MountToDirectory(ctx context.Context, diskNumber int, dir string) error {
 	if diskNumber < 0 {
 		return apperr.InvalidParam("disk_number")
@@ -140,7 +147,11 @@ func (m *Manager) MountToDirectory(ctx context.Context, diskNumber int, dir stri
 		winps.String("DiskNumber", strconv.Itoa(diskNumber)),
 		winps.String("AccessPath", dir),
 	}
-	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeMountDir, params, nil); err != nil {
+	var result struct {
+		Action  string `json:"action"`
+		Created bool   `json:"created"`
+	}
+	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeMountDir, params, &result); err != nil {
 		if mapped := mappedReasonError(err, map[string]*apperr.Error{
 			"dir_not_found":   ErrMountDirNotFound(dir),
 			"not_a_directory": ErrMountDirNotFound(dir),
@@ -152,20 +163,36 @@ func (m *Manager) MountToDirectory(ctx context.Context, diskNumber int, dir stri
 		}
 		return err
 	}
-	m.logger.Info("已挂载到目录", "disk_number", diskNumber, "path", dir)
+	if result.Action == "healed" {
+		// 修复过就告警一次：这台机器此前残留过卷挂载点，出问题时这是第一线索。
+		m.logger.Warn("挂载点下方是本磁盘残留的挂载点，已清理后重新挂载",
+			"disk_number", diskNumber, "path", dir)
+	}
+	m.logger.Info("已挂载到目录",
+		"disk_number", diskNumber, "path", dir, "action", result.Action, "created", result.Created)
 	return nil
 }
 
 // Unmount 移除挂载点（盘符或目录），不改变磁盘数据。幂等。
+//
+// action=cleaned 表示分区已经不认领这个路径，但路径本身仍是残留的卷挂载点（junction），本次
+// 顺手摘掉了它 —— 这是清理僵尸挂载点的第二条路（第一条在 MountToDirectory）。
 func (m *Manager) Unmount(ctx context.Context, mountPath string) error {
 	if strings.TrimSpace(mountPath) == "" {
 		return apperr.InvalidParam("mount_path")
 	}
 	params := []winps.Param{winps.String("AccessPath", mountPath)}
-	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeUnmount, params, nil); err != nil {
+	var result struct {
+		Action string `json:"action"`
+	}
+	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeUnmount, params, &result); err != nil {
 		return err
 	}
-	m.logger.Info("已移除挂载点", "mount_path", mountPath)
+	if result.Action == "cleaned" {
+		m.logger.Warn("分区上已无该挂载点记录，但路径仍是残留的卷挂载点，已清理",
+			"mount_path", mountPath)
+	}
+	m.logger.Info("已移除挂载点", "mount_path", mountPath, "action", result.Action)
 	return nil
 }
 

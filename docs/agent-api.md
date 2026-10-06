@@ -23,6 +23,9 @@ POST   /agent/session
 
 DELETE /agent/session          # 退出登录时调用，代理停止心跳并解除订阅
   ↑ {ok:true}
+
+POST   /agent/server/reconnect # 界面"重试"按钮：清零自动重连失败计数并立即重连一次
+  ↑ AgentServerState
 ```
 
 `cert_sha256` 是服务端证书 DER 的 SHA-256（小写十六进制），由前端在「测试连接」时经
@@ -47,6 +50,24 @@ Go 默认的证书链校验。渲染进程侧的同名信任由 Electron 主进�
   网络/服务端暂时不可用 → 按最小间隔退避重试。
 - **日志**：只记录 `server_url` / `username` / 新旧过期时间，**绝不记录 token 原文**。
 
+### 无会话时的自动重连与手动重试
+
+代理重启后客户端**不会**重新推会话（客户端只在自身启动/登录时推一次），此时没有会话可用。
+为此代理内建一条自动重连循环：**无会话 + 未连接 + 已装身份**时用客户端证书身份
+（`POST {server}/v1/auth/cert-login`）换一个新会话回来，效果与 `POST /agent/session` 一致。
+
+- **首次等待**：启动后 20s 才试第一次（给客户端推会话留出时间，避免抢先后白多一次证书登录）；
+- **复检间隔**：30s；
+- **放弃条件**：**连续失败 2 次**即停手，并把 `server.phase` 置为 `disconnected`
+  （`fail_count` 记在上限上）。无休止重试只会刷满日志，用户也永远分不清"还在连"和"连不上"；
+- **手动重试**：界面在"未连接"旁给"重试"按钮，调下面的接口。重试会**清零失败计数**并立即
+  试一次，成功前 `phase` 回到 `connecting`（界面显示转圈的"连接中"，不显示"未连接"）。
+
+```
+POST /agent/server/reconnect      # 界面"重试"按钮：清零失败计数 + 立即重连一次
+  ↑ AgentServerState              # 成功时的最新服务端状态（连接状态另经 server 事件广播）
+```
+
 ## 状态查询
 
 ```
@@ -57,7 +78,12 @@ GET /agent/health
 
 GET /agent/state
   ↑ {
-      server:{url, instance_id, name, connected, last_error},
+      # phase / fail_count：连接阶段与**连续**失败次数。界面据此区分"正在连"与"连不上" ——
+      #   connecting   ：正在连接/自动重连（界面显示转圈的"连接中"，**不显示**"未连接"）；
+      #   connected    ：已连接；
+      #   disconnected ：自动重连次数已用尽（界面显示"未连接" + 手动重试按钮）。
+      # fail_count 达上限后代理不再自动重连，等界面调 POST /agent/server/reconnect。
+      server:{url, instance_id, name, connected, phase, fail_count, last_error},
       user:{id, username},
       mounts:[MountState...],
       auto_mount:bool,
@@ -67,8 +93,11 @@ GET /agent/state
       session:SessionView            # 可选：当前服务端会话（未推送会话时缺省）
     }
 
-GET /agent/log?tail=<字节数>        # 日志模块：读当天日志文件末尾（默认 256KiB）
-  ↑ {path:<当天日志文件路径>, text:<原始文本(JSON Lines)>, error?}
+# 日志模块：日志按天切分，一次回一天的文件尾部。
+# day=YYYY-MM-DD 指定日期（省略或非法一律按当天）；tail 为读取字节数（默认 256KiB，上限 8MiB）。
+GET /agent/log?day=<日期>&tail=<字节数>
+  ↑ {day:<本次返回的日期>, days:[<可查询日期(升序)>],
+     path:<该日期日志文件路径>, text:<原始文本(JSON Lines)>, error?}
 
 HostState = {
   iscsi_available:bool,              # 找得到 IscsiInitiator 模块/cmdlet
@@ -393,21 +422,32 @@ GET   /agent/config
      download_connections, language, start_at_login:bool, update_channel, server_alias,
      repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool}}}
 PATCH /agent/config
-  ↓ 上述字段的任意子集（不含 repo_mounts）
+  ↓ 上述字段的任意子集（不含 repo_mounts / default_mount_mode / default_mount_dir）
   ↑ {config:{...}}
-PUT   /agent/repo-mounts/{repo_id}
+POST  /agent/repo-mounts/{repo_id}
   ↓ {mount_mode, mount_dir, auto_mount:bool}
   ↑ {config:{...}}
 ```
 
 `repo_mounts` 是**每个存储库各自独立**的挂载偏好（形态 / 目录 / 启动后自动挂载），
-没有条目的库跟随 `default_mount_mode`、`default_mount_dir` 与 `auto_mount` 的全局默认值；
+没有条目的库跟随 `default_mount_mode`、`default_mount_dir` 与 `auto_mount` 的兜底默认值；
 界面上的默认值是"填进去等用户确认"，不是隐式继承。
 
-- 写入必须用 `PUT /agent/repo-mounts/{repo_id}` 单库更新：`PATCH /agent/config` 不接受
+- 写入必须用 `POST /agent/repo-mounts/{repo_id}` 单库更新：`PATCH /agent/config` 不接受
   `repo_mounts`（整表替换会让"两个窗口各改一个库"变成后写覆盖前写）。
+- `default_mount_mode` / `default_mount_dir` 是**只读**的兜底默认值（`letter` / `C:\Vault`）：
+  界面上没有这两项，`PATCH /agent/config` 也不接受 —— 挂载形态与目录一律按库配置
+  （`repo_mounts`），放一份"全局默认"只会让用户以为改一处就能管所有库。
+- 用 POST 而非 PUT：界面不直连代理，请求由 Electron 主进程代发，主进程**按方法放行**
+  （只接受 GET/POST/PATCH/DELETE），PUT 会被挡在代理之外并向上报成 `network.error`。
 - `mount_mode` 为空串表示跟随 `default_mount_mode`；非法值返回
   `system.invalid_param`（args.field=mount_mode），空 `repo_id` 返回 args.field=repo_id。
+- `mount_dir` 是目录模式下的**父目录**（绝对路径，或相对 `default_mount_dir` 的相对路径）：
+  真正的挂载点是它下面一层 `<服务端名称>_<存储库名称>` 子目录，界面上把算好的最终路径
+  如实显示给用户。服务端下发的 `mount_path`：**绝对路径**（管理员的显式指定）原样使用；
+  **相对路径**（服务端自动拼的 `<服务端名称>\<库名>`）也归一到同一命名，同一个库不会因为
+  "从哪挂"得到两种目录名。父目录末段已经就是那一层时不再追加（重挂/恢复会把上次的最终挂载点
+  当请求传回来，否则每重挂一次就多套一层目录）。
 - 语义与全局 `auto_mount` 的区别：全局开关只管"恢复本机上次留下的挂载记录"；
   某库 `auto_mount=true` 时即使本机没有记录（甚至还没有分配）也会在会话就绪后自动挂载
   （没有可用分配时由代理调用 `POST /v1/repos/{id}/allocations` 建一个），
@@ -444,7 +484,10 @@ GET /agent/events
                        # 非 mounted 变成 mounted** 才提示"已挂载"（会话实测不会产生这种变化）。
      event: unmount     data: {allocation_id}
      event: revoked     data: {allocation_id, reason}   # 服务端踢下线，代理已自行卸载
-     event: server      data: {connected, last_error}   # 连接状态**真正变化**时才发（值未变不发）
+     event: server      data: {connected, phase, fail_count, last_error}
+                      # connected / phase / fail_count / last_error **任一变化**时才发（值未变不发）。
+                      # phase 必须一起发：只推 connected 的话，"没连上、但一直在重连"的代理在界面上
+                      # 永远停在"未连接"，用户分不清"还在连"和"连不上"。
     event: host        data: HostState                 # 本机就绪状态（iSCSI 发起端）变化时才发：
                                                        # 启动探测完成、管理员启动 MSiSCSI 后自动转就绪
      event: session     data: SessionView               # 客户端证书会话自动续期成功（新令牌）

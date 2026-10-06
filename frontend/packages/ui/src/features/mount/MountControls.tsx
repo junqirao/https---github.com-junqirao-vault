@@ -6,6 +6,7 @@ import type { AgentMountMode, AgentMountState } from '../../api/agentTypes'
 import { errorCodeOf, errorHintKeyOf, mountErrorInfoOf, translateError } from '../../api/errors'
 import { hasKey, useI18n } from '../../i18n'
 import { palette, radius } from '../../tokens/palette'
+import { effectiveMountDir } from '../../utils/mountPath'
 
 /**
  * 挂载错误的**唯一**标记：红色感叹号 + 悬浮详情（多行）。
@@ -24,7 +25,8 @@ function MountErrorMarker({ lines }: { lines: string[] }): JSX.Element {
       placement="top"
       title={t('agent.mount.lastError')}
       content={
-        <Space direction="vertical" size={2} style={{ maxWidth: 420 }}>
+        // 悬浮层存在的前提就是"鼠标移进来能选中/复制这段报错"：全局默认禁选，这里显式放开。
+        <Space className="selectable" direction="vertical" size={2} style={{ maxWidth: 420 }}>
           {lines.map((line, index) => (
             <Typography.Text
               key={`${index}:${line}`}
@@ -274,6 +276,8 @@ export function MountActionButtons({
 export interface MountDialogProps {
   open: boolean
   repoName?: string
+  /** 目录名里用的服务端名称（本地别名优先）：用于如实告知"实际挂载到哪"。 */
+  serverAlias?: string
   mode: AgentMountMode
   path: string
   submitting?: boolean
@@ -283,10 +287,16 @@ export interface MountDialogProps {
   onCancel: () => void
 }
 
-/** 挂载前确认：目录模式下允许先修改目标目录。 */
+/**
+ * 挂载前确认：目录模式下允许先修改目标目录。
+ *
+ * 这里填的是**父目录**，实际挂载点在它下面一级 `<服务端名称>_<存储库名称>`（代理侧规则）；
+ * 弹窗里直接把算好的最终路径显示出来 —— 用户点挂载前就该知道文件会出现在哪。
+ */
 export function MountDialog({
   open,
   repoName,
+  serverAlias,
   mode,
   path,
   submitting,
@@ -298,6 +308,7 @@ export function MountDialog({
   const { t } = useI18n()
   const directory = mode === 'directory'
   const invalid = directory && !path.trim()
+  const effectiveDir = directory ? effectiveMountDir(path, serverAlias ?? '', repoName ?? '') : ''
 
   return (
     <Modal
@@ -332,6 +343,15 @@ export function MountDialog({
             {invalid ? (
               <Typography.Text type="danger" style={{ fontSize: 12 }}>
                 {t('agent.mount.dialog.dirRequired')}
+              </Typography.Text>
+            ) : (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {t('agent.mount.dialog.dirParentHint')}
+              </Typography.Text>
+            )}
+            {effectiveDir ? (
+              <Typography.Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+                {t('agent.mount.dialog.dirEffective', { path: effectiveDir })}
               </Typography.Text>
             ) : null}
           </div>
