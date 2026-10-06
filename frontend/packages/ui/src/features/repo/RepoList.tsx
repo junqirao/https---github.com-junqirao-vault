@@ -1,7 +1,8 @@
-import { useMemo, useState } from 'react'
-import { Button, Card, Col, Input, Progress, Row, Skeleton, Space, Tag, Tooltip, Typography, message } from 'antd'
+import { useEffect, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
+import { Button, Card, Col, Input, Pagination, Progress, Row, Segmented, Skeleton, Space, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
-import { InfoCircleOutlined, SettingOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, BarsOutlined } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 
 import { DataTable } from '../../components/DataTable'
@@ -16,7 +17,7 @@ import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
-import { RepoMountActions, RepoMountStateTag, RepoMountStatus, useRepoMount } from './RepoMount'
+import { RepoCard, RepoRow } from './RepoCards'
 import { RepoMountSettingsModal } from './RepoMountSettings'
 
 export interface RepoListProps {
@@ -25,187 +26,80 @@ export interface RepoListProps {
   onOpen: (repoId: string) => void
 }
 
-interface RepoCardProps {
-  repo: RepoDTO
-  currentUserId: string
-  onOpen: (repoId: string) => void
-  onConfigure: (repo: RepoDTO) => void
-}
+/** 用户端展示形式：卡片网格（默认，一眼扫过多块盘）/ 整页宽度的列表（一库一行，便于横向比对）。 */
+type RepoViewMode = 'card' | 'list'
 
 /**
- * 用户端卡片：整卡可点打开本机挂载目录，容量进度条使用统一色板 token。
- *
- * 卡片上的三处动作分工（都只在这一张卡上完成，不必先进详情页）：
- *   - 整卡点击 = 打开文件（未挂载时如实提示）；
- *   - 「详情」图标 = 进详情页（默认停在「设置」tab）；
- *   - 「配置」图标 + 挂载按钮 = 这个库在本机怎么挂 / 挂上或卸下。
+ * 每页条数按形态分别取值：卡片一行 3~4 张（每页 8 张 = 两行上下），列表一行一库（每页 10 行）。
+ * 两者都压在一屏上下，分页才有意义 —— 一页要滚三屏的话，用户只会直接找搜索框。
  */
-function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardProps): JSX.Element {
-  const { t } = useI18n()
-  const mountController = useRepoMount(repo, currentUserId)
-  // 用量口径统一在 repoUsage 里（分母 = 库容量），卡片只负责画。
-  const { percent, text: usage } = repoUsage(repo)
+const PAGE_SIZE: Record<RepoViewMode, number> = { card: 8, list: 10 }
 
-  /**
-   * 整卡点击 = 打开本机挂载目录。
-   *
-   * 原来的「打开目录」小按钮撤掉了（按用户要求把"点击卡片进详情"换成"打开文件"）；
-   * 未挂载时打开只会得到系统级"路径不存在"，这里直接如实提示未挂载。
-   */
-  const openMountDir = (): void => {
-    if (!mountController.mounted) {
-      void message.warning(t('repo.mount.notMounted'))
-      return
-    }
-    void mountController.openMountDir()
+/**
+ * 展示形式的本地偏好键。
+ *
+ * 与客户端配置（`vault.client.config`，走 Electron IPC 写 config.json）**分开**：展示形式是纯界面偏好，
+ * 只跟"这台机器的这个界面"有关，不值得为它多铺一条跨进程写盘路径；localStorage 在浏览器 dev 与
+ * Electron 渲染进程两边都在，刷新/重开都还在。
+ */
+const VIEW_PREF_KEY = 'vault.repo.view'
+
+/** 读取本地记住的展示形式：读不到、值不合法、存储不可用，一律退回默认的卡片。 */
+function readStoredView(): RepoViewMode {
+  try {
+    const raw = window.localStorage.getItem(VIEW_PREF_KEY)
+    return raw === 'list' || raw === 'card' ? raw : 'card'
+  } catch {
+    return 'card'
   }
+}
 
-  return (
-    <Card
-      hoverable
-      onClick={openMountDir}
-      style={{ height: '100%' }}
-      styles={{ body: { padding: spacing.md } }}
-    >
-      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs }}>
-        <Typography.Text
-          strong
-          ellipsis={{ tooltip: repo.name }}
-          style={{ flex: 1, minWidth: 0, fontSize: fontSize.lg }}
-        >
-          {repo.name}
-        </Typography.Text>
-        <Tooltip title={t('repo.card.detail')}>
-          <Button
-            type="text"
-            size="small"
-            icon={<InfoCircleOutlined />}
-            aria-label={t('repo.card.detail')}
-            onClick={(event) => {
-              event.stopPropagation()
-              onOpen(repo.id)
-            }}
-          />
-        </Tooltip>
-      </div>
-
-      <Space size={spacing.xs} wrap style={{ marginTop: spacing.xs }}>
-        <Tag>{repoModeLabel(repo.mode)}</Tag>
-        <StatusTag group="repo" value={repo.state} />
-        {/* 挂载状态紧跟存储库状态：两个状态并排读，避免"看着正常却挂载失败"的困惑 */}
-        <RepoMountStateTag controller={mountController} />
-      </Space>
-
-      <div style={{ marginTop: spacing.md }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-            {t('repo.used')}
-          </Typography.Text>
-          <Typography.Text style={{ fontSize: fontSize.sm }}>{usage}</Typography.Text>
-        </div>
-        <Progress
-          percent={percent}
-          showInfo={false}
-          size="small"
-          strokeColor={palette.accent}
-          trailColor={palette.neutralFill}
-          style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-        />
-      </div>
-
-      {/* 建库进度：只在这一刻有信息量（服务端正在预创建差异盘/目标），建完换回常驻信息行 */}
-      <RepoPrepareProgress repo={repo} />
-
-      <Space size={spacing.md} wrap style={{ marginTop: spacing.sm }}>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-          {t('repo.card.shareCount')} {repo.share_count ?? repo.max_diff_disks}
-        </Typography.Text>
-        {/* 「已预创建」= 差异盘与 iSCSI 目标在建库时就备好：分配到手的盘挂载即用，不必现场下发 */}
-        {repo.pool ? (
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-            {t('repo.card.pool')}
-          </Typography.Text>
-        ) : null}
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-          {t('repo.parentVersion')} {repo.parent_version}
-        </Typography.Text>
-      </Space>
-
-      {/* 底部一行：左侧挂载点/失败原因，右侧「配置」+挂载按钮（按钮一律靠右，不被内容挤到左边） */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: spacing.sm, marginTop: spacing.sm }}>
-        <RepoMountStatus controller={mountController} />
-        <div
-          style={{
-            marginLeft: 'auto',
-            flexShrink: 0,
-            display: 'flex',
-            alignItems: 'center',
-            gap: spacing.xs
-          }}
-        >
-          {/* 配置图标紧挨挂载按钮左侧：改的是"这一个库在本机怎么挂"，与挂载是同一处动作 */}
-          <Tooltip title={t('repo.settings.title')}>
-            <Button
-              type="text"
-              size="small"
-              icon={<SettingOutlined />}
-              aria-label={t('repo.settings.title')}
-              onClick={(event) => {
-                event.stopPropagation()
-                onConfigure(repo)
-              }}
-            />
-          </Tooltip>
-          <RepoMountActions controller={mountController} />
-        </div>
-      </div>
-    </Card>
-  )
+/** 记住展示形式：localStorage 可能不可用（隐私模式、配额写满），写不进去就当没记住，绝不影响界面。 */
+function storeView(view: RepoViewMode): void {
+  try {
+    window.localStorage.setItem(VIEW_PREF_KEY, view)
+  } catch {
+    // 忽略：偏好没记住不是错误，不值得打扰用户。
+  }
 }
 
 /**
- * 建库进度：把服务端"预创建"的三个阶段摊给用户看（建母盘 → 派生差异盘 → 建 iSCSI 目标）。
+ * 用户端分组区块标题：标题 + 数量在左，`extra`（形态切换）贴右。
  *
- * 只在 state=creating 且拿到进度时有意义：建库是个几十秒到几分钟的异步过程，
- * 只显示"建库中"三个字，用户无法区分"在建"和"卡住了"。
+ * 切换控件放在内容区第一个分组的标题行右侧，而不是页面头部工具栏：它只作用于这一块列表，
+ * 与搜索/刷新/新建（页面级操作）不是一类东西；标题为空时（拿不到当前用户的分组兜底）只渲染右侧控件。
  */
-function RepoPrepareProgress({ repo }: { repo: RepoDTO }): JSX.Element | null {
-  const { t } = useI18n()
-  const prepare = repo.prepare
-  if (repo.state !== 'creating' || !prepare) return null
-  const percent = prepare.total > 0 ? Math.min(100, Math.round((prepare.done / prepare.total) * 100)) : 0
-
+function RepoGroupHeader({
+  title,
+  count,
+  extra
+}: {
+  title: string
+  count: number
+  extra?: ReactNode
+}): JSX.Element {
   return (
-    <div style={{ marginTop: spacing.sm }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-          {t(`repo.prepare.${prepare.phase}`)}
-        </Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-          {`${prepare.done}/${prepare.total}`}
-        </Typography.Text>
-      </div>
-      <Progress
-        percent={percent}
-        showInfo={false}
-        size="small"
-        strokeColor={palette.accent}
-        trailColor={palette.neutralFill}
-        style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-      />
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: spacing.sm,
+        marginBottom: spacing.sm
+      }}
+    >
+      {title ? (
+        <Space align="baseline" size={spacing.xs}>
+          <Typography.Text strong>{title}</Typography.Text>
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+            {count}
+          </Typography.Text>
+        </Space>
+      ) : (
+        <span />
+      )}
+      {extra}
     </div>
-  )
-}
-
-/** 用户端分组区块标题：标题 + 数量，不加解释性文案。 */
-function RepoGroupHeader({ title, count }: { title: string; count: number }): JSX.Element {
-  return (
-    <Space align="baseline" size={spacing.xs} style={{ marginBottom: spacing.sm }}>
-      <Typography.Text strong>{title}</Typography.Text>
-      <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-        {count}
-      </Typography.Text>
-    </Space>
   )
 }
 
@@ -276,12 +170,153 @@ function QuotaOverview({ repos }: { repos: RepoDTO[] }): JSX.Element | null {
   )
 }
 
-/** 存储库列表：管理端表格；用户端响应式卡片（按归属分组）。 */
+/** 卡片 / 列表形态切换：只挂在分组标题行右侧（见 RepoGroupHeader 的 extra）。 */
+function RepoViewSwitch({
+  value,
+  onChange
+}: {
+  value: RepoViewMode
+  onChange: (next: RepoViewMode) => void
+}): JSX.Element {
+  const { t } = useI18n()
+  return (
+    <Segmented
+      value={value}
+      onChange={(next) => onChange(next as RepoViewMode)}
+      options={[
+        {
+          value: 'card',
+          label: (
+            <Space size={spacing.xs}>
+              <AppstoreOutlined />
+              {t('repo.view.card')}
+            </Space>
+          )
+        },
+        {
+          value: 'list',
+          label: (
+            <Space size={spacing.xs}>
+              <BarsOutlined />
+              {t('repo.view.list')}
+            </Space>
+          )
+        }
+      ]}
+    />
+  )
+}
+
+interface RepoSectionProps {
+  title: string
+  items: RepoDTO[]
+  viewMode: RepoViewMode
+  currentUserId: string
+  /** 标题行右侧的附加内容（形态切换）；只由列表页交给第一个分组。 */
+  headerExtra?: ReactNode
+  onOpen: (repoId: string) => void
+  onConfigure: (repo: RepoDTO) => void
+}
+
+/**
+ * 一个分组区块：标题 + 当前页 + 分页。
+ *
+ * 分页**每个分组各自一份**：两个分组的含义不同（我拥有的 / 我参与的），
+ * 合成一个跨组的分页器时，"第 2 页"读到什么全凭两组各有几个库，很难理解。
+ */
+function RepoSection({
+  title,
+  items,
+  viewMode,
+  currentUserId,
+  headerExtra,
+  onOpen,
+  onConfigure
+}: RepoSectionProps): JSX.Element {
+  const [page, setPage] = useState(1)
+  const pageSize = PAGE_SIZE[viewMode]
+  // 切换形态会换掉每页条数（卡片 8 / 列表 10），当前页可能已经越界；
+  // 回到第 1 页最不容易迷失（越界本身另有兜底，见下面的 current）。
+  useEffect(() => setPage(1), [viewMode])
+
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize))
+  const current = Math.min(page, pageCount)
+  const visible = items.slice((current - 1) * pageSize, current * pageSize)
+
+  return (
+    <div>
+      {title || headerExtra ? <RepoGroupHeader title={title} count={items.length} extra={headerExtra} /> : null}
+      {viewMode === 'card' ? (
+        <Row gutter={[spacing.md, spacing.md]}>
+          {visible.map((repo) => (
+            <Col key={repo.id} xs={24} sm={12} xl={8} xxl={6}>
+              <RepoCard repo={repo} currentUserId={currentUserId} onOpen={onOpen} onConfigure={onConfigure} />
+            </Col>
+          ))}
+        </Row>
+      ) : (
+        <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
+          {visible.map((repo) => (
+            <RepoRow key={repo.id} repo={repo} currentUserId={currentUserId} onOpen={onOpen} onConfigure={onConfigure} />
+          ))}
+        </Space>
+      )}
+      {items.length > pageSize ? (
+        <div style={{ display: 'flex', justifyContent: 'center', marginTop: spacing.md }}>
+          <Pagination
+            size="small"
+            current={current}
+            pageSize={pageSize}
+            total={items.length}
+            showSizeChanger={false}
+            onChange={setPage}
+          />
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+/** 加载骨架：按当前形态出骨架（卡片网格 / 列表行），避免加载完"跳一下"。 */
+function RepoListSkeleton({ viewMode }: { viewMode: RepoViewMode }): JSX.Element {
+  if (viewMode === 'card') {
+    return (
+      <Row gutter={[spacing.md, spacing.md]}>
+        {Array.from({ length: 8 }).map((_, index) => (
+          <Col key={index} xs={24} sm={12} xl={8} xxl={6}>
+            <Card style={{ height: '100%' }} styles={{ body: { padding: spacing.md } }}>
+              <Skeleton active paragraph={{ rows: 3 }} />
+            </Card>
+          </Col>
+        ))}
+      </Row>
+    )
+  }
+  return (
+    <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
+      {Array.from({ length: 6 }).map((_, index) => (
+        <Card key={index} styles={{ body: { padding: `${spacing.sm}px ${spacing.md}px` } }}>
+          <Skeleton active paragraph={{ rows: 1 }} />
+        </Card>
+      ))}
+    </Space>
+  )
+}
+
+/** 存储库列表：管理端表格；用户端卡片/列表两种形态（可切换 + 分组分页）。 */
 export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const { user } = useAuth()
   const [keyword, setKeyword] = useState('')
+  // 展示形式只影响用户端（管理端是一张运维表，形态切换对它没有意义）。
+  // 初值取本地记住的那一份：用户上次选了列表，刷新/重开客户端仍是列表。
+  const [viewMode, setViewMode] = useState<RepoViewMode>(readStoredView)
+  /** 切换形态：即时生效并记住（下次进来直接是这一种）。 */
+  const changeView = (next: RepoViewMode): void => {
+    setViewMode(next)
+    storeView(next)
+  }
   // 挂载配置弹窗只服务当前点开的这一个库（弹窗在列表这一层只保留一份，避免每张卡都挂一个）。
   const [settingsRepo, setSettingsRepo] = useState<RepoDTO | null>(null)
 
@@ -357,19 +392,7 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
   }, [isSuperAdmin, onOpen, ownerName, t])
 
   const renderUserRepos = (): JSX.Element => {
-    if (reposQuery.isLoading) {
-      return (
-        <Row gutter={spacing.md}>
-          {Array.from({ length: 6 }).map((_, index) => (
-            <Col key={index} xs={24} sm={12} xl={8} xxl={6}>
-              <Card style={{ height: '100%' }} styles={{ body: { padding: spacing.md } }}>
-                <Skeleton active paragraph={{ rows: 3 }} />
-              </Card>
-            </Col>
-          ))}
-        </Row>
-      )
-    }
+    if (reposQuery.isLoading) return <RepoListSkeleton viewMode={viewMode} />
 
     if (rows.length === 0) {
       return (
@@ -394,22 +417,21 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
         <QuotaOverview repos={rows} />
         {sections
           .filter((section) => section.items.length > 0)
-          .map((section) => (
-            <div key={section.key}>
-              {section.title ? <RepoGroupHeader title={section.title} count={section.items.length} /> : null}
-              <Row gutter={spacing.md}>
-                {section.items.map((repo) => (
-                  <Col key={repo.id} xs={24} sm={12} xl={8} xxl={6}>
-                    <RepoCard
-                      repo={repo}
-                      currentUserId={userId ?? ''}
-                      onOpen={onOpen}
-                      onConfigure={setSettingsRepo}
-                    />
-                  </Col>
-                ))}
-              </Row>
-            </div>
+          .map((section, index) => (
+            // key 里带上关键字：搜索词一变就重挂载，页码随之回到第 1 页
+            // （否则在第 3 页搜索很容易搜出"空结果"，其实结果在第 1 页）。
+            <RepoSection
+              key={`${section.key}-${keyword}`}
+              title={section.title}
+              items={section.items}
+              viewMode={viewMode}
+              currentUserId={userId ?? ''}
+              // 切换控件只挂第一个分组（正常就是「我拥有的」）的标题行右侧：
+              // 它管的是下面这一整片列表，挂一次就够；没有自己拥有的库时自然落到「我参与的」标题行。
+              headerExtra={index === 0 ? <RepoViewSwitch value={viewMode} onChange={changeView} /> : undefined}
+              onOpen={onOpen}
+              onConfigure={setSettingsRepo}
+            />
           ))}
       </Space>
     )
@@ -420,6 +442,7 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
       title={t(isSuperAdmin ? 'page.repos.title' : 'page.myRepos.title')}
       extra={
         <>
+          {/* 展示形式切换已移入内容区第一个分组标题行右侧（只服务用户端，见 RepoViewSwitch）。 */}
           <Input.Search
             allowClear
             placeholder={t('common.search')}

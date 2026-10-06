@@ -12,11 +12,12 @@ import {
   ServerEndpointForm,
   agentApi,
   useI18n,
+  useServerConfig,
   type BootstrapResponse,
-  type Language
+  type Language,
+  type ServerChoice
 } from '@vault/ui'
 
-import { selectActiveServer, useAppStore } from '../store/appStore'
 import type { StartupFlow } from './useStartupFlow'
 import { AppRoutes } from '../routes'
 
@@ -86,7 +87,19 @@ export function PhaseView({
   const { t } = useI18n()
   const { phase, checking, setPhase, recheck, continueAfterCompat } = flow
   const [configuring, setConfiguring] = useState(false)
-  const activeBaseUrl = useAppStore((state) => selectActiveServer(state)?.baseUrl)
+  // 服务端注册表来自 <ServerConfigProvider>（与顶栏切换器同一份数据）。
+  const { servers, activeKey, active, setActive } = useServerConfig()
+  const activeBaseUrl = active?.baseUrl
+
+  /**
+   * "无法连接服务端"页上的备选服务端：**除当前这台以外**的已保存服务端。
+   *
+   * 只做展示层筛选（key 即服务端实例标识，同一台服务端在 store 里只有一条，见 appStore 的去重），
+   * 选中后交给 setActive —— activeKey 一变，useStartupFlow 的 effect 就会对新服务端重跑整套检查。
+   */
+  const serverChoices: ServerChoice[] = servers
+    .filter((server) => server.key !== activeKey)
+    .map((server) => ({ key: server.key, label: server.serverName || server.baseUrl, baseUrl: server.baseUrl }))
 
   if (configuring || phase.kind === 'config') {
     return (
@@ -119,6 +132,10 @@ export function PhaseView({
         loading={checking}
         onRetry={recheck}
         onChangeAddress={() => setConfiguring(true)}
+        // 有其他服务端时多一个"选择服务器"入口：连不上当前这台时，切到另一台已配好的
+        // 服务端比重新填地址快得多（详见 OfflineNotice 的说明）。
+        alternatives={serverChoices}
+        onSelectServer={setActive}
       />
     )
   }

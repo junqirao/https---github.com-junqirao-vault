@@ -5,7 +5,9 @@ import { fontFamily, fontSize, palette, radius, spacing } from './palette'
 /**
  * 由设计 token 生成 antd 主题。
  *
- * 刻意关闭动效（motion: false）与透明效果，符合"简洁大气、无动效"的取向。
+ * 刻意关闭 antd 全局动效（motion: false）与透明效果，符合"简洁大气、无装饰动效"的取向。
+ * 例外只有一处、由业务样式精确指定（见 apps/client/index.html 与 tokens/palette.ts 顶部说明）：
+ * 卡片悬停阴影的 0.2s 浮起过渡。
  */
 export function createVaultTheme(): ThemeConfig {
   return {

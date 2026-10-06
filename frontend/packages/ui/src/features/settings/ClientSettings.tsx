@@ -53,11 +53,6 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
   const hasUpdate = Boolean(update?.available || updateState?.available_version)
   const updatePercent =
     progressTotal > 0 ? Math.min(100, Math.round((progressReceived / progressTotal) * 100)) : undefined
-  // 服务端不提供更新时的可诊断信息（如 update.no_manifest · manifest_missing）。
-  const diagnostics =
-    update && !update.available && update.server_code
-      ? `${update.server_code}${update.server_reason ? ` · ${update.server_reason}` : ''}`
-      : null
 
   // 客户端资源热更：进度真源在 agent.webUpdate（来自 web_update 事件 / GET /agent/update/web）。
   const webState = agent.webUpdate
@@ -151,8 +146,7 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
         default_download_dir: config.default_download_dir,
         language,
         start_at_login: config.start_at_login,
-        update_channel: config.update_channel,
-        server_alias: config.server_alias
+        update_channel: config.update_channel
       })
       setConfig(result.config)
       setNotice(t('settings.saved'))
@@ -320,15 +314,6 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
             options={LANGUAGES.map((value) => ({ value, label: LANGUAGE_LABELS[value] }))}
           />
           <div>
-            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>{t('settings.serverAlias')}</Typography.Text>
-            <Input
-              value={config?.server_alias ?? ''}
-              disabled={disabled}
-              style={{ maxWidth: 320 }}
-              onChange={(event) => patch({ server_alias: event.target.value })}
-            />
-          </div>
-          <div>
             <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>{t('settings.updateChannel')}</Typography.Text>
             <Input
               value={config?.update_channel ?? ''}
@@ -414,32 +399,12 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
         }
       >
         <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
-          {update ? (
-            <Descriptions size="small" column={1} bordered>
-              <Descriptions.Item label={t('field.version')}>
-                {update.available
-                  ? t('settings.update.available', { version: update.version ?? '-' })
-                  : t('settings.update.upToDate')}
-              </Descriptions.Item>
-              <Descriptions.Item label={t('settings.update.source')}>{update.source || '-'}</Descriptions.Item>
-              <Descriptions.Item label={t('settings.update.size')}>{formatBytes(update.size_bytes)}</Descriptions.Item>
-              <Descriptions.Item label={t('settings.update.notes')}>{update.notes || '-'}</Descriptions.Item>
-            </Descriptions>
-          ) : (
-            <Typography.Text type="secondary">{t('settings.update.notAvailable')}</Typography.Text>
-          )}
-
-          {diagnostics ? (
-            <Typography.Text type="secondary">
-              {`${t('update.diagnostics')}: ${diagnostics}`}
-            </Typography.Text>
-          ) : null}
-
+          {/* 整包更新这一块只回答一个问题："要不要更新"。
+              有可更新的版本才展开进度与安装按钮；没有就一个对勾说清楚，不再铺版本/来源/
+              包大小/更新说明这些发布侧信息（用户在这一步用不到）。 */}
           {hasUpdate ? (
             <Space direction="vertical" size={spacing.xs} style={{ width: '100%' }}>
-              {!update?.available && targetVersion ? (
-                <Typography.Text>{t('settings.update.available', { version: targetVersion })}</Typography.Text>
-              ) : null}
+              <Typography.Text>{t('settings.update.available', { version: targetVersion ?? '-' })}</Typography.Text>
               {updatePercent === undefined ? <Progress status="active" /> : <Progress percent={updatePercent} />}
               <Space>
                 <Typography.Text type="secondary">
@@ -455,6 +420,12 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
                 </Button>
               </Space>
             </Space>
+          ) : update ? (
+            <Typography.Text type="success">
+              <CheckCircleOutlined /> {t('settings.update.upToDate')}
+            </Typography.Text>
+          ) : disabled ? (
+            <Typography.Text type="secondary">{t('settings.update.notAvailable')}</Typography.Text>
           ) : null}
 
           <div>
@@ -483,16 +454,16 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
                   <Button onClick={() => void relaunchClient()}>{t('update.web.restart')}</Button>
                 </Space>
               ) : null}
-              {webState?.state === 'failed' && webState.error === 'not_newer' ? (
-                // 资源版本不高于当前版本 = 没有可更新的内容，是**正常结果**而非错误：
-                // 绿色对勾明确告诉用户"无需更新"（真实反馈："版本相同不是错误，绿色对勾才对"）。
+              {/* 资源版本不高于当前版本，或服务端根本没有可下发的资源包，都等于"没有要更新的东西"：
+                  这是**正常结果**而非错误，用绿色对勾直说"无需更新"
+                  （真实反馈："版本相同不是错误，绿色对勾才对"）。 */}
+              {webState?.state === 'failed' && (webState.error === 'not_newer' || webNoArtifact) ? (
                 <Typography.Text type="success">
                   <CheckCircleOutlined /> {t('update.web.upToDate')}
                 </Typography.Text>
               ) : webState?.state === 'failed' && webState.error ? (
                 <ErrorNotice error={new ApiError({ kind: 'business', code: webState.error })} />
               ) : null}
-              {webNoArtifact ? <Typography.Text type="secondary">{t('update.web.noArtifact')}</Typography.Text> : null}
             </Space>
           </div>
         </Space>

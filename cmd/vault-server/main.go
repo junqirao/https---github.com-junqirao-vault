@@ -655,7 +655,11 @@ func runServe(configPath *string, migrateOnly *bool) int {
 			"type="+string(j.Type)+" "+job.PanicSummary(panicValue, stack), domain.AuditResultError)
 	})
 
-	router := api.New(api.Deps{App: application, Log: log, Cfg: watcher, Store: st, Events: events})
+	// Logs 交给管理端「服务日志」页读取：读的是服务端自己的按天日志文件
+	// （客户端日志是本机代理的事，走 GET /agent/log，两者互不相干）。
+	router := api.New(api.Deps{
+		App: application, Log: log, Cfg: watcher, Store: st, Events: events, Logs: logger,
+	})
 	server := &http.Server{
 		Addr:              raw.HTTP.Listen,
 		Handler:           router,

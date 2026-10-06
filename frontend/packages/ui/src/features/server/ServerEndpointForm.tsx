@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react'
 import { useState } from 'react'
-import { CheckCircleFilled, CloseCircleFilled, ExclamationCircleFilled } from '@ant-design/icons'
+import { CheckCircleFilled, CloseCircleFilled } from '@ant-design/icons'
 import { Button, Card, Descriptions, Form, Input, Space, Typography } from 'antd'
 
 import type { ServerProbe } from '../../api/agentTypes'
@@ -140,7 +140,6 @@ export function ServerEndpointForm({
           <Form.Item
             name="baseUrl"
             label={t('field.baseUrl')}
-            extra={t('server.tlsHint')}
             rules={[
               { required: true, message: t('server.required') },
               {
@@ -166,30 +165,21 @@ export function ServerEndpointForm({
         </Form>
 
         {tested ? (
-          <>
-            {tested.upgraded_to_tls ? (
-              <ResultPanel
-                tone="warning"
-                icon={<ExclamationCircleFilled style={{ color: palette.warning }} />}
-                title={t('server.tlsUpgraded')}
-              />
-            ) : null}
-            <ResultPanel
-              tone="success"
-              icon={<CheckCircleFilled style={{ color: palette.success }} />}
-              title={t('server.testSuccess')}
-            >
-              <Descriptions size="small" column={1} style={{ marginTop: spacing.xxs }}>
-                <Descriptions.Item label={t('system.serverName')}>{tested.server_name || '-'}</Descriptions.Item>
-                <Descriptions.Item label={t('server.apiVersion')}>{tested.api_version}</Descriptions.Item>
-                <Descriptions.Item label={t('server.serverVersion')}>{tested.server_version}</Descriptions.Item>
-                <Descriptions.Item label={t('field.baseUrl')}>{tested.server_url}</Descriptions.Item>
-                <Descriptions.Item label={t('server.certFingerprint')}>
-                  <CopyableText value={tested.cert?.sha256} monospace />
-                </Descriptions.Item>
-              </Descriptions>
-            </ResultPanel>
-          </>
+          // 连接成功只说用户要用的三件事：连的是哪个服务端、实际生效的地址、证书指纹（可核对）。
+          // 协议版本/服务端版本这类实现信息不在这里露出来，点了"测试连接"的用户不需要它们。
+          <ResultPanel
+            tone="success"
+            icon={<CheckCircleFilled style={{ color: palette.success }} />}
+            title={t('server.testSuccess')}
+          >
+            <Descriptions size="small" column={1} style={{ marginTop: spacing.xxs }}>
+              <Descriptions.Item label={t('system.serverName')}>{tested.server_name || '-'}</Descriptions.Item>
+              <Descriptions.Item label={t('field.baseUrl')}>{tested.server_url}</Descriptions.Item>
+              <Descriptions.Item label={t('server.certFingerprint')}>
+                <CopyableText value={tested.cert?.sha256} monospace />
+              </Descriptions.Item>
+            </Descriptions>
+          </ResultPanel>
         ) : null}
 
         {error ? (

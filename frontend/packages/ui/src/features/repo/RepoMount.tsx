@@ -27,6 +27,14 @@ export interface RepoMountController {
   sessionLive: boolean | undefined
   /** 记录还在，但代理实测本机已无活动会话（盘实际不在了）。 */
   sessionLost: boolean
+  /**
+   * 挂载**失败**（需要用户看一眼）：本次请求报错，或本机状态为 error/revoked，
+   * 或记录说"已挂载"但实测会话已断。
+   *
+   * 与标签行里那个红色感叹号（MountStateCell 的 mountErrorLines）同一套口径：
+   * 它返回 true，就一定有一段可读的报错能展示；库名前的红点与它说的也是同一件事。
+   */
+  failed: boolean
   /** 代理侧状态机进行中（挂载中 / 卸载中）。 */
   pending: boolean
   /** 本次操作请求进行中。 */
@@ -97,6 +105,10 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
   // "挂载和卸载的按钮应以实际为准，看对应的 iSCSI 连接是否在活动中的"）。
   const mounted = mount?.state === 'mounted' && !sessionLost
   const pending = mount?.state === 'mounting' || mount?.state === 'unmounting'
+  // 失败口径与标签行的红色感叹号一致（见 MountStateCell → mountErrorLines）：本次请求报错，
+  // 或本机状态 error/revoked；断线（sessionLost）也算 —— 盘实际不在，标签行已经写着「已断开」，
+  // 此时还标一颗"从没挂过"的灰点，两个标记会互相矛盾。
+  const failed = Boolean(error) || mount?.state === 'error' || mount?.state === 'revoked' || sessionLost
   // 库必须 active 才能挂载：建库中（creating）时差异盘还没派生出来，此时"挂载"点了也只会
   // 换来一句对不上的报错（真实反馈："逻辑有误啊，creating 中的存储库不允许挂载啊"）。
   // 服务端同样拦住（RequestMount → repo.creating），这里只是提前把按钮置灰并说清原因。
@@ -167,6 +179,7 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     mounted,
     sessionLive,
     sessionLost,
+    failed,
     pending,
     busy,
     canMount,

@@ -7,6 +7,7 @@ import dayjs, { type Dayjs } from 'dayjs'
 
 import { agentApi } from '../../api/agentClient'
 import { ApiError } from '../../api/errors'
+import { useApi } from '../../api/provider'
 import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
@@ -114,19 +115,37 @@ function LevelTag({ level }: { level: string }): JSX.Element {
   )
 }
 
+/** 日志来源：本机代理（客户端）日志，或服务端日志。 */
+export type LogSourceKind = 'agent' | 'server'
+
+export interface LogViewerProps {
+  /**
+   * 日志来源：
+   *  - 'agent'（默认）：本机代理（客户端）日志，读 GET /agent/log；
+   *  - 'server'：服务端日志，读 GET /v1/system/logs（管理端「服务日志」页，仅超级管理员）。
+   *
+   * 两者不能混用：代理日志只有本机能读，管理员在别的机器上打开管理控制台时，
+   * 代理日志只会显示自己这台客户端的记录，与服务端发生了什么毫无关系。
+   */
+  source?: LogSourceKind
+}
+
 /**
- * 代理日志查看器（日志模块）。
+ * 日志查看器（客户端「日志」页 / 管理端「服务日志」页共用）。
  *
- * 为什么要有它：挂载失败时原始报错（如 Connect-IscsiTarget 的 .NET 异常）只进代理日志，
+ * 为什么要有它：挂载失败时原始报错（如 Connect-IscsiTarget 的 .NET 异常）只进日志文件，
  * 界面只能看到稳定码（真实反馈："在客户端上加一个日志模块……不然什么都看不到"）。
+ * 管理端同理：服务端内部报错只进服务端日志，管理员必须能就地看到。
  *
  * 日志本身是结构化 JSON，直接铺成控制台既难读也翻不动，因此这里：
  * - 按天切分（日志文件本来就一天一份），先选日期再看；
  * - 解析成表格（时间 / 级别 / 消息 / 字段），字段多时可以展开看完整 JSON；
  * - 支持时间范围、级别、关键字过滤与分页，避免日志一多就没法看。
  */
-export function LogViewer(): JSX.Element {
+export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
+  const api = useApi()
   const { t } = useI18n()
+  const fromServer = source === 'server'
   /** 选中的日期；空串表示"当天"（由代理回填 data.day）。 */
   const [day, setDay] = useState('')
   const [level, setLevel] = useState<string>('all')
@@ -136,8 +155,12 @@ export function LogViewer(): JSX.Element {
   const [newestFirst, setNewestFirst] = useState(true)
 
   const logQuery = useQuery({
-    queryKey: ['agent-log', day],
-    queryFn: () => agentApi.log({ day: day || undefined, tailBytes: TAIL_BYTES })
+    // 两种来源的缓存互不覆盖（同一台机器上两个页面可能同时打开）。
+    queryKey: ['logs', source, day],
+    queryFn: () =>
+      fromServer
+        ? api.systemLogs({ day: day || undefined, tailBytes: TAIL_BYTES })
+        : agentApi.log({ day: day || undefined, tailBytes: TAIL_BYTES })
   })
   const data = logQuery.data
 
@@ -167,8 +190,8 @@ export function LogViewer(): JSX.Element {
   }, [data])
 
   /**
-   * 代理"读不动日志文件"时回的稳定错误码。包成业务错误才能走到统一的按码本地化提示
-   * （错误码本身也照样贴出来，方便排障）。
+   * 读不动日志文件时回的稳定错误码（代理与被查询的服务端返回同形结构）。
+   * 包成业务错误才能走到统一的按码本地化提示（错误码本身也照样贴出来，方便排障）。
    */
   const logError = useMemo(
     () => (data?.error ? new ApiError({ kind: 'business', code: data.error }) : null),
@@ -226,7 +249,7 @@ export function LogViewer(): JSX.Element {
 
   return (
     <PageShell
-      title={t('page.logs.title')}
+      title={fromServer ? t('page.serverLogs.title') : t('page.logs.title')}
       extra={
         <Button icon={<ReloadOutlined />} loading={logQuery.isFetching} onClick={() => void logQuery.refetch()}>
           {t('common.refresh')}
@@ -307,6 +330,8 @@ export function LogViewer(): JSX.Element {
             <ErrorNotice error={logError} />
           </div>
         ) : null}
+        {/* 分页直接用表格自带的 Pagination（antd 框架组件），不另做一套；
+            条数总量已经由卡片标题右侧给出，分页里不再重复一遍。 */}
         <DataTable<LogEntry>
           columns={columns}
           rows={rows}
@@ -314,28 +339,37 @@ export function LogViewer(): JSX.Element {
           loading={logQuery.isLoading}
           empty={<EmptyState title={t('log.empty')} description={t('log.emptyHint')} />}
           scroll={{ x: 1080 }}
-          pagination={{
-            pageSize: 50,
-            showSizeChanger: true,
-            pageSizeOptions: [20, 50, 100, 200],
-            showTotal: (total) => t('log.entries.total', { total })
-          }}
+          pagination={{ pageSize: 50, showSizeChanger: true }}
           expandable={{
-            expandedRowRender: (entry) => (
-              <pre
-                className="selectable"
-                style={{
-                  margin: 0,
-                  fontFamily: MONO_FONT,
-                  fontSize: fontSize.xs,
-                  lineHeight: 1.6,
-                  whiteSpace: 'pre-wrap',
-                  wordBreak: 'break-all'
-                }}
-              >
-                {entry.parsed ? JSON.stringify(entry.json, null, 2) : entry.raw}
-              </pre>
-            )
+            expandedRowRender: (entry) => {
+              const detail = entry.parsed ? JSON.stringify(entry.json, null, 2) : entry.raw
+              return (
+                <>
+                  {/* 展开的完整 JSON 是典型的"要贴出去"的内容：给一个显式复制入口，
+                      另外整块文本也放开选中（见 index.html 的全局禁选）。 */}
+                  <Typography.Text
+                    type="secondary"
+                    style={{ display: 'block', marginBottom: spacing.xxs, fontSize: fontSize.xs }}
+                    copyable={{ text: detail, tooltips: [t('common.copy'), t('common.copied')] }}
+                  >
+                    {t('log.detail.copy')}
+                  </Typography.Text>
+                  <pre
+                    className="selectable"
+                    style={{
+                      margin: 0,
+                      fontFamily: MONO_FONT,
+                      fontSize: fontSize.xs,
+                      lineHeight: 1.6,
+                      whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-all'
+                    }}
+                  >
+                    {detail}
+                  </pre>
+                </>
+              )
+            }
           }}
         />
       </SectionCard>

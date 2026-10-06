@@ -172,7 +172,9 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
         <Route path="orphans" element={<OrphanDisks />} />
         <Route path="jobs" element={<JobList />} />
         <Route path="audit" element={<AuditList />} />
-        <Route path="logs" element={<LogViewer />} />
+        {/* 管理端看的是**服务端**日志（GET /v1/system/logs，仅超管）；
+            客户端自己的代理日志在应用端 /logs，两者不是一回事。 */}
+        <Route path="logs" element={<LogViewer source="server" />} />
         <Route path="system" element={<SystemSettings isSuperAdmin={isSuperAdmin} />} />
       </Route>
     </Routes>

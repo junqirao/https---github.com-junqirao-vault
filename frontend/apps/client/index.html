@@ -54,6 +54,42 @@
       * {
         transition: none !important;
       }
+      /*
+        **卡片的例外**：上面这条 `* { transition: none !important }` 把 antd 卡片自带的
+        `transition: box-shadow 0.2s` 也一起关掉了，于是鼠标移上去阴影是"啪"地弹出
+        （真实反馈："hover 到卡片时的阴影展示慢一些，现在的效果很突兀"）。
+
+        只给卡片开这一条口子：0.2s + 缓出曲线（起手快、收尾慢），阴影才是"浮"起来而不是跳出来。
+        时长跟着实机反馈走了三轮：520ms（"慢一些"）→ 400ms（"过于慢了"）→ 200ms
+        （"速度改成 0.2s"）。0.2s 刚好等于 antd 默认时长，但这条规则**仍然不能删**——
+        它换的是被上面 `* { transition: none !important }` 关掉的那三个属性本身，且用的是
+        缓出曲线而非 antd 默认的 ease。权重说明：`.ant-card-hoverable`（0,1,0）高于
+        `*`（0,0,0），两边都带 !important 时按权重取胜，所以这条能覆盖全局关闭。
+
+        hover 时的阴影值同时换成两层（近处 1px 收边 + 远处 28px 大扩散），比 antd 默认
+        单层更柔和；`translateY(-2px)` 是极轻的上浮暗示，幅度刻意压小，避免网格里晃眼。
+      */
+      .ant-card-hoverable {
+        transition:
+          box-shadow 200ms cubic-bezier(0.22, 0.61, 0.36, 1),
+          border-color 200ms cubic-bezier(0.22, 0.61, 0.36, 1),
+          transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+      }
+      .ant-card-hoverable:hover {
+        transform: translateY(-2px);
+        box-shadow:
+          0 1px 2px rgba(0, 0, 0, 0.04),
+          0 12px 28px -8px rgba(0, 0, 0, 0.16) !important;
+      }
+
+      /*
+        这里曾有第二处例外：「已挂载」磁盘徽标（features/repo/RepoCards.tsx）的呼吸灯。
+        该徽标已按用户反馈撤掉（"图标的呼吸灯效果不要有背景…不要在图标上呼吸了，
+        在名称前加个绿点就可以了"），改成库名前的 8px 静态绿点，因此这组
+        @keyframes / .vault-disk-badge--* 规则一并删除 —— 现在全站唯一的动效就是上面那条
+        卡片悬停过渡。若日后再加"承载持续状态"的动效，请连同 tokens/palette.ts
+        的说明一起改，别让注释里的"例外清单"与实现脱节。
+      */
 
       /*
         默认**不允许**选择文本：客户端是操作台，不是文档。
@@ -118,6 +154,45 @@
         display: none;
         width: 0;
         height: 0;
+      }
+
+      /*
+        表格里三处 antd 默认装饰要压掉（都用 !important：antd 的样式是运行时注入的，
+        与这里的顺序不确定，靠权重保证生效）。
+
+        1) 行展开/收起图标：antd 按 operationUnit 给它画了一个带边框和底色的方块，
+           在"点开看详情"的行里看着像多出来的一个按钮，和行内容不是一体，去掉圈只留 +/−；
+           去掉后没有边框高亮，悬停改为变色，否则鼠标移上去完全没反馈。
+        2) 表头圆角：卡片自己已经有圆角，表格容器与表头首/末单元格再各画一次半径，
+           就变成"卡片里嵌了一个圆角小框"，这里统一压平，表头与卡片对齐。
+        3) 分页：去掉了卡片内边距（flush）后，分页默认只有上下 margin，
+           会贴死卡片右边缘，这里补上四周间距。
+      */
+      .ant-table-wrapper .ant-table-row-expand-icon,
+      .ant-table-wrapper .ant-table-row-expand-icon:hover,
+      .ant-table-wrapper .ant-table-row-expand-icon:focus,
+      .ant-table-wrapper .ant-table-row-expand-icon:active {
+        border: none !important;
+        background: transparent !important;
+      }
+      .ant-table-wrapper .ant-table-row-expand-icon:hover,
+      .ant-table-wrapper .ant-table-row-expand-icon:focus {
+        /* palette.accent（与 tokens/palette.ts 保持一致） */
+        color: #0a6cff;
+      }
+      .ant-table-wrapper .ant-table-container,
+      .ant-table-wrapper .ant-table-title,
+      .ant-table-wrapper .ant-table-header {
+        border-start-start-radius: 0 !important;
+        border-start-end-radius: 0 !important;
+      }
+      .ant-table-wrapper .ant-table-container > table > thead > tr:first-child > *:first-child,
+      .ant-table-wrapper .ant-table-container > table > thead > tr:first-child > *:last-child {
+        border-start-start-radius: 0 !important;
+        border-start-end-radius: 0 !important;
+      }
+      .ant-table-wrapper .ant-table-pagination.ant-pagination {
+        margin: 16px !important;
       }
     </style>
   </head>

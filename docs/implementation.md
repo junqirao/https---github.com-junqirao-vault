@@ -520,7 +520,7 @@ POST /v1/system/bootstrap      匿名（仅未初始化时可用）← {username
  │    ├─ incompatible_protocol → 硬性提示页（协议不匹配，不可继续）
  │    └─ needs_client_upgrade / needs_server_upgrade → 提示页 + 允许"仍然继续（只读查看）"
  ├─ GET  /v1/system/bootstrap
- │    ├─ 网络失败 → "无法连接服务端" + 重试/修改地址
+ │    ├─ 网络失败 → "无法连接服务端" + 重试/修改地址/选择服务器（有其他已保存服务端时才出现）
  │    ├─ needs_bootstrap = true → 【初始化向导】
  │    ├─ blocked_reason = bootstrap_disabled / bootstrap_window_expired → 对应提示页
  │    └─ 否则 → 有本地有效 token 则校验后进主界面，无 token 则进【登录页】
@@ -1930,6 +1930,9 @@ GET    /v1/system/bootstrap               ★ 匿名：初始化状态（见 3.5
 POST   /v1/system/bootstrap               ★ 匿名且仅未初始化时可用：创建首个超级管理员并下发会话
 GET    /v1/system/events                  SSE
 GET    /v1/system/audit
+GET    /v1/system/logs                    ★ 仅 super_admin：服务端日志（按天切分，一次回一天的文件
+                                          尾部，?day=&tail=），供管理端「服务日志」页；
+                                          客户端自身的代理日志走本地 GET /agent/log，两者不同源
 GET/PATCH /v1/system/settings             仅可改 server.name（别名）等运行时可改项；
                                           ★ client_compat 为**只读展示**（真源在 config.yaml，见 3.4.2）
 ```
@@ -2393,7 +2396,7 @@ Vault-Server sign release -artifact agent=... -artifact client_web=dist.zip
 代理提供 `GET /agent/update/web` 查询状态、SSE `web_update` 事件推送进度，
 页面刷新后据此恢复展示（见 docs/agent-api.md「客户端资源热更」）。
 
-**生效时机（两段）**
+**生效时机（三段）**
 
 1. **启动时选层**：热更层版本必须**严格高于**内置层才会被采用。内置层版本取打包目录里的
    `package.json`（**不用 `app.getVersion()`**：应用 package.json 缺 `version` 字段时它会回退成
@@ -2404,6 +2407,12 @@ Vault-Server sign release -artifact agent=... -artifact client_web=dist.zip
    重新解析并加载新层（`vault:apply-web-layer`），**无需重启客户端**，也不打断既有挂载。
    主进程按"解析出的入口文件是否等于已加载文件"去重（相同即返回 `applied=false`），
    因此不会形成重载循环。
+   3. **启动自愈**：应用升级后，旧热更层（版本 ≤ 应用版本）永远不会再被加载，残留在机器上只会
+    造成"设置页显示一个不生效的版本号 + 每次启动刷一条告警 + 白占几十上百 MB 磁盘"。代理在
+    `Start()` 后台执行一次 `reconcileWebLayer`：摘掉失效的 `current.json`、删除失效版本目录、
+    清理 `.tmp-*` / `.part` 残留（判据与第 1 段完全一致；应用版本不可解析时不判定、不动手）。
+    **用户无需手工删 `%ProgramData%\Vault\webapp`**。
+
 
 ### 7.5 i18n
 

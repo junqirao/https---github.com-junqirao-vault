@@ -1,4 +1,4 @@
-import { LoadingOutlined, WarningFilled } from '@ant-design/icons'
+import { ExclamationCircleFilled, LoadingOutlined } from '@ant-design/icons'
 import { Button, Input, Modal, Popover, Radio, Space, Tag, Tooltip, Typography } from 'antd'
 
 import { StatusTag } from '../../components/StatusTag'
@@ -9,12 +9,17 @@ import { palette, radius } from '../../tokens/palette'
 import { effectiveMountDir } from '../../utils/mountPath'
 
 /**
- * 挂载错误的**唯一**标记：红色感叹号 + 悬浮详情（多行）。
+ * 挂载错误的**唯一**标记：红色圆形感叹号 + 悬浮详情（多行）。
  *
  * 为什么这样收敛（真实反馈："错误信息也不用一直摆着…把那个红色三角感叹的功能替换掉这个
  * 错误的标记，只展示一次就行了，如果有多个错误信息加多一行去展示，不要展示多个，这样很乱"）：
  *   - 错误不再以文字形式长期占据列表列与卡片（那些位置只留状态本身）；
  *   - "本次请求失败"与"本机残留错误"汇聚到同一个标记里，逐行展示，复制一次拿全。
+ *
+ * 图标用 `ExclamationCircleFilled`（圆形）而**不是** `WarningFilled`（三角形）：
+ * 三角形在这套界面里是"系统级警告/风险"的语气，而挂载失败只是"这一项这次没成功"，
+ * 每个失败的库都顶着一个红三角过于刺眼（真实反馈："挂载错误时不要用三角感叹号的图标，
+ * 你换一个，那个太突兀了"）。圆形感叹号同样一眼可辨，语气平静得多。
  */
 function MountErrorMarker({ lines }: { lines: string[] }): JSX.Element {
   const { t } = useI18n()
@@ -45,7 +50,7 @@ function MountErrorMarker({ lines }: { lines: string[] }): JSX.Element {
         </Space>
       }
     >
-      <WarningFilled style={{ color: palette.danger, fontSize: 14, cursor: 'help' }} />
+      <ExclamationCircleFilled style={{ color: palette.danger, fontSize: 14, cursor: 'help' }} />
     </Popover>
   )
 }

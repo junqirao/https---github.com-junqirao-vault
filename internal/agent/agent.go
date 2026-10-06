@@ -296,6 +296,11 @@ func (a *Agent) Start(ctx context.Context) (string, error) {
 		a.runHostRecheckLoop(a.baseCtx)
 	})
 
+	// 启动即自愈渲染层资源目录：应用升级后旧热更层会永久失效（客户端只加载比应用版本新的层），
+	// 这里自动摘掉失效指针、删掉死资源，用户不需要手工删 %ProgramData%\Vault\webapp。
+	// 放后台执行：极端情况下要删几百 MB，不该拖慢本地 HTTP 服务就绪。
+	safeGo(a.logger, "web_layer_reconcile", a.reconcileWebLayer)
+
 	a.logger.Info("Vault-Agent 已启动",
 		"addr", listener.Addr().String(), "admin", a.admin, "version", a.version)
 	if !a.admin {
@@ -359,12 +364,18 @@ func (a *Agent) UnmountAll(ctx context.Context) {
 // setSession 保存会话并触发服务端信息刷新、事件订阅与自动挂载。
 func (a *Agent) setSession(session *Session) {
 	a.store.SetSession(session)
+	// 这里只表示"拿到会话了"，真正连上要等 onSessionEstablished 的 SystemInfo 或事件流确认，
+	// 因此把阶段显式置回 connecting：若整体覆盖成零值 ServerState（Phase 归空），界面会从
+	// "连接中"闪一下"未连接"（真实观感问题）。
+	before := a.store.Server()
 	a.store.SetServer(ServerState{
 		URL:        session.ServerURL,
 		InstanceID: session.ServerInstanceID,
 		Name:       session.ServerName,
 		Connected:  false,
+		Phase:      ServerPhaseConnecting,
 	})
+	a.publishServerIfChanged(before)
 	a.store.SetUser(UserState{ID: session.UserID, Username: session.Username})
 	a.eventsUnsupported.Store(false)
 	// 新会话已建立：解除"需要重新登录"标记，重新允许自动续期。

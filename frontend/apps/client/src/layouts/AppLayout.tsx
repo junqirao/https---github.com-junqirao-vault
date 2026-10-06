@@ -12,6 +12,7 @@ import {
   FileTextOutlined,
   HddOutlined,
   LoadingOutlined,
+  ReloadOutlined,
   SettingOutlined,
   TeamOutlined,
   UserOutlined
@@ -83,7 +84,7 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
     { key: '/admin/leases', icon: <HddOutlined />, label: t('nav.leases') },
     { key: '/admin/jobs', icon: <DashboardOutlined />, label: t('nav.jobs') },
     { key: '/admin/audit', icon: <AuditOutlined />, label: t('nav.audit') },
-    { key: '/admin/logs', icon: <FileTextOutlined />, label: t('nav.logs') },
+    { key: '/admin/logs', icon: <FileTextOutlined />, label: t('nav.serverLogs') },
     { key: '/admin/system', icon: <ClusterOutlined />, label: t('nav.system') }
   ]
 
@@ -236,9 +237,6 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
           })}
         </Typography.Text>
       ) : null}
-      <Button size="small" onClick={() => void agent.refresh()}>
-        {t('common.refresh')}
-      </Button>
     </Space>
   )
 
@@ -302,7 +300,26 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
                 </Button>
               </Dropdown>
               {active?.instanceId ? <Tag>{active.instanceId.slice(0, 8)}</Tag> : null}
-              <Popover content={agentDetail} title={t('agent.troubleshoot.title')} trigger="click" placement="bottomLeft">
+              {/* 刷新按钮跟着标题走：面板内容会被"最近一次挂载失败"原文撑长，按钮放底部既难找、
+                  又会被内容推走；图标按钮 + 悬浮提示，无障碍语义由 aria-label 兜住。 */}
+              <Popover
+                content={agentDetail}
+                trigger="click"
+                placement="bottomLeft"
+                title={
+                  <Space size={spacing.xs}>
+                    <span>{t('agent.troubleshoot.title')}</span>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<ReloadOutlined />}
+                      title={t('common.refresh')}
+                      aria-label={t('common.refresh')}
+                      onClick={() => void agent.refresh()}
+                    />
+                  </Space>
+                }
+              >
                 <Tag color={agentTone} style={{ cursor: 'pointer' }}>
                   {serverConnecting ? (
                     <Space size={4}>

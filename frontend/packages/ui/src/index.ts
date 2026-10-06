@@ -100,7 +100,8 @@ export {
   OfflineNotice,
   type BlockedNoticeProps,
   type CompatNoticeProps,
-  type OfflineNoticeProps
+  type OfflineNoticeProps,
+  type ServerChoice
 } from './features/bootstrap/StartupNotice'
 export {
   BootstrapWizard,

@@ -28,7 +28,14 @@ const (
 //   - errServerEventsUnsupported：服务端未实现该通道（调用方应降级为仅心跳）；
 //   - nil：连接被服务端正常关闭（调用方可短暂等待后重连）；
 //   - 其他错误：网络/认证错误（调用方可退避重试）。
-func (c *serverClient) streamEvents(ctx context.Context, handle func(eventType string, data json.RawMessage)) error {
+//
+// onOpen 在事件通道**真正建立**（HTTP 200、开始读流）时回调一次，可为 nil；调用方据此确认
+// "服务端可达且会话有效"。
+func (c *serverClient) streamEvents(
+	ctx context.Context,
+	handle func(eventType string, data json.RawMessage),
+	onOpen func(),
+) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+"/v1/system/events", nil)
 	if err != nil {
 		return errServerUnreachable(err)
@@ -50,6 +57,11 @@ func (c *serverClient) streamEvents(ctx context.Context, handle func(eventType s
 	if resp.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, maxServerResponseBytes))
 		return parseServerError(resp.StatusCode, data)
+	}
+
+	// 通道建立即回调：这是"服务端可达且会话有效"的直接证据。
+	if onOpen != nil {
+		onOpen()
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -121,7 +133,12 @@ func (a *Agent) runServerEvents(ctx context.Context) {
 			return
 		}
 
-		err = client.streamEvents(ctx, a.handleServerEvent)
+		// 事件流就绪即确认连接：SystemInfo 可能失败（10s 超时），而心跳只在**有挂载**时才发
+		// （见 lease.go 的 sweepHeartbeats），两条路都不通时界面会一直卡在"未连接"，
+		// 即使服务端其实完全可达。
+		err = client.streamEvents(ctx, a.handleServerEvent, func() {
+			a.setServerConnected(true, "")
+		})
 		switch {
 		case ctx.Err() != nil:
 			return

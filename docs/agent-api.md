@@ -585,6 +585,10 @@ Electron 主进程应读取 `%ProgramData%\Vault\webapp\current.json`，以其�
 - 失败/取消：清理 `.tmp-*` 目录；已存在的旧 `<version>/` 与 `current.json` 保持可用，
   **绝不留下半激活状态**。
 - 保留最近 2 个版本目录，更旧的删除。
+- **启动自愈**：应用升级后，版本不高于应用版本的热更层永远不会再被加载。代理启动时后台执行
+  一次 `reconcileWebLayer`：摘掉失效的 `current.json`、删除失效版本目录、清理 `.tmp-*` 与
+  `.part` 残留（判据与激活拦截同一套：应用版本不可解析时不判定、不动手）。
+  用户**无需手工删除** `%ProgramData%\Vault\webapp`。
 - 幂等：同一版本重复 apply 直接返回 `activated`，不重复下载。
 
 ## 退出

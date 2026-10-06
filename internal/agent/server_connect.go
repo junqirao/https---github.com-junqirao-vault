@@ -10,10 +10,13 @@ import (
 const (
 	// serverConnectInitialDelay 是启动后第一次自动重连前的等待时间。
 	//
-	// 刻意先等一会儿：客户端启动时会主动推会话（POST /agent/session），那是首选路径，
-	// 别去和它抢 —— 抢了会白多一次证书登录，日志里也更难读。
-	serverConnectInitialDelay = 20 * time.Second
-	// serverConnectCheckInterval 是自动重连的复检间隔。
+	// 只留一个很短的窗口：客户端启动时会主动推会话（POST /agent/session），那是首选路径，
+	// 让它先落地即可。此前这里是 20 秒，于是"客户端不会推会话"的启动路径（未勾"记住我"、
+	// 或停在登录页且没触发免密登录）必须干等 20 秒才可能自愈，用户观感是
+	// "重开客户端要半分钟才连上服务端"（真实反馈）。而"抢推会话"的顾虑本身由
+	// needsServerReconnect 的会话判定兜住：有会话时这条循环根本不会出手。
+	serverConnectInitialDelay = 2 * time.Second
+	// serverConnectCheckInterval 是首次尝试失败后的复检间隔。
 	serverConnectCheckInterval = 30 * time.Second
 )
 

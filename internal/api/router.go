@@ -20,6 +20,8 @@ type Deps struct {
 	Cfg    *config.Watcher
 	Store  *store.Store
 	Events *EventHub
+	// Logs 服务端日志只读访问（管理端「服务日志」页）；可为 nil（不提供日志查询）。
+	Logs LogSource
 }
 
 // Router 是 HTTP 路由器（实现 http.Handler）。
@@ -101,6 +103,9 @@ func (r *Router) routes() {
 		g.Get("/v1/system/config", r.requireSuperAdmin(r.handleGetConfig))
 		g.Patch("/v1/system/config", r.requireSuperAdmin(r.handlePatchConfig))
 		g.Get("/v1/system/audit", r.requireSuperAdmin(r.handleListAudit))
+		// 服务端日志（管理端「服务日志」页）：读的是服务端自己的按天日志文件。
+		// 仅超级管理员——日志含内部实现细节，且只有管理员才需要对服务端排障。
+		g.Get("/v1/system/logs", r.requireSuperAdmin(r.handleSystemLogs))
 		g.With(r.requireSuperAdminMW).Get("/v1/system/reconcile", r.handleGetReconcile)
 		// 孤儿磁盘文件：对账只报告（见 5.11），这里由管理员在「孤儿磁盘」页面上逐个手动删除。
 		g.With(r.requireSuperAdminMW).Get("/v1/system/orphans", r.handleScanOrphans)

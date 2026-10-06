@@ -40,6 +40,7 @@ import type {
   SettingsResponse,
   StorageDTO,
   SystemInfo,
+  SystemLog,
   UpdateRepoRequest,
   UpdateUserRequest,
   UserDTO
@@ -117,6 +118,19 @@ export class VaultApi extends ApiClient {
 
   auditLogs(params?: { user_id?: string; action?: string; limit?: number; offset?: number }): Promise<ListResponse<AuditDTO>> {
     return this.request<ListResponse<AuditDTO>>('GET', '/v1/system/audit', undefined, params)
+  }
+
+  /**
+   * 服务端日志（管理端「服务日志」页，仅超级管理员）。
+   *
+   * 日志按天切分：`day` 指定日期（省略即当天），`tailBytes` 限制读取的文件末尾字节数
+   * （省略由服务端取默认 256KiB）。注意服务端的查询参数名是 `tail`。
+   */
+  systemLogs(params?: { day?: string; tailBytes?: number }): Promise<SystemLog> {
+    return this.request<SystemLog>('GET', '/v1/system/logs', undefined, {
+      day: params?.day,
+      tail: params?.tailBytes
+    })
   }
 
   /** 现扫一遍孤儿磁盘文件（未登记却真实存在的 .vhdx；仅超级管理员）。 */

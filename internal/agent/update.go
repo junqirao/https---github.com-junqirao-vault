@@ -1167,7 +1167,10 @@ func (m *webUpdateManager) snapshot() WebUpdateState {
 				// 指针里的版本不高于本机应用版本：客户端主进程不会加载它（会用内置资源），
 				// 因此这里**不能**报告"已激活"——否则设置页会显示一个根本不生效的版本号
 				// （历史遗留指针常见于此，例如应用已升级到 0.1.37 而指针仍停在 0.1.28）。
-				m.a.logger.Warn("已激活的渲染层资源不高于本机应用版本，客户端将使用内置资源",
+				//
+				// 只是"如实说明当前不生效"，不是故障：该指针与对应资源目录会由启动自愈
+				// （reconcileWebLayer）自动清理，用户无需手工删除。故用 Info 而非 Warn。
+				m.a.logger.Info("已激活的渲染层资源不高于本机应用版本，客户端将使用内置资源（代理将自动清理）",
 					"active", cur.Version, "app", m.a.version)
 			} else {
 				m.state.ActiveVersion = cur.Version
@@ -1645,6 +1648,80 @@ func readWebCurrent(path string) (webCurrentPointer, bool) {
 		return webCurrentPointer{}, false
 	}
 	return ptr, true
+}
+
+// reconcileWebLayer 启动阶段自愈渲染层资源目录（幂等、尽力而为；调用点见 Agent.Start）。
+//
+// 解决的真实问题：应用（exe）升级后，机器上遗留的热更层会**永久失效**——客户端主进程只加载
+// "热更层版本 > 内置（=应用）版本"的资源（见 frontend/apps/client/electron/webapp.ts），
+// 于是 current.json 指向的旧版本再也不会生效：设置页显示一个不生效的版本号、每次启动都刷一条
+// 告警、磁盘上还留着几十上百 MB 的死资源。此前只能让用户手工删 %ProgramData%\Vault\webapp，
+// 这不现实，所以这里做成启动即自愈。
+//
+// 判据与加载口径完全一致（webTargetApplies）：应用版本缺失或不可解析（开发构建）时
+// decided=false，一律不动手，避免误删仍会被加载的资源。
+func (a *Agent) reconcileWebLayer() {
+	m := a.web
+	if m == nil {
+		return
+	}
+	webappDir := a.webappDir()
+	if fi, err := os.Stat(webappDir); err != nil || !fi.IsDir() {
+		return // 从未热更过：无需处理
+	}
+	m.mu.Lock()
+	running := m.running
+	m.mu.Unlock()
+	if running {
+		return // 正有一次热更在跑：不与它抢目录，下次启动再自愈
+	}
+
+	// 顺序很重要：先摘掉失效指针，再删资源目录。反过来的话，中途失败会留下
+	// "指针指向不存在目录"的状态（主进程会兜底用内置资源，但日志会误导排障）。
+	removed := ""
+	if cur, ok := readWebCurrent(a.webCurrentPath()); ok {
+		if applies, decided := a.webTargetApplies(cur.Version); decided && !applies {
+			if err := os.Remove(a.webCurrentPath()); err != nil && !os.IsNotExist(err) {
+				a.logger.Warn("清理失效的渲染层激活指针失败，本次跳过热更层自愈",
+					"active", cur.Version, "error", err)
+				return
+			}
+			removed = cur.Version
+		}
+	}
+
+	cleanupWebTemp(webappDir, a.logger)
+
+	entries, err := os.ReadDir(webappDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.Contains(name, webTempPrefix) {
+			_ = os.RemoveAll(filepath.Join(webappDir, name))
+			continue
+		}
+		if _, err := semver.Parse(name); err != nil {
+			continue // 非版本号目录：不是热更产物，不动它
+		}
+		if applies, decided := a.webTargetApplies(name); !decided || applies {
+			continue // 仍可能被加载（或无从判定）：保留
+		}
+		if err := os.RemoveAll(filepath.Join(webappDir, name)); err != nil {
+			a.logger.Warn("清理失效的渲染层资源目录失败", "version", name, "error", err)
+			continue
+		}
+		a.logger.Info("已自动清理失效的渲染层资源（不高于本机应用版本，客户端不会加载）",
+			"version", name, "app", a.version)
+	}
+	if removed != "" {
+		a.logger.Info("已自动清理失效的渲染层激活指针，客户端将改用内置资源",
+			"active", removed, "app", a.version)
+	}
 }
 
 // cleanupWebTemp 清理 <webapp> 下遗留的临时解压目录与下载残留（尽力而为）。

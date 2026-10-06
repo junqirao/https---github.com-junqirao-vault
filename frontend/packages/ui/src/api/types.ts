@@ -340,6 +340,25 @@ export interface HealthStatus {
   failures?: string[]
 }
 
+/**
+ * GET /v1/system/logs：服务端日志（管理端「服务日志」页，仅超级管理员）。
+ *
+ * 与本地代理的 GET /agent/log 同形（按天切分、一次回一天的文件尾部），差别在于这里的
+ * 日志来自**服务端进程自己**的日志文件。
+ */
+export interface SystemLog {
+  /** 本次返回的日期（YYYY-MM-DD）；请求未指定 day 时即当天。 */
+  day: string
+  /** 存在日志文件的日期（YYYY-MM-DD，升序），供界面做按时间切分的选择。 */
+  days: string[]
+  /** 该日期日志文件路径（可能为空）。 */
+  path: string
+  /** 日志文件末尾的原始文本（JSON Lines，slog 输出）。 */
+  text: string
+  /** 读取失败时的稳定错误码。 */
+  error?: string
+}
+
 export type ClientCheckState =
   | 'compatible'
   | 'needs_client_upgrade'
