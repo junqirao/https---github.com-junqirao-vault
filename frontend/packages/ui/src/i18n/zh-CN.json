@@ -201,6 +201,7 @@
   "log.level.all": "全部级别",
   "log.keyword": "关键字过滤",
   "log.path": "日志文件",
+  "log.follow": "跟随最新",
   "log.empty": "暂无日志",
   "nav.users": "用户管理",
   "nav.repos": "存储库管理",

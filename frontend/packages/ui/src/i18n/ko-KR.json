@@ -201,6 +201,7 @@
   "log.level.all": "모든 레벨",
   "log.keyword": "키워드 필터",
   "log.path": "로그 파일",
+  "log.follow": "최신 로그 따라가기",
   "log.empty": "로그가 없습니다",
   "nav.users": "사용자",
   "nav.repos": "저장소",

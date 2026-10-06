@@ -201,6 +201,7 @@
   "log.level.all": "すべてのレベル",
   "log.keyword": "キーワードで絞り込み",
   "log.path": "ログファイル",
+  "log.follow": "最新に追従",
   "log.empty": "ログがありません",
   "nav.users": "ユーザー",
   "nav.repos": "リポジトリ",

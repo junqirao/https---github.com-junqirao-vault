@@ -201,6 +201,7 @@
   "log.level.all": "All levels",
   "log.keyword": "Filter by keyword",
   "log.path": "Log file",
+  "log.follow": "Follow latest",
   "log.empty": "No logs yet",
   "nav.users": "Users",
   "nav.repos": "Repositories",

@@ -13,6 +13,9 @@ Vault 项目一体化构建脚本。
    产出 manifest.json / manifest.json.sig / artifacts/，并复制到服务端
    `update.artifacts_dir`（默认为 `updates/`）——即服务端镜像目录。
 4. **零第三方依赖**：仅用 Python 标准库（PyYAML 若存在则用于更稳地读配置）。
+5. **自动清理旧版本残留**：每次构建都清掉 `dist/` 中**不属于本次版本**的产物
+   （顶层的 `Vault-Web-<旧版本>.zip`、`dist/package/` 下旧版本的目录与压缩包），
+   避免越积越多、也避免误把旧产物当成这次的发布物。
 
 关于 TLS 证书（重要）
 ---------------------
@@ -603,6 +606,54 @@ def clean_outputs() -> None:
             shutil.rmtree(path, ignore_errors=True)
             info(f"已删除 {path.relative_to(ROOT)}")
     ok("清理完成")
+
+
+def _version_in_name(name: str) -> str | None:
+    """从产物名里取出语义化版本（如 `Vault-Web-0.1.62.zip` → `0.1.62`）；没有则 None。"""
+    m = re.search(r"\d+\.\d+\.\d+", name)
+    return m.group(0) if m else None
+
+
+def clean_stale_dist_artifacts(keep_version: str) -> None:
+    """清掉 `dist/` 中**不属于本次版本**的旧版本产物（best-effort，失败只告警）。
+
+    为什么需要：`dist/` 顶层每构建一次就多一个 `Vault-Web-<版本>.zip`，`dist/package/`
+    每打包一次就多一组 `<包名>-<版本>-<平台>` 的目录与压缩包。长期累积既白占空间，又容易
+    让人误拿到旧包（"发出去的客户端怎么还是旧界面"这类事故，根因常常就是取了目录里
+    上一版留下的产物）。
+
+    归属判定只看文件名里的语义化版本号：与本次版本不同的即视为旧产物并删除；没有版本号的
+    文件（`Vault-Server.exe` / `Vault-Agent.exe` / `vault-server-linux-amd64`）是每次原地
+    覆盖的固定产物，一律不动。
+
+    删除刻意 best-effort：旧产物可能正被占用（例如运行中的客户端正用着 `dist/package/`
+    里的文件，或资源管理器开着预览），此时只告警跳过，绝不影响本次构建。
+    """
+    # PACKAGE_DIR 定义在本文件靠后的"部署打包"一节，模块级常量在调用时已就绪。
+    stale: list[Path] = []
+    for directory in (DIST_DIR, PACKAGE_DIR):
+        if not directory.is_dir():
+            continue
+        for item in sorted(directory.iterdir()):
+            ver = _version_in_name(item.name)
+            if ver is not None and ver != keep_version:
+                stale.append(item)
+
+    if not stale:
+        return
+
+    step(f"清理 dist 中的旧版本产物（仅保留 {keep_version}）")
+    for item in stale:
+        rel = item.relative_to(ROOT) if item.is_relative_to(ROOT) else item
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            info(f"已删除 {rel}")
+        except OSError as exc:
+            warn(f"旧版本产物未能删除（可能被占用，已跳过）：{rel}（{exc}）")
+    ok(f"旧版本产物清理完成（dist 中只保留 {keep_version} 的产物）")
 
 
 def _frontend_deps_ready() -> bool:
@@ -2201,6 +2252,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.clean:
         clean_outputs()
+
+    # 每次构建都把 dist 里不属于本次版本的旧产物清掉（--clean 已整体清空时无事可做）。
+    clean_stale_dist_artifacts(version)
 
     # ---- 2) 前端 ----
     if args.skip_frontend:
