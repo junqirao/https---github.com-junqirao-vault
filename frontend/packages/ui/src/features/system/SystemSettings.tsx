@@ -77,6 +77,7 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
 
       <SectionCard
         title={t('field.version')}
+        loading={infoQuery.isLoading || settingsQuery.isLoading}
         extra={
           isSuperAdmin ? (
             <Button
@@ -99,7 +100,7 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
         </Descriptions>
       </SectionCard>
 
-      <SectionCard title={t('system.clientCompat')}>
+      <SectionCard title={t('system.clientCompat')} loading={infoQuery.isLoading}>
         {compat && !compat.enabled ? (
           <Alert type="warning" showIcon message={t('system.clientCompat.disabled')} description={t('system.clientCompat.disabledWarn')} />
         ) : null}
@@ -109,7 +110,7 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
         </Descriptions>
       </SectionCard>
 
-      <SectionCard title={t('system.features')}>
+      <SectionCard title={t('system.features')} loading={infoQuery.isLoading}>
         <Space wrap>
           {(info?.features ?? []).length === 0 ? (
             <Typography.Text type="secondary">{t('common.empty')}</Typography.Text>
@@ -119,7 +120,7 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
         </Space>
       </SectionCard>
 
-      <SectionCard title={t('system.capabilities')}>
+      <SectionCard title={t('system.capabilities')} loading={infoQuery.isLoading}>
         <Descriptions size="small" column={2} bordered>
           <Descriptions.Item label={t('system.cap.platform')}>{info?.capabilities.platform_kind || '-'}</Descriptions.Item>
           <Descriptions.Item label={t('system.cap.lvm')}>
@@ -140,7 +141,7 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
 
       <LvmPoolCard enabled={Boolean(info?.capabilities.lvm)} isSuperAdmin={isSuperAdmin} />
 
-      <SectionCard title={t('storage.title')}>
+      <SectionCard title={t('storage.title')} loading={storagesQuery.isLoading}>
         {storagesQuery.error ? <ErrorNotice error={storagesQuery.error} /> : null}
         {storages.length === 0 ? (
           <Typography.Text type="secondary">{t('storage.empty')}</Typography.Text>
@@ -173,7 +174,7 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
 
       <SectionCard title={t('system.health')}>
         {healthQuery.error ? <ErrorNotice error={healthQuery.error} /> : null}
-        <HealthTable health={health} />
+        <HealthTable health={health} loading={healthQuery.isLoading} />
       </SectionCard>
 
       <Modal
@@ -212,7 +213,13 @@ interface HealthRow {
   result: string
 }
 
-function HealthTable({ health }: { health?: HealthStatus }): JSX.Element {
+/**
+ * 健康检查结果表。
+ *
+ * `loading` 传进来时必须用上：`checks` 是异步来的，不传的话首屏先渲染一次"暂无数据"，
+ * 数据到了再变成几行 —— 用户最先看到的是一句错话。
+ */
+function HealthTable({ health, loading }: { health?: HealthStatus; loading?: boolean }): JSX.Element {
   const { t } = useI18n()
   const rows: HealthRow[] = Object.entries(health?.checks ?? {}).map(([name, result]) => ({ name, result }))
   return (
@@ -239,6 +246,7 @@ function HealthTable({ health }: { health?: HealthStatus }): JSX.Element {
         ]}
         rows={rows}
         rowKey={(row) => row.name}
+        loading={loading}
         empty={t('common.empty')}
         pagination={false}
       />

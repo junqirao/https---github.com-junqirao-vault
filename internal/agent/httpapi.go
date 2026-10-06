@@ -298,16 +298,26 @@ type unmountRequest struct {
 }
 
 // handleUnmount 卸载指定分配。
+//
+// 卸载成功后把这个库记进"本次运行手动卸载过"的名单（见 manualUnmountGuard）：库级配置里的
+// "启动后自动挂载"确实还开着，若不做这件事，下一次会话建立（客户端推会话、令牌续期等）就会
+// 立刻把它挂回来 —— 用户看到的是"卸载没用"。
 func (a *Agent) handleUnmount(w http.ResponseWriter, r *http.Request) {
 	var req unmountRequest
 	if err := decodeJSON(r, &req); err != nil {
 		a.writeError(w, err)
 		return
 	}
+	// 库 ID 必须在卸载**之前**抓：卸载成功会连记录一起删掉，之后问不出这条卸载针对哪个库。
+	repoID := ""
+	if ms, _, ok := a.store.GetMount(strings.TrimSpace(req.AllocationID)); ok {
+		repoID = ms.RepoID
+	}
 	if err := a.engine.unmount(r.Context(), req.AllocationID); err != nil {
 		a.writeError(w, err)
 		return
 	}
+	a.manualUnmounts.block(repoID)
 	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

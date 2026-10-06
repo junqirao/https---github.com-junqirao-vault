@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -9,11 +10,60 @@ import (
 // autoMountConcurrency 是自动挂载的并发上限（避免同时连接过多 iSCSI 目标）。
 const autoMountConcurrency = 2
 
-// restoreMounts 在拿到服务端会话后尽力恢复挂载，分两件事：
+// manualUnmountGuard 记住"本次运行期间被用户手动卸载过"的存储库：这些库不再参与自动挂载。
+//
+// 为什么需要它（真实反馈："卸载设置了自动挂载的存储库，立马又自己挂回来了"）：
+// 卸载成功会删掉本地挂载记录（见 mountEngine.unmountLocked 末尾），而每库配置里的
+// auto_mount 还开着 —— 只要再发生一次"拿到服务端会话"（客户端推会话、证书免密登录、
+// 令牌定时续期都会走 setSession → onSessionEstablished），restoreMounts 就会把它当成
+// "从来没挂过、但用户要求自动挂载的库"重新挂上，用户的卸载动作等于白点。
+//
+// 用户的这一次点击是最明确的意图，必须压过配置文件：
+//
+//   - 只挡**自动**挂载。用户手动点"挂载"照常能挂（那是他自己的动作）；
+//   - 只活在内存里。代理进程重启即清空 —— 客户端退出会连代理一起结束
+//     （见 apps/client/electron/agent.ts 的拉起与回收），因此语义正好是
+//     "客户端内当次不再自动挂载，直到下一次启动"；
+//   - 重启后自动挂载恢复生效：用户上次的手动卸载已经落盘（记录被删），下次启动想挂回来
+//     就得靠自己再挂一遍，或者点一次"挂载"（配置里的 auto_mount 依然为真）。
+type manualUnmountGuard struct {
+	mu    sync.Mutex
+	repos map[string]struct{}
+}
+
+// block 记下一次"用户手动卸载了某个库"。库 ID 为空（记录里没有库信息）时忽略：按库封禁
+// 的前提是知道是哪个库，记不下就没有语义。
+func (g *manualUnmountGuard) block(repoID string) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.repos == nil {
+		g.repos = make(map[string]struct{})
+	}
+	g.repos[repoID] = struct{}{}
+}
+
+// blocked 判断该库是否已被手动卸载过（本次运行内不再自动挂载）。
+func (g *manualUnmountGuard) blocked(repoID string) bool {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	_, ok := g.repos[repoID]
+	return ok
+}
+
+// restoreMounts 在拿到服务端会话后尽力恢复挂载，分三件事：
 //
 //  1. 全局 auto_mount 打开时，恢复本机状态文件里留下的挂载记录（见 restoreRecordedMounts）；
 //  2. 配置里**显式**为某个库打开"启动后自动挂载"的，把它挂上（见 mountConfiguredRepos）——
-//     这一项每个库独立，不受全局开关约束（全局开关的语义只是"恢复上次的挂载"）。
+//     这一项每个库独立，不受全局开关约束（全局开关的语义只是"恢复上次的挂载"）；
+//  3. 上面两条都要让开"用户本次运行手动卸载过"的库（见 manualUnmountGuard）。
 //
 // 单个失败只记录状态并通过 SSE 通知，不阻塞其他分配。
 func (a *Agent) restoreMounts(ctx context.Context) {
@@ -68,6 +118,13 @@ func (a *Agent) restoreRecordedMounts(ctx context.Context, prefs map[string]Repo
 		if !ok {
 			continue
 		}
+		// 本次运行被用户手动卸载过：不留、不恢复。卸载成功已经删掉记录，正常走不到这里，
+		// 兜住的是"记录因卸载失败残留"（比如卸载中断后状态被写回）这种边角情况。
+		if a.manualUnmounts.blocked(item.RepoID) {
+			a.logger.Info("该库本次运行已被手动卸载，跳过自动挂载",
+				"repo_id", item.RepoID, "allocation_id", item.AllocationID)
+			continue
+		}
 
 		wg.Add(1)
 		safeGo(a.logger, "automount_restore", func() {
@@ -117,6 +174,10 @@ func recordedMountRequest(item MountState, prefs map[string]RepoMountPref) (Moun
 //
 // 与恢复记录不同，这些库在本机可能从来没挂过（没有本地记录、甚至没有分配），
 // 所以要先向服务端问出"我在这个库里的分配"，没有就建一个（见 ensureMyAllocation）。
+//
+// ⚠️ 这里正是"手动卸载后马上又被挂回来"的入口：卸载删了记录，于是这个库看起来就是
+// "从来没挂过、但配置要求自动挂载"，任何一次会话建立（含令牌续期）都会重新挂上。
+// 因此必须先让开"用户本次运行手动卸载过"的库（见 manualUnmountGuard）。
 func (a *Agent) mountConfiguredRepos(ctx context.Context, prefs map[string]RepoMountPref) {
 	if len(prefs) == 0 {
 		return
@@ -133,20 +194,7 @@ func (a *Agent) mountConfiguredRepos(ctx context.Context, prefs map[string]RepoM
 			recorded[m.RepoID] = struct{}{}
 		}
 	}
-	type target struct {
-		repoID string
-		pref   RepoMountPref
-	}
-	todo := make([]target, 0, len(prefs))
-	for repoID, pref := range prefs {
-		if !pref.AutoMount {
-			continue
-		}
-		if _, ok := recorded[repoID]; ok {
-			continue
-		}
-		todo = append(todo, target{repoID: repoID, pref: pref})
-	}
+	todo := configuredAutoMountTargets(prefs, recorded, a.manualUnmounts.blocked)
 	if len(todo) == 0 {
 		return
 	}
@@ -186,6 +234,44 @@ func (a *Agent) mountConfiguredRepos(ctx context.Context, prefs map[string]RepoM
 		})
 	}
 	wg.Wait()
+}
+
+// autoMountTarget 是一个"本次运行该自动挂载的库"及其配置。
+type autoMountTarget struct {
+	repoID string
+	pref   RepoMountPref
+}
+
+// configuredAutoMountTargets 从每库配置里挑出**本次运行该自动挂载**的库（顺序无关，按库 ID 排序稳定输出）。
+//
+// 三条排除规则：
+//   - 配置里 auto_mount=false：用户明确关掉了这个库的自动挂载；
+//   - 本机已有记录（recorded）：交给 restoreRecordedMounts，这里只补"从来没挂过"的；
+//   - blocked 判定为真（用户本次运行手动卸载过）：配置压不过用户的那一次点击
+//     （见 manualUnmountGuard，这就是"卸载后马上又被挂回来"的修复点）。
+//
+// 抽成纯函数是因为它是"该不该自动挂"的唯一判据：策略被单独测试，调用方只负责执行。
+func configuredAutoMountTargets(
+	prefs map[string]RepoMountPref,
+	recorded map[string]struct{},
+	blocked func(repoID string) bool,
+) []autoMountTarget {
+	out := make([]autoMountTarget, 0, len(prefs))
+	for repoID, pref := range prefs {
+		if !pref.AutoMount {
+			continue
+		}
+		if _, ok := recorded[repoID]; ok {
+			continue
+		}
+		if blocked(repoID) {
+			continue
+		}
+		out = append(out, autoMountTarget{repoID: repoID, pref: pref})
+	}
+	// 稳定的遍历顺序：日志与测试输出不会因 map 迭代顺序而变。
+	sort.Slice(out, func(i, j int) bool { return out[i].repoID < out[j].repoID })
+	return out
 }
 
 // repoNames 返回"存储库 ID -> 名称"（仅当前会话可见的库）。

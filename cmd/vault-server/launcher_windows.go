@@ -86,8 +86,7 @@ func runLauncher(configPath string) int {
 		pauseForUser()
 		return 1
 	} else if created {
-		fmt.Printf("未找到配置文件，已从模板生成: %s\n", configPath)
-		fmt.Println("  提示：请确认其中的 storage.whitelist_root 指向你的数据目录（模板默认 D:\\VaultData）。")
+		fmt.Print(configCreatedHint(configPath))
 	}
 
 	loaded, err := config.Load(configPath)

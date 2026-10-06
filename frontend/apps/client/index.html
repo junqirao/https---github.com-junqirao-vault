@@ -160,21 +160,14 @@
         表格里三处 antd 默认装饰要压掉（都用 !important：antd 的样式是运行时注入的，
         与这里的顺序不确定，靠权重保证生效）。
 
-        1) 行展开/收起图标：antd 按 operationUnit 给它画了一个带边框和底色的方块，
-           在"点开看详情"的行里看着像多出来的一个按钮，和行内容不是一体，去掉圈只留 +/−；
-           去掉后没有边框高亮，悬停改为变色，否则鼠标移上去完全没反馈。
+        1) 行展开/收起图标：**不动外观**。早先这里把 antd 给它的边框与底色都压平、只留
+           一个光秃秃的 +/−，看着反倒像自己用文字拼出来的符号（真实反馈："图标不要自己画，
+           用组件提供的"）—— 图标一律保持组件原样，这里只留"悬停变色"这一条交互反馈。
         2) 表头圆角：卡片自己已经有圆角，表格容器与表头首/末单元格再各画一次半径，
            就变成"卡片里嵌了一个圆角小框"，这里统一压平，表头与卡片对齐。
         3) 分页：去掉了卡片内边距（flush）后，分页默认只有上下 margin，
            会贴死卡片右边缘，这里补上四周间距。
       */
-      .ant-table-wrapper .ant-table-row-expand-icon,
-      .ant-table-wrapper .ant-table-row-expand-icon:hover,
-      .ant-table-wrapper .ant-table-row-expand-icon:focus,
-      .ant-table-wrapper .ant-table-row-expand-icon:active {
-        border: none !important;
-        background: transparent !important;
-      }
       .ant-table-wrapper .ant-table-row-expand-icon:hover,
       .ant-table-wrapper .ant-table-row-expand-icon:focus {
         /* palette.accent（与 tokens/palette.ts 保持一致） */

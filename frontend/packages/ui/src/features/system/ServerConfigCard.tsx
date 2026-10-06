@@ -147,7 +147,7 @@ export function ServerConfigCard({ isSuperAdmin }: { isSuperAdmin: boolean }): J
   ]
 
   return (
-    <SectionCard title={t('system.config.title')}>
+    <SectionCard title={t('system.config.title')} loading={query.isLoading}>
       <Space direction="vertical" size={12} style={{ width: '100%' }}>
         <Space wrap>
           <Select

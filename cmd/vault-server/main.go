@@ -53,6 +53,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -308,6 +309,28 @@ func run() (code int, promptHandled bool) {
 	return runServe(configPath, migrateOnly), false
 }
 
+// configCreatedHint 返回"已从模板生成配置文件"的启动提示。
+//
+// ⚠️ 必须分平台写：storage.whitelist_root 在 Windows 上是 VHDX 的存放目录（要运维自己建），
+// 在 Linux 上**不是**存储目录——「存储」是受管的 thin LV，只能在管理端创建，
+// 该字段仅作 GET /v1/fs/* 与建库 source_dir 的浏览白名单。
+// 照搬 Windows 文案会引导 Linux 运维去"设一个数据目录"，而那个目录永远不会被当作存储。
+func configCreatedHint(path string) string {
+	root := config.DefaultStorageRoot(runtime.GOOS)
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf("未找到配置文件，已从模板生成: %s\n"+
+			"  提示：请确认其中的 storage.whitelist_root 指向你的数据目录（模板默认 %s）。\n"+
+			"        该文件已写入默认值，服务将继续启动；后续修改可保存后重启生效。\n",
+			path, root)
+	}
+	return fmt.Sprintf("未找到配置文件，已从模板生成: %s\n"+
+		"  提示：已按当前平台调整存储相关默认值（storage.whitelist_root=%s）。\n"+
+		"        Linux 上该字段只作浏览白名单；「存储」请在管理端创建\n"+
+		"        （服务端会自动 lvcreate → mkfs → 挂载）。\n"+
+		"        该文件已写入默认值，服务将继续启动；后续修改可保存后重启生效。\n",
+		path, root)
+}
+
 // runServe 执行 serve 主流程：前台运行，直到收到退出信号或跨进程停止请求。
 //
 // configPath 与 migrateOnly 来自 run 中的命令行解析结果。
@@ -320,11 +343,7 @@ func runServe(configPath *string, migrateOnly *bool) int {
 		fmt.Fprintln(os.Stderr, "准备配置文件失败:", err)
 		return 1
 	} else if created {
-		fmt.Fprintf(os.Stdout,
-			"未找到配置文件，已从模板生成: %s\n"+
-				"  提示：请确认其中的 storage.whitelist_root 指向你的数据目录（模板默认 D:\\VaultData）。\n"+
-				"        该文件已写入默认值，服务将继续启动；后续修改可保存后重启生效。\n",
-			*configPath)
+		fmt.Fprint(os.Stdout, configCreatedHint(*configPath))
 	}
 
 	loaded, err := config.Load(*configPath)

@@ -80,6 +80,16 @@ export function createVaultTheme(): ThemeConfig {
       },
       Descriptions: {
         labelBg: palette.bgPage
+      },
+      /**
+       * 状态点尺寸：默认 `fontSizeSM / 2`（本项目为 6px），这里对齐设计里的 8px。
+       *
+       * 只有一处用到：库名前的挂载状态圆点（features/repo/RepoCards.tsx 的 RepoMountDot）。
+       * 该圆点现在是 antd `Badge` 的色点，尺寸只能从组件 token 给 —— 与 16px 的库名同处一行时
+       * 8px 不抢戏但一眼可辨（真实反馈："如果没有挂载则展示灰色，挂载失败展示红色"）。
+       */
+      Badge: {
+        statusSize: 8
       }
     }
   }

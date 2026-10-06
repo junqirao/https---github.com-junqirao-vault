@@ -89,6 +89,11 @@ database:
 storage:
   # 「存储」种子（单根旧写法，保持兼容）：留空 whitelist_roots 时使用本字段。
   # 建议独立数据盘，例如 D:\VaultData
+  # ⚠️ 本模板 Windows/Linux 共用一份，而校验要求"根必须是**本平台**的绝对路径"：
+  #    服务端"首次启动自动生成 config.yaml"时会按平台改写下面两处默认值
+  #    （Linux → /var/lib/vault，见 internal/config 的 platformizeExample）。
+  #    若手工 `cp config.example.yaml config.yaml`，请自行改成 Linux 绝对路径，
+  #    否则 server 会直接拒绝启动（"每个根都必须是绝对路径"）。
   whitelist_root: "D:\\VaultData"
   # 「存储」种子（多根）：非空时优先于 whitelist_root，可配置多个存储路径。
   #   - 首次启动会把每个根写成一条「存储」（名称取路径最后一段），之后请在管理端维护。

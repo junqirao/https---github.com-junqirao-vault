@@ -306,8 +306,11 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
  *
  * 单独抽成一个组件，是因为 `useRepoMount` 需要一份完整的库记录，而详情页的库是异步查出来的
  * ——在父组件里调用会踩到 "hooks 必须在提前 return 之前" 的限制。
+ *
+ * 尺寸取中号：这一排（返回/编辑/母盘操作/复制/删除）都是 antd 默认尺寸，挂载按钮必须同款
+ * （真实反馈："存储库详情里的挂载按钮要和其他按钮一样大"），卡片里的小号尺寸是紧凑排布才用的。
  */
 function RepoDetailMountActions({ repo, currentUserId }: { repo: RepoDTO; currentUserId: string }): JSX.Element {
   const controller = useRepoMount(repo, currentUserId)
-  return <RepoMountActions controller={controller} />
+  return <RepoMountActions controller={controller} size="middle" />
 }

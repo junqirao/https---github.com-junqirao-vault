@@ -15,6 +15,13 @@ export interface LvmPoolCardProps {
   /** 是否具备 LVM 存储池管理能力（来自 system-info 的能力探测）。 */
   enabled: boolean
   isSuperAdmin: boolean
+  /**
+   * 能力探测（system-info）还在路上：先按"可能存在"渲染骨架。
+   *
+   * 不这么做的话，`enabled` 在探测回来前一直是 false，整张卡片会先缺席、探测完再"冒"出来
+   * —— 首屏看起来就是页面抖了一下。
+   */
+  loading?: boolean
 }
 
 /**
@@ -24,7 +31,7 @@ export interface LvmPoolCardProps {
  * 本卡片不做任何在线修改，唯一的写操作是"初始化存储池"——它幂等：
  * 已存在的卷组 / thin pool / 缓存一律跳过，绝不覆盖既有数据。
  */
-export function LvmPoolCard({ enabled, isSuperAdmin }: LvmPoolCardProps): JSX.Element | null {
+export function LvmPoolCard({ enabled, isSuperAdmin, loading }: LvmPoolCardProps): JSX.Element | null {
   const api = useApi()
   const { t } = useI18n()
   const queryClient = useQueryClient()
@@ -64,7 +71,8 @@ export function LvmPoolCard({ enabled, isSuperAdmin }: LvmPoolCardProps): JSX.El
     onError: (err) => setError(err)
   })
 
-  if (!enabled) {
+  // 能力确定不存在才整块不显示；探测中（loading）先按"可能有"渲染骨架，避免卡片闪现。
+  if (!enabled && !loading) {
     return null
   }
 
@@ -76,9 +84,11 @@ export function LvmPoolCard({ enabled, isSuperAdmin }: LvmPoolCardProps): JSX.El
   return (
     <SectionCard
       title={t('system.lvm.title')}
+      loading={loading || statusQuery.isLoading}
       extra={
         isSuperAdmin ? (
-          <Button size="small" onClick={() => setOpen(true)}>
+          // 状态没到就点"初始化"，弹窗里的既有池/设备判断都是空的 —— 先禁掉。
+          <Button size="small" disabled={loading || statusQuery.isLoading} onClick={() => setOpen(true)}>
             {status?.exists ? t('system.lvm.init.attachCache') : t('system.lvm.init.action')}
           </Button>
         ) : null

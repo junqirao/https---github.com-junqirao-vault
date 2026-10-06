@@ -452,6 +452,11 @@ POST  /agent/repo-mounts/{repo_id}
   某库 `auto_mount=true` 时即使本机没有记录（甚至还没有分配）也会在会话就绪后自动挂载
   （没有可用分配时由代理调用 `POST /v1/repos/{id}/allocations` 建一个），
   `auto_mount=false` 时不恢复该库的记录。
+- **用户手动卸载压过自动挂载（本次运行内）**：`POST /agent/unmount` 成功后，该库进代理内存里
+  的"本次运行手动卸载过"名单，之后不再被自动挂载 —— 否则卸载删掉记录后，下一次会话就绪
+  （客户端推会话 / 证书免密登录 / 令牌定时续期都会触发）会把它当成"从没挂过的自动挂载库"
+  立刻挂回来。名单只活在代理进程内存里，重启即清空（客户端退出会结束代理），
+  即"本次运行不再自动挂载，直到下次启动"；它只挡自动挂载，用户手动点"挂载"照常可用。
 
 `default_download_dir` 是「母盘拷贝到本地」的默认目标目录，默认 `C:\Vault\Downloads`。
 取值必须是非空绝对路径；非法值返回 `system.invalid_param`（args.field=default_download_dir）。

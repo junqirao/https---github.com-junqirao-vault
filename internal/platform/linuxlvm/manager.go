@@ -28,6 +28,11 @@ const (
 	defaultTimeout = 10 * time.Minute
 	// probeTimeout 无 ctx 的只读探测（Exists/PhysicalSize/Fingerprint）使用的短超时。
 	probeTimeout = 10 * time.Second
+	// metadataSnapTimeout 是"元数据快照"三步
+	// （reserve_metadata_snap → thin_ls -m → release_metadata_snap）的预算。
+	// 比 probeTimeout 宽松：大池的元数据扫描可能较慢，而这一步又必须留有
+	// 足够的余量去执行 release——快照被 held 期间池的元数据块无法回收。
+	metadataSnapTimeout = 60 * time.Second
 )
 
 // Options 是 Manager 的构造参数。

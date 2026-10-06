@@ -404,10 +404,10 @@ func (r *report) caveats() {
 		r.skip("VirtDisk 的 Go 绑定直调",
 			"跨平台单文件无法引入 windows-only 包；已用 New-IscsiVirtualDisk / Mount-DiskImage / volume_* 脚本等价覆盖同一套系统能力")
 	}
-	if runtime.GOOS == "linux" {
-		r.skip("LVM 全链路写操作",
-			"默认关闭以避免在生产机上创建卷组；需要时加 -lvm-sandbox 重跑（用 loop 设备，结束自动清理）")
-	}
+	// Linux 侧不再在这里重复声明"LVM 全链路未覆盖"：
+	// 该状态由 E 节自己按 -lvm-sandbox 实参报告（未开启时输出 SKIP，
+	// 开启并跑完时输出实际结果）。在这里按 GOOS 无条件打一条，
+	// 会在 -lvm-sandbox 已开启、E 节全绿的情况下仍然谎报"跳过"。
 }
 
 func header(r *report, host string) {
@@ -1435,7 +1435,7 @@ func checkLinuxLVMSandbox(r *report) {
 
 	// 无论成败都要清理：按相反顺序尽力执行。
 	defer func() {
-		_ = runCmd(opts.timeout, "lvremove", "-y", vg).failed()
+		// 上面的步骤已逐个删除 LV；这里只剩 VG/PV/loop 要收尾。
 		runCmd(opts.timeout, "vgremove", "-y", vg)
 		runCmd(opts.timeout, "pvremove", "-y", loop)
 		runCmd(opts.timeout, "losetup", "-d", loop)
@@ -1453,22 +1453,77 @@ func checkLinuxLVMSandbox(r *report) {
 		{"lvchange", "-ay", "-K", vg + "/snap"},
 		{"lvs", "--reportformat", "json"},
 		{"lvs", "--noheadings", "-o", "lv_name", vg + "/data"},
-		{"thin_ls", "--no-headers", "-o", "DEV,MAPPED_BLOCKS,EXCLUSIVE_BLOCKS",
-			"/dev/mapper/" + vg + "-pool_tmeta"},
 		{"lvextend", "-L", "+16M", vg + "/data"},
+	}
+	runSteps := func(steps [][]string) {
+		for _, step := range steps {
+			name := "E " + strings.Join(step, " ")
+			res := runCmd(opts.timeout, step[0], step[1:]...)
+			if res.failed() {
+				r.fail(name, res.describe(), strings.Join(step, " "))
+			} else {
+				r.pass(name, "exit=0 耗时="+fmt.Sprint(res.ms)+"ms", "")
+			}
+		}
+	}
+	runSteps(steps)
+
+	// thin_ls 不能在 live metadata 上直接跑：open 返回 EBUSY，
+	// 报 "you cannot run this tool with these options on live metadata"。
+	// 必须先 reserve_metadata_snap、带 -m 读、最后 release。
+	// 生产 thinExclusiveBytes 走的就是这条三步链路，这里逐字复刻
+	// （少了 reserve/-m，PhysicalSize 会悄悄退化成 lvs data_percent 估算）。
+	snapName := "E thin_ls -m（reserve → 读元数据快照 → release）"
+	poolDev := "/dev/mapper/" + vg + "-pool-tpool"
+	tmeta := "/dev/mapper/" + vg + "-pool_tmeta"
+	res := runCmd(opts.timeout, "dmsetup", "message", poolDev, "0", "reserve_metadata_snap")
+	if res.failed() {
+		r.fail(snapName+"：reserve_metadata_snap", res.describe(),
+			"dmsetup message "+poolDev+" 0 reserve_metadata_snap")
+	} else {
+		ls := runCmd(opts.timeout, "thin_ls", "-m", "--no-headers",
+			"-o", "DEV,MAPPED_BLOCKS,EXCLUSIVE_BLOCKS", tmeta)
+		// 解析断言：thin_ls 的 DEV 列是 thin device id（十进制），要与
+		// dmsetup table 的第 5 列对上。只判 exit=0 会漏掉
+		// "跑通了但一行都没匹配上"（那正是生产代码曾经的 bug）。
+		devID := ""
+		if tb := runCmd(opts.timeout, "dmsetup", "table", "/dev/mapper/"+vg+"-data"); !tb.failed() {
+			if f := strings.Fields(tb.stdout); len(f) >= 5 && f[2] == "thin" {
+				devID = f[4]
+			}
+		}
+		matched := ""
+		for _, line := range strings.Split(ls.stdout, "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 3 && devID != "" && f[0] == devID {
+				matched = strings.TrimSpace(line)
+				break
+			}
+		}
+		lsCmd := "thin_ls -m --no-headers -o DEV,MAPPED_BLOCKS,EXCLUSIVE_BLOCKS " + tmeta
+		switch {
+		case ls.failed():
+			r.fail(snapName, ls.describe(), lsCmd)
+		case matched == "":
+			r.fail(snapName,
+				"thin_ls 输出中没有 thin id="+devID+" 的行\nstdout: "+
+					clampText(strings.TrimSpace(ls.stdout), 500), lsCmd)
+		default:
+			r.pass(snapName, "thin id="+devID+" → "+matched, "")
+		}
+		if rl := runCmd(opts.timeout, "dmsetup", "message", poolDev, "0", "release_metadata_snap"); rl.failed() {
+			r.fail("E thin_ls 后置 release_metadata_snap", rl.describe(),
+				"dmsetup message "+poolDev+" 0 release_metadata_snap")
+		}
+	}
+
+	// 删卷放到最后：上面的元数据快照检查需要池和 data 都还在。
+	// 这里保留 data + snap 共存的现场，正好覆盖"快照共享块"这条路径。
+	runSteps([][]string{
 		{"lvremove", "-y", vg + "/snap"},
 		{"lvremove", "-y", vg + "/data"},
 		{"lvremove", "-y", vg + "/pool"},
-	}
-	for _, step := range steps {
-		name := "E " + strings.Join(step, " ")
-		res := runCmd(opts.timeout, step[0], step[1:]...)
-		if res.failed() {
-			r.fail(name, res.describe(), strings.Join(step, " "))
-		} else {
-			r.pass(name, "exit=0 耗时="+fmt.Sprint(res.ms)+"ms", "")
-		}
-	}
+	})
 }
 
 // ---------------------------------------------------------------------------

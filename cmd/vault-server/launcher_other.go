@@ -48,7 +48,7 @@ func runLauncher(configPath string) int {
 		fmt.Fprintln(os.Stderr, "准备配置文件失败:", err)
 		return 1
 	} else if created {
-		fmt.Printf("未找到配置文件，已从模板生成: %s\n", configPath)
+		fmt.Print(configCreatedHint(configPath))
 	}
 
 	loaded, err := config.Load(configPath)

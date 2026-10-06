@@ -52,6 +52,13 @@ export interface RepoMountController {
    * **与库状态无关**：库异常/删除中时，本机已经挂上的盘反而更需要能摘掉。
    */
   canUnmount: boolean
+  /**
+   * 本人分配还在解析中（`repo-allocations` 首次取数）。
+   *
+   * 必须把"解析中"和"确实没有分配"分开：解析中若按"没有分配"渲染，非库主会先看到一颗灰着的
+   * 「未分配」按钮，列表回来才变成可点 —— 用户的第一眼是句错话。
+   */
+  resolving: boolean
   /** 不可挂载的原因文案；可挂载时为空。 */
   disabledReason: string | undefined
   error: unknown
@@ -97,6 +104,8 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     return mounts.find((item) => item.repo_id !== '' && item.repo_id === repo.id)
   }, [agent.state, allocationId, repo.id])
 
+  // 分配列表首次取数中："没有 allocationId"此刻只代表"还不知道"，不代表"没有分配"。
+  const resolving = allocationsQuery.isLoading
   const isOwner = repo.owner_id === currentUserId
   // 实测会话状态：界面判断"挂没挂上"以此为准（会话被断后记录仍是 mounted，会撒谎）。
   const sessionLive = mountSessionLive(mount)
@@ -181,6 +190,7 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     sessionLost,
     failed,
     pending,
+    resolving,
     busy,
     canMount,
     canUnmount,
@@ -194,12 +204,19 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
 
 export interface RepoMountActionsProps {
   controller: RepoMountController
+  /**
+   * 按钮尺寸（同 antd Button 的 size）。默认 `small`：卡片头部那一排是紧凑排布。
+   *
+   * 存储库详情的按钮排要例外 —— 那里「返回/编辑/母盘操作/复制/删除」都是默认中号，
+   * 挂载按钮若还按卡片的小号来，会明显小一号（真实反馈："存储库详情里的挂载按钮要和其他按钮一样大"）。
+   */
+  size?: 'small' | 'middle' | 'large'
 }
 
 /** 卡片头部的挂载/卸载按钮：与「打开」图标并排，随标题行垂直居中。 */
-export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Element {
+export function RepoMountActions({ controller, size = 'small' }: RepoMountActionsProps): JSX.Element {
   const { t } = useI18n()
-  const { mount, sessionLost, pending, busy, canMount, canUnmount, disabledReason } = controller
+  const { mount, sessionLost, pending, resolving, busy, canMount, canUnmount, disabledReason } = controller
   // 挂载/卸载只受"代理可用 + 有分配"约束，与库状态无关：库异常/建库中时仍要能摘掉本机的盘。
   // "操作进行中"（pending）由下面的 working 统一接管，这里不再重复判断。
   const mountDisabled = !canMount
@@ -208,8 +225,10 @@ export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Ele
   // 用户点它只是把记录收掉，盘还是挂不上。此时给"挂载"：代理会先清理残留再真重连
   // （服务端/代理自己闭环），用户不必先卸载再挂载。
   const showMount = mount === undefined || sessionLost
-  // 操作进行中：本次请求在跑，或代理状态机已经是 mounting/unmounting。
-  const working = busy || pending
+  // 操作进行中：本次请求在跑、代理状态机已经是 mounting/unmounting，或本人分配还在解析。
+  // 解析中必须一起算进来：那一刻"没有分配"只是"还不知道"，先亮一个灰着的「未分配」按钮、
+  // 等列表回来再变成可点，有分配的用户第一眼会以为被收走了。
+  const working = busy || pending || resolving
 
   return (
     // 卡片整卡可点进详情，按钮区的事件不得冒泡触发跳转。
@@ -220,9 +239,10 @@ export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Ele
         // 为什么不能沿用文字：挂载请求一发出，代理状态机立刻变成 mounting，showMount 翻假，
         // 按钮会换成"卸载"（而且被 pending 一起置灰）—— 用户刚点完挂载就看见"卸载"，
         // 只能理解为"点错了"或"系统反过来要求我卸载"。留空就不会说错。
-        // minWidth 与带文字的按钮对齐，避免操作前后布局跳动。
+        // minWidth 与带文字的按钮对齐，避免操作前后布局跳动：64 同时罩得住小号（≈46px）
+        // 与中号（≈62px）的「挂载/卸载」文字按钮。
         <Button
-          size="small"
+          size={size}
           loading
           disabled
           aria-label={t('common.loading')}
@@ -232,7 +252,7 @@ export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Ele
         <Tooltip title={disabledReason}>
           <span style={{ display: 'inline-block' }}>
             <Button
-              size="small"
+              size={size}
               type="primary"
               disabled={mountDisabled}
               onClick={() => void controller.mountRepo()}
@@ -242,7 +262,7 @@ export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Ele
           </span>
         </Tooltip>
       ) : (
-        <Button size="small" disabled={unmountDisabled} onClick={() => void controller.unmountRepo()}>
+        <Button size={size} disabled={unmountDisabled} onClick={() => void controller.unmountRepo()}>
           {t('action.unmount')}
         </Button>
       )}

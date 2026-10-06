@@ -1,11 +1,11 @@
 import type { CSSProperties, MouseEvent } from 'react'
-import { Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
+import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
 import { InfoCircleOutlined, SettingOutlined } from '@ant-design/icons'
 
 import { StatusTag } from '../../components/StatusTag'
 import type { RepoDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
-import { fontSize, palette, radius, spacing } from '../../tokens/palette'
+import { fontSize, palette, spacing } from '../../tokens/palette'
 import { repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import {
@@ -22,9 +22,6 @@ export interface RepoCardProps {
   onOpen: (repoId: string) => void
   onConfigure: (repo: RepoDTO) => void
 }
-
-/** 库名前挂载状态圆点的直径：8px —— 与 16px 的库名同处一行时不抢戏，但一眼可辨。 */
-const DOT_SIZE = 8
 
 /**
  * 挂载状态圆点：库名前的**绿点**（本机已挂载）/ 灰点（未挂载）/ 红点（挂载失败）/
@@ -43,6 +40,14 @@ const DOT_SIZE = 8
  *   - 失败（错误 / 撤销 / 断线）→ 红（danger），与标签行那个红色感叹号同源（controller.failed）；
  *   - 挂载中/卸载中 → 蓝（accent），转场中，看一眼就知道还在动。
  * 因为始终有一颗点，**所有卡片/行的库名起始位置一致**，列表纵向扫读时名字不会忽左忽右。
+ *
+ * 画法交给 antd `Badge`：状态点也算图标，不自己拿 div + border-radius 拼一个圆
+ * （真实反馈："图标不要自己画，用组件提供的"）：
+ *   - 尺寸走 theme.components.Badge.statusSize（8px，和原来的点一样大）；
+ *   - 垂直位置交给 antd 自己的 `.ant-badge-status-dot`（`vertical-align: middle` + `top: -1px`），
+ *     不再需要手工的光学修正量；
+ *   - 颜色继续用 palette —— `color` 本来就是 Badge 给自定义色点留的口子，
+ *     不该为了"用组件"把"小面积浅绿"这条反馈一起丢掉。
  */
 export function RepoMountDot({ controller }: { controller: RepoMountController }): JSX.Element {
   const { mounted, pending, failed } = controller
@@ -55,19 +60,14 @@ export function RepoMountDot({ controller }: { controller: RepoMountController }
         : palette.textTertiary
 
   return (
-    <span
+    <Badge
       aria-hidden
+      color={color}
       style={{
-        width: DOT_SIZE,
-        height: DOT_SIZE,
-        borderRadius: radius.pill,
-        background: color,
-        flexShrink: 0,
-        // 与库名同处一行：显式靠行中线对齐（行里可能有比圆点高得多的兄弟元素，比如列表形态
-        // 的标签、按钮），不让它跟着行高/文字基线漂移（真实反馈："要在名称行上下居中"）。
+        // 与库名同处一行：靠 flex 中线对齐（行里可能有比圆点高得多的兄弟元素，比如列表形态的
+        // 标签、按钮），不让它跟着行高/文字基线漂移。
         alignSelf: 'center',
-        display: 'inline-block',
-        lineHeight: 1,
+        flexShrink: 0,
         // 纯状态标记：不参与鼠标事件（整卡点击 = 打开挂载目录），也不做 tooltip
         // —— 挂载点就在下面的信息行里，悬浮提示只是重复。
         pointerEvents: 'none'

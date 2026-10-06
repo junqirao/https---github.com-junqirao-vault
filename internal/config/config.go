@@ -8,9 +8,11 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -361,6 +363,51 @@ func Load(path string) (*Loaded, error) {
 	return &Loaded{Raw: c, Compat: compat, Path: path}, nil
 }
 
+// 模板 config.example.yaml 是**两个平台共用一份**的，其中存储种子的默认值只能写成一个
+// 平台的形态；而校验要求"每个根都必须是**本平台**的绝对路径"（见 validate），于是另一个
+// 平台拿到模板原样生成就会立刻启动失败：
+//
+//	加载配置失败: config: storage.whitelist_roots 的每个根都必须是绝对路径: "D:\\VaultData"
+//
+// （Windows 的 D:\VaultData 在 Linux 上 filepath.IsAbs=false；/var/lib/vault 在 Windows
+// 上同理。）因此"从模板生成配置文件"这一步要按当前平台改写这几处字面量。
+const (
+	// winStorageRoot 是模板里 Windows 形态的存储种子默认根（给人看的写法）。
+	winStorageRoot = `D:\VaultData`
+	// winStorageRootYAMLLiteral 是它在模板里的**字面量**写法：位于 YAML 双引号内，
+	// 反斜杠被转义成两个，所以文件里实际就是 D:\\VaultData 这 12 个字符。
+	winStorageRootYAMLLiteral = `D:\\VaultData`
+	// linuxStorageRoot 是 Linux 上的等价默认根：取存储挂载点的父目录
+	// （「存储」的默认挂载点是 /var/lib/vault/storages/<名称>-<短 ID>，见 docs/design.md）。
+	// ⚠️ Linux 上该根**不参与存储种子**（否则会种出一个绕过 thin pool 的目录存储），
+	// 只作为 GET /v1/fs/* 与建库 source_dir 的默认浏览白名单；存储请在管理端创建。
+	linuxStorageRoot = "/var/lib/vault"
+)
+
+// DefaultStorageRoot 返回该平台下模板默认的存储种子根。
+//
+// 供启动提示与下面的模板改写共用同一份取值，避免文案与生成结果两处各写一份而漂移。
+func DefaultStorageRoot(goos string) string {
+	if goos == "windows" {
+		return winStorageRoot
+	}
+	return linuxStorageRoot
+}
+
+// platformizeExample 按 goos 改写模板中"另一个平台专用"的存储种子默认值。
+//
+// 只做**字面量替换、不做 YAML 往返**：生成出来的 config.yaml 必须保留模板的全部注释
+// （运维就是照着注释改配置的，见 persist.go 里 Save 会丢注释的说明）。
+// 注释里的单反斜杠写法（`# 建议独立数据盘，例如 D:\VaultData`）也一并改写，
+// 否则 Linux 生成的配置里会留着"建议用 D:\VaultData"这种自相矛盾的说明。
+func platformizeExample(goos string, data []byte) []byte {
+	if goos == "windows" {
+		return data // 模板本身就是 Windows 形态，无需改写
+	}
+	out := bytes.ReplaceAll(data, []byte(winStorageRootYAMLLiteral), []byte(linuxStorageRoot))
+	return bytes.ReplaceAll(out, []byte(winStorageRoot), []byte(linuxStorageRoot))
+}
+
 // EnsureFromExample 在目标配置文件**不存在**时，从同目录的模板文件生成一份。
 //
 // 模板路径由目标路径推导：把 <base><ext> 映射为 <base>.example<ext>，
@@ -369,6 +416,9 @@ func Load(path string) (*Loaded, error) {
 // 这样做的两个目的：
 //   - 部署包只需携带 config.example.yaml，避免升级解压时覆盖运维已修改的 config.yaml；
 //   - 首次启动即自动得到一份可用的配置，开箱可跑（首次启动会再补写实例 ID 与主密钥）。
+//
+// 生成时会把模板里"另一个平台专用"的默认值改写成当前平台可用的值（见 platformizeExample），
+// 保证生成的 config.yaml **一定能通过本平台的校验**、开箱即可启动。
 //
 // 返回值 created 表示本次是否真的生成了新文件；目标已存在时返回 false, nil（绝不覆盖）。
 // 若目标不存在且模板也不存在，返回带明确指引的错误。
@@ -394,6 +444,10 @@ func EnsureFromExample(path string) (created bool, err error) {
 		}
 		return false, fmt.Errorf("config: 读取配置模板失败: %w", readErr)
 	}
+
+	// 模板是两个平台共用的一份：生成前按当前平台改写其中的平台专属默认值，
+	// 否则 Linux 上会生成一份含 Windows 绝对路径的配置，紧接着就被 validate 拒绝。
+	data = platformizeExample(runtime.GOOS, data)
 
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {

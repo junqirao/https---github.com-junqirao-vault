@@ -1569,8 +1569,14 @@ DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
    本包**故意只带配置模板 config.example.yaml，不带 config.yaml**，
    这样以后升级解压不会覆盖你已经改好的配置文件。
 
-       cp config.example.yaml config.yaml
-       # 也可以直接启动：检测不到 config.yaml 时会自动从模板生成一份并继续启动。
+       # 直接启动即可（推荐）：检测不到 config.yaml 时会自动从模板生成一份并继续启动，
+       # 且会按 Linux 改写模板里的存储相关默认值（storage.whitelist_root → /var/lib/vault）。
+       ./vault-server
+
+   ⚠️ 若你更想"先改好再启动"，也可以 `cp config.example.yaml config.yaml`，
+      但**必须**把 storage.whitelist_root / whitelist_roots 改成 Linux 绝对路径：
+      模板是两个平台共用的一份，里面写的是 Windows 的 D:\\VaultData，
+      它在 Linux 上不是绝对路径，服务端会直接拒绝启动（报"每个根都必须是绝对路径"）。
 
 4) Linux 侧需要关注的配置项（与 Windows 包差异最大之处）：
       platform.kind              "auto"            ← 跑在 Linux 上即为 linux
@@ -1727,10 +1733,15 @@ chmod 755 "$DEST_DIR/vault-server"
 if [ -f "$SRC_DIR/config.example.yaml" ]; then
     cp -f "$SRC_DIR/config.example.yaml" "$DEST_DIR/config.example.yaml"
 fi
-# 已存在的 config.yaml 绝不覆盖：里面含自动生成的 master_key
-if [ ! -f "$DEST_DIR/config.yaml" ] && [ -f "$DEST_DIR/config.example.yaml" ]; then
-    cp -f "$DEST_DIR/config.example.yaml" "$DEST_DIR/config.yaml"
-    echo "已从模板生成 $DEST_DIR/config.yaml（请按需修改后重启服务）"
+# config.yaml 刻意**不在这里预生成**：服务端首次启动会自动从模板生成一份，
+# 并按运行平台改写其中的平台专属默认值（Linux 上 storage.whitelist_root → /var/lib/vault）。
+# 这里直接 cp 模板会把它原样带过去：模板是 Windows/Linux 共用的一份，
+# 其中的 D:\\VaultData 在 Linux 上不是绝对路径，服务端会**直接拒绝启动**。
+# 已存在的 config.yaml 绝不覆盖：里面含自动生成的 master_key。
+if [ -f "$DEST_DIR/config.yaml" ]; then
+    echo "$DEST_DIR/config.yaml 已存在，保持不动（含已生成的密钥）"
+else
+    echo "首次启动将自动从模板生成 $DEST_DIR/config.yaml"
 fi
 if [ -d "$SRC_DIR/updates" ]; then
     mkdir -p "$DEST_DIR/updates"

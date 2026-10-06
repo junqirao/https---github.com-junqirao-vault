@@ -294,11 +294,18 @@ func (m *Manager) PhysicalSize(ref string) (int64, error) {
 }
 
 // thinExclusiveBytes 用 thin_ls 读取该 thin LV 的独占物理占用。
+//
+// ⚠️ thin_ls **拒绝在 live metadata 上直接运行**（open 返回 EBUSY：
+// "you cannot run this tool with these options on live metadata"），
+// 必须先 reserve_metadata_snap、带 -m/--metadata-snap 读、最后 release；
+// 而池只要有设备激活，其 tmeta 就必然被 device-mapper 持有，
+// 所以这条"快照三步"是唯一可行路径（少了任何一步都会退化成估算口径）。
 func (m *Manager) thinExclusiveBytes(vg, lv string) (int64, error) {
 	if _, err := LookPath("thin_ls"); err != nil {
 		return 0, err
 	}
-	ctx, cancel := m.probeCtx()
+	// 三步共用一份预算：中途超时由下面的 defer 兜住 release。
+	ctx, cancel := context.WithTimeout(context.Background(), metadataSnapTimeout)
 	defer cancel()
 
 	pool, err := m.poolOf(ctx, vg, lv)
@@ -308,7 +315,7 @@ func (m *Manager) thinExclusiveBytes(vg, lv string) (int64, error) {
 	if pool == "" {
 		return 0, fmt.Errorf("not a thin volume")
 	}
-	majmin, err := m.kernelID(ctx, vg, lv)
+	devID, err := m.thinDevID(ctx, vg, lv)
 	if err != nil {
 		return 0, err
 	}
@@ -316,12 +323,30 @@ func (m *Manager) thinExclusiveBytes(vg, lv string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	// thin_ls 读的是池的元数据设备 <vg>-<pool>_tmeta。
+	// thin_ls 读池的元数据设备 <vg>-<pool>_tmeta；
+	// reserve/release 消息要发给池目标设备 <vg>-<pool>-tpool
+	// （LVM 的内部 LV [<pool>_tpool]，即 <vg>-<pool> 底下真正跑 thin-pool 的那个 dm 设备）。
 	tmeta := mapperPrefix + vg + "-" + pool + "_tmeta"
 	if _, err := os.Stat(tmeta); err != nil {
 		return 0, err
 	}
-	out, err := Run(ctx, m.logger, "thin_ls", "--no-headers",
+	poolDev := mapperPrefix + vg + "-" + pool + "-tpool"
+	if _, err := Run(ctx, m.logger, "dmsetup", "message", poolDev, "0", "reserve_metadata_snap"); err != nil {
+		// 同一时刻只允许 held 一份：别人持有时这里就是 EBUSY，由调用方退回估算口径。
+		return 0, fmt.Errorf("reserve_metadata_snap: %w", err)
+	}
+	// release 必须执行：held 期间池的元数据块无法回收，久持会让池元数据空间吃紧。
+	// 用 WithoutCancel，保证上层取消/超时后仍然释放。
+	defer func() {
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), probeTimeout)
+		defer rcancel()
+		if _, err := Run(rctx, m.logger, "dmsetup", "message", poolDev, "0", "release_metadata_snap"); err != nil {
+			m.logger.Error("release_metadata_snap 失败：池的元数据快照仍被 held，元数据空间无法回收，需人工释放",
+				"pool", poolDev, "err", err.Error())
+		}
+	}()
+
+	out, err := Run(ctx, m.logger, "thin_ls", "-m", "--no-headers",
 		"-o", "DEV,MAPPED_BLOCKS,EXCLUSIVE_BLOCKS", tmeta)
 	if err != nil {
 		return 0, err
@@ -329,23 +354,24 @@ func (m *Manager) thinExclusiveBytes(vg, lv string) (int64, error) {
 	blocks := int64(-1)
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
-		if len(f) < 2 || f[0] != majmin {
+		// DEV 列是 thin device id（十进制），不是 <major>:<minor>。
+		if len(f) < 2 || f[0] != devID {
 			continue
 		}
 		// 独占块优先（更贴合"独占物理占用"）；老版本可能没有第三列。
-		if len(f) >= 3 {
-			if v, e := strconv.ParseInt(f[2], 10, 64); e == nil && v > 0 {
-				blocks = v
-				break
-			}
+		idx := 2
+		if len(f) < 3 {
+			idx = 1
 		}
-		if v, e := strconv.ParseInt(f[1], 10, 64); e == nil {
+		// 必须用 >=0：全新或全共享的 LV 独占块就是 0，
+		// 用 >0 会串到 mapped 列，把共享块算成独占。
+		if v, e := strconv.ParseInt(f[idx], 10, 64); e == nil && v >= 0 {
 			blocks = v
 		}
 		break
 	}
 	if blocks < 0 {
-		return 0, fmt.Errorf("thin_ls 未找到设备 %s 的条目", majmin)
+		return 0, fmt.Errorf("thin_ls 未找到 thin id %s 的条目", devID)
 	}
 	return blocks * chunk, nil
 }
@@ -378,21 +404,25 @@ func (m *Manager) poolOf(ctx context.Context, vg, lv string) (string, error) {
 	return strings.TrimSpace(rowStr(rows[0], "pool_lv")), nil
 }
 
-// kernelID 返回 LV 的 <major>:<minor>，用于在 thin_ls 输出里定位对应条目。
-func (m *Manager) kernelID(ctx context.Context, vg, lv string) (string, error) {
-	rows, err := m.lvsRows(ctx, "-o", "lv_kernel_major,lv_kernel_minor", vg+"/"+lv)
+// thinDevID 返回 thin LV 在池内的 thin device id，用于在 thin_ls 输出里定位条目。
+//
+// thin_ls 的 DEV 列打的就是这个 id（十进制），**不是** <major>:<minor>；
+// 取值来源是 dm 的目标行 "0 <len> thin <pool_dev> <dev_id> [<origin_dev>]" 的第 5 列
+// （见内核 Documentation/admin-guide/device-mapper/thin-provisioning）。
+func (m *Manager) thinDevID(ctx context.Context, vg, lv string) (string, error) {
+	out, err := m.run(ctx, "dmsetup", "table", lvRef(vg, lv))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("LV 未激活或不是 thin 卷，取不到 thin id: %w", err)
 	}
-	if len(rows) == 0 {
-		return "", fmt.Errorf("lvs 无结果")
+	f := strings.Fields(out)
+	if len(f) < 5 || f[2] != "thin" {
+		return "", fmt.Errorf("dmsetup table 输出异常: %q", strings.TrimSpace(out))
 	}
-	maj := strings.TrimSpace(rowStr(rows[0], "lv_kernel_major"))
-	min := strings.TrimSpace(rowStr(rows[0], "lv_kernel_minor"))
-	if maj == "" || min == "" {
-		return "", fmt.Errorf("LV 未激活，无内核设备号")
+	id := f[4]
+	if _, err := strconv.ParseInt(id, 10, 64); err != nil {
+		return "", fmt.Errorf("thin id 非法: %q", id)
 	}
-	return maj + ":" + min, nil
+	return id, nil
 }
 
 // chunkSizeOf 返回 thin pool 的 chunk 大小（字节）。

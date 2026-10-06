@@ -95,6 +95,9 @@ type Agent struct {
 	downloads *downloadManager
 	// uploads 管理"本地目录 → 存储库"上传任务（内存态 + <DataDir>/uploads.json 续传记录）。
 	uploads *uploadManager
+	// manualUnmounts 是"本次运行被用户手动卸载过"的库（内存态，进程重启即清空）：
+	// 这些库不再被自动挂载，避免用户点了卸载却马上被 auto_mount 挂回来。
+	manualUnmounts manualUnmountGuard
 
 	// hostMu / host 是本机就绪状态（当前只有 iSCSI 发起端）：启动时只读探测一次，
 	// 未就绪期间低频复检。预检的定位是"提前告知"而非"提前失败"——不阻断启动，界面挂横幅。
