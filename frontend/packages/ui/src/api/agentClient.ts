@@ -19,6 +19,7 @@ import type {
   AgentLog,
   AgentMountMode,
   AgentMountState,
+  AgentRepoMountPref,
   AgentSessionState,
   AgentState,
   DownloadState,
@@ -596,6 +597,20 @@ export const agentApi = {
 
   patchConfig(patch: Partial<AgentConfig>): Promise<{ config: AgentConfig }> {
     return request({ method: 'PATCH', path: '/agent/config', body: patch })
+  },
+
+  /**
+   * 写入**单个存储库**的挂载偏好（形态 / 目录 / 启动后自动挂载）。
+   *
+   * 单独一个接口而不是走 PATCH /agent/config 的整表替换：每个库的配置互相独立，
+   * 整表替换会让"两个窗口各改一个库"变成后写覆盖前写。
+   */
+  setRepoMountPref(repoId: string, pref: AgentRepoMountPref): Promise<{ config: AgentConfig }> {
+    return request({
+      method: 'PUT',
+      path: `/agent/repo-mounts/${encodeURIComponent(repoId)}`,
+      body: pref
+    })
   },
 
   /** 读取本地客户端证书身份（未安装时仅 installed:false；绝不含私钥/证书原文）。 */

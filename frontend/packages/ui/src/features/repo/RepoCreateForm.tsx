@@ -41,6 +41,12 @@ export function RepoCreateForm({
   const { t } = useI18n()
   const queryClient = useQueryClient()
   const [form] = Form.useForm<RepoFormValues>()
+  // 独享库没有差异盘（整块盘直接给用户），服务端会把共享数量静默归零：
+  // 与其让用户填一个不起作用的数字，不如当场置灰并说明原因。
+  //
+  // 用 onValuesChange 而不是 Form.useWatch：上传进行中表单会被进度面板替换掉，
+  // 此时 useWatch 会去读一个"没有挂在任何 Form 上"的实例，开发模式会刷告警。
+  const [exclusive, setExclusive] = useState(false)
   const [error, setError] = useState<unknown>(null)
   const [sourceDirValid, setSourceDirValid] = useState(true)
   const [upload, setUpload] = useState<UploadState | null>(null)
@@ -66,7 +72,12 @@ export function RepoCreateForm({
 
   const mutation = useMutation({
     mutationFn: (values: CreateRepoRequest) => api.createRepo(values),
-    onSuccess: (response) => onCreated(response.repo),
+    onSuccess: (response) => {
+      // 新建库立刻占用用户配额（「我的存储库」顶部的总账），列表页的 ['me'] 必须一起失效，
+      // 否则用户建完库回到列表，看到的还是建库前的"已用"。
+      void queryClient.invalidateQueries({ queryKey: ['me'] })
+      onCreated(response.repo)
+    },
     onError: (err) => setError(err)
   })
 
@@ -107,8 +118,13 @@ export function RepoCreateForm({
   }, [uploads, tracked])
 
   // 上传完成：刷新存储库列表（repo_id 缺失时这是唯一的成功反馈之一）。
+  //
+  // ['me'] 也要刷：上传建库是配额真正落账的时刻（建库时按逻辑大小预留、建盘后按实测占用校正），
+  // 只刷列表会让顶部的"已用 / 总共可用"长期停在建库前的数字。
   useEffect(() => {
-    if (tracked?.state === 'done') void queryClient.invalidateQueries({ queryKey: ['repos'] })
+    if (tracked?.state !== 'done') return
+    void queryClient.invalidateQueries({ queryKey: ['repos'] })
+    void queryClient.invalidateQueries({ queryKey: ['me'] })
   }, [tracked?.state, queryClient])
 
   const submit = async (): Promise<void> => {
@@ -150,6 +166,7 @@ export function RepoCreateForm({
             form={form}
             layout="vertical"
             initialValues={{ mode: 'shared', max_diff_disks: 1 }}
+            onValuesChange={(_changed, values) => setExclusive(values.mode === 'exclusive')}
             style={{ maxWidth: 880 }}
           >
             <Row gutter={16}>
@@ -218,8 +235,17 @@ export function RepoCreateForm({
                   而这个容量就是它占用的配额（从创建者的配额里扣除）。配额本身是**用户级**的策略值，
                   由管理员在用户表单里设置；库这边只需要给出容量。
                 */}
-                <Form.Item name="max_diff_disks" label={t('field.maxDiffDisks')}>
-                  <InputNumber min={0} style={{ width: '100%' }} />
+                {/*
+                  「共享数量」就是服务端的 max_diff_disks：它不只是"上限"，而是**建库时预创建几个池位**
+                  （几块差异盘 + 几个 iSCSI 目标）。名字必须以"预创建"为准 —— 叫"差异盘上限"时，
+                  连开发者都会以为填了只在超限时报错，于是填 0，结果每次挂载都要等服务端现场下发。
+                */}
+                <Form.Item
+                  name="max_diff_disks"
+                  label={t('field.shareCount')}
+                  extra={exclusive ? t('repo.create.shareCountExclusive') : t('repo.create.shareCountHint')}
+                >
+                  <InputNumber min={0} disabled={exclusive} style={{ width: '100%' }} />
                 </Form.Item>
               </Col>
               <Col span={12}>

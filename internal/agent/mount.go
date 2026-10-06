@@ -829,8 +829,15 @@ func repoNameOf(req MountRequest, spec *MountSpec) string {
 }
 
 // resolveMountDir 计算目录模式的绝对挂载路径。
+//
+// 取值顺序与 resolveMode 一致：请求 > 每库配置 > 服务端下发 > 「挂载根\别名\库名」。
 func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec) (string, error) {
 	raw := strings.TrimSpace(req.MountPath)
+	if raw == "" {
+		if pref, ok := e.repoPref(req.RepoID); ok {
+			raw = strings.TrimSpace(pref.MountDir)
+		}
+	}
 	if raw == "" && spec != nil {
 		raw = strings.TrimSpace(spec.MountPath)
 	}
@@ -920,10 +927,28 @@ func (e *mountEngine) renderPostScript(script string, spec *MountSpec, mountPath
 	return replacer.Replace(script)
 }
 
-// resolveMode 确定本次挂载模式：请求 > 服务端下发 > 本地默认。
+// repoPref 返回该库在本机的挂载偏好（卡片「配置」里存的那份）。
+func (e *mountEngine) repoPref(repoID string) (RepoMountPref, bool) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return RepoMountPref{}, false
+	}
+	pref, ok := e.a.cfg.Get().RepoMounts[repoID]
+	return pref, ok
+}
+
+// resolveMode 确定本次挂载模式：请求 > 每库配置 > 服务端下发 > 本地默认。
+//
+// 每库配置排在服务端下发之前：它是用户在这台机器上**确认过**的选择（弹窗里存下来的），
+// 界面上显示什么形态就该挂成什么形态；服务端 client_config 里的 mount_mode 只是库的缺省建议。
 func (e *mountEngine) resolveMode(req MountRequest, spec *MountSpec) string {
 	if mode := normalizeMountMode(req.MountMode); mode != "" {
 		return mode
+	}
+	if pref, ok := e.repoPref(req.RepoID); ok {
+		if mode := normalizeMountMode(pref.MountMode); mode != "" {
+			return mode
+		}
 	}
 	if spec != nil {
 		if mode := normalizeMountMode(spec.MountMode); mode != "" {

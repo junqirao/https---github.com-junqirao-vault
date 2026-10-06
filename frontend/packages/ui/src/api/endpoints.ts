@@ -84,6 +84,16 @@ export class VaultApi extends ApiClient {
     return this.request<void>('POST', '/v1/auth/logout')
   }
 
+  /**
+   * 当前登录用户的完整信息（含配额与已用）。
+   *
+   * 配额是**用户级**的（多个库共享一份），登录响应的 user 只在登录那一刻准确，
+   * 「我的存储库」要显示实时用量，所以单独走一个可重复拉取的接口。
+   */
+  me(): Promise<UserDTO> {
+    return this.request<UserDTO>('GET', '/v1/auth/me')
+  }
+
   // ---- 系统（管理员） ----
 
   settings(): Promise<SettingsResponse> {

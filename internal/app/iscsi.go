@@ -446,7 +446,7 @@ func (s *IscsiService) ReconcileTargets(ctx context.Context) error {
 // createUserTarget 新建一个面向该磁盘的 user 目标（默认 CHAP）。
 //
 // allocationID 允许为空：建库预创建时还没有任何分配（池位目标就是这样建的），
-// 之后分配/挂载时再由 adoptDiskTarget 把关联补上。
+// 之后分配/挂载时再由 resolveUserTarget 把关联补上。
 func (s *IscsiService) createUserTarget(ctx context.Context, repo *domain.Repository,
 	disk *domain.Disk, allocationID *string) (*domain.IscsiTarget, error) {
 	if s.Cipher == nil {
@@ -481,13 +481,10 @@ func (s *IscsiService) createUserTarget(ctx context.Context, repo *domain.Reposi
 	return target, nil
 }
 
-// adoptDiskTarget 认领一块盘上**已经预建好**的 user 目标，并把它绑到这次分配上。
-//
-// 池化库的常态路径：目标与映射在建库阶段就建好并发布了，分配/挂载只是补一行关联，
-// 之后按 allocation 查目标（Unpublish、摘要、会话管理）都能查到。
+// findUserTargetForDisk 查一块盘上的 user 目标，**不改任何绑定**。
 //
 // 盘上没有 user 目标时返回 (nil, nil)：调用方按"现建"的老路径处理。
-func (s *IscsiService) adoptDiskTarget(ctx context.Context, diskID, allocationID string) (*domain.IscsiTarget, error) {
+func (s *IscsiService) findUserTargetForDisk(ctx context.Context, diskID string) (*domain.IscsiTarget, error) {
 	targets, err := s.Store.ListIscsiTargetsByDisk(ctx, diskID)
 	if err != nil {
 		if isNotFound(err) {
@@ -496,42 +493,100 @@ func (s *IscsiService) adoptDiskTarget(ctx context.Context, diskID, allocationID
 		return nil, err
 	}
 	for i := range targets {
-		t := &targets[i]
-		if t.Purpose != domain.PurposeUser {
-			continue
+		if targets[i].Purpose == domain.PurposeUser {
+			return &targets[i], nil
 		}
-		if t.AllocationID == nil || *t.AllocationID != allocationID {
-			if err := s.Store.SetIscsiTargetAllocation(ctx, t.ID, allocationID); err != nil {
-				return nil, err
-			}
-			allocID := allocationID
-			t.AllocationID = &allocID
-		}
-		return t, nil
 	}
 	return nil, nil
+}
+
+// resolveUserTarget 取这块盘上的 user 目标；没有就建一个，必要时把它绑到分配上。
+//
+// 这是"目标从哪来"的唯一入口：池化预建、分配即预建、挂载时现建，三条来源都走这里，
+// 于是"这块盘到底该不该有目标、已经有了就认领"这件事只有一个判断点。
+//
+// bindAllocation 语义：
+//   - nil：不改变目标与分配的绑定（只保证"目标存在"）；
+//   - 非 nil：按该值绑定；传空串表示"建库阶段，目标还没有归属"。
+//
+// 并发安全：目标名由"库 + 盘"派生（targetNameForDisk），schema 上 target_name 是 UNIQUE。
+// 挂载路径（Publish）与预创建路径（EnsureDiskTarget）完全可能同时算到同一个目标名 ——
+// 盘在 JobCreateDiff 结尾刚变 ready，客户端就被 awaitBackingReady 唤醒。输的一方 INSERT
+// 失败，这里再查一次把赢家的记录认下来继续；否则两个目标映射同一块盘，
+// 客户端连上哪个都是薛定谔的盘。
+func (s *IscsiService) resolveUserTarget(ctx context.Context, repo *domain.Repository,
+	disk *domain.Disk, bindAllocation *string) (*domain.IscsiTarget, error) {
+	target, err := s.findUserTargetForDisk(ctx, disk.ID)
+	if err != nil {
+		return nil, err
+	}
+	if target == nil {
+		// 新建时只在有真实绑定时才写关联：空串等价于"没有分配"，保持 NULL 语义与老路径一致。
+		createBind := bindAllocation
+		if createBind != nil && *createBind == "" {
+			createBind = nil
+		}
+		created, err := s.createUserTarget(ctx, repo, disk, createBind)
+		if err != nil {
+			// 并发：另一条路径同时建出了同一个目标名的记录。让赢家赢，把它认下来。
+			again, findErr := s.findUserTargetForDisk(ctx, disk.ID)
+			if findErr != nil || again == nil {
+				return nil, err
+			}
+			target = again
+		} else {
+			target = created
+		}
+	}
+	if bindAllocation != nil && (target.AllocationID == nil || *target.AllocationID != *bindAllocation) {
+		if err := s.Store.SetIscsiTargetAllocation(ctx, target.ID, *bindAllocation); err != nil {
+			return nil, err
+		}
+		allocID := *bindAllocation
+		target.AllocationID = &allocID
+	}
+	return target, nil
 }
 
 // EnsurePoolTarget 保证池位盘有一个已启用的 user 目标（建库预创建阶段三反复调用）。
 //
 // 与 Publish 的区别是**不依赖分配**：建库时还没有任何分配，目标先建好、启用，
-// 客户端什么都不用做；之后的分配与挂载只是把它认领过去（adoptDiskTarget）。
+// 客户端什么都不用做；之后的分配与挂载只是把它认领过去（resolveUserTarget）。
 //
 // 幂等：先查后建、先查后改，任务重试不会多出第二个映射同一块盘的目标。
 func (s *IscsiService) EnsurePoolTarget(ctx context.Context, repo *domain.Repository, disk *domain.Disk) error {
+	// 建库阶段目标确实还没有归属，显式按空值绑定，沿用老语义（见 resolveUserTarget）。
+	empty := ""
+	return s.ensureUserTarget(ctx, repo, disk, &empty)
+}
+
+// EnsureDiskTarget 提前为一块盘建好并启用 user 目标：资源先就位，再分配给用户。
+//
+// 覆盖原先两条"只能等用户挂载时现场下发"的路径：
+//   - 非池化共享库的差异盘：分配时才派生（JobCreateDiff），在派生完成后顺手把目标建好；
+//   - 独享库的盘：建库时就有（分配只是把它指给用户），在盘建好后就把目标建好。
+//
+// 收益：用户点挂载只剩"连接"——Publish 命中目标指纹后整段跳过（省掉一次约 35 秒的
+// 全量下发），挂载不再卡在服务端现场建目标上。
+//
+// 与 EnsurePoolTarget 的唯一区别是**不碰 AllocationID**：本方法可能在分配之后才被调用
+// （任务重试、补建），把已经认领的绑定抹掉会让后续按 allocation 查目标（Unpublish、
+// 会话管理、摘要）查不到东西。
+func (s *IscsiService) EnsureDiskTarget(ctx context.Context, repo *domain.Repository, disk *domain.Disk) error {
+	return s.ensureUserTarget(ctx, repo, disk, nil)
+}
+
+// ensureUserTarget 是 EnsurePoolTarget / EnsureDiskTarget 的公共实现：
+// 保证目标存在且已启用（必要时绑定），并把期望状态下发到平台。
+func (s *IscsiService) ensureUserTarget(ctx context.Context, repo *domain.Repository,
+	disk *domain.Disk, bindAllocation *string) error {
 	if s.Iscsi == nil {
-		// 平台没装配 iSCSI 后端（Linux/测试环境）：池位只建盘，发布留给挂载路径。
+		// 平台没装配 iSCSI 后端（Linux/测试环境）：盘照建，发布留给挂载路径。
 		return nil
 	}
-	target, err := s.adoptDiskTarget(ctx, disk.ID, "")
+	target, err := s.resolveUserTarget(ctx, repo, disk, bindAllocation)
 	if err != nil {
 		return err
-	}
-	if target == nil {
-		target, err = s.createUserTarget(ctx, repo, disk, nil)
-		if err != nil {
-			return err
-		}
 	}
 	if target == nil {
 		return nil
@@ -541,7 +596,7 @@ func (s *IscsiService) EnsurePoolTarget(ctx context.Context, repo *domain.Reposi
 	defer unlock()
 
 	iqn := target.IQN(s.iqnPrefix())
-	// 这里是整条建库链路最慢的一步：Windows 上一次全量下发实测约 35 秒（见 IscsiService 说明）。
+	// 这里是整条预创建链路最慢的一步：Windows 上一次全量下发实测约 35 秒（见 IscsiService 说明）。
 	// 付一次就够 —— 期望状态与"已下发"记账都进了 DB，之后的每次挂载只是分发。
 	if _, err := s.pushTarget(ctx, target, true); err != nil {
 		return err
@@ -563,7 +618,8 @@ func (s *IscsiService) EnsurePoolTarget(ctx context.Context, repo *domain.Reposi
 			return err
 		}
 	}
-	s.audit(ctx, "", "iscsi.publish", "target:"+target.TargetName, "pool disk="+disk.ID, domain.AuditResultOK)
+	// 预创建路径：池位盘（建库阶段三）与"分配即预建"的盘（非池化差异盘 / 独享库盘）共用。
+	s.audit(ctx, "", "iscsi.publish", "target:"+target.TargetName, "disk="+disk.ID, domain.AuditResultOK)
 	return nil
 }
 
@@ -590,20 +646,21 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	}
 
 	if target == nil {
-		// 池化库：目标在建库时就按"共享数量"预建好了（那时还没有分配，所以只按 disk 关联）。
-		// 先认领它，而不是再建一个 —— 两个目标映射同一个 VHDX 会在平台侧互相抢映射，
-		// 客户端连上哪个都是薛定谔的盘。
-		target, err = s.adoptDiskTarget(ctx, disk.ID, allocationID)
+		// 池化库（以及"分配即预建/建库即预建"的库）：目标早就建好了（那时还没有分配，
+		// 所以只按 disk 关联）。先认领它，而不是再建一个 —— 两个目标映射同一个 VHDX 会在
+		// 平台侧互相抢映射，客户端连上哪个都是薛定谔的盘。
+		//
+		// 目标确实不存在时（既没池化也没预建）由同一条路径建出来并直接绑到这次分配上。
+		target, err = s.resolveUserTarget(ctx, repo, disk, &alloc.ID)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if target == nil {
-		target, err = s.createUserTarget(ctx, repo, disk, &alloc.ID)
-		if err != nil {
-			return nil, err
-		}
-	} else if target.DiskID == nil || *target.DiskID != disk.ID {
+		// 理论不可达（resolveUserTarget 只会返回"找到或建好"的目标）；留一手不裸解引用。
+		return nil, apperr.IscsiTargetNotFound()
+	}
+	if target.DiskID == nil || *target.DiskID != disk.ID {
 		target.DiskID = &disk.ID
 		if err := s.Store.UpdateIscsiTarget(ctx, target); err != nil {
 			return nil, err

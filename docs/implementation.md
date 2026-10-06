@@ -936,10 +936,14 @@ minimum = 3MB                            // VirtDisk 硬下限
 **iSCSI 命名规范**
 
 ```
-target_name = vault-{repo_id短}_{allocation_id短}
+target_name = vault-{repo_id短}-{disk_id短}          # 见 targetNameForDisk
 IQN         = iqn.2026-01.com.vault:{target_name}
                                 ↑ 服务端启动时从配置读取，需全局唯一且稳定
 ```
+
+> 名字按**磁盘**派生（而不是按分配）：预创建的目标诞生时还没有分配，名字若跟着分配走，
+> 池位盘释放回池原地重建后就得换名 —— 那意味着 Windows 侧多一次"删旧目标 + 建新目标"的全量下发。
+> 分隔符只能用 `-`：目标名会被 Windows 当 IQN 后缀校验，而 IQN 语法（RFC 3720）不允许 `_`。
 
 **鉴权模式（三选一，按库配置）**
 
@@ -977,6 +981,29 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 > 记账随进程重启仍然有效：**分配阶段全量下发一次，之后的分发阶段直接命中并跳过**，
 > 不再付这份成本。只有拆除（`clearApplied`）、对账判定漂移、鉴权/停用变更时才走强制下发
 > （`forcePushTarget`），把记账清空或刷新。
+
+> **目标必须"预先创建"，挂载才退化成"连接"**：上一条记账能省时间的前提是"目标确实已经存在"。
+> 否则用户点挂载时目标才被现场建出来，第一次挂载仍要付整段全量下发（真实工单："再连一次要等 1 分钟"）。
+> 三条来源都在**分配时就准备好**，且都走唯一入口 `IscsiService.resolveUserTarget`
+> （取或建 + 可选绑定）；并发由 `iscsi_targets.target_name` 的 UNIQUE 约束兜底 ——
+> 挂载路径（`Publish`）与预创建路径（`EnsureDiskTarget`）可能同时算到同一个名字
+> （盘在 `JobCreateDiff` 结尾刚变 ready，客户端就被 `awaitBackingReady` 唤醒），
+> 输的一方 INSERT 失败后回查把赢家的记录认下来，否则两个目标映射同一块 VHDX。
+>
+> | 来源 | 触发点 | 绑定 | 代码 |
+> | --- | --- | --- | --- |
+> | 池化共享库的池位盘 | 建库阶段三（母盘 → 池位盘 → 目标） | 空串（此时确实还没有分配） | `runPrepareRepo` → `EnsurePoolTarget` |
+> | 非池化共享库的差异盘 | 分配时派生完成（`JobCreateDiff` 末尾） | 不改（`nil`） | `prePublishTarget` → `EnsureDiskTarget` |
+> | 独享库的整块盘 | 建库建盘完成（`JobCreateVHDX` 末尾） | 不改（`nil`） | `prePublishTarget` → `EnsureDiskTarget` |
+>
+> 绑定语义的差异是刻意的：`EnsurePoolTarget` 显式按空值绑定；`EnsureDiskTarget` **一律不动
+> `AllocationID`**，因为它可能在分配之后才被调用（任务重试、补建），抹掉已认领的绑定会让
+> 按 allocation 查目标的路径（`Unpublish` / 会话管理 / 摘要）查不到东西。
+> 池位盘上预建的目标由分配阶段 `RepoService.bindPoolTarget` 认领给这次分配。
+>
+> `prePublishTarget` 刻意跳过**共享库的母盘**：交给用户的是差异盘，提前发布母盘等于在平台上
+> 多开一条能读到基线数据的通路。预创建失败**只告警不返回错误**：盘本身是好的，把它判失败会让
+> 一块完好的盘卡在重试链上；最坏结果只是退回老行为 —— 用户挂载时现场下发，多等十几秒。
 
 ### 5.4 存储库状态机、维护状态与母盘保护
 
@@ -2162,13 +2189,22 @@ Vault-Agent (Go)
 ```
 启动序列：
   1. 读本地配置 + 从服务端拉取用户配置（见 design.md 服务端-本地用户-4）
-  2. 对每个标记 auto_mount 的存储库：
-     - 请求 POST /allocations/{id}/mount
-     - 成功 → 挂载 → 执行 post_script
-     - 失败 → 记录到"待处理"列表，托盘提示，不阻塞其它库
-  3. 并发限制：同时最多 2 个挂载任务（避免网络/磁盘争抢）
+  2. 全局 auto_mount 打开时：恢复状态文件里本机上次留下的挂载记录
+     （服务端没有"本机应挂载哪些分配"的清单接口，只能按本地记录恢复）
+  3. 每库独立的 repo_mounts[<repo_id>].auto_mount：
+     - =true  → 即使本机没有记录（甚至还没有分配）也要挂上
+                （先 GET /v1/repos/{id}/allocations 找我在该库里的可用分配，
+                  没有则 POST /v1/repos/{id}/allocations 建一个，再挂载）
+     - =false → 连记录都不恢复（用户明确关掉了这个库的自动挂载）
+  4. 每次挂载：POST /allocations/{id}/mount → 连会话 → 挂载 → 执行 post_script；
+     失败保留一条 error 记录（下次启动仍会重试），不阻塞其它库
+  5. 并发限制：同时最多 2 个挂载任务（避免网络/磁盘争抢）
 开机启动：注册 HKCU\...\Run 或计划任务（后者可提权，推荐）
 ```
+
+> 「全局 auto_mount」与「每库 auto_mount」不是同一个开关：前者是"把上次挂着的挂回"，会被
+> 重装、断线、手工卸载等情况清空记录；后者是用户对**单个库**的显式表态，因此不受前者约束，
+> 也不受"有没有挂过"影响（见 docs/agent-api.md「本地配置」的 repo_mounts）。
 
 ### 7.4 自动更新
 
@@ -2391,7 +2427,10 @@ Vault-Server sign release -artifact agent=... -artifact client_web=dist.zip
   "default_mount_mode": "letter",          // letter | directory
   "default_mount_dir": "C:\\Vault",        // 目录模式实际路径 = <dir>\<alias>\<repo>
   "group_view": "aggregate",               // aggregate（同名聚合）| by_server
-  "auto_mount": true,
+  "auto_mount": true,                      // 全局：恢复上次留下的挂载记录（被重装/手工卸载清空后不再生效）
+  "repo_mounts": {                         // 每库独立：形态/目录/启动后自动挂载（空串=跟随上面的默认值）
+    "8f1c...": { "mount_mode": "directory", "mount_dir": "D:\\vault\\样品库", "auto_mount": true }
+  },
   "start_at_login": true,
   "update_channel": "stable",
   "log_level": "info"

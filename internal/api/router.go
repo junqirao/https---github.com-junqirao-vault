@@ -89,6 +89,9 @@ func (r *Router) routes() {
 		g.Use(r.middlewareAudit)
 
 		g.Post("/v1/auth/logout", r.handleLogout)
+		// 任何登录用户查看自己的信息（含配额与已用）：客户端「我的存储库」要展示
+		// "已用多少 / 总共可用多少"，而 /v1/users/{id} 只对超管开放。
+		g.Get("/v1/auth/me", r.handleMe)
 		// 任何登录用户为自己换取客户端证书（无需超管）。
 		g.Post("/v1/auth/client-certificate", r.handleClientCertificate)
 		g.Get("/v1/system/events", r.handleEvents)

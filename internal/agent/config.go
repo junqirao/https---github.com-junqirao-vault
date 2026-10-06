@@ -26,6 +26,23 @@ func DefaultConfigPath() string { return filepath.Join(DataDir(), "agent-config.
 // DefaultStatePath 返回默认的本地状态文件路径。
 func DefaultStatePath() string { return filepath.Join(DataDir(), "agent-state.json") }
 
+// RepoMountPref 是**单个存储库**在本机的挂载偏好（见 docs/agent-api.md「本地配置」）。
+//
+// 为什么是客户端本地配置而不是服务端库属性：挂载形态与挂载目录都是"这台机器"的事
+// （盘符、D:\vault\xxx 之类的本地路径对别的机器没有意义），自动挂载也由本机代理执行。
+type RepoMountPref struct {
+	// MountMode letter | directory；空串表示跟随 DefaultMountMode。
+	MountMode string `json:"mount_mode,omitempty"`
+	// MountDir 目录模式的目标目录；空串表示跟随 DefaultMountDir（<根>\<服务端别名>\<库名>）。
+	MountDir string `json:"mount_dir,omitempty"`
+	// AutoMount 是否在该库所在客户端启动（拿到会话）后自动挂载它。
+	//
+	// 语义与全局 AutoMount 的区别：全局开关只管"恢复本机上次留下的挂载记录"，
+	// 而这里是**每个库独立**的表态 —— 为 true 时即使本机没有记录（甚至还没有分配）
+	// 也要挂上；为 false 时连记录都不恢复（用户明确关掉了这个库的自动挂载）。
+	AutoMount bool `json:"auto_mount"`
+}
+
 // Config 是代理的本地配置（见 docs/agent-api.md「本地配置」）。
 type Config struct {
 	// AutoMount 是否在拿到服务端会话后自动恢复本地记录的挂载。
@@ -54,6 +71,8 @@ type Config struct {
 	UpdateChannel string `json:"update_channel"`
 	// ServerAlias 服务端别名（目录模式命名空间，见 3.4.5）。
 	ServerAlias string `json:"server_alias"`
+	// RepoMounts 按存储库 ID 保存的挂载偏好；没有条目的库跟随上面的全局默认值。
+	RepoMounts map[string]RepoMountPref `json:"repo_mounts,omitempty"`
 
 	// autoLoginSet 记录 auto_login 是否被**显式**配置过。
 	//
@@ -178,6 +197,17 @@ func normalizeConfig(c Config) Config {
 	if strings.TrimSpace(c.UpdateChannel) == "" {
 		c.UpdateChannel = def.UpdateChannel
 	}
+	// 每库挂载偏好：非法形态归一为"跟随默认"（不丢用户的自动挂载表态），目录去空白。
+	// 这里就地改 map：它只在 load / Patch 的持有锁路径上，不会被外部共享。
+	for repoID, pref := range c.RepoMounts {
+		if mode := normalizeMountMode(pref.MountMode); mode != "" {
+			pref.MountMode = mode
+		} else {
+			pref.MountMode = ""
+		}
+		pref.MountDir = strings.TrimSpace(pref.MountDir)
+		c.RepoMounts[repoID] = pref
+	}
 	return c
 }
 
@@ -201,7 +231,53 @@ func (s *ConfigStore) Path() string { return s.path }
 func (s *ConfigStore) Get() Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cfg
+	return cloneConfig(s.cfg)
+}
+
+// cloneConfig 深拷贝配置里的 map，避免调用方（含只读的 GET /agent/config）改到 store 内部状态。
+func cloneConfig(c Config) Config {
+	if len(c.RepoMounts) == 0 {
+		return c
+	}
+	out := make(map[string]RepoMountPref, len(c.RepoMounts))
+	for repoID, pref := range c.RepoMounts {
+		out[repoID] = pref
+	}
+	c.RepoMounts = out
+	return c
+}
+
+// SetRepoMountPref 写入单个存储库的挂载偏好并持久化。
+//
+// 单独开一个入口（而不是复用 Patch 的整表替换）：每个库的配置互相独立，
+// 整表替换会让"两个窗口各改一个库"变成最后一次写覆盖掉前一次。
+func (s *ConfigStore) SetRepoMountPref(repoID string, pref RepoMountPref) (Config, error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return s.Get(), apperr.InvalidParam("repo_id")
+	}
+	if raw := strings.TrimSpace(pref.MountMode); raw != "" {
+		mode := normalizeMountMode(raw)
+		if mode == "" {
+			return s.Get(), apperr.InvalidParam("mount_mode")
+		}
+		pref.MountMode = mode
+	} else {
+		pref.MountMode = ""
+	}
+	pref.MountDir = strings.TrimSpace(pref.MountDir)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.RepoMounts == nil {
+		s.cfg.RepoMounts = make(map[string]RepoMountPref)
+	}
+	s.cfg.RepoMounts[repoID] = pref
+	if err := s.persistLocked(); err != nil {
+		s.logger.Warn("写入本地配置失败（仅内存生效）", "path", s.path, "error", err)
+		return cloneConfig(s.cfg), err
+	}
+	return cloneConfig(s.cfg), nil
 }
 
 // Patch 部分更新配置并持久化。

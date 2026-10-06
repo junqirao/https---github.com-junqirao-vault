@@ -482,6 +482,62 @@ func (c *serverClient) FindRepoID(ctx context.Context, name string) (string, err
 	return "", nil
 }
 
+// allocationStateReleased 是服务端分配状态里"已释放"的取值（见 internal/domain AllocationState）。
+const allocationStateReleased = "released"
+
+// allocationItem 是 GET /v1/repos/{id}/allocations 的最小响应形状（只取筛选用得到的字段）。
+type allocationItem struct {
+	ID     string `json:"id"`
+	RepoID string `json:"repo_id"`
+	UserID string `json:"user_id"`
+	State  string `json:"state"`
+}
+
+// ListRepos 调用 GET /v1/repos 返回当前会话可见的存储库（id + 名称）。
+func (c *serverClient) ListRepos(ctx context.Context) ([]repoListItem, error) {
+	var out struct {
+		Items []repoListItem `json:"items"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/v1/repos?limit=200&offset=0", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+// ListAllocations 调用 GET /v1/repos/{id}/allocations 列出该库的**全部**分配。
+//
+// 注意：服务端不按用户/状态过滤，已释放的历史记录也在列表里，调用方自己筛
+// （见 ensureMyAllocation）。
+func (c *serverClient) ListAllocations(ctx context.Context, repoID string) ([]allocationItem, error) {
+	if strings.TrimSpace(repoID) == "" {
+		return nil, apperr.InvalidParam("repo_id")
+	}
+	var out struct {
+		Items []allocationItem `json:"items"`
+	}
+	path := "/v1/repos/" + url.PathEscape(repoID) + "/allocations"
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+// Allocate 调用 POST /v1/repos/{id}/allocations 为指定用户在该库建立分配。
+//
+// 用 doLong：共享库要派生差异盘、独享库要建独立盘，服务端在请求内同步完成。
+func (c *serverClient) Allocate(ctx context.Context, repoID, userID string) (allocationItem, error) {
+	var out allocationItem
+	if strings.TrimSpace(repoID) == "" {
+		return out, apperr.InvalidParam("repo_id")
+	}
+	path := "/v1/repos/" + url.PathEscape(repoID) + "/allocations"
+	body := map[string]any{"user_id": userID}
+	if err := c.doLong(ctx, http.MethodPost, path, body, &out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
 // GetRawBytes 发起 GET 并返回响应体的**原始字节**（不做任何解析）。
 //
 // 更新清单与签名必须逐字节取回：客户端要对这些字节验签，

@@ -37,6 +37,8 @@ func (a *Agent) localMux() http.Handler {
 
 	mux.HandleFunc("GET /agent/config", a.handleGetConfig)
 	mux.HandleFunc("PATCH /agent/config", a.handlePatchConfig)
+	// 单个存储库的挂载偏好（形态 / 目录 / 启动后自动挂载），每库独立。
+	mux.HandleFunc("PUT /agent/repo-mounts/{repo_id}", a.handleSetRepoMountPref)
 
 	// 母盘内容下载（后台异步，见 docs/agent-api.md「磁盘内容下载」）。
 	mux.HandleFunc("POST /agent/disks/download", a.handleDiskDownload)
@@ -305,6 +307,37 @@ func (a *Agent) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg, err := a.cfg.Patch(patch)
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
+}
+
+// repoMountPrefRequest 是单个存储库挂载偏好的写入请求。
+type repoMountPrefRequest struct {
+	MountMode string `json:"mount_mode"`
+	MountDir  string `json:"mount_dir"`
+	AutoMount bool   `json:"auto_mount"`
+}
+
+// handleSetRepoMountPref 写入单个存储库的挂载偏好（每个库各自独立，互不影响）。
+func (a *Agent) handleSetRepoMountPref(w http.ResponseWriter, r *http.Request) {
+	repoID := strings.TrimSpace(r.PathValue("repo_id"))
+	if repoID == "" {
+		a.writeError(w, apperr.InvalidParam("repo_id"))
+		return
+	}
+	var in repoMountPrefRequest
+	if err := decodeJSON(r, &in); err != nil {
+		a.writeError(w, err)
+		return
+	}
+	cfg, err := a.cfg.SetRepoMountPref(repoID, RepoMountPref{
+		MountMode: in.MountMode,
+		MountDir:  in.MountDir,
+		AutoMount: in.AutoMount,
+	})
 	if err != nil {
 		a.writeError(w, err)
 		return

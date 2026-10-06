@@ -65,6 +65,25 @@ func (r *Router) handleLogout(w http.ResponseWriter, req *http.Request) {
 	r.writeNoContent(w)
 }
 
+// handleMe 返回调用者自己的用户信息（含配额与已用）。
+//
+// 为什么单独开一个接口：配额是**用户级**的（多库共享一份配额），而 /v1/users/{id}
+// 只对超管开放，普通用户此前没有任何途径看到"我还剩多少"——客户端界面只能显示
+// 每个库自己的容量，看不出配额是否快用完。
+func (r *Router) handleMe(w http.ResponseWriter, req *http.Request) {
+	p, err := r.principal(req)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	user, err := r.deps.App.Users().Get(req.Context(), p.UserID)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusOK, toUserDTO(user))
+}
+
 // enrollRequest 是客户端证书注册请求。
 type enrollRequest struct {
 	Token string `json:"token"`

@@ -352,10 +352,16 @@ func (s *DiskService) runCreateVHDX(ctx context.Context, j *domain.Job, rep job.
 // buildVHDXFromSource 是建盘核心流水线：创建动态盘 → 挂载 → 格式化 → 拷入目录 →
 // 校验 → 分离 → 回写状态（见 docs/implementation.md 5.2 / 5.10 步骤 ⑤）。
 //
-// 幂等：disk 已是 ready 且文件存在时直接返回。sourceDir 为空表示建空盘。
+// 幂等：disk 已是 ready/published 且文件存在时直接返回。sourceDir 为空表示建空盘。
 // 供 DiskService 的建盘任务与 UploadService 的完成任务复用。
 func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk, sourceDir string, rep job.Reporter) error {
-	if disk.State == domain.DiskStateReady && s.Disk != nil && s.Disk.Exists(disk.VHDXPath) {
+	// published 是 ready 的超集（盘建好且目标已下发，见 awaitBackingReady 的说明）：
+	// 独享盘在这里被预创建目标后就是 published，若只认 ready，任务重试会把整棵源目录
+	// 再拷一遍（拷入目标盘已经含有内容）。
+	if isDiskBuilt(disk.State) && s.Disk != nil && s.Disk.Exists(disk.VHDXPath) {
+		// 盘已建好，但预创建的目标可能在上一次尝试里没下发成功（下面的预创建只告警不失败）：
+		// 幂等补一次，任务重试到这里仍有第二次机会。
+		s.prePublishTarget(ctx, disk)
 		return nil
 	}
 	if s.Disk == nil || s.Vol == nil {
@@ -410,7 +416,47 @@ func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk
 	}
 	rep.Progress(100)
 	s.audit(ctx, "", "disk.create.done", "disk:"+disk.ID, disk.VHDXPath, domain.AuditResultOK)
+	s.prePublishTarget(ctx, disk)
 	return nil
+}
+
+// isDiskBuilt 判断磁盘是否已经建好（published 蕴含"已建好"，是 ready 的超集）。
+func isDiskBuilt(state domain.DiskState) bool {
+	return state == domain.DiskStateReady || state == domain.DiskStatePublished
+}
+
+// prePublishTarget 为"会直接交给用户"的盘提前建好并启用 iSCSI 目标（服务端"预先创建"）。
+//
+// 覆盖两条原先只能等用户挂载时现场下发的路径：
+//   - 独享库的 standalone 盘：建库时就有，用户拿到的就是它；
+//   - 非池化共享库的差异盘：分配时才派生（JobCreateDiff），派生完成即预建。
+//
+// 共享库的母盘（parent）刻意跳过：共享库交给用户的是差异盘，母盘只作为派生来源，
+// 提前发布它等于在平台上多开一条能读到基线数据的通路，没有必要。
+//
+// 失败只告警不返回错误：盘本身是好的，把建盘任务判失败会让一块完好的盘卡在重试链上；
+// 最坏结果是回到老行为 —— 用户挂载时服务端现场下发（多等十几秒）。
+func (s *DiskService) prePublishTarget(ctx context.Context, disk *domain.Disk) {
+	if disk == nil || disk.Kind == domain.DiskKindParent {
+		return
+	}
+	if s.IscsiSvc == nil {
+		return
+	}
+	repo, err := s.Store.GetRepository(ctx, disk.RepoID)
+	if err != nil {
+		if !isNotFound(err) {
+			s.Log.Warn("预创建 iSCSI 目标失败：读取存储库出错",
+				"disk_id", disk.ID, "repo_id", disk.RepoID, "error", err)
+		}
+		return
+	}
+	if err := s.IscsiSvc.EnsureDiskTarget(ctx, repo, disk); err != nil {
+		s.Log.Warn("预创建 iSCSI 目标失败，用户挂载时将现场下发",
+			"disk_id", disk.ID, "repo_id", repo.ID, "error", err)
+		return
+	}
+	s.Log.Info("已预先创建并启用 iSCSI 目标", "disk_id", disk.ID, "repo_id", repo.ID)
 }
 
 // runCreateDiff 从母盘派生差异盘。
@@ -433,7 +479,11 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 		}
 		return err
 	}
-	if disk.State == domain.DiskStateReady && s.Disk != nil && s.Disk.Exists(disk.VHDXPath) {
+	if isDiskBuilt(disk.State) && s.Disk != nil && s.Disk.Exists(disk.VHDXPath) {
+		// 盘已派生好（published 是 ready 的超集）：不重复派生，但补一次预创建 ——
+		// 预创建只告警不失败，上一次尝试可能就是"盘建成了、目标没下发成功"，
+		// 任务重试只能从这里进入，直接 return 会让预创建永远没有第二次机会。
+		s.prePublishTarget(ctx, disk)
 		return nil
 	}
 	if s.Disk == nil {
@@ -456,7 +506,13 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 		}
 		return err
 	}
-	return s.ensureDiffDisk(ctx, disk, parent, repo, rep)
+	if err := s.ensureDiffDisk(ctx, disk, parent, repo, rep); err != nil {
+		return err
+	}
+	// 派生完成立刻把 iSCSI 目标建好启用（服务端"预先创建"）：用户拿着这次分配点挂载
+	// 时，Publish 命中指纹即整段跳过，不必再等一次约 35 秒的现场下发。
+	s.prePublishTarget(ctx, disk)
+	return nil
 }
 
 // ensureDiffDisk 保证一块差异盘物理存在且状态为 ready（幂等）。

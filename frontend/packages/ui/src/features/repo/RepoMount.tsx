@@ -187,25 +187,41 @@ export interface RepoMountActionsProps {
 export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Element {
   const { t } = useI18n()
   const { mount, sessionLost, pending, busy, canMount, canUnmount, disabledReason } = controller
-  // 卸载只受"代理可用 + 有分配"约束，与库状态无关：库异常/建库中时仍要能摘掉本机的盘。
-  const mountDisabled = !canMount || pending
-  const unmountDisabled = !canUnmount || pending
+  // 挂载/卸载只受"代理可用 + 有分配"约束，与库状态无关：库异常/建库中时仍要能摘掉本机的盘。
+  // "操作进行中"（pending）由下面的 working 统一接管，这里不再重复判断。
+  const mountDisabled = !canMount
+  const unmountDisabled = !canUnmount
   // 记录在、但实测已无活动会话（会话被断/服务重启）：盘实际不在了，"卸载"是错的入口 ——
   // 用户点它只是把记录收掉，盘还是挂不上。此时给"挂载"：代理会先清理残留再真重连
   // （服务端/代理自己闭环），用户不必先卸载再挂载。
   const showMount = mount === undefined || sessionLost
+  // 操作进行中：本次请求在跑，或代理状态机已经是 mounting/unmounting。
+  const working = busy || pending
 
   return (
     // 卡片整卡可点进详情，按钮区的事件不得冒泡触发跳转。
     <span style={{ display: 'inline-flex', flexShrink: 0 }} onClick={(event) => event.stopPropagation()}>
-      {showMount ? (
+      {working ? (
+        // 进行中只留一个"置灰 + 转圈"的按钮，**不写文字**。
+        //
+        // 为什么不能沿用文字：挂载请求一发出，代理状态机立刻变成 mounting，showMount 翻假，
+        // 按钮会换成"卸载"（而且被 pending 一起置灰）—— 用户刚点完挂载就看见"卸载"，
+        // 只能理解为"点错了"或"系统反过来要求我卸载"。留空就不会说错。
+        // minWidth 与带文字的按钮对齐，避免操作前后布局跳动。
+        <Button
+          size="small"
+          loading
+          disabled
+          aria-label={t('common.loading')}
+          style={{ minWidth: 64 }}
+        />
+      ) : showMount ? (
         <Tooltip title={disabledReason}>
           <span style={{ display: 'inline-block' }}>
             <Button
               size="small"
               type="primary"
               disabled={mountDisabled}
-              loading={busy}
               onClick={() => void controller.mountRepo()}
             >
               {t('action.mount')}
@@ -213,7 +229,7 @@ export function RepoMountActions({ controller }: RepoMountActionsProps): JSX.Ele
           </span>
         </Tooltip>
       ) : (
-        <Button size="small" disabled={unmountDisabled} loading={busy} onClick={() => void controller.unmountRepo()}>
+        <Button size="small" disabled={unmountDisabled} onClick={() => void controller.unmountRepo()}>
           {t('action.unmount')}
         </Button>
       )}

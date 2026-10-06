@@ -13,7 +13,7 @@ export interface ListResponse<T> {
 export type Role = 'super_admin' | 'user'
 export type Permission = 'read' | 'mount' | 'manage'
 export type RepoMode = 'shared' | 'exclusive'
-export type RepoState = 'active' | 'sealing' | 'deleting' | 'error'
+export type RepoState = 'creating' | 'active' | 'sealing' | 'deleting' | 'error'
 export type ParentCondition = 'idle' | 'derived' | 'temp_shared' | 'maintenance'
 export type DiskKind = 'parent' | 'diff' | 'standalone'
 export type DiskState = 'creating' | 'ready' | 'published' | 'deleting' | 'error'
@@ -62,6 +62,20 @@ export interface IssuedCertificateDTO {
   not_after: number
 }
 
+/** 建库预创建的阶段：母盘 → 差异盘 → iSCSI 目标。 */
+export type RepoPreparePhase = 'parent' | 'diffs' | 'targets'
+
+/** 建库预创建进度快照（state=creating 期间存在）。 */
+export interface RepoPrepareDTO {
+  phase: RepoPreparePhase
+  /** 当前阶段内已完成的数量。 */
+  done: number
+  /** 当前阶段需要完成的总数。 */
+  total: number
+  /** 失败时是**错误码**（如 disk.create_failed），非空表示该库已进入 error。 */
+  error?: string
+}
+
 export interface RepoDTO {
   id: string
   name: string
@@ -70,6 +84,12 @@ export interface RepoDTO {
   parent_disk_id?: string
   parent_version: number
   parent_condition?: ParentCondition
+  /**
+   * 共享数量：建库时预创建了几个差异盘（池位），也就是最多能分给几个用户。
+   *
+   * 与 `max_diff_disks` 永远同值（后者是改名前的字段，见服务端 repoDTO 的说明）。
+   */
+  share_count: number
   max_diff_disks: number
   quota_bytes: number
   /** 库容量：建库时设定的容量（那块盘的 VHDX 标称容量），服务端读时派生。 */
@@ -78,6 +98,10 @@ export interface RepoDTO {
   state: RepoState
   group?: string
   client_config?: Record<string, unknown>
+  /** 是否为池化共享库：建库时已把差异盘池建好并发布，分配即用（挂载免等）。 */
+  pool: boolean
+  /** 建库进度：state=creating 时用于显示"正在派生差异盘 3/5"。 */
+  prepare?: RepoPrepareDTO
   created_at: number
   updated_at: number
 }

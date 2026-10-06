@@ -390,11 +390,28 @@ UploadState = {
 ```
 GET   /agent/config
   ↑ {auto_mount:bool, default_mount_mode, default_mount_dir, default_download_dir,
-     download_connections, language, start_at_login:bool, update_channel, server_alias}
+     download_connections, language, start_at_login:bool, update_channel, server_alias,
+     repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool}}}
 PATCH /agent/config
-  ↓ 上述字段的任意子集
+  ↓ 上述字段的任意子集（不含 repo_mounts）
+  ↑ {config:{...}}
+PUT   /agent/repo-mounts/{repo_id}
+  ↓ {mount_mode, mount_dir, auto_mount:bool}
   ↑ {config:{...}}
 ```
+
+`repo_mounts` 是**每个存储库各自独立**的挂载偏好（形态 / 目录 / 启动后自动挂载），
+没有条目的库跟随 `default_mount_mode`、`default_mount_dir` 与 `auto_mount` 的全局默认值；
+界面上的默认值是"填进去等用户确认"，不是隐式继承。
+
+- 写入必须用 `PUT /agent/repo-mounts/{repo_id}` 单库更新：`PATCH /agent/config` 不接受
+  `repo_mounts`（整表替换会让"两个窗口各改一个库"变成后写覆盖前写）。
+- `mount_mode` 为空串表示跟随 `default_mount_mode`；非法值返回
+  `system.invalid_param`（args.field=mount_mode），空 `repo_id` 返回 args.field=repo_id。
+- 语义与全局 `auto_mount` 的区别：全局开关只管"恢复本机上次留下的挂载记录"；
+  某库 `auto_mount=true` 时即使本机没有记录（甚至还没有分配）也会在会话就绪后自动挂载
+  （没有可用分配时由代理调用 `POST /v1/repos/{id}/allocations` 建一个），
+  `auto_mount=false` 时不恢复该库的记录。
 
 `default_download_dir` 是「母盘拷贝到本地」的默认目标目录，默认 `C:\Vault\Downloads`。
 取值必须是非空绝对路径；非法值返回 `system.invalid_param`（args.field=default_download_dir）。

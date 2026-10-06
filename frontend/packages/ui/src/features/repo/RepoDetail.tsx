@@ -18,6 +18,7 @@ import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../ut
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
 import { RepoMountActions, useRepoMount } from './RepoMount'
+import { RepoMountSettingsPanel } from './RepoMountSettings'
 
 export interface RepoDetailProps {
   repoId: string
@@ -64,6 +65,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const refresh = (): void => {
     void queryClient.invalidateQueries({ queryKey: ['repo', repoId] })
     void queryClient.invalidateQueries({ queryKey: ['repos'] })
+    // 容量变更（扩容/维护/母盘更新）会改用户级用量，列表页顶部的总账也要跟着变。
+    void queryClient.invalidateQueries({ queryKey: ['me'] })
   }
 
   const updateMutation = useMutation({
@@ -83,6 +86,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       // 这里**不能**再 refresh() 详情 —— 会立刻 refetch 一个已删除的库并闪出 404 错误。
       queryClient.removeQueries({ queryKey: ['repo', repoId] })
       void queryClient.invalidateQueries({ queryKey: ['repos'] })
+      // 删除会释放这块库占用的配额：列表页的顶部总账必须重新拉。
+      void queryClient.invalidateQueries({ queryKey: ['me'] })
       onBack()
     },
     onError: (err) => setError(err)
@@ -160,7 +165,20 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       {repoQuery.error ? <ErrorNotice error={repoQuery.error} /> : null}
 
       <Tabs
+        // 用户端默认落在「设置」：卡片「详情」进来看的就是"这个库在本机怎么挂"。
+        // 管理端没有挂载配置（配置存在本机），保持原来的「概览」默认。
+        defaultActiveKey={isSuperAdmin ? 'overview' : 'settings'}
         items={[
+          ...(isSuperAdmin
+            ? []
+            : [
+                {
+                  key: 'settings',
+                  label: t('repo.detail.settings'),
+                  // 库记录还没到（加载中/出错）时先占位：不能因为详情没回来就少一个默认 tab。
+                  children: repo ? <RepoMountSettingsPanel repo={repo} /> : <LoadingState />
+                }
+              ]),
           {
             key: 'overview',
             label: t('repo.detail.overview'),

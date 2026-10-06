@@ -105,6 +105,69 @@ func TestAutoLoginPatchRespectsExplicitChoice(t *testing.T) {
 	}
 }
 
+// TestRepoMountPrefIsIndependentPerRepo 每库挂载偏好各存各的：写入两个库后互不影响、
+// 能落盘、并且 Get() 返回的副本被改动不会污染 store 内部状态。
+func TestRepoMountPrefIsIndependentPerRepo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-config.json")
+	store, err := NewConfigStore(path, testLogger())
+	if err != nil {
+		t.Fatalf("加载配置失败：%v", err)
+	}
+	if _, err := store.SetRepoMountPref("repo-a", RepoMountPref{
+		MountMode: mountModeDirectory,
+		MountDir:  `D:\vault\a`,
+		AutoMount: true,
+	}); err != nil {
+		t.Fatalf("写入 repo-a 偏好失败：%v", err)
+	}
+	if _, err := store.SetRepoMountPref("repo-b", RepoMountPref{
+		MountMode: mountModeLetter,
+		AutoMount: false,
+	}); err != nil {
+		t.Fatalf("写入 repo-b 偏好失败：%v", err)
+	}
+
+	// 副本不可写穿：界面拿到配置后随手改一改，不能影响真正落盘的值。
+	cfg := store.Get()
+	cfg.RepoMounts["repo-a"] = RepoMountPref{AutoMount: false}
+	if got := store.Get().RepoMounts["repo-a"]; !got.AutoMount || got.MountMode != mountModeDirectory {
+		t.Fatalf("Get() 副本被外部改动污染了 store：%+v", got)
+	}
+
+	reloaded, err := NewConfigStore(path, testLogger())
+	if err != nil {
+		t.Fatalf("重新加载配置失败：%v", err)
+	}
+	got := reloaded.Get().RepoMounts
+	if len(got) != 2 {
+		t.Fatalf("应有两个库的偏好，实际 %d 个：%+v", len(got), got)
+	}
+	if a := got["repo-a"]; !a.AutoMount || a.MountMode != mountModeDirectory || a.MountDir != `D:\vault\a` {
+		t.Fatalf("repo-a 偏好未正确落盘：%+v", a)
+	}
+	if b := got["repo-b"]; b.AutoMount || b.MountMode != mountModeLetter {
+		t.Fatalf("repo-b 偏好未正确落盘：%+v", b)
+	}
+}
+
+// TestSetRepoMountPrefRejectsBadInput 非法形态/空库 ID 必须报错，且不落盘。
+func TestSetRepoMountPrefRejectsBadInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-config.json")
+	store, err := NewConfigStore(path, testLogger())
+	if err != nil {
+		t.Fatalf("加载配置失败：%v", err)
+	}
+	if _, err := store.SetRepoMountPref("repo-a", RepoMountPref{MountMode: "volume"}); err == nil {
+		t.Fatal("非法挂载形态应报错")
+	}
+	if _, err := store.SetRepoMountPref("   ", RepoMountPref{AutoMount: true}); err == nil {
+		t.Fatal("空库 ID 应报错")
+	}
+	if got := store.Get().RepoMounts; len(got) != 0 {
+		t.Fatalf("报错的写入不应落盘，实际：%+v", got)
+	}
+}
+
 // TestConfigMarshalKeepsAutoLoginBool 落盘/透出的 JSON 里 auto_login 必须是布尔值，
 // 不能因为内部用"指针 + 是否显式设置"表示默认值就变成 null 或消失（前端读的是布尔）。
 func TestConfigMarshalKeepsAutoLoginBool(t *testing.T) {

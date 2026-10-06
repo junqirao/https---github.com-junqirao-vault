@@ -206,6 +206,37 @@ function fetchHealth(
   })
 }
 
+/** /agent/state 里 mounts 数组中与"到底挂没挂上"有关的字段。 */
+export interface AgentMountRecord {
+  state?: string
+  session_active?: boolean
+  session_checked_at?: number
+}
+
+/**
+ * 统计**真正挂载中**的存储库数量。
+ *
+ * 不能拿记录条数当"挂载中"：状态文件里的记录会被有意保留（代理侧只在用户显式卸载时删），
+ * 于是下面这些残留都会被算成一个"还在挂着的库"：
+ *   - 卸载过但记录还在（用户看界面就是"未挂载"）；
+ *   - 挂载失败（state=error）或被服务端踢下线（state=revoked）；
+ *   - 记录写着 mounted，但实测本机已经没有活动会话（会话被断开、MSiSCSI 重启）。
+ * 真实反馈："每次关闭时都会展示仍有一个存储库处于挂载状态…其实并没有挂载"。
+ *
+ * 判据与界面完全一致（见 packages/ui 的 mountSessionLive）：只有 state=mounted，
+ * 且没有被实测判定为"会话已断"（session_checked_at 有值而 session_active 不为真）时才算。
+ * 尚未核对（session_checked_at 缺省）时按记录状态算 —— 不能把"没有证据"当成"断线"。
+ */
+export function countActiveMounts(mounts: AgentMountRecord[] | undefined): number {
+  if (!Array.isArray(mounts)) return 0
+  return mounts.filter((mount) => mount.state === 'mounted' && !sessionCheckedDead(mount)).length
+}
+
+/** 实测确认会话已断（区别于"尚未核对"）。 */
+function sessionCheckedDead(mount: AgentMountRecord): boolean {
+  return Boolean(mount.session_checked_at) && mount.session_active !== true
+}
+
 export class AgentManager {
   private child: ChildProcess | null = null
   private info: AgentInfo = { available: false, baseUrl: null, token: null, error: 'not_started' }
@@ -265,7 +296,7 @@ export class AgentManager {
     })
   }
 
-  /** 活跃挂载数量（代理不可用时返回 0）。 */
+  /** 活跃挂载数量：只数**真正挂着**的库（判据见 countActiveMounts），代理不可用时返回 0。 */
   async activeMountCount(): Promise<number> {
     const { available, baseUrl, token } = this.info
     if (!available || !baseUrl || !token) return 0
@@ -286,8 +317,8 @@ export class AgentManager {
           })
           response.on('end', () => {
             try {
-              const parsed = JSON.parse(body) as { mounts?: unknown }
-              resolve(Array.isArray(parsed.mounts) ? parsed.mounts.length : 0)
+              const parsed = JSON.parse(body) as { mounts?: AgentMountRecord[] }
+              resolve(countActiveMounts(parsed.mounts))
             } catch {
               resolve(0)
             }

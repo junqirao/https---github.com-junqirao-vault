@@ -200,6 +200,26 @@ export interface AgentHealth {
   }
 }
 
+/**
+ * 单个存储库自己的挂载偏好（GET /agent/config 的 repo_mounts，写用 PUT /agent/repo-mounts/{id}）。
+ *
+ * 为什么不放服务端：挂载形态与挂载目录是"这台机器"的事（盘符、D:\vault\xxx 这类本地路径
+ * 对别的机器没有意义），自动挂载也由本机代理执行。没有条目的库跟随上面的全局默认值。
+ */
+export interface AgentRepoMountPref {
+  /** letter | directory；空串表示跟随 default_mount_mode。 */
+  mount_mode?: AgentMountMode | ''
+  /** 目录模式的目标目录；空串表示跟随 default_mount_dir。 */
+  mount_dir?: string
+  /**
+   * 是否在该库所在客户端启动后自动挂载它（每个库独立）。
+   *
+   * 与全局 auto_mount 的区别：全局开关只管"恢复本机上次留下的挂载记录"，
+   * 这里是每库显式表态 —— 为 true 时本机没有记录也会挂上；为 false 时连记录都不恢复。
+   */
+  auto_mount: boolean
+}
+
 /** GET /agent/config 与 PATCH /agent/config。 */
 export interface AgentConfig {
   auto_mount: boolean
@@ -213,6 +233,8 @@ export interface AgentConfig {
   server_alias: string
   /** 是否用本地客户端证书免密登录（identity.json 存在时生效）。 */
   auto_login: boolean
+  /** 按存储库 ID 保存的挂载偏好；没有条目的库跟随上面的全局默认值（PATCH 不接受该字段）。 */
+  repo_mounts?: Record<string, AgentRepoMountPref>
 }
 
 /** GET /agent/identity 与 POST /agent/identity/install 的响应（永不含私钥与证书原文）。 */
