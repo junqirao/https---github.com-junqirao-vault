@@ -471,6 +471,29 @@ function createTrayIcon(): Electron.NativeImage {
   return nativeImage.createFromDataURL(`data:image/png;base64,${png}`)
 }
 
+/**
+ * 开源许可的官方在线地址。
+ *
+ * 为什么是外链：Chromium 及其第三方组件的许可清单（LICENSES.chromium.html）约 9 MB，
+ * 随包分发会显著增大客户端体积，而它几乎不会被打开。打包时改为外链分发（见
+ * scripts/after-pack.cjs）：包内只保留 Electron 的 MIT 许可全文 + 一份指向下列地址的
+ * THIRD-PARTY-NOTICES.txt，本入口负责让用户真的点得到。
+ *
+ * ⚠️ 若发布方自托管了完整清单（构建时用环境变量 VAULT_THIRD_PARTY_LICENSES_URL 指定），
+ * 请把该地址加到列表最前面，与 after-pack.cjs 的 NOTICE 保持一致。
+ */
+const LICENSE_URLS: readonly string[] = [
+  'https://github.com/electron/electron/blob/main/LICENSE',
+  'https://chromium.googlesource.com/chromium/src/+/refs/heads/main/LICENSE'
+]
+
+/** 用系统浏览器打开开源许可（外链，不在应用内导航）。 */
+function openLicensePages(): void {
+  for (const url of LICENSE_URLS) {
+    void shell.openExternal(url)
+  }
+}
+
 function createTray(): void {
   try {
     tray = new Tray(createTrayIcon())
@@ -478,6 +501,7 @@ function createTray(): void {
     tray.setContextMenu(
       Menu.buildFromTemplate([
         { label: '显示窗口', click: () => showWindow() },
+        { label: '开源许可', click: () => openLicensePages() },
         { type: 'separator' },
         {
           label: '退出',

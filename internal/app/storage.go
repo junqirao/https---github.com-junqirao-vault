@@ -131,6 +131,11 @@ type CreateStorageInput struct {
 	Mode string
 	// SizeBytes 分配容量（thin 必填，>0）；register_* 忽略。
 	SizeBytes int64
+	// PoolRef 存储池（"<vg>/<thin_pool>"，见 PoolService.ListPools）；仅 thin 使用。
+	//
+	// 一台机器可以有多个存储池，创建存储时"选择或新建"其中之一（可留空 = 后端默认池）。
+	// 该存储的底层卷与其下所有磁盘都会落在同一个池里。
+	PoolRef string
 	// FileSystem 存储卷文件系统（ext4 默认 / xfs）；仅 thin 使用。
 	FileSystem string
 	// Ref 已有 LV 引用（register_lv 必填，形如 /dev/mapper/<vg>-<lv>）。
@@ -247,8 +252,8 @@ func (s *StorageService) Create(ctx context.Context, in CreateStorageInput) (*St
 		return nil, err
 	}
 	s.audit(ctx, "", "storage.create", "storage:"+st.ID,
-		fmt.Sprintf("name=%s path=%s enabled=%t mode=%s size_bytes=%d",
-			st.Name, st.Path, st.Enabled, mode, in.SizeBytes), domain.AuditResultOK)
+		fmt.Sprintf("name=%s path=%s enabled=%t mode=%s size_bytes=%d pool_ref=%s",
+			st.Name, st.Path, st.Enabled, mode, in.SizeBytes, strings.TrimSpace(in.PoolRef)), domain.AuditResultOK)
 	return s.Get(ctx, st.ID)
 }
 
@@ -326,16 +331,22 @@ func (s *StorageService) setupStorageVolume(ctx context.Context, st *domain.Stor
 		if s.Disk == nil {
 			return apperr.PlatformUnsupported()
 		}
-		ref, err := s.Disk.DiskRef("", "storages/"+st.ID)
+		if in.SizeBytes <= 0 {
+			return apperr.InvalidParam("size_bytes")
+		}
+		// 存储池：用户选了就落在该池（引用要在该池的 VG 里生成），没选则用后端默认池。
+		poolRef, err := normalizePoolRef(in.PoolRef)
 		if err != nil {
 			return err
 		}
-		if in.SizeBytes <= 0 {
-			return apperr.InvalidParam("size_bytes")
+		ref, err := s.storageRefFor(poolRef, st.ID)
+		if err != nil {
+			return err
 		}
 		vol.Kind = domain.StorageVolumeKindThin
 		vol.Managed = true
 		vol.Ref = ref
+		vol.PoolRef = poolRef
 		vol.FileSystem = strings.TrimSpace(in.FileSystem) // 空 = ext4，由平台层归一化
 		vol.SizeBytes = in.SizeBytes
 		if err := s.Store.CreateStorageVolume(ctx, vol); err != nil {
@@ -343,6 +354,7 @@ func (s *StorageService) setupStorageVolume(ctx context.Context, st *domain.Stor
 		}
 		status, err := s.Deps.StorageVol.CreateStorageVolume(ctx, platform.StorageVolumeSpec{
 			Ref:        ref,
+			PoolRef:    poolRef,
 			SizeBytes:  in.SizeBytes,
 			FileSystem: vol.FileSystem,
 			MountPoint: st.Path,
@@ -385,6 +397,33 @@ func (s *StorageService) setupStorageVolume(ctx context.Context, st *domain.Stor
 	}
 }
 
+// storageRefFor 生成存储卷的设备引用。
+//
+// 用户选了存储池时，引用必须在该池的 VG 里生成（后端实现 PooledDiskBackend）；
+// 平台不支持"按池生成引用"（Windows）时退化为默认引用——此时池参数在平台层本来也被忽略。
+func (s *StorageService) storageRefFor(poolRef, storageID string) (string, error) {
+	rel := "storages/" + storageID
+	if poolRef != "" {
+		if pb, ok := s.Disk.(platform.PooledDiskBackend); ok {
+			return pb.DiskRefInPool(poolRef, rel)
+		}
+	}
+	return s.Disk.DiskRef("", rel)
+}
+
+// normalizePoolRef 校验并归一化存储池键（"<vg>/<thin_pool>"）；空串表示后端默认池。
+func normalizePoolRef(raw string) (string, error) {
+	key := strings.TrimSpace(raw)
+	if key == "" {
+		return "", nil
+	}
+	vg, pool, err := platform.SplitPoolKey(key)
+	if err != nil {
+		return "", apperr.InvalidParam("pool_ref")
+	}
+	return platform.PoolKey(vg, pool), nil
+}
+
 // markVolumeReady 回填平台层给出的实际口径并把卷标记为 ready。
 func (s *StorageService) markVolumeReady(ctx context.Context, vol *domain.StorageVolume, status *platform.StorageVolumeStatus) error {
 	if status == nil || !status.Mounted {
@@ -411,8 +450,19 @@ func (s *StorageService) markVolumeReady(ctx context.Context, vol *domain.Storag
 func (s *StorageService) rollbackCreate(ctx context.Context, st *domain.Storage, mode string) {
 	switch mode {
 	case StorageModeThin:
-		if s.Disk != nil {
-			if ref, err := s.Disk.DiskRef("", "storages/"+st.ID); err == nil {
+		if s.Disk != nil && s.Deps.StorageVol != nil {
+			// 优先用**已登记**的引用：用户可能选了非默认存储池，
+			// 重新按默认口径推导会得到另一个 VG 里的 LV，删错卷/漏删卷。
+			ref := ""
+			if vol, err := s.Store.GetStorageVolume(ctx, st.ID); err == nil && vol != nil {
+				ref = strings.TrimSpace(vol.Ref)
+			}
+			if ref == "" {
+				if r, err := s.storageRefFor("", st.ID); err == nil {
+					ref = r
+				}
+			}
+			if ref != "" {
 				if err := s.Deps.StorageVol.DeleteStorageVolume(ctx, ref); err != nil {
 					s.Log.Warn("回滚存储卷失败（可能留下无主 LV，请检查）",
 						"storage_id", st.ID, "ref", ref, "error", err)

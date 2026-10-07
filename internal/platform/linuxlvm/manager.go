@@ -7,7 +7,9 @@
 //   - 零 cgo：所有 LVM/dm 操作都通过 exec 调用官方 CLI；
 //   - 引用(ref) 形如 /dev/mapper/<vg>-<lv>，且 VG/LV 名不含 '-'，
 //     从而"第一个 '-' 即分隔符"，ref 可逆解析（见 lvNameRe 的说明）；
-//   - 单机共用一个 thin pool，磁盘之间的隔离靠应用层精算 + 本包的水位闸门。
+//   - 一台机器可以有**多个存储池**（多个 VG，各带一个 thin pool），
+//     磁盘的池由 ref 里的 VG 反查（resolvePool），存储卷的池由 pool_ref 显式指定；
+//     磁盘之间的隔离靠应用层精算 + 本包的水位闸门。
 package linuxlvm
 
 import (
@@ -45,7 +47,8 @@ type Options struct {
 	ThinPool string
 	// ChunkSize thin pool 的 chunk（如 "256K"）。
 	ChunkSize string
-	// MetadataSize thin pool 元数据大小（如 "4G"）。
+	// MetadataSize thin pool 元数据大小（如 "256M"）；留空表示按池容量自适应
+	// （见 poolMetaSizeFor：约 1/500，夹在 64 MiB ~ 4 GiB）。
 	MetadataSize string
 	// WatermarkPercent 应用层空间闸门阈值，默认 90。
 	WatermarkPercent float64
@@ -70,11 +73,13 @@ type Manager struct {
 	mu sync.Mutex
 }
 
-// 编译期断言：Manager 必须同时满足三个后端接口。
+// 编译期断言：Manager 必须同时满足四个后端接口（含多存储池目录与按池生成引用）。
 var (
-	_ platform.DiskBackend   = (*Manager)(nil)
-	_ platform.VolumeBackend = (*Manager)(nil)
-	_ platform.StorageAdmin  = (*Manager)(nil)
+	_ platform.DiskBackend      = (*Manager)(nil)
+	_ platform.VolumeBackend    = (*Manager)(nil)
+	_ platform.StorageAdmin     = (*Manager)(nil)
+	_ platform.PoolCatalog      = (*Manager)(nil)
+	_ platform.PooledDiskBackend = (*Manager)(nil)
 )
 
 // New 构造 Manager。
@@ -134,13 +139,16 @@ func (m *Manager) probeCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), probeTimeout)
 }
 
-// poolPath 返回 thin pool 的 "<vg>/<lv>" 形式路径，集中校验池名合法性。
-func (m *Manager) poolPath(vg string) (string, error) {
+// poolPath 把 (vg, pool) 拼成 lvm 的 "<vg>/<lv>" 形式，并集中校验两者名字合法性。
+//
+// 多存储池下池名不再是常量：调用方先按 VG 反查（resolvePool，见 poolcatalog.go），
+// 或直接来自用户选择的 pool_ref。
+func poolPath(vg, pool string) (string, error) {
 	if !lvNameRe.MatchString(vg) {
 		return "", apperr.InvalidParam("vg")
 	}
-	if !lvNameRe.MatchString(m.thinPool) {
+	if !lvNameRe.MatchString(pool) {
 		return "", apperr.InvalidParam("thin_pool")
 	}
-	return vg + "/" + m.thinPool, nil
+	return vg + "/" + pool, nil
 }

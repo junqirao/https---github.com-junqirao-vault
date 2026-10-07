@@ -272,9 +272,11 @@ func DescribeFields() []FieldDef {
 		},
 		{
 			Key: "platform.lvm.metadata_size", Section: "platform", Kind: KindString, path: []string{"Platform", "LVM", "MetadataSize"},
-			Desc:     "thin pool 元数据大小（建池时使用）。",
+			Desc: "thin pool 元数据大小（如 256M / 4G）。留空表示按池容量自适应（约 1/500，" +
+				"下限 64M、上限 4G）：元数据要从同一个卷组另划，pmspare 还会再占一份等大的，" +
+				"小盘上给大值会直接建不出池。",
 			Editable: true,
-			Default:  "4G",
+			Default:  "",
 		},
 		{
 			Key: "platform.lvm.autoextend_threshold", Section: "platform", Kind: KindInt, path: []string{"Platform", "LVM", "AutoextendThreshold"},

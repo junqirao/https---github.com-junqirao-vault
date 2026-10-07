@@ -1655,10 +1655,15 @@ lvconvert --type cache --cachepool <vg>/cachepool <vg>/<pool>_tdata
 ```
 GET  /v1/system/lvm                 # 只读现状：VG/pool 是否存在、容量、使用率、缓存统计与健康度
 GET  /v1/system/block-devices       # 枚举块设备（供缓存/数据盘选择器；含 reason 说明为何不可选）
+POST /v1/system/block-devices/release # 释放设备：清掉挂载/swap/签名/PV/映射，把盘清回可选（见 §5.15.9）
 POST /v1/system/lvm/initialize      # 幂等初始化：建 VG → 建 thin pool → 建/挂 cache pool
+GET  /v1/system/pools               # 多池目录：全部池 + 卷组 + 默认池（创建存储时"选择或新建"，见 §5.15.8）
+POST /v1/system/pools               # 新建一个池（与 lvm/initialize 同一动作，但响应返回**刚建的那个池**）
+POST /v1/system/pools/estimate      # 新建卷组前估算可建池容量（见 §5.15.8"容量口径"）
 ```
 
-三者**仅超级管理员**可访问；Windows 后端整体返回 `501 platform.unsupported`，前端据此隐藏入口。
+以上**仅超级管理员**可访问；Windows 后端整体返回 `501 platform.unsupported`（`GET /v1/system/pools`
+例外：返回空目录，前端据此整块隐藏池 UI），前端据此隐藏入口。
 
 **块设备可用性判定（真源在服务端）**
 
@@ -1690,7 +1695,7 @@ POST /v1/system/lvm/initialize      # 幂等初始化：建 VG → 建 thin pool
 - **`Enabled=false` ≠ 卸载**：停用只影响"新盘放置"，不影响卷是否挂载。
 - **挂载持久化不写 `/etc/fstab`、不生成 systemd unit**，完全由服务端负责（见 5.15.4）。
 
-#### 5.15.2 数据模型（schema v3：`storage_volumes`）
+#### 5.15.2 数据模型（schema v5：`storage_volumes`）
 
 ```
 storage_volumes (
@@ -1699,6 +1704,7 @@ storage_volumes (
   managed     -- true=系统创建，删除时可 lvremove；false=登记已有卷，绝不删除
   state       -- pending | ready
   ref         -- 设备引用，如 /dev/mapper/vg-lv；dir 模式为空
+  pool_ref    -- 存储池 "<vg>/<thin_pool>"（v5 新增）；空 = 后端默认池
   file_system -- ext4 | xfs
   size_bytes  -- 分配容量；dir 模式为 0
   created_at / updated_at
@@ -1708,6 +1714,7 @@ storage_volumes (
 - **无行 = 目录模式**（Windows / 历史存储），此时挂载点一律取 `storages.path`。
 - `state=pending` 标记"`lvcreate` 成功但 mkfs/mount/落库尚未走完"的中间态，崩溃后据此识别无主 LV。
 - `managed=false` 的卷**绝不能被 `lvremove`**；删除存储时只解除登记 + 卸载。
+- `pool_ref` 记录该存储落在哪个池（见 §5.15.8）；v5 之前的历史行留空，按"后端默认池"处理。
 
 #### 5.15.3 创建流程（`StorageService.Create`）
 
@@ -1773,7 +1780,151 @@ storage_volumes (
 > Windows 上若装配了非 nil 的 `StorageVol`，会让 `Mounted` 非 nil 且 `computed=false`，
 > 结果是**所有存储被 fail-closed 剔除、落盘彻底失效**——必须避免。
 
-#### 5.15.8 明确不在本轮范围
+#### 5.15.8 多存储池（`pool_ref`）
+
+一台机器可以有**多个存储池**：每个卷组（VG）带一个 thin pool，池键为 `<vg>/<thin_pool>`。
+创建存储时由管理员**选择或新建**其中之一，逻辑链是「选/建池 → 设定存储 → 由存储去设置存储库」。
+
+**为什么必须显式记录池**（而不是让后端推导）：磁盘引用 `ref = /dev/mapper/<vg>-<lv>`
+里**只有 VG、没有池名**，所以磁盘只能由 VG 反查池（`resolvePool`）。由此得到一条硬约束：
+
+> **一个卷组只允许一个 thin pool。** 否则"这块盘落在哪个池"失去唯一解。
+> `InitializePool` 对"同 VG 建第二个池"显式返回 409，同池重复初始化仍然幂等跳过。
+
+**放置规则**：存储卷与其下所有磁盘落在**同一个池**里（`storagePoolFor` 校验 `pool_ref` 的 VG
+与 `ref` 的 VG 一致，不允许跨池建卷）。
+
+**接口**：
+
+```
+GET  /v1/system/pools    多池目录：items[]（各池现状，默认池在最前）、
+                         volume_groups[]（现有卷组 + 各自已有的 thin pool）、
+                         default_vg / default_pool（前端预选用）
+POST /v1/system/pools    新建一个池（与 POST /v1/system/lvm/initialize 同一动作，幂等）
+                         body: {vg?, thin_pool?, hdd_devices[], size_bytes,
+                                chunk_size?, metadata_size?,
+                                cache_devices[], cache_chunk_size?, cache_policy?, cache_mode?}
+POST /v1/system/pools/estimate
+                         按"待建卷组的设备"估算能建多大的池（新建卷组这条路径专用）
+                         body: {hdd_devices[], metadata_size?} → {pool_max_bytes}
+```
+
+> `size_bytes` 必给：thin pool 是**固定容量**的 LV，`lvcreate --type thin-pool` 缺容量只会
+> 报 `No command with matching syntax recognised`（真机反馈，见 exit status 3）。
+> 留空（`0`）由后端退化为 `-l 100%FREE`（占满 VG 剩余空间）。
+>
+> **容量必须在 `lvcreate` 之前校验。** 请求超过卷组剩余空间时（真机反馈：填 1 TiB、
+> 卷组只剩 12 GiB），LVM 先打印 `insufficient free space (3070 extents): 262144 required`，
+> 紧接着问 `Do you really want to remove and DISCARD logical volume <vg>/lvol0_pmspare? [y/n]`——
+> 在一次**没有 tty 的服务调用**里做破坏性提问，默认取 n 后以 exit 5 失败，用户只看到一句英文；
+> 而一旦有人为了"别卡住"补上 `-y`，pmspare 卷就真被抹了。因此：
+>
+> - 后端按「剩余空间 − 元数据预留」校验，超限返回 `400 platform.pool_size_exceeded`
+>   （带 `free_bytes` / `requested_bytes`）。预留口径（`poolMetaReserveBytes`）按**两份**元数据算：
+>   `lvcreate --type thin-pool` 除了 <pool>_tmeta 还会建 VG 级的 <vg>_pmspare（备用元数据，大小与
+>   metadata 相同，用于元数据损坏时就地恢复），**两份都从同一个 VG 另划**——上面那句
+>   `DISCARD lvol0_pmspare` 说的就是它。只扣一份（曾经按 ×1.1）的话，用户照着"可用值"填仍会被
+>   LVM 顶回来，于是变成"前端说可用 11.6 GB、填进去却 insufficient free space"。
+>   显式 `metadata_size` 按它 ×2，再留 10% + 32 MiB 给 extent 对齐（VG 的 PE 默认 4 MiB，
+>   tdata / tmeta / pmspare 三个 LV 各自向上取整，元数据小的时候这点开销会超过比例余量）；
+> - 元数据大小**不设固定默认值**（`platform.lvm.metadata_size` 留空即自适应，见
+>   `poolMetaSizeFor`）：按池数据容量的 1/500 取，夹在 64 MiB ~ 4 GiB。
+>   16G 的盘 → 64M（正是被固定 4G 逼死的那种盘），4T 的池 → 4G（与老默认值一致）。
+>   建池时**总是显式传 `--poolmetadatasize`**：预留计算必须与实际占用一致，
+>   交给 LVM 自己挑的话它挑多大我们算不出来，就又回到"自动填好的值一提交就失败"；
+> - `pool_max_bytes` 随 `volume_groups[]` 一并下发（已有卷组）；新建卷组时卷组还不存在，
+>   由 `POST /v1/system/pools/estimate` 现算。两条路径共用同一个 `poolMaxBytesWith`——
+>   容量口径只有这一处权威计算，避免"前端放行、后端拒绝"的割裂；
+> - 读容量一律**显式取字节**（`vgs`/`lvs` 加 `--units b --nosuffix`）：LVM 默认报告是 `12.00g`
+>   这类带单位后缀的串，直接解析会失败并退化成 0——"读到了"被当成"0 字节可用"，前置校验就会
+>   把**任何**容量都判成超限（真机反馈：容量改小照样报超限）。读不出数值时一律按"读不到"处理
+>   （放行，交给 `lvcreate` 自己报错），不让 0 冒充真实空余。
+>
+> Windows 上 `GET /v1/system/pools` 返回**空目录**（而非 501）：前端据此整块隐藏池 UI。
+
+`POST /v1/storages` 的 `pool_ref?` 指定落到哪个池（留空 = 后端默认池）；
+`POST /v1/system/pools` 的响应是**刚建好的那个池**（含 `key`），前端拿它作为后续建存储的 `pool_ref`。
+
+**前端形态**：创建存储是**独立页面** `/admin/storages/new`（`StorageCreateForm`），不再是弹窗——
+内联建池要带块设备表格与卷组水位，弹窗既装不下也看不清；页面内的顺序为
+**选/建池 → 设定存储**，保存成功后 `replace` 跳回 `/admin/storages`。
+列表页（`StorageList`）只保留编辑/启停/挂载/卸载/扩容/移除记录。
+
+> 页面本身很长（新建卷组时还要在末尾选盘），所以两处版式按"用户在**最底部**点创建"来定：
+> **创建失败走弹窗**（`modal.error`）而不是页面内的错误横幅——横幅挂在页面顶部，
+> 用户点完创建时页面已经拉到底，报错完全看不见（真机反馈）；
+> **表单居中**（`maxWidth: 1040` + `margin: 0 auto`）——管理端内容区是铺满的，
+> 不居中就整块贴在左边缘、右侧空一大片（真机反馈）。
+
+**容量与设备的三条约束**（`StorageCreateForm` + `InitializePool`）：
+
+> - **池容量必须罩得住存储**：池容量就是这次要建的存储的可用上限，因此做**双向校验**——
+>   池容量字段要求 ≥ 存储容量，存储容量字段的 `max` 取池容量。用户刚填完就能看到
+>   "这块池装不下"，不必等到提交后才被拒；
+> - **池容量替用户自动填**（这是建池时唯一需要用户"算"的数字），且两种场景都取**后端算好的上限**：
+>   已有卷组用 `pool_max_bytes`（等于把该卷组剩余空间交给这个池）；新建卷组用
+>   `POST /v1/system/pools/estimate`（按所选磁盘总容量 − 元数据预留现算，并先留 1% 给卷组自身的
+>   metadata area 与 PE 对齐）。**前端不再自己推公式**：一度按"总容量 ÷ 1.01 − 1GB"估，
+>   真机上两块 8 GB 盘被自动填了 14 GB，提交却报"可用 11.6 GB"——那时后端只扣了一份元数据
+>   （4G × 1.1），而 `metadata_size` 又被默认值钉死在 4G：这块盘上 tmeta + pmspare 就要 8 GB，
+>   14 GB 的池压根建不出来。现在元数据随容量自适应、预留按两份算，同样的盘自动填约 15.8 GB。
+>   用户改元数据大小会重算（`queryKey` 带上它）：把元数据写大，可建容量随之变小；
+>   估算过程中框下显示"正在估算"，估算失败（设备被拔掉、路径变了）则提示刷新设备，
+>   而不是把一个说不清来历的数字留在输入框里。
+>   用户手改过就不再覆盖（`autoPoolSizeRef` 记住上次自动填进去的值），否则会"改完又被改回去"；
+> - **同一块盘不能既作容量盘又作缓存盘**：一块 PV 无法同时承载 thin pool 与 cache pool，
+>   真走到 LVM 只会得到一句看不懂的报错。前端两个选择器**互相禁用**并说明原因
+>   （`BlockDevicePicker` 的 `usedPaths` / `usedReason`；占用中的盘也不再提供"释放"），
+>   后端 `firstSharedPath` 在 `InitializePool` 里再拒一次
+>   （`400 platform.cache_device_overlap`，带 `device`），守住直连 API 这条路。
+
+#### 5.15.9 释放设备（把盘清回"可入卷组"状态）
+
+新建存储选盘时，只要盘上还留着**任何一层痕迹**（挂载点、swap、分区表/文件系统签名、PV 标签、
+md/dm 映射）就会被 `unavailableReason` 判为不可选。而这些盘往往只是"以前用过"，
+用户需要一条**明确的、逐步可见的**清理路径——于是有了 `POST /v1/system/block-devices/release`。
+
+**动作顺序**（破坏性由强到弱，与前端确认框文案一致）：
+
+```
+umount（含 umount -l 兜底）→ swapoff → wipefs -a（抹签名，含分区表）
+→ pvremove -f -y（移出卷组）→ 停用残留 md/dm 映射（mdadm --stop / dmsetup remove）
+→ partprobe → udevadm settle（重扫，让内核与上层看到干净的盘）
+```
+
+**设计要点**：
+
+| 点 | 说明 |
+| --- | --- |
+| 逐步回报 | 返回 `steps[]`（step / target / ok / skipped / detail）。释放本就允许"部分成功"，逐步结果比一句"释放失败"有用得多 |
+| 过程性失败不报错 | 只有入参非法、设备不存在、**系统盘**才返回 error；其余（设备忙、工具缺失）记进 `steps` |
+| 跳过 ≠ 失败 | 未挂载、未启用 swap、不是 PV、工具未安装都记为 `skipped`，避免刷出无意义的红叉 |
+| 不做无谓探测 | swapoff 以 `swapon --show=NAME` 的活动列表为准；pvremove 只对 `pvs` 里真实存在的 PV 执行 |
+| 系统盘双保险 | 前端不展示按钮，后端 `deviceCarriesSystemMount` 再拒一次 |
+| 完成判据 | 以**重新枚举后的 `reason` 为空**为准，而不是"我们认为清干净了"（`released` / `reason` 字段） |
+
+**接口**：
+
+```
+POST /v1/system/block-devices/release   body: { path: "/dev/sdb" }
+                                        → { path, released, reason?, steps[] }
+```
+
+> ⚠️ 破坏性：会抹掉盘上的文件系统与 LVM 标签。前端必须二次确认；
+> 设备选择器只在「新建存储」的设备选区内开放该按钮（`allowRelease`），系统设置页不提供释放。
+
+块设备管理的入口**不新增页面**：释放内联在新建存储页的设备选择区（`BlockDevicePicker`）。
+
+**版面上的两点取舍**（`BlockDevicePicker` + `DeviceRefreshButton`）：
+
+> - **不摆提示框**：原先每个选盘器上方都挂着一条"系统盘已自动排除，其余不可选设备的原因见状态列"，
+>   而"为什么不能选"本来就在状态列里逐盘写着——同一句话在一个页面里出现两遍（容量设备、缓存设备各一次），
+>   属于重复占版面，直接去掉；
+> - **刷新收进标题**：刷新从表格上方的一条空行改成标题右侧的图标按钮
+>   （「缓存设备 ⟳」，`DeviceRefreshButton` 由 `Form.Item` 的 `label` 承载）。
+>   "重新枚举设备"是低频动作，图标 + 悬停提示足够被发现，版面留给真正要看的磁盘列表。
+
+#### 5.15.10 明确不在本轮范围
 
 - Linux LV 级孤儿/对账扫描（沿用既有的文件级扫描）。
 - 每存储硬配额强制（thin LV 的 `-V` 只是名义容量，未做写满保护）。
@@ -1899,7 +2050,7 @@ GET    /v1/storages                       列表（任何登录用户可读，�
 POST   /v1/storages                       创建（仅 super_admin）
                                           body: {name, mount_point?, enabled?,
                                                  mode?(thin|register_dir|register_lv),
-                                                 size_bytes?, file_system?, ref?}
+                                                 size_bytes?, file_system?, ref?, pool_ref?}
 PATCH  /v1/storages/{id}                  改名 / 改挂载点 / 启停（仅 super_admin）
 DELETE /v1/storages/{id}                  仅 super_admin；拒绝有盘 / 进行中上传，
                                           仅删除系统创建的卷（managed=true），见 §5.15.5
@@ -1909,7 +2060,11 @@ POST   /v1/storages/{id}/resize           扩容（仅 super_admin；仅 kind=th
                                           body: {size_bytes}
 
 storage DTO 在基础字段之外增补：kind(thin|lv|dir，空=目录模式)、mounted(bool，目录模式恒 true)、
-ref(设备引用)、size_bytes(分配容量)。Windows 上 mount/unmount/resize 返回 501 platform.unsupported。
+ref(设备引用)、pool_ref(所属存储池 "<vg>/<thin_pool>"，空=后端默认池 / 目录模式)、size_bytes(分配容量)。
+Windows 上 mount/unmount/resize 返回 501 platform.unsupported。
+
+`pool_ref` 仅 `mode=thin` 使用：一台机器可以有**多个存储池**（每个卷组一个 thin pool），
+创建存储时"选择或新建"其一——该存储的底层卷与其下所有磁盘都会落在同一个池里（见 §5.15.8）。
 
 # 任务
 GET    /v1/jobs/{id}
@@ -3370,7 +3525,7 @@ design.md 新增的「多服务端」方向没问题，但原表述有 **3 处�
 | R21 | 为排障临时关闭版本检查（`client_compat.enabled: false`）后**忘记恢复**，导致不兼容的旧客户端长期接入 | 中 | 中 | 启动时对 `enabled: false` 打 WARN；管理页顶部常驻告警条；审计记录开启/关闭；可选：关闭超过 N 天后升级为 ERROR 并每日提醒 |
 | R22 | 客户端"枚举证书尝试登录"消耗失败计数，**把用户自己锁死**（撞防爆破 5 次/15min） | 中 | 中 | 客户端用 `(server_instance_id, user_id) → 证书` 本地映射直接定位，**禁止盲试**；确认类请求不计入失败计数（服务端侧加标记） |
 | R23 | 服务端 CA 被静默替换（重装/被攻陷），客户端未察觉而继续信任 → **MITM** | 低 | **极高** | 首次信任后锁定 CA 指纹（`trust.json`）；指纹变化 → **拒绝连接 + 高优告警 + 要求人工重新确认**，绝不自动接受 |
-| R24 | **thin pool 数据/元数据被写满** → 所有 thin LV 集体只读/损坏（thin 的经典故障） | 中 | **极高** | 启动/定期读 `data_percent`、`metadata_percent`；超过 `watermark_percent`（默认 90）**拒绝新建盘并告警**；元数据给足（`metadata_size` 默认 4G）；`autoextend` 仅作缓冲不作为主手段 |
+| R24 | **thin pool 数据/元数据被写满** → 所有 thin LV 集体只读/损坏（thin 的经典故障） | 中 | **极高** | 启动/定期读 `data_percent`、`metadata_percent`；超过 `watermark_percent`（默认 90）**拒绝新建盘并告警**；元数据给足（`metadata_size` 留空即按池容量自适应，1/500 夹在 64M~4G，见 §5.15.8；大池可显式配大）；`autoextend` 仅作缓冲不作为主手段 |
 | R25 | thin **快照**作为差异盘时，单盘物理增长无上限（写满池拖垮全部盘） | 中 | **极高** | 必须在**每盘**建/写前检查池水位（见 R24 的水位闸门）；配 `discard` 与定期回收；文档明确"共享库水位硬约束" |
 | R26 | `lvcreate -V` **漏写 `B` 单位** → 盘容量被当 MB 解析，实际为期望值的 1/1000 | 中 | **极高** | 所有尺寸统一以**字节字符串 + `B`** 生成（代码内不出现裸数字）；以 T20 实测兜底 |
 | R27 | 发布时 LV **未激活**（thin 默认 skip-activation）→ backstore 指向不存在的 dm 节点 | 中 | 高 | `linuxbackend` 在 `EnsureTarget`/`EnsureVirtualDisk`/`AttachLun` 前统一 `Activate`；以 T22 实测 |

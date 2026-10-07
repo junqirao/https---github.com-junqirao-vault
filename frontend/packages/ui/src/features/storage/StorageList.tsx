@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Collapse, Form, Input, InputNumber, Modal, Select, Space, Switch, Tag, Tooltip, Typography } from 'antd'
+import { Alert, Button, Form, Input, InputNumber, Modal, Space, Switch, Tag, Tooltip, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -9,26 +9,18 @@ import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { useApi } from '../../api/provider'
-import type { CreateStorageRequest, StorageDTO } from '../../api/types'
+import type { StorageDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
 import { formatBytes } from '../../utils/format'
 
 const BYTES_PER_GB = 1024 ** 3
 
-/** 创建模式（与后端 app.StorageMode* 一致）。 */
-type StorageMode = 'thin' | 'register_dir' | 'register_lv'
-
-interface StorageFormValues {
+/** 编辑表单值：只有这三个字段可改（挂载点对卷承载的存储是锁定项）。 */
+interface StorageEditValues {
   name: string
   enabled: boolean
-  mode: StorageMode
-  /** 分配容量，仅 thin 使用；表单以 GB 为单位。 */
-  sizeGB?: number
-  fileSystem?: string
   mountPoint?: string
-  /** 已有 LV 引用，仅 register_lv 使用。 */
-  ref?: string
 }
 
 /** 按卷去重后的容量汇总：同一卷上的多条存储只计一条容量。 */
@@ -44,12 +36,17 @@ function isVolumeBacked(storage: StorageDTO): boolean {
   return storage.kind === 'thin' || storage.kind === 'lv'
 }
 
-/** 存储管理（管理员）：列表 / 新建 / 编辑 / 启停 / 挂载 / 卸载 / 扩容 / 移除记录。 */
-export function StorageList(): JSX.Element {
+/**
+ * 存储管理（管理员）：列表 / 编辑 / 启停 / 挂载 / 卸载 / 扩容 / 移除记录。
+ *
+ * 创建不在本页：逻辑链是「选/建存储池 → 设定存储 → 存储库」，内联建池还要带块设备表格，
+ * 弹窗装不下也看不清，所以独立成创建页（StorageCreateForm），保存后跳回本页。
+ */
+export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const queryClient = useQueryClient()
-  const [form] = Form.useForm<StorageFormValues>()
+  const [form] = Form.useForm<StorageEditValues>()
   const [resizeForm] = Form.useForm<{ sizeGB: number }>()
   const [error, setError] = useState<unknown>(null)
   const [formOpen, setFormOpen] = useState(false)
@@ -58,64 +55,33 @@ export function StorageList(): JSX.Element {
   const [pendingUnmount, setPendingUnmount] = useState<StorageDTO | null>(null)
   const [resizeTarget, setResizeTarget] = useState<StorageDTO | null>(null)
 
-  // 能力探测：lvm=true 表示平台有"存储底层卷"（Linux），才展示 thin LV 相关的交互。
-  const infoQuery = useQuery({ queryKey: ['system-info'], queryFn: () => api.systemInfo() })
-  const supportsVolumes = Boolean(infoQuery.data?.capabilities.lvm)
-  // 能力未知前不渲染与平台强相关的表单项，避免先闪出 Windows 的挂载点输入框再跳成「高级」。
-  const platformKnown = infoQuery.isSuccess
-
   const storagesQuery = useQuery({ queryKey: ['storages', 'list'], queryFn: () => api.listStorages() })
   const storages = storagesQuery.data?.items ?? []
-
-  const formMode = Form.useWatch('mode', form) ?? 'thin'
-  // 池水位提示只在"新建 thin 卷"时需要；复用既有的 GET /v1/system/lvm（与系统设置页共享缓存）。
-  // 必须带上 supportsVolumes：Windows 上表单里残留的 thin 默认值不该触发 LVM 提示。
-  const creatingThin = supportsVolumes && formOpen && editing === null && formMode === 'thin'
-  const lvmQuery = useQuery({ queryKey: ['lvm-status'], queryFn: () => api.lvmStatus(), enabled: supportsVolumes && creatingThin })
 
   const invalidate = (): void => {
     void queryClient.invalidateQueries({ queryKey: ['storages'] })
   }
 
   useEffect(() => {
-    if (!formOpen) return
+    if (!formOpen || !editing) return
     setError(null)
-    if (editing) {
-      form.setFieldsValue({ name: editing.name, mountPoint: editing.path, enabled: editing.enabled })
-    } else {
-      form.resetFields()
-      form.setFieldsValue({ enabled: true, mode: 'thin', fileSystem: 'ext4' })
-    }
+    form.setFieldsValue({ name: editing.name, mountPoint: editing.path, enabled: editing.enabled })
   }, [editing, form, formOpen])
 
   const saveMutation = useMutation({
-    mutationFn: (values: StorageFormValues) => {
-      const mountPoint = (values.mountPoint ?? '').trim()
-      if (editing) {
-        const patch: { name: string; enabled: boolean; path?: string } = {
-          name: values.name,
-          enabled: values.enabled
-        }
-        // 绑定底层卷的存储其"挂载点即路径"，改路径会让卷与目录脱钩，后端会拒绝，这里直接不发。
-        if (mountPoint && mountPoint !== editing.path && !isVolumeBacked(editing)) {
-          patch.path = mountPoint
-        }
-        return api.updateStorage(editing.id, patch)
-      }
-      // Windows 没有底层卷：模式恒为登记目录（显式写死，避免把表单里的 thin 默认值发给后端拿 501）。
-      const mode: StorageMode = supportsVolumes ? values.mode : 'register_dir'
-      const body: CreateStorageRequest = {
+    mutationFn: async (values: StorageEditValues) => {
+      // 弹窗只在编辑态打开，editing 不该为空；用窄化而不是断言，避免类型逃逸。
+      if (!editing) throw new Error('storage not selected')
+      const patch: { name: string; enabled: boolean; path?: string } = {
         name: values.name,
-        enabled: values.enabled,
-        mode
+        enabled: values.enabled
       }
-      if (mountPoint) body.mount_point = mountPoint
-      if (mode === 'thin') {
-        body.size_bytes = Math.round((values.sizeGB ?? 0) * BYTES_PER_GB)
-        if (values.fileSystem) body.file_system = values.fileSystem
+      // 绑定底层卷的存储其"挂载点即路径"，改路径会让卷与目录脱钩，后端会拒绝，这里直接不发。
+      const mountPoint = (values.mountPoint ?? '').trim()
+      if (mountPoint && mountPoint !== editing.path && !isVolumeBacked(editing)) {
+        patch.path = mountPoint
       }
-      if (mode === 'register_lv') body.ref = (values.ref ?? '').trim()
-      return api.createStorage(body)
+      return api.updateStorage(editing.id, patch)
     },
     onSuccess: () => {
       setError(null)
@@ -339,13 +305,7 @@ export function StorageList(): JSX.Element {
       extra={
         <>
           <Button onClick={() => void storagesQuery.refetch()}>{t('common.refresh')}</Button>
-          <Button
-            type="primary"
-            onClick={() => {
-              setEditing(null)
-              setFormOpen(true)
-            }}
-          >
+          <Button type="primary" onClick={onCreate}>
             {t('storage.create')}
           </Button>
         </>
@@ -378,7 +338,7 @@ export function StorageList(): JSX.Element {
 
       <Modal
         open={formOpen}
-        title={t(editing ? 'storage.edit' : 'storage.create')}
+        title={t('storage.edit')}
         width={560}
         centered
         okText={t('common.save')}
@@ -395,106 +355,13 @@ export function StorageList(): JSX.Element {
         maskClosable={false}
       >
         {error ? <ErrorNotice error={error} /> : null}
-        {creatingThin ? (
-          <Alert
-            type={lvmQuery.data && !lvmQuery.data.exists ? 'warning' : 'info'}
-            showIcon
-            style={{ marginBottom: spacing.md }}
-            message={
-              lvmQuery.data && lvmQuery.data.exists
-                ? t('storage.poolHint', {
-                    free: formatBytes(lvmQuery.data.free_bytes),
-                    total: formatBytes(lvmQuery.data.size_bytes),
-                    percent: lvmQuery.data.data_percent.toFixed(1)
-                  })
-                : t('storage.poolMissing')
-            }
-          />
-        ) : null}
-        <Form form={form} layout="vertical" initialValues={{ enabled: true, mode: 'thin', fileSystem: 'ext4' }}>
+        <Form form={form} layout="vertical">
           <Form.Item name="name" label={t('field.name')} rules={[{ required: true }]}>
             <Input maxLength={64} />
           </Form.Item>
-
-          {!editing && platformKnown && !supportsVolumes ? (
-            // Windows：没有底层卷，存储就是本地目录，必须显式给出。
-            <Form.Item
-              name="mountPoint"
-              label={t('field.mountPoint')}
-              rules={[{ required: true, message: t('storage.mountPointRequired') }]}
-            >
-              <Input spellCheck={false} />
-            </Form.Item>
-          ) : null}
-
-          {!editing && supportsVolumes && formMode === 'thin' ? (
-            <>
-              <Form.Item
-                name="sizeGB"
-                label={t('storage.sizeGb')}
-                rules={[{ required: true, message: t('storage.sizeGbRequired') }]}
-              >
-                <InputNumber min={0.1} precision={2} style={{ width: '100%' }} addonAfter="GB" />
-              </Form.Item>
-              <Form.Item name="fileSystem" label={t('system.cap.fileSystem')}>
-                <Select
-                  options={[
-                    { value: 'ext4', label: 'ext4' },
-                    { value: 'xfs', label: 'xfs' }
-                  ]}
-                />
-              </Form.Item>
-            </>
-          ) : null}
-
-          {!editing && supportsVolumes && formMode === 'register_lv' ? (
-            <Form.Item
-              name="ref"
-              label={t('storage.ref')}
-              rules={[{ required: true, message: t('storage.refRequired') }]}
-              extra={t('storage.refHint')}
-            >
-              <Input spellCheck={false} placeholder="/dev/mapper/vg-lv" />
-            </Form.Item>
-          ) : null}
-
           <Form.Item name="enabled" label={t('common.status')} valuePropName="checked">
             <Switch checkedChildren={t('common.enabled')} unCheckedChildren={t('common.disabled')} />
           </Form.Item>
-
-          {!editing && supportsVolumes ? (
-            <Collapse
-              ghost
-              items={[
-                {
-                  key: 'advanced',
-                  label: t('storage.advanced'),
-                  children: (
-                    <>
-                      <Form.Item name="mode" label={t('field.mode')}>
-                        <Select<StorageMode>
-                          options={[
-                            { value: 'thin', label: t('storage.mode.thin') },
-                            { value: 'register_dir', label: t('storage.mode.registerDir') },
-                            { value: 'register_lv', label: t('storage.mode.registerLv') }
-                          ]}
-                        />
-                      </Form.Item>
-                      <Form.Item
-                        name="mountPoint"
-                        label={t('field.mountPoint')}
-                        extra={formMode === 'register_dir' ? t('storage.mountPointRequired') : t('storage.mountPointAuto')}
-                        rules={[{ required: formMode === 'register_dir', message: t('storage.mountPointRequired') }]}
-                      >
-                        <Input spellCheck={false} placeholder={t('storage.mountPointPlaceholder')} />
-                      </Form.Item>
-                    </>
-                  )
-                }
-              ]}
-            />
-          ) : null}
-
           {editing ? (
             <Form.Item
               name="mountPoint"

@@ -14,8 +14,11 @@ import type {
   CreateStorageRequest,
   CreateUserRequest,
   CreateUserResponse,
+  DeviceReleaseReportDTO,
   DiskDTO,
   EnrollmentTokenResponse,
+  EstimatePoolSizeRequest,
+  EstimatePoolSizeResponse,
   FsBrowseResult,
   FsRoot,
   FsStat,
@@ -31,6 +34,7 @@ import type {
   LoginResponse,
   LvmPoolStatusDTO,
   MemberDTO,
+  PoolCatalogDTO,
   MountSpec,
   OrphanDeleteResultDTO,
   OrphanScanDTO,
@@ -151,8 +155,37 @@ export class VaultApi extends ApiClient {
     return this.request<LvmPoolStatusDTO>('GET', '/v1/system/lvm')
   }
 
+  /** 列出**全部**存储池与卷组（多存储池：创建存储时"选择或新建"用）。 */
+  listPools(): Promise<PoolCatalogDTO> {
+    return this.request<PoolCatalogDTO>('GET', '/v1/system/pools')
+  }
+
   listBlockDevices(): Promise<ListResponse<BlockDeviceDTO>> {
     return this.request<ListResponse<BlockDeviceDTO>>('GET', '/v1/system/block-devices')
+  }
+
+  /**
+   * 释放一块设备（卸载 → 关 swap → 抹签名 → 移出卷组 → 停 md/dm → 重扫）。
+   *
+   * 破坏性操作：调用前必须由用户显式确认。返回逐步结果，已完成的步骤不会回滚。
+   */
+  releaseBlockDevice(path: string): Promise<DeviceReleaseReportDTO> {
+    return this.request<DeviceReleaseReportDTO>('POST', '/v1/system/block-devices/release', { path })
+  }
+
+  /** 新建一个存储池（幂等：同名池已存在时跳过）。 */
+  createPool(body: InitializePoolRequest): Promise<LvmPoolStatusDTO> {
+    return this.request<LvmPoolStatusDTO>('POST', '/v1/system/pools', body)
+  }
+
+  /**
+   * 估算"用这些设备新建卷组后能建多大的 thin pool"。
+   *
+   * 只用于"新建卷组"这条路径：卷组还不存在，目录里没有 pool_max_bytes 可用，
+   * 而容量口径必须与建池时的校验一致（否则自动填入的值一提交就超限）。
+   */
+  estimatePoolSize(body: EstimatePoolSizeRequest): Promise<EstimatePoolSizeResponse> {
+    return this.request<EstimatePoolSizeResponse>('POST', '/v1/system/pools/estimate', body)
   }
 
   initializePool(body: InitializePoolRequest): Promise<LvmPoolStatusDTO> {

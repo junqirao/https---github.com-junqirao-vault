@@ -115,7 +115,17 @@ func (r *Router) routes() {
 		// 仅超级管理员；Windows 后端返回 501 platform.unsupported，前端据此隐藏入口。
 		g.With(r.requireSuperAdminMW).Get("/v1/system/lvm", r.handleLvmStatus)
 		g.With(r.requireSuperAdminMW).Get("/v1/system/block-devices", r.handleListBlockDevices)
+		// 释放设备：卸载/关 swap/抹签名/移出卷组，把"用过又不再需要"的盘清回可选状态。
+		// 破坏性操作，前端必须二次确认（仅超级管理员）。
+		g.With(r.requireSuperAdminMW).Post("/v1/system/block-devices/release", r.handleReleaseBlockDevice)
 		g.With(r.requireSuperAdminMW).Post("/v1/system/lvm/initialize", r.handleInitializePool)
+		// 多存储池："列出全部池 + 卷组"（创建存储时要"选择或新建池"）、"新建一个池"。
+		// initialize 与 POST /pools 是同一个动作（前者保留兼容），区别只是语义更明确的入口。
+		g.With(r.requireSuperAdminMW).Get("/v1/system/pools", r.handleListPools)
+		g.With(r.requireSuperAdminMW).Post("/v1/system/pools", r.handleInitializePool)
+		// 新建卷组前估算可建池容量：此刻卷组还不存在，前端拿不到 pool_max_bytes，
+		// 而容量口径必须与建池时的校验一致，否则"自动填好的容量"一提交就超限。
+		g.With(r.requireSuperAdminMW).Post("/v1/system/pools/estimate", r.handleEstimatePoolSize)
 
 		// 用户与证书（管理员）
 		g.With(r.requireSuperAdminMW).Get("/v1/users", r.handleListUsers)

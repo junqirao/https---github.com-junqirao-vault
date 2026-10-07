@@ -10,6 +10,40 @@ files:
   - dist/**/*
   - dist-electron/**/*
   - package.json
+  # 排除 node_modules。
+  #
+  # 为什么可以排除：渲染层依赖（react / antd / dayjs …）已经被 vite 打包进 dist/assets 的
+  # 单个 js 里，主进程只 require electron 与 node 内置模块（见 dist-electron/*.js），
+  # 所以运行时不需要任何 npm 包。而 electron-builder 默认会把 package.json 的
+  # dependencies 原样复制进 app.asar —— 对我们这种"前端全打包"的 Electron 应用来说，
+  # 那是整整 76 MB 的死重量（app.asar 会从约 2 MB 涨到约 79 MB）。
+  # 若将来主进程真的要 require 某个包，把对应依赖移回 package.json 的 dependencies 并去掉
+  # 这一行排除即可。
+  - '!node_modules/**/*'
+  # 注意：@vault/ui 这类 workspace 链接包**不受**上面这条规则约束（electron-builder 对它有
+  # 单独的"复制链接包"路径，实测加 '!node_modules/@vault/**/*' 也拦不住，app.asar 里仍会多出
+  # 约 0.7 MB 的 .tsx/.json 源码）。所以包的 package.json 里 dependencies 是空的：渲染层依赖
+  # 一律放 devDependencies —— electron-builder 只复制 dependencies，devDependencies 一概不进包。
+
+# 只保留界面真正支持的语言包（locales/*.pak）。
+#
+# 为什么：Electron 运行时自带 55 个语言的 .pak，合计约 39 MB，而客户端界面只提供
+# 简体中文 / English / 日本語 / 한국어（真源是 @vault/ui 的 LANGUAGES）。语言包只影响
+# Chromium 自带的原生 UI（右键菜单、原生对话框按钮等），界面文案由 @vault/ui 的 i18n 提供，
+# 所以删掉其余语言不会让界面缺字，只是让"系统语言不在白名单"的机器上原生控件回退英文。
+#
+# 名称必须与 locales/ 下的文件名一致（去掉 .pak）且用 Electron 的 locale 代码
+# （ja / ko 没有地区后缀）。写错的后果是"该语言被杀掉"，不会报错——改这里请顺手核对一遍
+# LANGUAGES。
+electronLanguages:
+  - en-US
+  - zh-CN
+  - ja
+  - ko
+
+# 打包收尾：许可文件外链化（删掉约 9 MB 的 LICENSES.chromium.html，换成给出官方
+# 在线地址的小 NOTICE 文件）。详见 scripts/after-pack.cjs 里的合规说明。
+afterPack: ./scripts/after-pack.cjs
 
 # 把 Vault-Agent.exe 放进安装目录根（即 Vault.exe 同级）。
 # 客户端主进程启动时会在"主程序同目录"查找该代理，找不到则进入降级模式

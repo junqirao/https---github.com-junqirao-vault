@@ -825,6 +825,16 @@ _client_app_dir: Path | None = None
 
 REQUIRED_APP_FILES = ("Vault.exe", "resources/app.asar", "icudtl.dat")
 
+# 程序目录里的最小文件数。
+#
+# 这个阈值只用来识破"清空旧目录半途失败留下的空壳"，不需要贴近真实数量，但**必须明显小于
+# 精简后的真实数量**：locales 只保留 4 种语言（见 electron-builder.yml 的 electronLanguages）
+# 并做许可外链化（见 scripts/after-pack.cjs）之后，整个目录只剩 22 个文件，
+# 沿用精简前的 40 会把正常产物误判成残缺，直接导致构建拒绝产出客户端包。
+# 取 15 而不是 22：留出继续精简（例如删掉 vk_swiftshader 那几个文件）的余量；
+# 空壳本身已由 REQUIRED_APP_FILES 挡住，这个数字只是第二道防线。
+MIN_APP_FILES = 15
+
 
 def is_complete_app_dir(app_dir: Path | None) -> bool:
     """判断目录是否是**完整可运行**的客户端程序目录。
@@ -841,7 +851,60 @@ def is_complete_app_dir(app_dir: Path | None) -> bool:
             return False
     if not list((app_dir / "locales").glob("*.pak")):
         return False
-    return sum(1 for _ in app_dir.rglob("*") if _.is_file()) >= 40
+    return sum(1 for _ in app_dir.rglob("*") if _.is_file()) >= MIN_APP_FILES
+
+
+# 精简后的客户端程序目录应有的形态（由 electron-builder.yml 的 electronLanguages 与
+# scripts/after-pack.cjs 决定，改那两处时这里要跟着改）。
+SLIM_LOCALES = ("en-US.pak", "zh-CN.pak", "ja.pak", "ko.pak")
+CHROMIUM_LICENSES_NAME = "LICENSES.chromium.html"
+# app.asar 的体积上限（仅用于告警）。
+#
+# 正常约 2.5 MB（vite 打包后的 dist + 主进程 dist-electron + package.json）。
+# 一旦明显超过这个数，几乎只可能是一件事：electron-builder 又把 package.json 的
+# dependencies 复制进来了（那会让它涨到约 79 MB）。判据见 electron-builder.yml
+# files 里的 `!node_modules/**/*`。
+ASAR_SIZE_WARN_BYTES = 10 * 1024 * 1024
+
+
+def _client_app_slim_issues(app_dir: Path | None) -> list[str]:
+    """返回"体积没精简到位"的问题清单（空列表 = 已精简）。
+
+    为什么需要它：精简由"打包配置 + afterPack 钩子"两个隐式环节实现，任何一环失效（有人手工
+    跑 electron-builder 时覆盖了 --config、Electron 换了语言包命名、钩子抛错被忽略…）都只会
+    体现为"包大了约 46 MB"——不报错、不影响运行，因而极易被忽略。所以这里把判断结果交给调用方：
+    打包前据此决定"要不要重新打包"（见 package_client），打完包再打印一遍（见 check_client_app_slim）。
+    """
+    if app_dir is None or not app_dir.is_dir():
+        return []
+    issues: list[str] = []
+    locales_dir = app_dir / "locales"
+    extra = [p for p in sorted(locales_dir.glob("*.pak")) if p.name not in SLIM_LOCALES]
+    if extra:
+        size = sum(p.stat().st_size for p in extra)
+        issues.append(f"多出 {len(extra)} 个语言包（约 {size / 1048576:.1f} MB）")
+    licenses = app_dir / CHROMIUM_LICENSES_NAME
+    if licenses.is_file():
+        issues.append(f"仍随包携带 {CHROMIUM_LICENSES_NAME}"
+                      f"（约 {licenses.stat().st_size / 1048576:.1f} MB）")
+    asar = app_dir / "resources" / "app.asar"
+    if asar.is_file() and asar.stat().st_size > ASAR_SIZE_WARN_BYTES:
+        issues.append(f"resources/app.asar 达 {asar.stat().st_size / 1048576:.1f} MB"
+                      "（正常约 2.5 MB，疑似把 node_modules 打进了包）")
+    return issues
+
+
+def check_client_app_slim(app_dir: Path | None) -> None:
+    """体检客户端程序目录是否**真的**做了体积精简（只告警，绝不阻断打包）。"""
+    for issue in _client_app_slim_issues(app_dir):
+        warn(f"客户端体积未精简到位：{issue}"
+             "（见 electron-builder.yml 的 electronLanguages / afterPack）")
+    if app_dir is None or not app_dir.is_dir():
+        return
+    missing = [name for name in SLIM_LOCALES
+               if not (app_dir / "locales" / name).is_file()]
+    if missing:
+        warn(f"客户端缺少语言包：{'、'.join(missing)}（Chromium 原生控件文案会回退英文）")
 
 
 def _app_dir_built_at(app_dir: Path | None) -> float:
@@ -1963,11 +2026,20 @@ def package_client(version: str, args=None) -> Path | None:
     # 客户端 = electron-builder 产出的**可运行程序目录**整体打包。
     # 不做安装包：解压后双击 Vault.exe 即打开界面，无需安装步骤。
     app_dir = find_client_app_dir()
-    if _client_app_stale(app_dir):
-        # ⚠️ 渲染层已经是新的，但 electron-builder 没重跑 → 目录里是**旧界面**。
-        # 直接打包的后果：用户拿到新版本包，界面却丝毫未变（"改了前端毫无变化"）。
-        warn(f"客户端程序目录（{app_dir.relative_to(ROOT)}）早于当前渲染层产物，"
-             "里面是旧界面，重新打包客户端")
+    stale = _client_app_stale(app_dir)
+    slim_issues = _client_app_slim_issues(app_dir)
+    if stale or slim_issues:
+        # 两种"目录不能直接对外"的情况，都必须重新打包：
+        #   1. 渲染层已经是新的，但 electron-builder 没重跑 → 目录里是**旧界面**。
+        #      直接打包的后果：用户拿到新版本包，界面却丝毫未变（"改了前端毫无变化"）。
+        #   2. 目录是**精简之前**留下的产物（例如本次改动之前打的包）：白白多出约 46 MB
+        #      （51 个多余语言包 + 9 MB 许可清单）。它不影响运行、不会报错，所以没人会发现，
+        #      只能在这里主动识别并重打。
+        if stale:
+            warn(f"客户端程序目录（{app_dir.relative_to(ROOT)}）早于当前渲染层产物，"
+                 "里面是旧界面，重新打包客户端")
+        for issue in slim_issues:
+            warn(f"客户端程序目录（{app_dir.relative_to(ROOT)}）{issue}，重新打包客户端")
         if args is not None:
             app_dir = build_client_app(args) or app_dir
     if not is_complete_app_dir(app_dir):
@@ -1993,6 +2065,8 @@ def package_client(version: str, args=None) -> Path | None:
         return None
     info(f"客户端程序目录：{app_dir.relative_to(ROOT)}"
          f"（界面构建于 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_app_dir_built_at(app_dir)))}）")
+    # 体积精简是否真的生效，只能在这里看出来（多出的体积不会报错，只会让包变大）。
+    check_client_app_slim(app_dir)
     shutil.copytree(app_dir, pkg_dir, dirs_exist_ok=True)
     # 目录里应已有 Vault-Agent.exe（由 electron-builder.yml 的 extraFiles 放入）；
     # 若缺失（例如复用了旧的产物目录），补一份，保证客户端能找到代理。
@@ -2038,6 +2112,11 @@ def package_client(version: str, args=None) -> Path | None:
         "  Vault-Agent.exe     本地代理：iSCSI 连接、磁盘挂载、租约心跳、自更新",
         "  其余 dll / locales / resources   Electron 运行时，请勿删除",
         "",
+        "  说明：locales 目录只保留界面支持的 4 种语言（简体中文 / English / 日本語 /",
+        "  韓国語）——这是刻意的精简，删掉其余语言包不影响界面文案（界面文字由程序自带，",
+        "  与 locales 无关），只是让系统语言不在这 4 种之内的机器上、Chromium 原生控件",
+        "  文案回退英文。请勿再手工删减目录里的其他文件。",
+        "",
         "-" * 60,
         "三、首次连接服务端",
         "-" * 60,
@@ -2060,6 +2139,14 @@ def package_client(version: str, args=None) -> Path | None:
         "  · 客户端会向服务端检查更新；更新包由发布方签名，客户端内置公钥验签",
         "  · 有活跃挂载时会拒绝更新（返回 agent.busy_mounts），需先卸载",
         "  · 更新失败连续 3 次会自动回滚到上一版本",
+        "",
+        "-" * 60,
+        "六、开源许可",
+        "-" * 60,
+        "  · Electron 许可（MIT）全文随包提供：LICENSE.electron.txt",
+        "  · Chromium 及其第三方组件的完整许可清单约 9 MB，为控制分发包体积未随包分发；",
+        "     获取方式与在线地址见同目录的 THIRD-PARTY-NOTICES.txt，",
+        "     也可以从客户端托盘右键菜单的「开源许可」直接打开。",
         "",
     ]
     _write_text(pkg_dir / "使用说明.txt", "\n".join(lines))

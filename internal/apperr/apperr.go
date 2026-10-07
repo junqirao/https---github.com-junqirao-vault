@@ -182,6 +182,28 @@ func PlatformUnsupported() *Error {
 	return New("platform.unsupported", http.StatusNotImplemented)
 }
 
+// PoolSizeExceeded 申请的池容量超过卷组当前可用空间。
+//
+// 必须在调用 lvcreate **之前**拦住：容量超限时 LVM 不但会失败，还会抛出
+// "Do you really want to remove and DISCARD logical volume <vg>/lvol0_pmspare?" 这种
+// 会破坏数据的交互式提问（真实反馈：真机上就是这么失败的）。服务进程没有 tty，
+// 提问默认取 n、命令以 exit 5 收场，用户只看到一句无从下手的英文；
+// 而一旦有人在命令里补上 -y，pmspare 卷就真被抹了。
+func PoolSizeExceeded(freeBytes, requestedBytes int64) *Error {
+	return New("platform.pool_size_exceeded", http.StatusBadRequest).
+		WithArg("free_bytes", freeBytes).
+		WithArg("requested_bytes", requestedBytes)
+}
+
+// CacheDeviceOverlap 同一块设备被同时指定为"容量盘"与"缓存盘"。
+//
+// 两者最终都要落进同一个卷组：一块 PV 不可能既承载 thin pool 又承载 cache pool。
+// 真走到 LVM 只会得到一句看不懂的报错（甚至可能把已经建好的池搅乱），
+// 因此在校验阶段就拒绝。前端已把两者做成互斥勾选，这里兜住直连 API 的情况。
+func CacheDeviceOverlap(device string) *Error {
+	return New("platform.cache_device_overlap", http.StatusBadRequest).WithArg("device", device)
+}
+
 // ---- repo ----
 
 func RepoNotFound() *Error  { return New("repo.not_found", http.StatusNotFound) }

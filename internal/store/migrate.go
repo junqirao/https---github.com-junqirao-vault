@@ -16,8 +16,11 @@ import (
 //	3 → 新增 storage_volumes 表（存储的底层卷登记，见 docs/implementation.md 5.1）；
 //	4 → iscsi_targets 新增"已下发记账"三列（applied_fingerprint / applied_at / actual_iqn）：
 //	    让"目标是否已按当前期望状态下发到平台"成为**可跨重启**的判据，
-//	    挂载路径不必每次重跑 PowerShell 下发（见 docs/implementation.md 5.3）。
-const currentSchemaVersion = 4
+//	    挂载路径不必每次重跑 PowerShell 下发（见 docs/implementation.md 5.3）；
+//	5 → storage_volumes 新增 pool_ref：记录存储落在哪个**存储池**（"<vg>/<thin_pool>"）。
+//	    一台机器可以有多个存储池，创建存储时用户选择或新建
+//	    （见 docs/implementation.md 5.14 Linux（LVM thin + LIO）/ 5.15 Linux 存储）。
+const currentSchemaVersion = 5
 
 // Migrate 建表并记录 schema 版本。
 //
@@ -102,6 +105,9 @@ func addColumns(ctx context.Context, q queryer, dialect Dialect) error {
 		{"iscsi_targets", "actual_iqn",
 			`ALTER TABLE iscsi_targets ADD COLUMN actual_iqn TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE iscsi_targets ADD COLUMN actual_iqn VARCHAR(255) NOT NULL DEFAULT ''`},
+		{"storage_volumes", "pool_ref",
+			`ALTER TABLE storage_volumes ADD COLUMN pool_ref TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE storage_volumes ADD COLUMN pool_ref VARCHAR(160) NOT NULL DEFAULT ''`},
 	}
 	for _, c := range columns {
 		exists, err := columnExists(ctx, q, dialect, c.table, c.column)

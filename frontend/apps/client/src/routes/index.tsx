@@ -13,6 +13,7 @@ import {
   RepoCreateForm,
   RepoDetail,
   RepoList,
+  StorageCreateForm,
   StorageList,
   SystemSettings,
   UserList,
@@ -168,7 +169,18 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
           }
         />
         <Route path="leases" element={<LeaseList canRevoke />} />
-        <Route path="storages" element={<StorageList />} />
+        <Route path="storages" element={<StorageList onCreate={() => navigate('/admin/storages/new')} />} />
+        <Route
+          path="storages/new"
+          element={
+            <StorageCreateForm
+              // 建存储成功即离开新建页：用 replace 顶掉新建页，
+              // 否则以后在别处按浏览器后退会回到那张已提交过的空表单。
+              onCreated={() => navigate('/admin/storages', { replace: true })}
+              onCancel={() => navigate('/admin/storages')}
+            />
+          }
+        />
         <Route path="orphans" element={<OrphanDisks />} />
         <Route path="jobs" element={<JobList />} />
         <Route path="audit" element={<AuditList />} />

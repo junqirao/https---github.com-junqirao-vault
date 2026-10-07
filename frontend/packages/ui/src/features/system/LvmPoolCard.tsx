@@ -9,7 +9,7 @@ import type { InitializePoolRequest } from '../../api/types'
 import { useI18n } from '../../i18n'
 import { spacing } from '../../tokens/palette'
 import { formatBytes } from '../../utils/format'
-import { BlockDevicePicker } from './BlockDevicePicker'
+import { BlockDevicePicker, DeviceRefreshButton } from './BlockDevicePicker'
 
 export interface LvmPoolCardProps {
   /** 是否具备 LVM 存储池管理能力（来自 system-info 的能力探测）。 */
@@ -158,9 +158,14 @@ export function LvmPoolCard({ enabled, isSuperAdmin, loading }: LvmPoolCardProps
 
         <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
           <div>
-            <Typography.Text strong>{t('system.lvm.init.hdd')}</Typography.Text>
+            <Space size={4}>
+              <Typography.Text strong>{t('system.lvm.init.hdd')}</Typography.Text>
+              <DeviceRefreshButton
+                loading={devicesQuery.isFetching}
+                onRefresh={() => void devicesQuery.refetch()}
+              />
+            </Space>
             <BlockDevicePicker
-              purpose="vg"
               devices={devices}
               loading={devicesQuery.isLoading}
               value={hdd}
@@ -168,9 +173,14 @@ export function LvmPoolCard({ enabled, isSuperAdmin, loading }: LvmPoolCardProps
             />
           </div>
           <div>
-            <Typography.Text strong>{t('system.lvm.init.cache')}</Typography.Text>
+            <Space size={4}>
+              <Typography.Text strong>{t('system.lvm.init.cache')}</Typography.Text>
+              <DeviceRefreshButton
+                loading={devicesQuery.isFetching}
+                onRefresh={() => void devicesQuery.refetch()}
+              />
+            </Space>
             <BlockDevicePicker
-              purpose="cache"
               devices={devices}
               loading={devicesQuery.isLoading}
               value={cache}

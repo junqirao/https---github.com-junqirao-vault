@@ -11,7 +11,7 @@ import (
 // ---------- storage_volumes ----------
 
 // storageVolumeCols 是 storage_volumes 表的列清单，供 NamedExec 复用。
-const storageVolumeCols = `storage_id, kind, managed, state, ref, file_system, size_bytes, created_at, updated_at`
+const storageVolumeCols = `storage_id, kind, managed, state, ref, pool_ref, file_system, size_bytes, created_at, updated_at`
 
 // CreateStorageVolume 插入存储卷登记（主键为 storage_id，与 storages 一对一）。
 func (s *Store) CreateStorageVolume(ctx context.Context, v *domain.StorageVolume) error {
@@ -20,7 +20,7 @@ func (s *Store) CreateStorageVolume(ctx context.Context, v *domain.StorageVolume
 
 	if _, err := s.q.NamedExecContext(ctx,
 		`INSERT INTO storage_volumes (`+storageVolumeCols+`)
-		 VALUES (:storage_id, :kind, :managed, :state, :ref, :file_system, :size_bytes, :created_at, :updated_at)`,
+		 VALUES (:storage_id, :kind, :managed, :state, :ref, :pool_ref, :file_system, :size_bytes, :created_at, :updated_at)`,
 		v); err != nil {
 		return fmt.Errorf("store: 创建存储卷登记失败: %w", err)
 	}
@@ -64,12 +64,12 @@ func (s *Store) ListStorageVolumesByState(ctx context.Context, state string) ([]
 	return out, nil
 }
 
-// UpdateStorageVolume 覆盖更新卷登记的可变字段（kind / managed / state / ref / file_system / size_bytes）。
+// UpdateStorageVolume 覆盖更新卷登记的可变字段（kind / managed / state / ref / pool_ref / file_system / size_bytes）。
 func (s *Store) UpdateStorageVolume(ctx context.Context, v *domain.StorageVolume) error {
 	v.UpdatedAt = nowMillis()
 	res, err := s.q.NamedExecContext(ctx,
 		`UPDATE storage_volumes
-		 SET kind=:kind, managed=:managed, state=:state, ref=:ref,
+		 SET kind=:kind, managed=:managed, state=:state, ref=:ref, pool_ref=:pool_ref,
 		     file_system=:file_system, size_bytes=:size_bytes, updated_at=:updated_at
 		 WHERE storage_id=:storage_id`, v)
 	if err != nil {

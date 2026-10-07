@@ -25,6 +25,10 @@ type createStorageRequest struct {
 	Mode string `json:"mode"`
 	// SizeBytes 分配容量（字节）；mode=thin 时必填且 > 0。
 	SizeBytes int64 `json:"size_bytes"`
+	// PoolRef 存储池（"<vg>/<thin_pool>"，取自 GET /v1/system/pools 的 items[].key）。
+	//
+	// 一台机器可以有多个存储池；留空 = 服务端配置的默认池。仅 mode=thin 使用。
+	PoolRef string `json:"pool_ref"`
 	// FileSystem 存储卷文件系统（ext4 默认 / xfs）；仅 mode=thin 使用。
 	FileSystem string `json:"file_system"`
 	// Ref 已有 LV 引用（如 /dev/mapper/<vg>-<lv>）；mode=register_lv 时必填。
@@ -75,6 +79,7 @@ func (r *Router) handleCreateStorage(w http.ResponseWriter, req *http.Request) {
 		Enabled:    enabled,
 		Mode:       in.Mode,
 		SizeBytes:  in.SizeBytes,
+		PoolRef:    in.PoolRef,
 		FileSystem: in.FileSystem,
 		Ref:        in.Ref,
 	})

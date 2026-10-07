@@ -76,6 +76,8 @@ function numericArgs(args: Record<string, unknown>): Record<string, unknown> {
   if (typeof args.quota_bytes === 'number') out.quota = formatBytes(args.quota_bytes)
   if (typeof args.used_bytes === 'number') out.used = formatBytes(args.used_bytes)
   if (typeof args.need_bytes === 'number') out.need = formatBytes(args.need_bytes)
+  if (typeof args.free_bytes === 'number') out.free = formatBytes(args.free_bytes)
+  if (typeof args.requested_bytes === 'number') out.requested = formatBytes(args.requested_bytes)
   return out
 }
 

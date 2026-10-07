@@ -51,9 +51,12 @@ func (m *Manager) CreateStorageVolume(ctx context.Context, spec platform.Storage
 	if err != nil {
 		return nil, err
 	}
-	if vg != strings.TrimSpace(m.vg) {
-		// 存储卷必须建在本后端配置的 VG 上（thin pool 也在该 VG 内）。
-		return nil, apperr.InvalidParam("ref")
+	// 存储卷落在哪个池由 spec.PoolRef 显式指定（用户在创建存储时选/建的池）；
+	// 没指定（历史数据 / 目录模式）就按 ref 的 VG 反查。
+	// 这里不再限制"必须是配置的 VG"：多存储池下每个 VG 都可以承载存储卷。
+	poolName, err := m.storagePoolFor(ctx, vg, spec.PoolRef)
+	if err != nil {
+		return nil, err
 	}
 	mp := filepath.Clean(strings.TrimSpace(spec.MountPoint))
 	if !filepath.IsAbs(mp) {
@@ -77,7 +80,7 @@ func (m *Manager) CreateStorageVolume(ctx context.Context, spec platform.Storage
 	dev := lvRef(vg, lv)
 	// 1) 建 thin LV（幂等：已存在则跳过，绝不覆盖）。
 	if !m.exists(vg, lv) {
-		pool, err := m.poolPath(vg)
+		pool, err := poolPath(vg, poolName)
 		if err != nil {
 			return nil, err
 		}
@@ -85,8 +88,9 @@ func (m *Manager) CreateStorageVolume(ctx context.Context, spec platform.Storage
 		if err := m.checkWatermark(ctx, vg); err != nil {
 			return nil, err
 		}
+		// -V 同样要求 512 的整数倍（见 alignSectorDown）：界面上两位小数的 GB 换算回字节必然带尾数。
 		if _, err := m.run(ctx, "lvcreate", "--type", "thin", "-n", lv,
-			"-V", strconv.FormatInt(spec.SizeBytes, 10)+"B", "-T", pool); err != nil {
+			"-V", strconv.FormatInt(alignSectorDown(spec.SizeBytes), 10)+"B", "-T", pool); err != nil {
 			return nil, err
 		}
 		m.logger.Info("已创建存储 thin LV", "ref", ref, "size_bytes", spec.SizeBytes)
@@ -266,6 +270,10 @@ func (m *Manager) ResizeStorageVolume(ctx context.Context, ref string, sizeBytes
 	if err != nil {
 		return err
 	}
+	// 目标容量先对齐扇区再比较：下面用的是增量（-L +delta），而 LVM 对增量同样要求
+	// 512 的整数倍（见 alignSectorDown）。先对齐还有一层好处——"目标比当前只大不到一个扇区"
+	// 会被判成没变化，直接跳过 lvextend，而不是发一条注定被拒的命令。
+	sizeBytes = alignSectorDown(sizeBytes)
 	if sizeBytes < cur {
 		// 缩容会丢数据，明确拒绝（不是 no-op，避免调用方误以为已生效）。
 		return apperr.InvalidParam("size_bytes")
@@ -521,9 +529,9 @@ func sameDevice(a, b string) bool {
 	return ea == nil && eb == nil && ra == rb
 }
 
-// vgFreeBytes 返回配置的 VG 的剩余容量（读不到时返回错误，调用方自行决定是否忽略）。
-func (m *Manager) vgFreeBytes(ctx context.Context) (int64, error) {
-	vg := strings.TrimSpace(m.vg)
+// vgFreeBytesOf 返回指定 VG 的剩余容量（读不到时返回错误，调用方自行决定是否忽略）。
+func (m *Manager) vgFreeBytesOf(ctx context.Context, vg string) (int64, error) {
+	vg = strings.TrimSpace(vg)
 	if vg == "" {
 		return 0, fmt.Errorf("未配置卷组")
 	}
@@ -533,7 +541,12 @@ func (m *Manager) vgFreeBytes(ctx context.Context) (int64, error) {
 	}
 	for _, r := range rows {
 		if strings.TrimSpace(rowStr(r, "vg_name")) == vg {
-			return rowInt(r, "vg_free"), nil
+			free, ok := rowIntOK(r, "vg_free")
+			if !ok {
+				// 有这一行却读不出容量：当成"读不到"上报，别让 0 冒充真实空余。
+				return 0, fmt.Errorf("读不出卷组 %s 的剩余容量", vg)
+			}
+			return free, nil
 		}
 	}
 	return 0, fmt.Errorf("未找到卷组 %s", vg)

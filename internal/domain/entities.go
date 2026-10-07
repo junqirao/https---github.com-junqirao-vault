@@ -83,6 +83,11 @@ type StorageVolume struct {
 	State string `db:"state" json:"state"`
 	// Ref 设备引用 /dev/mapper/<vg>-<lv>；kind=dir 时为空。
 	Ref string `db:"ref" json:"ref"`
+	// PoolRef 该卷所属的存储池（形如 "<vg>/<thin_pool>"）；空 = 后端默认池 / dir 模式。
+	//
+	// 一台机器可以有多个存储池，创建存储时由用户选择或新建（见 app.PoolService.ListPools），
+	// 该存储下的磁盘与暂存文件都会落在同一个池里。Ref 里的 VG 与 PoolRef 的 VG 必须一致。
+	PoolRef string `db:"pool_ref" json:"pool_ref"`
 	// FileSystem 文件系统类型（ext4 / xfs 等）；dir 模式为空。
 	FileSystem string `db:"file_system" json:"file_system"`
 	// SizeBytes 分配容量（LV 虚拟大小）；dir 模式为 0。

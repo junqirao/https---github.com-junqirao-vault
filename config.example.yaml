@@ -165,9 +165,12 @@ platform:
     vg: "vg0"
     # 目标 thin pool 名（限制同上）。
     thin_pool: "vault"
-    # thin pool chunk 大小与元数据大小（建池时使用；池已存在则忽略）。
+    # thin pool chunk 大小（建池时使用；池已存在则忽略）。
     chunk_size: "256K"
-    metadata_size: "4G"
+    # 池元数据大小（如 "256M" / "4G"）：**留空即按池容量自适应**（约数据的 1/500，夹在 64M~4G）。
+    # 元数据要从同一个卷组另划，且 pmspare 还要再占一份等大的——小盘上写 4G 会直接建不出池
+    # （真机反馈：两块 8G 盘的卷组上，光元数据就要 8G）。不确定就别写，让它自适应。
+    # metadata_size: "4G"
     # 下面两项仅用于**校验与告警**：真正的自动扩容由宿主机的 lvm.conf +
     # lvm2-monitor 执行，本服务不修改宿主机配置。
     autoextend_threshold: 80

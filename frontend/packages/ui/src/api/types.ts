@@ -135,6 +135,8 @@ export interface StorageDTO {
   mounted: boolean
   /** 底层卷设备引用（如 /dev/mapper/vg-lv）；目录模式为空串。 */
   ref: string
+  /** 底层卷所属的存储池（`<vg>/<thin_pool>`）；空串 = 服务端默认池 / 目录模式。 */
+  pool_ref: string
   /** 分配容量（字节）；目录模式为 0。 */
   size_bytes: number
 }
@@ -148,6 +150,12 @@ export interface CreateStorageRequest {
   mode?: 'thin' | 'register_dir' | 'register_lv'
   /** 分配容量（字节）；mode=thin 时必填。 */
   size_bytes?: number
+  /**
+   * 存储池（`<vg>/<thin_pool>`，取自 `GET /v1/system/pools` 的 `items[].key`）。
+   *
+   * 一台机器可以有多个存储池；留空 = 服务端默认池。仅 mode=thin 使用。
+   */
+  pool_ref?: string
   /** 存储卷文件系统（ext4 默认 / xfs）。 */
   file_system?: string
   /** 已有 LV 引用；mode=register_lv 时必填。 */
@@ -282,11 +290,39 @@ export interface BlockDeviceDTO {
   reason?: string
 }
 
+/** 释放设备过程中的一步结果。 */
+export interface DeviceReleaseStepDTO {
+  /** 步骤标识（umount / swapoff / wipefs / pvremove / mdadm / dmsetup / partprobe / udevadm）。 */
+  step: string
+  /** 该步作用的设备或挂载点。 */
+  target?: string
+  /** 执行成功。 */
+  ok: boolean
+  /** 无需执行（未挂载、不是 swap、没有对应签名、工具缺失等）。 */
+  skipped: boolean
+  /** 失败原因或补充说明（原始命令输出，可能为空）。 */
+  detail?: string
+}
+
+/** POST /v1/system/block-devices/release 的响应：一次"释放设备"的逐步结果。 */
+export interface DeviceReleaseReportDTO {
+  path: string
+  steps: DeviceReleaseStepDTO[]
+  /** 释放后该设备是否已可被选作卷组设备。 */
+  released: boolean
+  /** 仍不可用的原因（released 为 true 时为空）。 */
+  reason?: string
+}
+
 /** GET /v1/system/lvm 的存储池与缓存现状。 */
 export interface LvmPoolStatusDTO {
   kind: string
   vg: string
   thin_pool: string
+  /** 池的稳定标识（`<vg>/<thin_pool>`）：创建存储时作为 `pool_ref` 传回。 */
+  key: string
+  /** 是否为服务端配置的默认池（列表置顶 / 预选用）。 */
+  default: boolean
   /** false 表示该 VG 或 thin pool 尚不存在，需要先初始化。 */
   exists: boolean
   size_bytes: number
@@ -294,6 +330,13 @@ export interface LvmPoolStatusDTO {
   /** thin pool 数据/元数据使用率（0–100）。 */
   data_percent: number
   metadata_percent: number
+  /**
+   * 该池上新建存储能设置的最大逻辑容量（字节；0 表示未知）。
+   *
+   * 即池自身的数据容量，**不是**上面的 `size_bytes`（那是卷组容量，可能比池大得多）：
+   * 池是存储的容器，拿卷组容量当上限会把池撑爆。用作"容量"输入框的预填值与 max。
+   */
+  max_storage_volume_bytes: number
   cache_attached: boolean
   cache_mode?: string
   cache_chunk_size?: string
@@ -308,12 +351,73 @@ export interface LvmPoolStatusDTO {
   cache_health?: string
 }
 
-/** POST /v1/system/lvm/initialize 的请求体。 */
+/**
+ * 一个卷组（存储池的容量来源）。
+ *
+ * `GET /v1/system/pools` 返回它，用于"在已有卷组里新建池"或"新建卷组"。
+ */
+export interface VolumeGroupDTO {
+  name: string
+  /** 卷组总容量 / 剩余空间（字节）。 */
+  size_bytes: number
+  free_bytes: number
+  /** 物理卷数量。 */
+  pv_count: number
+  /** 该卷组里已有的 thin pool 名（通常 0 或 1 个）。 */
+  thin_pools?: string[]
+  /**
+   * 在该卷组上**新建** thin pool 时数据容量的上限（字节；<=0 表示不可新建）。
+   *
+   * 由后端按"剩余空间 − 元数据预留"算好，直接用作容量输入框的 max：
+   * 池的元数据要另占卷组空间，"填满剩余空间"必被 LVM 拒绝，口径只能有一处权威计算。
+   */
+  pool_max_bytes: number
+}
+
+/** `GET /v1/system/pools` 的响应：多存储池目录。 */
+export interface PoolCatalogDTO {
+  /** 现有存储池（每个卷组的 thin pool 一项），默认池在最前。 */
+  items: LvmPoolStatusDTO[]
+  /** 现有卷组（新建池时可选已有卷组，或新建卷组）。 */
+  volume_groups: VolumeGroupDTO[]
+  /** 服务端配置的默认池（可能尚未创建）。 */
+  default_vg: string
+  default_pool: string
+}
+
+/** POST /v1/system/pools/estimate 的请求体：新建卷组前估算可建池容量。 */
+export interface EstimatePoolSizeRequest {
+  /** 打算组成新卷组的块设备全路径（至少一块）。 */
+  hdd_devices: string[]
+  /** 池元数据大小（如 "4G"）；留空取服务端配置值。 */
+  metadata_size?: string
+}
+
+/** POST /v1/system/pools/estimate 的响应。 */
+export interface EstimatePoolSizeResponse {
+  /**
+   * 这些设备能建出的 thin pool 数据容量上限（字节；<=0 表示建不出来）。
+   *
+   * 由后端按与真正建池时**同一套**口径算（已扣掉池元数据 tmeta + pmspare 与卷组开销），
+   * 直接用作容量输入框的自动填入值与 max：卷组还不存在时没有 pool_max_bytes，
+   * 前端自己乘系数必然与后端校验对不上。
+   */
+  pool_max_bytes: number
+}
+
+/** POST /v1/system/pools（与 /v1/system/lvm/initialize 等价）的请求体。 */
 export interface InitializePoolRequest {
   vg?: string
   thin_pool?: string
   /** 组成 VG 的块设备全路径（VG 已存在时忽略）。 */
   hdd_devices?: string[]
+  /**
+   * thin pool 的**数据容量**（字节）。
+   *
+   * thin pool 必须给容量，否则 lvcreate 只会报 "No command with matching syntax
+   * recognised"。省略（0）表示"占满 VG 当前剩余空间"。
+   */
+  size_bytes?: number
   chunk_size?: string
   metadata_size?: string
   /** 用作 dm-cache 的块设备全路径（空表示不加缓存）。 */

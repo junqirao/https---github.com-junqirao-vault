@@ -59,11 +59,19 @@ func parseRef(ref string) (vg, lv string, err error) {
 
 // DiskRef 依据"本地存储目录 + 布局标识(rel)"生成 LV 引用。
 //
-// storageRoot 只是 storages.path（真实本地目录，暂存/回收站所在），**不参与**引用推导：
-// Linux 上磁盘是薄LV，落在后端配置的 VG 里，与 storages.path 目录无关。
-// 因此这里只用 rel 推导 LV 名，VG 取构造时的 Options.VG。
+// storageRoot 是 storages.path（真实本地目录，暂存/回收站所在），磁盘本身不落在该目录里，
+// 但**卷组**要从它推断：一台机器可以有多个存储池（多个 VG），某个存储落在哪个池，
+// 它下面的磁盘就必须落在同一个池（否则容量/隔离全乱）。判定链：
+//
+//	storageRoot → (mountinfo) 承载它的卷 → 形如 /dev/mapper/<vg>-<lv> → vg
+//
+// 取不到时（目录模式落在宿主根文件系统、未挂载、非 LV 挂载点）回退到 Options.VG。
+// 需要"在指定池里生成引用"（例如创建存储卷本身）时用 DiskRefInPool。
 func (m *Manager) DiskRef(storageRoot, rel string) (string, error) {
-	vg := strings.TrimSpace(m.vg)
+	vg := vgOfStorageRoot(storageRoot)
+	if vg == "" {
+		vg = strings.TrimSpace(m.vg)
+	}
 	if !lvNameRe.MatchString(vg) {
 		return "", apperr.New(apperr.CodeUnavailable, http.StatusInternalServerError).
 			WithArg("reason", "lvm_vg_not_configured")
@@ -73,6 +81,43 @@ func (m *Manager) DiskRef(storageRoot, rel string) (string, error) {
 		return "", err
 	}
 	return lvRef(vg, lv), nil
+}
+
+// DiskRefInPool 在指定存储池（"<vg>/<thin_pool>"）里生成虚拟磁盘引用。
+//
+// poolRef 为空时等价于 DiskRef("", rel)（后端默认池）。
+// 池的 VG 决定 LV 落在哪个卷组；池名本身不进引用（薄 LV 的池由 VG 反查，见 poolcatalog.go）。
+func (m *Manager) DiskRefInPool(poolRef, rel string) (string, error) {
+	key := strings.TrimSpace(poolRef)
+	if key == "" {
+		return m.DiskRef("", rel)
+	}
+	vg, _, err := platform.SplitPoolKey(key)
+	if err != nil || !lvNameRe.MatchString(vg) {
+		return "", apperr.InvalidParam("pool_ref")
+	}
+	lv, err := mapLVName(rel)
+	if err != nil {
+		return "", err
+	}
+	return lvRef(vg, lv), nil
+}
+
+// vgOfStorageRoot 推断承载 storageRoot 的卷所属的卷组；判定不出来返回空串。
+func vgOfStorageRoot(storageRoot string) string {
+	root := strings.TrimSpace(storageRoot)
+	if root == "" {
+		return ""
+	}
+	e, ok := mountOf(root)
+	if !ok {
+		return ""
+	}
+	vg, _, err := parseRef(e.source)
+	if err != nil {
+		return ""
+	}
+	return vg
 }
 
 // mapLVName 把平台中性的相对布局标识映射为 LV 名。
@@ -141,7 +186,8 @@ func (m *Manager) Create(ctx context.Context, ref string, sizeBytes int64) error
 	if err != nil {
 		return err
 	}
-	pool, err := m.poolPath(vg)
+	// 池由 ref 的 VG 反查：多存储池下每个 VG 一个 thin pool（见 poolcatalog.go）。
+	pool, err := poolPath(vg, m.resolvePool(ctx, vg))
 	if err != nil {
 		return err
 	}
@@ -151,10 +197,11 @@ func (m *Manager) Create(ctx context.Context, ref string, sizeBytes int64) error
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// -V 同样要求 512 的整数倍：界面上两位小数的 GB 换算回字节必然带尾数（见 alignSectorDown）。
 	if _, err := m.run(ctx, "lvcreate",
 		"--type", "thin",
 		"-n", lv,
-		"-V", strconv.FormatInt(sizeBytes, 10)+"B",
+		"-V", strconv.FormatInt(alignSectorDown(sizeBytes), 10)+"B",
 		"-T", pool,
 	); err != nil {
 		return err
@@ -380,7 +427,8 @@ func (m *Manager) thinExclusiveBytes(vg, lv string) (int64, error) {
 func (m *Manager) estimatePhysicalBytes(vg, lv string) (int64, error) {
 	ctx, cancel := m.probeCtx()
 	defer cancel()
-	rows, err := m.lvsRows(ctx, "-o", "lv_size,data_percent", vg+"/"+lv)
+	// lv_size 要按字节读：默认报告是 "1.00g"，解析不出来会退化成 0。
+	rows, err := m.lvsRows(ctx, "--units", "b", "--nosuffix", "-o", "lv_size,data_percent", vg+"/"+lv)
 	if err != nil {
 		return 0, err
 	}
@@ -445,7 +493,7 @@ func (m *Manager) chunkSizeOf(ctx context.Context, vg, pool string) (int64, erro
 func (m *Manager) lvSizeBytes(vg, lv string) (int64, error) {
 	ctx, cancel := m.probeCtx()
 	defer cancel()
-	rows, err := m.lvsRows(ctx, "-o", "lv_size", vg+"/"+lv)
+	rows, err := m.lvsRows(ctx, "--units", "b", "--nosuffix", "-o", "lv_size", vg+"/"+lv)
 	if err != nil {
 		return 0, err
 	}
@@ -534,7 +582,9 @@ func (m *Manager) ResetDiskIdentifier(ctx context.Context, ref string) error {
 // 且 thin pool 的**元数据**打满比数据打满更致命（元数据满后所有写失败）。
 // 任一百分比达到阈值即拒绝，并把两个百分比带给前端。
 func (m *Manager) checkWatermark(ctx context.Context, vg string) error {
-	pool, err := m.poolPath(vg)
+	// 池名按 VG 反查（多存储池）；判定不出来时 resolvePool 回退配置池名。
+	poolName := m.resolvePool(ctx, vg)
+	pool, err := poolPath(vg, poolName)
 	if err != nil {
 		return err
 	}
@@ -548,12 +598,12 @@ func (m *Manager) checkWatermark(ctx context.Context, vg string) error {
 		//      所以这里直接给出可执行的错误码与参数。
 		//   2) 其它原因（权限不足、字段不被支持等）：状态未知，保守跳过闸门，
 		//      仍交给 lvcreate 兜底，避免在这里误报"空间不足"。
-		if kind := m.poolMissingKind(ctx, vg, pool); kind != "" {
+		if kind := m.poolMissingKind(ctx, vg, poolName); kind != "" {
 			m.logger.Error("存储池不存在，拒绝创建（请先初始化存储池）",
-				"vg", vg, "thin_pool", m.thinPool, "missing", kind)
+				"vg", vg, "thin_pool", poolName, "missing", kind)
 			return apperr.New(CodePoolMissing, http.StatusServiceUnavailable).
 				WithArg("vg", vg).
-				WithArg("thin_pool", m.thinPool)
+				WithArg("thin_pool", poolName)
 		}
 		m.logger.Warn("读取 thin pool 水位失败，跳过水位闸门", "pool", pool, "err", err.Error())
 		return nil

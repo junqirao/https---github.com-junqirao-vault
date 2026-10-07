@@ -192,7 +192,8 @@ type LVMPoolConfig struct {
 	ThinPool string `yaml:"thin_pool"`
 	// ChunkSize thin pool 的 chunk 大小（如 256K）。
 	ChunkSize string `yaml:"chunk_size"`
-	// MetadataSize thin pool 元数据大小（如 4G）。
+	// MetadataSize thin pool 元数据大小（如 256M / 4G）；**留空表示按池容量自适应**
+	// （见 linuxlvm.poolMetaSizeFor：约 1/500，夹在 64 MiB ~ 4 GiB）。
 	MetadataSize string `yaml:"metadata_size"`
 	// AutoextendThreshold / AutoextendPercent 仅用于**校验与告警**：
 	// 真正的自动扩容由宿主机的 lvm.conf + lvm2-monitor 执行，本服务不修改宿主机配置。
@@ -569,9 +570,10 @@ func (c *Config) applyDefaults() {
 	if c.Platform.LVM.ChunkSize == "" {
 		c.Platform.LVM.ChunkSize = "256K"
 	}
-	if c.Platform.LVM.MetadataSize == "" {
-		c.Platform.LVM.MetadataSize = "4G"
-	}
+	// MetadataSize 刻意**不设默认值**：留空表示"按池容量自适应"
+	// （见 linuxlvm.poolMetaSizeFor：约 1/500，夹在 64 MiB ~ 4 GiB）。
+	// 曾经默认 4G，结果在两块 8G 盘（16G 卷组）上要吃掉 4G tmeta + 4G pmspare，
+	// 用户想建的池直接建不出来（真机反馈）。
 	if c.Platform.LVM.AutoextendThreshold <= 0 {
 		c.Platform.LVM.AutoextendThreshold = 80
 	}

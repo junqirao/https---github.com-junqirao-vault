@@ -54,9 +54,16 @@ func (r *Router) writeError(w http.ResponseWriter, req *http.Request, err error)
 	body := errorBody{Error: errorDetail{Code: apperr.CodeOf(err)}}
 	if e, ok := apperr.As(err); ok {
 		body.Error.Args = e.Args
-		r.deps.Log.Debug("请求返回业务错误",
+		// 业务错误必须按级别落到默认就能看见的地方：只记 Debug 时，
+		// 真机日志里只剩下一句 "status":400，是哪个字段被拒无从判断。
+		// 带上 args（如 field=size_bytes）才能直接从日志定位。
+		log := r.deps.Log.Warn
+		if status >= http.StatusInternalServerError {
+			log = r.deps.Log.Error
+		}
+		log("请求返回业务错误",
 			"method", req.Method, "path", req.URL.Path,
-			"code", e.Code, "status", status, "cause", err.Error())
+			"code", e.Code, "status", status, "args", e.Args, "cause", err.Error())
 	} else {
 		r.deps.Log.Error("请求处理失败",
 			"method", req.Method, "path", req.URL.Path,

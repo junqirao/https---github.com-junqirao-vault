@@ -41,8 +41,13 @@ func (m *Manager) lvsRows(ctx context.Context, args ...string) ([]lvsRow, error)
 }
 
 // vgsRows 读取全部卷组（名称 + 总容量 + 剩余容量）。
+//
+// 容量必须显式要字节：LVM 报告的默认形态是 "12.00g" 这类带单位后缀的人类可读串，
+// 直接 ParseFloat 会失败并退化成 0——"读到了"却被当成"0 字节可用"，
+// 于是容量前置校验变成"填什么容量都超限"（真机反馈：容量改小照样报超限）。
 func (m *Manager) vgsRows(ctx context.Context) ([]lvsRow, error) {
-	out, err := m.run(ctx, "vgs", "--reportformat", "json", "-o", "vg_name,vg_size,vg_free")
+	out, err := m.run(ctx, "vgs", "--reportformat", "json", "--units", "b", "--nosuffix",
+		"-o", "vg_name,vg_size,vg_free")
 	if err != nil {
 		return nil, err
 	}
@@ -104,16 +109,25 @@ func rowFloat(r lvsRow, key string) float64 {
 }
 
 func rowInt(r lvsRow, key string) int64 {
+	v, _ := rowIntOK(r, key)
+	return v
+}
+
+// rowIntOK 与 rowInt 同源，但把"字段缺失 / 解析不出来"如实报成 ok=false。
+//
+// 容量类字段必须用它：读不到就要能区分"确实是 0 字节"和"根本没读懂"，
+// 否则一次格式变化就会被当成 0，把合法请求误判成"容量超限"。
+func rowIntOK(r lvsRow, key string) (int64, bool) {
 	s := strings.TrimSpace(rowStr(r, key))
 	if s == "" {
-		return 0
+		return 0, false
 	}
 	// JSON 里的数字会被解码成 float64，用 ParseFloat 再取整可兼容 "1.07e+09" 这类科学计数。
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return int64(f)
+	return int64(f), true
 }
 
 func scalarStr(v any) string {

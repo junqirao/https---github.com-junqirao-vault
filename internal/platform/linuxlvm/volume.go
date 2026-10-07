@@ -163,12 +163,18 @@ func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.Volume
 	}
 
 	name, fsType := p, ""
+	// 剩余容量要按该路径所在**存储池（卷组）**算：多存储池下每个池各算各的，
+	// 用配置的 VG 会导致"池 A 满了却还能往池 B 里选盘"（或反之）。
+	vgOfPath := strings.TrimSpace(m.vg)
 	if e, ok := mountOf(p); ok {
 		name, fsType = e.source, e.fsType
+		if vg, err := vgFromPath(e.source); err == nil {
+			vgOfPath = vg
+		}
 	}
 
 	free := size.freeBytes
-	if vgFree, vgErr := m.vgFreeBytes(ctx); vgErr == nil && vgFree > 0 && vgFree < free {
+	if vgFree, vgErr := m.vgFreeBytesOf(ctx, vgOfPath); vgErr == nil && vgFree > 0 && vgFree < free {
 		free = vgFree
 	}
 	return &domain.VolumeSpace{

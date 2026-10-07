@@ -389,6 +389,8 @@ type storageDTO struct {
 	Mounted bool `json:"mounted"`
 	// Ref 底层卷设备引用（如 /dev/mapper/<vg>-<lv>）；目录模式为空。
 	Ref string `json:"ref"`
+	// PoolRef 底层卷所属的存储池（"<vg>/<thin_pool>"）；空 = 后端默认池 / 目录模式。
+	PoolRef string `json:"pool_ref"`
 	// SizeBytes 分配容量（字节）；目录模式为 0。
 	SizeBytes int64 `json:"size_bytes"`
 }
@@ -404,6 +406,7 @@ func toStorageDTO(v app.StorageView) storageDTO {
 	if v.Volume != nil {
 		dto.Kind = v.Volume.Kind
 		dto.Ref = v.Volume.Ref
+		dto.PoolRef = v.Volume.PoolRef
 		dto.SizeBytes = v.Volume.SizeBytes
 	}
 	return dto
