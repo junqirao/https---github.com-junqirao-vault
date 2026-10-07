@@ -79,6 +79,12 @@ type CreateRepoInput struct {
 	//   - 为空 → 在所有**启用**的存储中按"所在卷可用空间最大"自动选（现有 Pick 语义）；
 	//   - 非空 → 使用该存储的根；存储不存在或已停用会返回明确错误。
 	StorageID string
+	// ClientOS 可选：**将使用该库的客户端操作系统**（"windows"/"linux"，留空按 windows）。
+	//
+	// 它决定建盘时的文件系统：Windows → NTFS，Linux → ext4（见 domain.ClientOS）。
+	// 必须在建盘前定下来——分区表与格式化都写进盘里了，事后无法就地转换；
+	// 选定结果持久化在盘记录上（domain.Disk.FileSystem），作为"这块盘是什么格式"的标记。
+	ClientOS string
 }
 
 // UpdateRepoInput 是更新存储库的入参；指针字段为 nil 表示不修改。
@@ -114,6 +120,12 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 	if ownerID == "" {
 		return nil, nil, apperr.InvalidParam("owner_id")
 	}
+	// 客户端系统决定建盘用的文件系统，必须在建盘前定下来（见 CreateRepoInput.ClientOS）。
+	clientOS, ok := domain.ParseClientOS(in.ClientOS)
+	if !ok {
+		return nil, nil, apperr.InvalidParam("client_os")
+	}
+	fileSystem := clientOS.FileSystem()
 
 	// share 是"共享数量"：共享模式下建库时就按这个数量把差异盘池建好
 	// （每个池位 = 一块差异盘 + 一个 iSCSI 目标），之后每次分配占用一格。
@@ -246,12 +258,13 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 		}
 
 		d := &domain.Disk{
-			RepoID:    r.ID,
-			Kind:      kind,
-			VHDXPath:  abs,
-			SizeBytes: size,
-			VHDType:   domain.VHDTypeDynamic,
-			State:     domain.DiskStateCreating,
+			RepoID:     r.ID,
+			Kind:       kind,
+			VHDXPath:   abs,
+			SizeBytes:  size,
+			VHDType:    domain.VHDTypeDynamic,
+			State:      domain.DiskStateCreating,
+			FileSystem: fileSystem,
 		}
 		if err := tx.CreateDisk(ctx, d); err != nil {
 			return err
@@ -829,6 +842,8 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			SizeBytes:     parent.SizeBytes,
 			VHDType:       domain.VHDTypeDifferencing,
 			State:         domain.DiskStateCreating,
+			// 差异盘是母盘的快照，分区表与文件系统都继承自母盘，标记必须跟着母盘走。
+			FileSystem: parent.FileSystemOrDefault(),
 		}
 		if err := tx.CreateDisk(ctx, d); err != nil {
 			return err

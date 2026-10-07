@@ -174,7 +174,10 @@ export function StoragePoolsPanel({ open, onClose }: StoragePoolsPanelProps): JS
       width={960}
       centered
       maskClosable={false}
-      footer={<Button onClick={onClose}>{t('common.close')}</Button>}
+      // 关闭只保留右上角的 X（走 onCancel）：底部再放一个「关闭」是重复入口，
+      // 而这里原先既没给 onCancel、又只留了底部按钮，X 点了毫无反应（真机反馈）。
+      onCancel={onClose}
+      footer={null}
     >
       {/* 「新建」放在内容区右上角（Modal 没有 extra 槽位，antd 只有 Drawer 有）。 */}
       <Space

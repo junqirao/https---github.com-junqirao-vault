@@ -142,18 +142,63 @@ func sameSession(store *stateStore, key string, want *Session) bool {
 
 // restoreMounts 在服务端确认连上后尽力恢复挂载，分三件事：
 //
-//  1. 全局 auto_mount 打开时，恢复本机状态文件里留下的挂载记录（见 restoreRecordedMounts）；
-//  2. 配置里**显式**为某个库打开"启动后自动挂载"的，把它挂上（见 mountConfiguredRepos）——
+//  1. 把上次进程死在卸载中途留下的"卸载中"记录补完（见 finishInterruptedUnmounts）；
+//  2. 全局 auto_mount 打开时，恢复本机状态文件里留下的挂载记录（见 restoreRecordedMounts）；
+//  3. 配置里**显式**为某个库打开"启动后自动挂载"的，把它挂上（见 mountConfiguredRepos）——
 //     这一项每个库独立，不受全局开关约束（全局开关的语义只是"恢复上次的挂载"）；
-//  3. 上面两条都要让开"用户本次运行手动卸载过"的库（见 manualUnmountGuard）。
+//  4. 上面两条都要让开"用户本次运行手动卸载过"的库（见 manualUnmountGuard）。
 //
 // 单个失败只记录状态并通过 SSE 通知，不阻塞其他分配。
 func (a *Agent) restoreMounts(ctx context.Context, key string) {
 	cfg := a.cfg.Get()
+	// 补完未完成的卸载**与全局自动挂载开关无关**：它是"把没收尾的动作做完"，而且用户的
+	// 最后意图就是卸载。这段逻辑原先写在 restoreRecordedMounts 里、被 `if cfg.AutoMount`
+	// 挡着——注释写着"与开关无关"，代码却受它管；结果没开自动挂载的用户重启后，那条记录
+	// 永远停在"卸载中"（真实反馈："重启之后客户端一直提示在卸载中，这种名存实亡的"）。
+	a.finishInterruptedUnmounts(ctx)
 	if cfg.AutoMount {
 		a.restoreRecordedMounts(ctx, key, cfg.RepoMounts)
 	}
 	a.mountConfiguredRepos(ctx, key, cfg.RepoMounts)
+}
+
+// finishInterruptedUnmounts 补完"上次没收尾的卸载"：state=unmounting 的记录是进程死在卸载
+// 中途留下的现场（记录在本机状态文件里，重装服务端也清不掉）。用户的最后意图是卸载，所以
+// 这里**补完卸载（幂等清理后删掉记录），绝不重挂** —— 否则一条死记录每次启动都被复活。
+//
+// 三条边界：
+//   - 不看全局 auto_mount：那个开关管的是"恢复挂载"，与收尾无关；
+//   - 不看服务端连接：卸载本身不需要服务端（最后回写释放是尽力而为，见 mount.go ⑤），而
+//     卡住这条记录的现场（服务端重装 / 连不上）恰恰等不到"连上"那一刻；
+//   - 不限定某一台服务端：逐条按记录处理，归属哪台由记录自己带着（见 mountClient）。
+func (a *Agent) finishInterruptedUnmounts(ctx context.Context) {
+	var stuck []MountState
+	for _, ms := range a.store.ListMounts() {
+		if ms.State == MountStateUnmounting {
+			stuck = append(stuck, ms)
+		}
+	}
+	if len(stuck) == 0 {
+		return
+	}
+
+	a.logger.Info("补完上次未完成的卸载", "count", len(stuck))
+	sem := make(chan struct{}, autoMountConcurrency)
+	var wg sync.WaitGroup
+	for i := range stuck {
+		item := stuck[i]
+		wg.Add(1)
+		safeGo(a.logger, "finish_interrupted_unmount", func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := a.engine.unmount(ctx, item.AllocationID); err != nil {
+				a.logger.Warn("补完未完成的卸载失败",
+					"allocation_id", item.AllocationID, "error", err)
+			}
+		})
+	}
+	wg.Wait()
 }
 
 // restoreRecordedMounts 依据本地状态文件中记录的分配，尽力恢复挂载（并发上限 2）。
@@ -175,19 +220,10 @@ func (a *Agent) restoreRecordedMounts(ctx context.Context, key string, prefs map
 	for i := range pending {
 		item := pending[i]
 
-		// 卸载中途代理退出（state=unmounting）：用户的最后意图是**卸载**，补完它
-		// （幂等清理后删除记录），绝不重挂 —— 否则一条死记录每次启动都被复活。
-		// 这条与自动挂载开关无关：它是"把没收尾的动作做完"。
+		// 卡住的卸载（state=unmounting）已由 finishInterruptedUnmounts 补完，而那一轮**不看**
+		// 自动挂载开关、也不等服务端连接（见 restoreMounts 与代理启动流程）。这里只跳过，
+		// 免得再来一遍拿到 errNotMounted、刷一条无意义的告警。
 		if item.State == MountStateUnmounting {
-			wg.Add(1)
-			safeGo(a.logger, "automount_finish_unmount", func() {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-				if err := a.engine.unmount(ctx, item.AllocationID); err != nil {
-					a.logger.Warn("补完未完成的卸载失败", "allocation_id", item.AllocationID, "error", err)
-				}
-			})
 			continue
 		}
 		// 错误/被踢记录是诊断残留（通常是清理失败的现场，比如服务端已重装、目标不存在）。

@@ -106,9 +106,34 @@ func (m *Manager) ensurePV(ctx context.Context, vg, dev string) error {
 // ⚠️ 缓存实际插在 thin pool 的 _tdata 子 LV 上；但 lvconvert 挂载时传的是 **pool 名**，
 // LVM 会自动落到 _tdata。而改 cachemode 必须针对 <pool>_tdata（见 setCacheMode），
 // 对 pool 名操作会报错/无效——这是 dm-cache 最容易踩的坑。
+//
+// ⚠️ **必须显式给 --zero**（真机反馈）。`--zero` 缺省时 LVM 会就"要不要抹掉 cache pool
+// 已有元数据"提问：
+//
+//	Do you want wipe existing metadata of cache pool test4/vault_cache? [y/n]: [n]
+//	  Conversion aborted.
+//	  To preserve cache metadata add option "--zero n".
+//	  WARNING: Reusing mismatched cache pool metadata MAY DESTROY YOUR DATA!
+//
+// 服务进程没有 tty，提问只能拿到默认值 n → 整条命令 exit 5 失败（用户只看到"创建失败"）。
+// LVM 源码里这个提问的守卫就是 `if (!arg_is_set(cmd, zero_ARG))`（tools/lvconvert.c），
+// 因此**只要显式给出 --zero，无论 y 还是 n 都不再提问**。
+//
+// 取 y（抹掉）而非 n（保留）的理由：
+//   - 本函数只被 InitializePool 调用，且紧跟在 ensureCachePool 的 lvcreate 之后——
+//     `lvcreate -n <pool>_cache` 撞上同名 LV 必然失败，所以走到这里时 cache pool 一定是
+//     本次刚建出来的，没有任何值得保留的缓存内容；
+//   - LVM 对 cache pool 的默认意图本就是抹：`zero_metadata = to_cachepool ?
+//     arg_int_value(cmd, zero_ARG, 1) : 1`，即不提问时它也会抹——这里只是把这层意图写明；
+//   - 反过来 `--zero n`（保留既有元数据）正是上面警告里的危险那条路。
+//
+// 不整条命令加 -y：那是"对所有提问都答 yes"的通行证，会把**别的**破坏性确认也一并吞掉
+// （例如容量不足时 LVM 会问"要不要抹掉 pmspare"，见 pool.go 里同类坑的注释）。只解决眼前
+// 这一问，不要把枪口放大。
 func (m *Manager) attachCache(ctx context.Context, vg, thinPool string) error {
 	_, err := m.run(ctx, "lvconvert",
 		"--type", "cache",
+		"--zero", "y",
 		"--cachepool", vg+"/"+cachePoolName(thinPool),
 		vg+"/"+thinPool,
 	)

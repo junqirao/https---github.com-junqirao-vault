@@ -256,9 +256,25 @@ type Disk struct {
 	// ObservedState 上一次对账观测到的实际状态。
 	ObservedState string `db:"observed_state" json:"observed_state"`
 	// Mounted 是否在本机挂载（服务端本地挂载，用于维护/建盘）。
-	Mounted   bool  `db:"mounted" json:"mounted"`
-	CreatedAt int64 `db:"created_at" json:"created_at"`
-	UpdatedAt int64 `db:"updated_at" json:"updated_at"`
+	Mounted bool `db:"mounted" json:"mounted"`
+	// FileSystem 是这块盘**分区**上的文件系统（ntfs/ext4），建盘时按"使用该盘的客户端
+	// 操作系统"决定并持久化：分区表与格式化都已经写进盘里，事后改不了，这里只是记账。
+	//
+	// 存量老记录（Linux 上整盘 NTFS、没有分区表）为空值，按 NTFS 处理，
+	// 见 Disk.FileSystemOrDefault。
+	FileSystem FileSystem `db:"file_system" json:"file_system"`
+	CreatedAt  int64      `db:"created_at" json:"created_at"`
+	UpdatedAt  int64      `db:"updated_at" json:"updated_at"`
+}
+
+// FileSystemOrDefault 返回盘的文件系统。
+//
+// 空值（升级前建的老盘）按 NTFS 处理：那是历史唯一的格式，也是当时的行为。
+func (d *Disk) FileSystemOrDefault() FileSystem {
+	if d != nil && d.FileSystem.Valid() {
+		return d.FileSystem
+	}
+	return FSNTFS
 }
 
 // Allocation 是把某个磁盘分配给某用户的记录。

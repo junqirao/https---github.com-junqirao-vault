@@ -3,7 +3,9 @@
 package linuxlvm
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -23,11 +25,11 @@ const (
 	releaseCleanTree = `{"blockdevices":[{"name":"sdb","path":"/dev/sdb","type":"disk","size":10737418240,"rota":true,"model":"FakeDisk","mountpoints":[],"fstype":null,"children":[]}]}`
 )
 
-// fakeReleaseEnv 构造一套假的块设备工具链并置于 PATH 最前。
+// fakeReleaseEnv 构造一套假的块设备工具链并置于 PATH 最前，返回目录以便按需覆盖某个命令。
 //
 // 假 lsblk 用标记文件实现"第一次返回 dirty、之后返回 clean"：
 // 这样既能走完释放流程，又能验证复核读的是**重新枚举**的结果。
-func fakeReleaseEnv(t *testing.T, dirty, clean string) {
+func fakeReleaseEnv(t *testing.T, dirty, clean string) string {
 	t.Helper()
 	dir := t.TempDir()
 	writeFake(t, dir, "lsblk", `if [ -e "$0.done" ]; then
@@ -44,6 +46,7 @@ fi`)
 	writeFake(t, dir, "partprobe", "exit 0")
 	writeFake(t, dir, "udevadm", "exit 0")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dir
 }
 
 func TestReleaseDeviceSteps(t *testing.T) {
@@ -74,6 +77,50 @@ func TestReleaseDeviceSteps(t *testing.T) {
 	}
 	if !rep.Released {
 		t.Fatalf("复核应判定为已可选，实际 released=false reason=%q", rep.Reason)
+	}
+}
+
+// TestReleaseDeviceToleratesNoPartitionTable：wipefs 之后设备上已经没有分区表了，
+// 此时真机 partprobe 会打印 `Error: /dev/sdb: unrecognised disk label` 并以非 0 退出。
+//
+// 那是"本来就没有表可重读"，属于正常分支：既不该记一条 ERROR 日志，也不该在报告里挂一条
+// 失败项——否则一次完全成功的释放看起来像失败了（真机反馈："所有操作都成功了，
+// 但是有这个日志"）。
+func TestReleaseDeviceToleratesNoPartitionTable(t *testing.T) {
+	dir := fakeReleaseEnv(t, releaseDirtyTree, releaseCleanTree)
+	writeFake(t, dir, "partprobe", `printf 'Error: %s: unrecognised disk label\n' "$1"
+exit 1`)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	m := New(Options{VG: "vg0", ThinPool: "vault", Logger: logger})
+
+	rep, err := m.ReleaseDevice(context.Background(), "/dev/sdb")
+	if err != nil {
+		t.Fatalf("ReleaseDevice 失败: %v", err)
+	}
+
+	var seen bool
+	for _, s := range rep.Steps {
+		if s.Step != "partprobe" {
+			continue
+		}
+		seen = true
+		if !s.OK && !s.Skipped {
+			t.Fatalf("「无分区表可重读」应记为跳过而非失败，实际 ok=%v skipped=%v detail=%s", s.OK, s.Skipped, s.Detail)
+		}
+		if s.Detail == "" {
+			t.Fatal("跳过也要带上原因（命令输出），否则用户看不懂这一步为什么没做")
+		}
+	}
+	if !seen {
+		t.Fatal("没有走到 partprobe 这一步，用例失去意义")
+	}
+	if !rep.Released {
+		t.Fatalf("释放应判定为已可选，实际 released=false reason=%q", rep.Reason)
+	}
+	if logs := buf.String(); strings.Contains(logs, "level=ERROR") {
+		t.Fatalf("预期内的非 0 退出不该记 ERROR，实际日志:\n%s", logs)
 	}
 }
 

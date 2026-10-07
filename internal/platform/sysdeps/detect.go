@@ -23,6 +23,8 @@ const (
 	procMountsPath = "/proc/mounts"
 	// osReleasePath 当前内核版本（用于定位 /lib/modules/<ver>/modules.dep）。
 	osReleasePath = "/proc/sys/kernel/osrelease"
+	// procFileSystemsPath 内核已注册的文件系统列表（用于判断是否有 ntfs3 驱动）。
+	procFileSystemsPath = "/proc/filesystems"
 
 	// defaultTimeout 单条外部命令（mount/modprobe）的超时。
 	defaultTimeout = 30 * time.Second
@@ -77,6 +79,19 @@ var lioTools = []toolSpec{
 	{exe: "targetcli", pkg: "targetcli-fb", pkgRPM: "targetcli"},
 }
 
+// 建盘用的分区工具：**必需**。
+//
+// 新建盘一律是"GPT + 单分区"布局（客户端按 磁盘/分区/卷 的模型挂载，整盘裸文件系统
+// 挂不上），所以建盘路径上必然用到：
+//   - parted：写 GPT 分区表、建占满全盘的分区（并按文件系统类型写分区类型 GUID）；
+//   - partx：让内核建立分区设备节点；停用/删除盘前摘掉分区映射（否则父设备移除不掉）。
+//
+// 缺任一项都建不出客户端能识别的盘，故列为必需项，让 doctor 提前报出来。
+var diskTools = []toolSpec{
+	{exe: "parted", pkg: "parted"},
+	{exe: "partx", pkg: "util-linux"},
+}
+
 // 可选工具：只在特定场景用到（NTFS 卷、thin 元数据检查），缺失不影响主流程。
 var miscTools = []toolSpec{
 	{exe: "thin_ls", pkg: "thin-provisioning-tools", pkgRPM: "device-mapper-persistent-data"},
@@ -96,7 +111,9 @@ func probeAll(o Options) []Item {
 		probeConfigFSMount(o),
 		probeLioTools(o),
 		probeTools("lvm_tools", "LVM2 工具链", lvmTools, true),
+		probeTools("disk_tools", "分区工具（GPT 布局）", diskTools, true),
 		probeFSTools(),
+		probeNTFSTools(),
 		probeTools("misc_tools", "其它辅助工具", miscTools, false),
 	}
 }
@@ -372,6 +389,58 @@ func probeFSTools() Item {
 	it.Detail = "mkfs.ext4 与 mkfs.xfs 都不可用，无法格式化新建的存储卷"
 	it.Hint = installHint(specs)
 	return it
+}
+
+// probeNTFSTools 检查 NTFS 支持。
+//
+// 盘的文件系统按**客户端操作系统**定（Windows → NTFS，见 domain.ClientOS），而建盘发生在
+// 服务端，所以 Linux 服务端必须"建得出 NTFS"（mkfs.ntfs，来自 ntfs-3g 包）并"挂得上 NTFS"
+// 才能把源目录内容拷进母盘：
+//   - 挂载优先用内核原生的 ntfs3（5.15+，比 FUSE 快得多），挂载路径上会自动回退；
+//   - 内核没有 ntfs3 时，回退 FUSE 的 ntfs-3g，此时**必须**装了它。
+func probeNTFSTools() Item {
+	it := Item{Key: "ntfs_tools", Title: "NTFS 支持（Windows 客户端建盘）", Required: true, Status: StatusOK}
+	has := func(exe string) bool { _, err := exec.LookPath(exe); return err == nil }
+
+	var present, missing []string
+	if has("mkfs.ntfs") {
+		present = append(present, "mkfs.ntfs")
+	} else {
+		missing = append(missing, "mkfs.ntfs（ntfs-3g 包）：无法建 NTFS 盘")
+	}
+	switch {
+	case kernelSupportsNTFS3():
+		present = append(present, "内核 ntfs3 驱动")
+	case has("ntfs-3g"):
+		present = append(present, "ntfs-3g（FUSE 回退）")
+	default:
+		missing = append(missing, "ntfs3 内核驱动或 ntfs-3g：挂不上 NTFS 盘")
+	}
+	if len(missing) == 0 {
+		it.Detail = "可用：" + strings.Join(present, "、")
+		return it
+	}
+	it.Status = StatusMissing
+	it.Detail = "缺少：" + strings.Join(missing, "、")
+	it.Hint = installHint([]toolSpec{{exe: "mkfs.ntfs", pkg: "ntfs-3g"}})
+	return it
+}
+
+// kernelSupportsNTFS3 报告内核是否提供 ntfs3 驱动。
+//
+// /proc/filesystems 只列出**已注册**的文件系统：驱动是模块且没加载时不会出现
+// （挂载路径上会先 modprobe 再判断，这里只做只读探测，不去改系统状态）。
+func kernelSupportsNTFS3() bool {
+	data, err := os.ReadFile(procFileSystemsPath)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if f := strings.Fields(line); len(f) > 0 && f[len(f)-1] == "ntfs3" {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- 系统信息读取（尽量只读 /proc 与文件，不依赖外部命令）----

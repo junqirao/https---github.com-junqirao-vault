@@ -735,7 +735,7 @@
   "err.platform.volume_group_not_found": "볼륨 그룹 {vg}이(가) 존재하지 않습니다",
   "err.platform.pool_in_use": "스토리지 풀 {vg}/{thin_pool}이(가) 사용 중이라 삭제할 수 없습니다",
   "err.platform.pool_in_use.thin_volumes": "이 풀에는 아직 thin 볼륨 {count}개({names})가 있습니다. 먼저 해당 스토리지를 삭제하세요",
-  "err.platform.pool_in_use.volume_group": "이 볼륨 그룹에는 아직 thin 풀이 있습니다. 먼저 그 스토리지 풀을 삭제하세요",
+  "err.platform.pool_in_use.volume_group": "이 볼륨 그룹에는 다른 논리 볼륨({names})이 남아 있어 삭제할 수 없습니다. 먼저 해당 볼륨을 삭제하세요",
   "err.platform.pool_in_use.storages": "이 풀에는 아직 스토리지 {count}개가 있습니다. 먼저 해당 스토리지를 삭제하세요",
   "err.platform.pool_protected": "스토리지 풀 {vg}/{thin_pool}은(는) 보호되어 있어 삭제할 수 없습니다",
   "err.platform.pool_protected.default_pool": "서버 설정의 기본 풀입니다. 삭제하면 서비스를 사용할 수 없습니다. 먼저 서버 설정을 변경하세요",

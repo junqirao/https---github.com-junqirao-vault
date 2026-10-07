@@ -7,6 +7,7 @@ package domain
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -130,6 +131,69 @@ const (
 // Valid 校验取值。
 func (t VHDType) Valid() bool {
 	return t == VHDTypeDynamic || t == VHDTypeFixed || t == VHDTypeDifferencing
+}
+
+// FileSystem 是磁盘**分区**上的文件系统类型。
+//
+// 它是建盘时定下来的**固有属性**：分区表与格式化都已经写进盘里，事后无法就地转换，
+// 因此只作为记账与展示（见 Disk.FileSystem），也是"这块盘能给哪个系统的客户端用"的标记。
+type FileSystem string
+
+const (
+	// FSNTFS Windows 客户端使用的文件系统。
+	//
+	// Linux 客户端也能挂载它（内核 ntfs3，5.15+；否则回退 ntfs-3g），
+	// 但反过来 ext4 在 Windows 上挂不了，所以格式必须按客户端系统选。
+	FSNTFS FileSystem = "ntfs"
+	// FSExt4 Linux 客户端使用的文件系统（预留：Linux 客户端尚未实现）。
+	FSExt4 FileSystem = "ext4"
+)
+
+// Valid 校验取值。
+func (f FileSystem) Valid() bool { return f == FSNTFS || f == FSExt4 }
+
+// String 返回规范化名（小写），可直接用于 `mkfs.<name>` 与 `mount -t <name>`。
+func (f FileSystem) String() string { return string(f) }
+
+// ClientOS 是**使用某块盘的客户端**的操作系统。
+//
+// 为什么建盘时就要知道它：分区与格式化发生在任何客户端挂载**之前**（客户端只是通过
+// iSCSI 看到一块已经分好区、格好式的裸盘），格式化格式只能按"这块盘将来给谁用"来定。
+type ClientOS string
+
+const (
+	// ClientOSWindows Windows 客户端。
+	ClientOSWindows ClientOS = "windows"
+	// ClientOSLinux Linux 客户端（预留：客户端尚未实现，仅服务端支持 ext4 布局）。
+	ClientOSLinux ClientOS = "linux"
+)
+
+// ClientOSDefault 是未显式指定时假定的客户端系统。
+//
+// 目前只有 Windows 客户端已实现，因此默认按 Windows 处理：老调用方（没有该参数）
+// 与既有数据的行为完全不变（NTFS）。
+const ClientOSDefault = ClientOSWindows
+
+// ParseClientOS 解析客户端操作系统；空串按默认值处理，无法识别时返回 false。
+func ParseClientOS(s string) (ClientOS, bool) {
+	switch ClientOS(strings.ToLower(strings.TrimSpace(s))) {
+	case "":
+		return ClientOSDefault, true
+	case ClientOSWindows:
+		return ClientOSWindows, true
+	case ClientOSLinux:
+		return ClientOSLinux, true
+	default:
+		return "", false
+	}
+}
+
+// FileSystem 返回该客户端系统对应的文件系统：Windows → NTFS，Linux → ext4。
+func (c ClientOS) FileSystem() FileSystem {
+	if c == ClientOSLinux {
+		return FSExt4
+	}
+	return FSNTFS
 }
 
 // AllocationState 分配状态。

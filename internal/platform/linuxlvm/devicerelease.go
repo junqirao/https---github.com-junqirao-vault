@@ -245,11 +245,18 @@ func (m *Manager) releaseRescan(ctx context.Context, disk *lsblkNode) []platform
 	path := nodePath(disk)
 	var steps []platform.DeviceReleaseStep
 	if _, err := LookPath("partprobe"); err == nil {
-		out, err := m.run(ctx, "partprobe", path)
-		if err != nil {
-			steps = append(steps, platform.DeviceReleaseStep{Step: "partprobe", Target: path, Detail: stepDetail(out, err)})
-		} else {
+		// 上一步 wipefs 已经把签名（含分区表）抹掉了，此时 partprobe 面对一块**无标签**的设备
+		// 会打印 `Error: <dev>: unrecognised disk label` 并以非 0 退出——那是"本来就没有表可
+		// 重读"，属正常分支，故用 runQuiet；报成"跳过"而不是"失败"，否则一次完全成功的释放
+		// 会在报告里挂一条红项（判定套路与 pvremove 的 isNotPV 一致）。
+		out, err := m.runQuiet(ctx, "partprobe", path)
+		switch {
+		case err == nil:
 			steps = append(steps, platform.DeviceReleaseStep{Step: "partprobe", Target: path, OK: true})
+		case hasNoDiskLabel(out):
+			steps = append(steps, platform.DeviceReleaseStep{Step: "partprobe", Target: path, Skipped: true, Detail: stepDetail(out, err)})
+		default:
+			steps = append(steps, platform.DeviceReleaseStep{Step: "partprobe", Target: path, Detail: stepDetail(out, err)})
 		}
 	}
 	if _, err := LookPath("udevadm"); err == nil {
@@ -338,6 +345,16 @@ func deviceCarriesSystemMount(n *lsblkNode) bool {
 func isNotPV(out string) bool {
 	low := strings.ToLower(out)
 	return strings.Contains(low, "not a physical volume") || strings.Contains(low, "no pv label")
+}
+
+// hasNoDiskLabel 识别"设备上本来就没有分区表"这类"无需重扫"的报错。
+//
+// wipefs 抹掉签名之后，parted/partprobe（libparted）对一块无标签的设备就是这么说的；
+// 英式拼写是它的原文，美式只是兜个不同构建的底。
+func hasNoDiskLabel(out string) bool {
+	low := strings.ToLower(out)
+	return strings.Contains(low, "unrecognised disk label") ||
+		strings.Contains(low, "unrecognized disk label")
 }
 
 // stepDetail 取命令失败时的说明：优先用命令输出，输出为空时退回错误文本。

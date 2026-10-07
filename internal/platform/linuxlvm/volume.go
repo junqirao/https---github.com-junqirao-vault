@@ -18,10 +18,21 @@ import (
 // mountOptions 是 ntfs-3g 的挂载选项。big_writes 显著提升大块写入吞吐（建盘拷入场景）。
 const mountOptions = "big_writes"
 
-// EnsureFormatted 幂等地初始化并格式化卷。目前只支持 NTFS。
+// EnsureFormatted 幂等地把盘准备好：分区表 + 单分区 + 分区上的文件系统。
+//
+// 服务端负责"把盘做成客户端能直接挂载的样子"（客户端只看结果，不再自己分区/格式化）：
+//  1. 激活 LV（保证 /dev/mapper 设备节点存在）；
+//  2. 布局：空盘写 GPT + 单分区；已有分区的盘复用第一个分区；升级前的整盘布局
+//     （裸文件系统直接在整盘上、盘里已有数据的旧盘）按原样使用，**不做转换**，
+//     见 ensureDiskLayout；
+//  3. 格式化：数据设备上**还没有**文件系统时才格式化；已有任何文件系统一律不覆盖。
+//
+// 支持 ntfs（Windows 客户端）与 ext4（Linux 客户端，预留）：用哪种由建库时的
+// "客户端操作系统"决定，并持久化在盘记录上（domain.Disk.FileSystem）。
 func (m *Manager) EnsureFormatted(ctx context.Context, ref, fileSystem, label string) (*platform.Volume, error) {
-	if !strings.EqualFold(strings.TrimSpace(fileSystem), "NTFS") {
-		return nil, apperr.InvalidParam("file_system")
+	fs, err := diskFileSystem(fileSystem)
+	if err != nil {
+		return nil, err
 	}
 	vg, lv, err := parseRef(ref)
 	if err != nil {
@@ -31,28 +42,30 @@ func (m *Manager) EnsureFormatted(ctx context.Context, ref, fileSystem, label st
 	if err := m.Activate(ctx, ref, false); err != nil {
 		return nil, err
 	}
-	dev := lvRef(vg, lv)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	fs, _ := m.blkidType(ctx, dev)
+
+	// 数据设备是"分区设备"（旧版整盘布局则是整盘本身）：GPT 只是给客户端看的壳，
+	// 文件系统建在分区上，客户端按"磁盘 → 分区 → 卷"的模型就能直接挂载。
+	dev, layout, err := m.ensureDiskLayout(ctx, lvRef(vg, lv), fs)
+	if err != nil {
+		return nil, err
+	}
+
+	existing, _ := m.blkidType(ctx, dev)
 	switch {
-	case strings.EqualFold(fs, "ntfs"):
-		m.logger.Info("已有 NTFS 文件系统，跳过格式化", "ref", ref)
-	case fs != "":
+	case strings.EqualFold(existing, fs):
+		m.logger.Info("数据设备已有目标文件系统，跳过格式化",
+			"ref", ref, "device", dev, "file_system", fs, "layout", layout)
+	case existing != "":
 		// 已有其它文件系统：绝不覆盖用户数据。
 		return nil, apperr.New(CodeMountFailed, http.StatusInternalServerError).
-			WithArg("existing_fs", fs)
+			WithArg("existing_fs", existing)
 	default:
-		args := []string{"-Q"}
-		if l := strings.TrimSpace(label); l != "" {
-			args = append(args, "-L", l)
-		}
-		args = append(args, dev)
-		if _, err := m.run(ctx, "mkfs.ntfs", args...); err != nil {
+		if err := m.formatVolume(ctx, dev, fs, label); err != nil {
 			return nil, err
 		}
-		m.logger.Info("已格式化 NTFS", "ref", ref, "label", label)
 	}
 
 	size, err := m.lvSizeBytes(vg, lv)
@@ -60,10 +73,10 @@ func (m *Manager) EnsureFormatted(ctx context.Context, ref, fileSystem, label st
 		size = 0
 	}
 	// 刻意不在此 Deactivate：LV 需要保持激活供 iSCSI(LIO iblock) 发布使用。
-	return &platform.Volume{Device: ref, FileSystem: "NTFS", SizeBytes: size}, nil
+	return &platform.Volume{Device: dev, FileSystem: strings.ToUpper(fs), SizeBytes: size}, nil
 }
 
-// MountAndCopy 一次性完成"激活 → 格式化 → 递归拷入 sourceDir 内容 → 校验 → 卸载"。
+// MountAndCopy 一次性完成"激活 → 分区 → 格式化 → 递归拷入 sourceDir 内容 → 校验 → 卸载"。
 //
 // 校验口径与项目既有 CopyTree 一致：目标侧文件数/字节数不得少于源，否则 platform.copy_failed。
 func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string) (int, int64, error) {
@@ -72,25 +85,27 @@ func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, 
 	if err != nil || !info.IsDir() {
 		return 0, 0, apperr.InvalidParam("source_dir")
 	}
-
-	// EnsureFormatted 内部会 Activate，保证设备节点存在。
-	if _, err := m.EnsureFormatted(ctx, ref, fileSystem, label); err != nil {
-		return 0, 0, err
-	}
-	vg, lv, err := parseRef(ref)
+	fs, err := diskFileSystem(fileSystem)
 	if err != nil {
 		return 0, 0, err
 	}
-	dev := lvRef(vg, lv)
 
-	mnt, err := os.MkdirTemp("", "vault-ntfs-")
+	// EnsureFormatted 内部会激活 LV、建好分区，并返回**数据设备**（分区）路径。
+	vol, err := m.EnsureFormatted(ctx, ref, fileSystem, label)
+	if err != nil {
+		return 0, 0, err
+	}
+	dev := vol.Device
+
+	mnt, err := os.MkdirTemp("", "vault-disk-")
 	if err != nil {
 		return 0, 0, apperr.New(CodeMountFailed, http.StatusInternalServerError).WithCause(err)
 	}
 	// defer 保证失败路径也清理临时目录。
 	defer func() { _ = os.Remove(mnt) }()
 
-	if _, err := m.run(ctx, "mount", "-t", "ntfs-3g", "-o", mountOptions, dev, mnt); err != nil {
+	// NTFS 优先内核 ntfs3、回退 ntfs-3g；ext4 走内核驱动（见 mountVolume）。
+	if err := m.mountVolume(ctx, dev, fs, mnt); err != nil {
 		return 0, 0, err
 	}
 	mounted := true
@@ -121,9 +136,12 @@ func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, 
 	mounted = false
 
 	// 尽力而为地修复 NTFS 日志（ntfsfix -d 清 dirty flag）；缺失或失败只告警，不影响建盘结果。
-	if _, err := LookPath("ntfsfix"); err == nil {
-		if _, err := m.run(ctx, "ntfsfix", "-d", dev); err != nil {
-			m.logger.Warn("ntfsfix 失败（忽略）", "ref", ref, "err", err.Error())
+	// 只对 NTFS 有意义，ext4 上没有这个工具也不需要。
+	if fs == "ntfs" {
+		if _, err := LookPath("ntfsfix"); err == nil {
+			if _, err := m.run(ctx, "ntfsfix", "-d", dev); err != nil {
+				m.logger.Warn("ntfsfix 失败（忽略）", "ref", ref, "err", err.Error())
+			}
 		}
 	}
 

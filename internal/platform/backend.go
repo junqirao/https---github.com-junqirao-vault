@@ -40,7 +40,9 @@ func IsUnsupported(err error) bool { return errors.Is(err, ErrUnsupported) }
 
 // Volume 是一次格式化/挂载操作返回的卷信息。
 type Volume struct {
-	// Device 卷设备标识：Windows 为盘符（如 "E"，无盘符时为空串）；Linux 为 /dev/mapper/<vg>-<lv>。
+	// Device 卷设备标识：Windows 为盘符（如 "E"，无盘符时为空串）；
+	// Linux 为承载文件系统的**数据设备**，即盘内分区（如 /dev/mapper/<vg>-<lv>1）；
+	// 升级前的整盘布局（无分区表）则是整盘 /dev/mapper/<vg>-<lv>。
 	Device string
 	// FileSystem 卷文件系统名。
 	FileSystem string
@@ -128,6 +130,10 @@ type VolumeBackend interface {
 	//
 	// 幂等保证：已有文件系统且与 fileSystem 一致时跳过格式化；
 	// 已有其它文件系统时报错（避免覆盖已有数据）。
+	//
+	// fileSystem 由建库时的"客户端操作系统"决定（Windows → ntfs，Linux → ext4），
+	// 且**必须在客户端挂载之前**落实：客户端只看到一块已经分好区、格好式的裸盘。
+	// 具体格式见 domain.ClientOS / domain.FileSystem。
 	EnsureFormatted(ctx context.Context, ref, fileSystem, label string) (*Volume, error)
 
 	// MountAndCopy 一次性完成"激活 → 格式化 → 递归拷入 sourceDir 内容 → 卸载"，

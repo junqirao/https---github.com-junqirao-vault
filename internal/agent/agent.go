@@ -299,6 +299,15 @@ func (a *Agent) Start(ctx context.Context) (string, error) {
 		a.runMountSessionProbeLoop(a.baseCtx)
 	})
 
+	// 上次进程死在卸载中途留下的"卸载中"记录：启动即补完 —— **不等服务端连接、不看全局
+	// 自动挂载开关**（见 finishInterruptedUnmounts）。缺了这一步，那条记录会一直显示"卸载中"，
+	// 重启多少次都一样（真实反馈："重启之后客户端一直提示在卸载中，这种名存实亡的"）。
+	a.wg.Add(1)
+	safeGo(a.logger, "finish_unmounts", func() {
+		defer a.wg.Done()
+		a.finishInterruptedUnmounts(a.baseCtx)
+	})
+
 	// 启动即预检本机 iSCSI 发起端（只读）：不就绪时界面会挂横幅，而不是等挂载失败才知道。
 	safeGo(a.logger, "iscsi_probe", func() {
 		probeCtx, cancel := context.WithTimeout(a.baseCtx, defaultProbeTimeout)
@@ -381,14 +390,46 @@ func (a *Agent) UnmountAll(ctx context.Context) {
 // key 为空时按会话自身字段推导（实例 ID/地址）。primary=true 表示客户端把该台指定为主服务端
 // （更新源等"没有服务端上下文"的操作默认用它，见 primaryServerKey）。
 // 返回会话实际归属的服务端键（可能与传入的 key 不同：同一台的两种键会被合并）。
+//
+// 会话按"台"覆盖：推**同一台服务端、同一个用户**的会话（客户端每次启动、令牌续期、切回某台
+// 都会推一次）不会打断这条已经建好的连接，见 sameSessionPeer。
 func (a *Agent) setSession(key string, session *Session, primary bool) string {
 	if session == nil {
 		return ""
 	}
+	// 先取"推之前"的那一份：SetSession 会就地覆盖会话（还可能把地址键合并到实例 ID 键上），
+	// 迟到一步就只能读到新的了。推一台全新服务端时 ResolveKey 返回空串（给了标识却没匹配
+	// 上），此处就当作"没有旧会话"，不会误认成主服务端那一份。
+	prevKey := a.store.ResolveKey(key, session.ServerURL)
+	var prev *Session
+	var hadPrev bool
+	if prevKey != "" {
+		prev, hadPrev = a.store.Session(prevKey)
+	}
+
 	serverKey := a.store.SetSession(key, session)
 	if primary {
 		a.store.SetPrimary(serverKey)
 	}
+	a.store.SetUser(serverKey, UserState{ID: session.UserID, Username: session.Username})
+	a.setEventsSupported(serverKey, true)
+	// 新会话已建立：解除"需要重新登录"标记，重新允许自动续期（只解这一台）。
+	a.renewMu.Lock()
+	delete(a.renewBlocked, serverKey)
+	a.renewMu.Unlock()
+
+	// 这台本来就连着、推的又是同一台服务端的同一个用户：**连接状态一个字都不动**。
+	//
+	// 否则会把一条正常连接打成"连接中"（Connected=false + phase=connecting），而要回到
+	// connected 只能等 SystemInfo 探测或事件流重连——探测恰逢服务端忙（真实场景：刚点了
+	// 删除存储库，服务端正在回收磁盘），事件流又一直没断、不会再触发"就绪即确认连接"，
+	// 两条路都不走，界面就**一直卡在"连接中"**（工单原话："点删除库会卡在连接中"）。
+	//
+	// 代价：本机给这台改的名字/别名要等下一次真正重连（或下次启动）才会同步进代理状态。
+	if cur, ok := a.store.Server(serverKey); ok && cur.Connected && hadPrev && sameSessionPeer(prev, session) {
+		return serverKey
+	}
+
 	// 这里只表示"拿到会话了"，真正连上要等 onSessionEstablished 的 SystemInfo 或事件流确认，
 	// 因此把阶段显式置回 connecting：若整体覆盖成零值 ServerState（Phase 归空），界面会从
 	// "连接中"闪一下"未连接"（真实观感问题）。
@@ -402,15 +443,30 @@ func (a *Agent) setSession(key string, session *Session, primary bool) string {
 		state.Phase = ServerPhaseConnecting
 	})
 	a.publishServerIfChanged(serverKey, before)
-	a.store.SetUser(serverKey, UserState{ID: session.UserID, Username: session.Username})
-	a.setEventsSupported(serverKey, true)
-	// 新会话已建立：解除"需要重新登录"标记，重新允许自动续期（只解这一台）。
-	a.renewMu.Lock()
-	delete(a.renewBlocked, serverKey)
-	a.renewMu.Unlock()
 
 	safeGo(a.logger, "session_established", func() { a.onSessionEstablished(serverKey) })
 	return serverKey
+}
+
+// sameSessionPeer 判断两份会话是不是"同一台服务端的同一个用户"。
+//
+// 刻意**不比令牌与有效期**：续期只是换令牌，连接本身没断（客户端续期后会把新会话推回来，
+// 若按"换了令牌 = 换了会话"处理，每续期一次界面就要闪一次"连接中"）。地址与实例 ID 才是
+// "同一台"的判据：两边都有值时必须一致（实例 ID 优先，地址按规范化形式比较）。
+func sameSessionPeer(prev, next *Session) bool {
+	if prev == nil || next == nil {
+		return false
+	}
+	if prev.UserID != next.UserID {
+		return false
+	}
+	if prev.ServerInstanceID != "" && next.ServerInstanceID != "" &&
+		prev.ServerInstanceID != next.ServerInstanceID {
+		return false
+	}
+	prevURL := normalizeServerURL(prev.ServerURL)
+	nextURL := normalizeServerURL(next.ServerURL)
+	return prevURL == "" || nextURL == "" || prevURL == nextURL
 }
 
 // onSessionEstablished 在拿到会话后刷新**该台**服务端信息、拉起事件订阅并尝试自动挂载。

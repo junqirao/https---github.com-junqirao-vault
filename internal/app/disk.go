@@ -376,10 +376,14 @@ func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk
 	}
 	rep.Progress(15)
 
+	// 文件系统按盘的标记走（建盘时按客户端操作系统定下，见 domain.ClientOS）：
+	// Windows 客户端 → NTFS，Linux 客户端（预留）→ ext4。
+	fs := disk.FileSystemOrDefault().String()
+
 	if sourceDir != "" {
-		// 有源目录：由卷后端一次性完成"激活 → 格式化 → 拷入 → 卸载"，
-		// 中间的挂载细节（Windows=盘符/robocopy，Linux=ntfs-3g/copyTree）不再泄漏到本层。
-		if _, _, err := s.Vol.MountAndCopy(ctx, disk.VHDXPath, sourceDir, "NTFS", "VAULT"); err != nil {
+		// 有源目录：由卷后端一次性完成"激活 → 分区 → 格式化 → 拷入 → 卸载"，
+		// 中间的挂载细节（Windows=盘符/robocopy，Linux=分区+ntfs3/ntfs-3g/copyTree）不再泄漏到本层。
+		if _, _, err := s.Vol.MountAndCopy(ctx, disk.VHDXPath, sourceDir, fs, "VAULT"); err != nil {
 			return err
 		}
 	} else {
@@ -396,7 +400,7 @@ func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk
 				s.Log.Warn("卸载虚拟磁盘失败", "disk_id", disk.ID, "error", dErr)
 			}
 		}()
-		if _, err := s.Vol.EnsureFormatted(ctx, disk.VHDXPath, "NTFS", "VAULT"); err != nil {
+		if _, err := s.Vol.EnsureFormatted(ctx, disk.VHDXPath, fs, "VAULT"); err != nil {
 			return err
 		}
 		if err := s.Disk.Deactivate(ctx, disk.VHDXPath); err != nil {
@@ -688,6 +692,8 @@ func (s *DiskService) runCopyVHDX(ctx context.Context, j *domain.Job, rep job.Re
 				SizeBytes: src.SizeBytes,
 				VHDType:   domain.VHDTypeDynamic,
 				State:     domain.DiskStateCreating,
+				// 拷贝出来的母盘沿用源盘的格式标记（内容整盘复制，布局不变）。
+				FileSystem: src.FileSystemOrDefault(),
 			}
 			if err := tx.CreateDisk(ctx, d); err != nil {
 				return err

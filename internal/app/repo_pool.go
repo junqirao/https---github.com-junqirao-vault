@@ -199,6 +199,8 @@ func (s *DiskService) ensurePoolDiffDisk(ctx context.Context, repo *domain.Repos
 		SizeBytes:     parent.SizeBytes,
 		VHDType:       domain.VHDTypeDifferencing,
 		State:         domain.DiskStateCreating,
+		// 池位差异盘同样是母盘快照，格式标记继承母盘。
+		FileSystem: parent.FileSystemOrDefault(),
 	}
 	if err := s.Store.CreateDisk(ctx, d); err != nil {
 		return nil, err

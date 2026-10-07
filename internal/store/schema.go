@@ -80,6 +80,7 @@ var sqliteSchema = []string{
 		desired_state       TEXT NOT NULL DEFAULT '',
 		observed_state      TEXT NOT NULL DEFAULT '',
 		mounted             INTEGER NOT NULL DEFAULT 0,
+		file_system         TEXT NOT NULL DEFAULT '',
 		created_at          INTEGER NOT NULL,
 		updated_at          INTEGER NOT NULL
 	)`,
@@ -326,6 +327,7 @@ var mysqlSchema = []string{
 		desired_state       VARCHAR(32) NOT NULL DEFAULT '',
 		observed_state      VARCHAR(32) NOT NULL DEFAULT '',
 		mounted             TINYINT(1) NOT NULL DEFAULT 0,
+		file_system         VARCHAR(16) NOT NULL DEFAULT '',
 		created_at          BIGINT NOT NULL,
 		updated_at          BIGINT NOT NULL,
 		KEY idx_disks_repo (repo_id),

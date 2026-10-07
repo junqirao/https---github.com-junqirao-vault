@@ -192,8 +192,11 @@ type diskDTO struct {
 	VHDType       string `json:"vhd_type"`
 	State         string `json:"state"`
 	Mounted       bool   `json:"mounted"`
-	CreatedAt     int64  `json:"created_at"`
-	UpdatedAt     int64  `json:"updated_at"`
+	// FileSystem 是盘**分区**上的文件系统（ntfs/ext4），建盘时按客户端操作系统定下。
+	// 它是盘的固有标记：分区表与格式化都写进盘里了，改不了。
+	FileSystem string `json:"file_system"`
+	CreatedAt  int64  `json:"created_at"`
+	UpdatedAt  int64  `json:"updated_at"`
 }
 
 func toDiskDTO(d *domain.Disk) diskDTO {
@@ -201,7 +204,9 @@ func toDiskDTO(d *domain.Disk) diskDTO {
 		ID: d.ID, RepoID: d.RepoID, Kind: string(d.Kind), VHDXPath: d.VHDXPath,
 		ParentVersion: d.ParentVersion, SizeBytes: d.SizeBytes, PhysicalBytes: d.PhysicalBytes,
 		VHDType: string(d.VHDType), State: string(d.State), Mounted: d.Mounted,
-		CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
+		// 存量老盘（升级前建的）标记为空，按历史行为回填 ntfs，前端不用再判空。
+		FileSystem: d.FileSystemOrDefault().String(),
+		CreatedAt:  d.CreatedAt, UpdatedAt: d.UpdatedAt,
 	}
 	if d.ParentID != nil {
 		dto.ParentID = *d.ParentID

@@ -333,7 +333,8 @@ func (s *Store) GetRepoMember(ctx context.Context, repoID, userID string) (*doma
 // ---------- disks ----------
 
 const diskCols = `id, repo_id, kind, vhdx_path, parent_id, parent_version, content_fingerprint,
-	size_bytes, physical_bytes, vhd_type, state, desired_state, observed_state, mounted, created_at, updated_at`
+	size_bytes, physical_bytes, vhd_type, state, desired_state, observed_state, mounted, file_system,
+	created_at, updated_at`
 
 // CreateDisk 插入磁盘记录。
 func (s *Store) CreateDisk(ctx context.Context, d *domain.Disk) error {
@@ -347,7 +348,7 @@ func (s *Store) CreateDisk(ctx context.Context, d *domain.Disk) error {
 		`INSERT INTO disks (`+diskCols+`)
 		 VALUES (:id, :repo_id, :kind, :vhdx_path, :parent_id, :parent_version, :content_fingerprint,
 		         :size_bytes, :physical_bytes, :vhd_type, :state, :desired_state, :observed_state,
-		         :mounted, :created_at, :updated_at)`,
+		         :mounted, :file_system, :created_at, :updated_at)`,
 		map[string]any{
 			"id":                  d.ID,
 			"repo_id":             d.RepoID,
@@ -363,6 +364,7 @@ func (s *Store) CreateDisk(ctx context.Context, d *domain.Disk) error {
 			"desired_state":       d.DesiredState,
 			"observed_state":      d.ObservedState,
 			"mounted":             d.Mounted,
+			"file_system":         string(d.FileSystem),
 			"created_at":          d.CreatedAt,
 			"updated_at":          d.UpdatedAt,
 		})
@@ -391,6 +393,7 @@ func (s *Store) scanDisk(ctx context.Context, query string, args ...any) (*domai
 		DesiredState       string  `db:"desired_state"`
 		ObservedState      string  `db:"observed_state"`
 		Mounted            bool    `db:"mounted"`
+		FileSystem         string  `db:"file_system"`
 		CreatedAt          int64   `db:"created_at"`
 		UpdatedAt          int64   `db:"updated_at"`
 	}
@@ -412,6 +415,7 @@ func (s *Store) scanDisk(ctx context.Context, query string, args ...any) (*domai
 		DesiredState:       row.DesiredState,
 		ObservedState:      row.ObservedState,
 		Mounted:            row.Mounted,
+		FileSystem:         domain.FileSystem(row.FileSystem),
 		CreatedAt:          row.CreatedAt,
 		UpdatedAt:          row.UpdatedAt,
 	}, nil
@@ -471,6 +475,7 @@ func (s *Store) listDisks(ctx context.Context, query string, args ...any) ([]dom
 		DesiredState       string  `db:"desired_state"`
 		ObservedState      string  `db:"observed_state"`
 		Mounted            bool    `db:"mounted"`
+		FileSystem         string  `db:"file_system"`
 		CreatedAt          int64   `db:"created_at"`
 		UpdatedAt          int64   `db:"updated_at"`
 	}
@@ -494,6 +499,7 @@ func (s *Store) listDisks(ctx context.Context, query string, args ...any) ([]dom
 			DesiredState:       r.DesiredState,
 			ObservedState:      r.ObservedState,
 			Mounted:            r.Mounted,
+			FileSystem:         domain.FileSystem(r.FileSystem),
 			CreatedAt:          r.CreatedAt,
 			UpdatedAt:          r.UpdatedAt,
 		})

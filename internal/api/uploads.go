@@ -47,6 +47,9 @@ type createUploadRequest struct {
 	RepoMode   string            `json:"repo_mode"`
 	StorageID  string            `json:"storage_id"`
 	QuotaBytes int64             `json:"quota_bytes"`
+	// ClientOS 将使用该库的客户端操作系统（windows | linux，留空按 windows）：
+	// 决定建盘用的文件系统并记在盘上（见 domain.ClientOS），建完之后不能改。
+	ClientOS string `json:"client_os"`
 }
 
 // parsePathInt 解析路径中的整型参数。
@@ -94,6 +97,7 @@ func (r *Router) handleCreateUpload(w http.ResponseWriter, req *http.Request) {
 		RepoMode:   in.RepoMode,
 		StorageID:  in.StorageID,
 		QuotaBytes: in.QuotaBytes,
+		ClientOS:   in.ClientOS,
 	})
 	if err != nil {
 		r.writeError(w, req, err)

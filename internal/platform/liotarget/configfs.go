@@ -148,6 +148,12 @@ func (m *Manager) coreRoot() string             { return path.Join(m.root, "core
 func (m *Manager) targetPath(iqn string) string { return path.Join(m.iscsiRoot(), iqn) }
 func (m *Manager) tpgPath(iqn string) string    { return path.Join(m.targetPath(iqn), tpgName) }
 func (m *Manager) aclsPath(iqn string) string   { return path.Join(m.tpgPath(iqn), "acls") }
+
+// tpgAuthDir 返回 TPG 级 CHAP 凭据目录（configfs 的 tpgt_1/auth，内核里是 tpg_demo_auth）。
+//
+// 别与 acls/<iqn>/auth 混为一谈：两者目录名与文件名都相同（userid / password），但落点与
+// 服务对象不同——这个只给**动态 ACL** 用，那个只给显式 ACL 用（见 Manager.setTpgAuth）。
+func (m *Manager) tpgAuthDir(iqn string) string { return path.Join(m.tpgPath(iqn), "auth") }
 func (m *Manager) tpgLunDir(iqn string) string {
 	return path.Join(m.tpgPath(iqn), "lun", "lun_0")
 }

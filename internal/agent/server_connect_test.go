@@ -190,6 +190,100 @@ func TestNeedsServerReconnect(t *testing.T) {
 	})
 }
 
+// TestSameSessionPeer 覆盖"算不算同一台服务端的同一个用户"的判据。
+func TestSameSessionPeer(t *testing.T) {
+	base := &Session{
+		ServerURL: "https://10.0.0.1:8443/", ServerInstanceID: "srv-a",
+		UserID: "u-1", Username: "alice", Token: "t1",
+	}
+	cases := []struct {
+		name       string
+		prev, next *Session
+		want       bool
+	}{
+		{
+			"同一台同一个用户（只剩令牌不同也算）",
+			base,
+			&Session{ServerURL: "https://10.0.0.1:8443", ServerInstanceID: "srv-a", UserID: "u-1", Token: "t2"},
+			true,
+		},
+		{
+			"地址大小写与末尾斜杠不算换台",
+			&Session{ServerURL: "https://10.0.0.1:8443", UserID: "u-1"},
+			&Session{ServerURL: "HTTPS://10.0.0.1:8443/", UserID: "u-1"},
+			true,
+		},
+		{
+			"换了用户",
+			base,
+			&Session{ServerURL: base.ServerURL, ServerInstanceID: "srv-a", UserID: "u-2", Token: "t2"},
+			false,
+		},
+		{
+			"换了实例",
+			base,
+			&Session{ServerURL: base.ServerURL, ServerInstanceID: "srv-b", UserID: "u-1", Token: "t2"},
+			false,
+		},
+		{
+			"换了地址",
+			base,
+			&Session{ServerURL: "https://10.0.0.2:8443", ServerInstanceID: "srv-a", UserID: "u-1", Token: "t2"},
+			false,
+		},
+		{"没有旧会话", nil, base, false},
+		{"没有新会话", base, nil, false},
+	}
+	for _, tc := range cases {
+		if got := sameSessionPeer(tc.prev, tc.next); got != tc.want {
+			t.Fatalf("%s：sameSessionPeer = %v，期望 %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestSetSessionKeepsSamePeerConnected 覆盖"重推同一台同一个用户的会话不打断连接"。
+//
+// 真实反馈：点删除存储库后界面**一直卡在"连接中"**。链路是：渲染层推会话（客户端启动、
+// 令牌续期、切回某台都会推一次）→ 代理把连接打成 connected=false / phase=connecting →
+// 回到 connected 只能等 SystemInfo 探测或事件流重连；探测恰逢服务端忙（正在回收磁盘）超时，
+// 事件流又一直没断、不会再触发"就绪即确认连接"，两条路都不走，阶段就永久停在"连接中"。
+// 同一台服务端的同一个用户重推会话（含只换了令牌的续期）不该有任何连接状态变化。
+func TestSetSessionKeepsSamePeerConnected(t *testing.T) {
+	a := newServerConnectTestAgent(t, nil)
+	first := Session{
+		ServerURL: "https://10.0.0.1:8443", ServerInstanceID: "srv-a", ServerName: "机房 A",
+		Alias: "a", UserID: "u-1", Username: "alice", Token: "t1",
+	}
+	key := seedTestServer(t, a, first)
+	a.store.SetServerConnected(key, true, "")
+
+	_, events := a.hub.Subscribe()
+
+	// 续期：同一台、同一个用户，只有令牌变了。
+	renewed := first
+	renewed.Token = "t2"
+	if got := a.setSession(key, &renewed, false); got != key {
+		t.Fatalf("会话应归到 %q，实际 %q", key, got)
+	}
+
+	server := serverStateOf(t, a, key)
+	if !server.Connected || server.Phase != ServerPhaseConnected {
+		t.Fatalf("同一台同一个用户重推会话不得打断连接，实际 connected=%v phase=%q",
+			server.Connected, server.Phase)
+	}
+	if server.FailCount != 0 {
+		t.Fatalf("重推会话不该产生失败计数，实际 %d", server.FailCount)
+	}
+	// 会话本身照旧更新（令牌以最后一次推送为准），只有连接状态不动。
+	if session, ok := a.store.Session(key); !ok || session.Token != "t2" {
+		t.Fatalf("会话应更新为新令牌，实际 %+v (ok=%v)", session, ok)
+	}
+	// 状态没变就不该广播：多推几次会话不该给界面发一串无意义的 server 事件。
+	if ev, ok := takeServerEvent(t, events); ok {
+		t.Fatalf("连接状态没变就不该广播事件，实际收到 %s", ev.Type)
+	}
+}
+
 // TestClearSessionStopsAutoReconnect 覆盖"退出登录后不被自动登回来"。
 //
 // 身份文件在退出登录后**仍然存在**，若不把失败计数顶到上限，自动重连循环会立刻用

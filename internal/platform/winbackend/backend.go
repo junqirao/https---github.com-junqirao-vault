@@ -152,7 +152,15 @@ func (b *Backend) Deactivate(ctx context.Context, ref string) error { return b.V
 // EnsureFormatted 幂等地初始化 + 分区 + 格式化，并把 VolumeInfo 映射为平台中性结构。
 //
 // Device 取盘符（无盘符时为空串），与 platform.Volume.Device 的约定一致。
+//
+// 只支持 NTFS：Windows 服务端给 Windows 客户端建盘，Format-Volume 也只会这一种。
+// 请求 ext4（Linux 客户端）时明确返回 ErrUnsupported，而不是丢给 PowerShell 报一个
+// 看不懂的 Format-Volume 错误。
 func (b *Backend) EnsureFormatted(ctx context.Context, ref, fileSystem, label string) (*platform.Volume, error) {
+	if !strings.EqualFold(strings.TrimSpace(fileSystem), "ntfs") {
+		b.log.Warn("Windows 服务端只能建 NTFS 盘，拒绝其它文件系统", "file_system", fileSystem)
+		return nil, platform.ErrUnsupported
+	}
 	info, err := b.Vol.EnsureFormatted(ctx, ref, fileSystem, label)
 	if err != nil {
 		return nil, err
@@ -170,6 +178,10 @@ func (b *Backend) EnsureFormatted(ctx context.Context, ref, fileSystem, label st
 // 卸载放在 defer 中并用 context.WithoutCancel 执行：即使中途失败或 ctx 取消，
 // 也必须把盘分离，避免留下"已挂载但无句柄管理"的脏状态（与 buildVHDXFromSource 一致）。
 func (b *Backend) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string) (int, int64, error) {
+	if !strings.EqualFold(strings.TrimSpace(fileSystem), "ntfs") {
+		b.log.Warn("Windows 服务端只能建 NTFS 盘，拒绝其它文件系统", "file_system", fileSystem)
+		return 0, 0, platform.ErrUnsupported
+	}
 	if _, err := b.VHD.Attach(ctx, ref, false); err != nil {
 		return 0, 0, err
 	}

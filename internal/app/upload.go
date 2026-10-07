@@ -43,6 +43,10 @@ type CreateUploadInput struct {
 	StorageID string
 	// QuotaBytes 可选应用层配额；0 表示不限。
 	QuotaBytes int64
+	// ClientOS 可选：将使用该库的客户端操作系统（"windows"/"linux"，留空按 windows）。
+	//
+	// 决定建盘用的文件系统（见 domain.ClientOS），随清单持久化，建盘时生效。
+	ClientOS string
 }
 
 // UploadSession 是创建上传会话的响应。
@@ -129,6 +133,11 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 	if in.QuotaBytes < 0 {
 		return nil, apperr.InvalidParam("quota_bytes")
 	}
+	// 客户端系统决定建盘用的文件系统（见 domain.ClientOS），留空按默认（Windows）。
+	clientOS, ok := domain.ParseClientOS(in.ClientOS)
+	if !ok {
+		return nil, apperr.InvalidParam("client_os")
+	}
 	storageID := strings.TrimSpace(in.StorageID)
 
 	entries, totalFiles, totalBytes, err := normalizeManifest(in.Manifest)
@@ -141,6 +150,7 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 		RepoMode:   repoMode,
 		StorageID:  storageID,
 		QuotaBytes: in.QuotaBytes,
+		ClientOS:   string(clientOS),
 	})
 	if err != nil {
 		return nil, err
@@ -601,6 +611,8 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 			SizeBytes: size,
 			VHDType:   domain.VHDTypeDynamic,
 			State:     domain.DiskStateCreating,
+			// 建盘格式按上传时声明的客户端系统决定（见 uploadManifestRecord.ClientOS）。
+			FileSystem: uploadClientOS(rec).FileSystem(),
 		}
 		if err := tx.CreateDisk(ctx, disk); err != nil {
 			return err
@@ -982,7 +994,7 @@ func normalizeManifest(m domain.UploadManifest) ([]domain.ManifestEntry, int, in
 
 // uploadManifestRecord 是持久化到 uploads.manifest 的清单记录。
 //
-// 除文件清单外还携带建库选项（repo_mode / storage_id / quota_bytes）：
+// 除文件清单外还携带建库选项（repo_mode / storage_id / quota_bytes / client_os）：
 // uploads 表没有这些列，而"完成建库"是异步任务（读不到创建时的请求参数），
 // 因此随清单一起持久化在同一个 JSON 里，供 runUploadComplete 使用。
 type uploadManifestRecord struct {
@@ -991,6 +1003,9 @@ type uploadManifestRecord struct {
 	RepoMode   string                 `json:"repo_mode,omitempty"`
 	StorageID  string                 `json:"storage_id,omitempty"`
 	QuotaBytes int64                  `json:"quota_bytes,omitempty"`
+	// ClientOS 将使用该库的客户端操作系统，决定建盘格式（见 domain.ClientOS）。
+	// 留空按默认（windows → NTFS）。
+	ClientOS string `json:"client_os,omitempty"`
 }
 
 // marshalManifest 把规范化后的清单记录序列化存储。
@@ -1009,6 +1024,19 @@ func parseManifest(raw string) (*uploadManifestRecord, error) {
 		return nil, apperr.New("upload.manifest_invalid", 500).WithCause(err)
 	}
 	return &m, nil
+}
+
+// uploadClientOS 返回该上传会话建盘用的客户端操作系统。
+//
+// 清单里存的是创建会话时校验过的取值（见 CreateUpload）；若为空或损坏，
+// 回退到默认（Windows）而不是报错：建盘阶段没必要因为一个可选标记让任务失败。
+func uploadClientOS(rec *uploadManifestRecord) domain.ClientOS {
+	if rec != nil {
+		if os, ok := domain.ParseClientOS(rec.ClientOS); ok {
+			return os
+		}
+	}
+	return domain.ClientOSDefault
 }
 
 // treeWriter 把拼接流顺序写入文件树，跨越文件边界。

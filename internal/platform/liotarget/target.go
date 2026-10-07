@@ -45,13 +45,23 @@ func (m *Manager) Available(ctx context.Context) error {
 // 收敛顺序（每一步都幂等，且每次下发后都回读 configfs 复验后置条件）：
 //  1. 归一化 IQN（转小写，必要时补前缀）；
 //  2. 目标对象（targetcli 建目标时一并建立 tpg1）；缺 tpg1 的半成品残骸直接重建；
-//  3. TPG attrib（authentication / generate_node_acls；"不要把已有 LUN 自动挂到新 ACL 上"
-//     是靠建 ACL 时带 add_mapped_luns=false 实现的，见 cmdCreateACL，它不是 TPG 属性）；
-//  4. 建/更新 backstore 及其 attrib（emulate_tpu/tpws、is_nonrot 属于 backstore，
+//  3. 归一化 initiator 白名单，并据此判定是否"不限制 initiator"（见下）；
+//  4. TPG attrib 与 TPG 级 CHAP 凭据（authentication / generate_node_acls /
+//     demo_mode_write_protect / tpgt_1/auth；"不要把已有 LUN 自动挂到新 ACL 上"是靠
+//     建 ACL 时带 add_mapped_luns=false 实现的，见 cmdCreateACL，它不是 TPG 属性）；
+//  5. 建/更新 backstore 及其 attrib（emulate_tpu/tpws、is_nonrot 属于 backstore，
 //     不属于 TPG）；
-//  5. ACL 全量收敛：建集合内的、删集合外的；
-//  6. LUN 映射：TPG 级 lun0 与每个 ACL 的映射 lun0（只读只在 ACL 层落实）；
-//  7. 最后才 enable（避免"先开服后配盘"造成客户端看到残缺配置）。
+//  6. ACL 收敛：有白名单时建集合内的、删集合外的；白名单为空（不限制）时**一个都不删**，
+//     授权交给 LIO 的动态 ACL（generate_node_acls=1）；
+//  7. LUN 映射：TPG 级 lun0 与每个**显式** ACL 的映射 lun0（只读在 ACL 层落实；动态 ACL
+//     的只读由 demo_mode_write_protect 决定）；
+//  8. 最后才 enable（避免"先开服后配盘"造成客户端看到残缺配置）。
+//
+// ⚠️ 白名单为空**不等于**"谁都不许连"，而是"不限制 initiator"——Windows 后端会把空列表
+// 落成通配 `IQN:*`（见 windows-iscsi-vhdx-api.md）。Linux 侧必须用 generate_node_acls=1
+// 复现同一语义：否则 LIO 不会为登录中的 initiator 建动态 ACL，
+// core_tpg_check_initiator_node_acl() 直接返回 NULL，客户端登录被拒并报
+// "Authorization Failure"（现象是门户可达、目标能发现，就是连不上）。
 func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) error {
 	if strings.TrimSpace(spec.Name) == "" {
 		return apperr.InvalidParam("target_name")
@@ -82,38 +92,16 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 	}
 
 	iqn := m.normalizeTargetName(spec.Name)
-	m.logger.Info("收敛 iSCSI 目标（LIO）",
-		"target", iqn,
-		"enabled", spec.Enabled,
-		"read_only", spec.ReadOnly,
-		"initiators", len(spec.Initiators),
-		"chap", chap,
-		"chap_secret", chapSecretLog(chap),
-		"backing_ref", spec.BackingRef)
 
-	// 1. 目标对象（targetcli 建目标时会一并建立 tpg1）。
+	// 2. 目标对象（targetcli 建目标时会一并建立 tpg1）。
 	if err := m.ensureTargetObject(ctx, iqn); err != nil {
 		return err
 	}
-	// 2. TPG 属性。
-	if err := m.applyTpgAttribs(ctx, iqn, chap); err != nil {
-		return err
-	}
 
-	// 3. backstore 及其 attrib（UNMAP 仿真 / SSD 声明）。名字由目标名稳定派生，
-	// 保证重复收敛得到同一个 backstore。
-	bs := ""
-	if strings.TrimSpace(spec.BackingRef) != "" {
-		bs = backstoreNameForTarget(iqn)
-		if err := m.ensureBackstore(ctx, bs, spec.BackingRef); err != nil {
-			return err
-		}
-		if err := m.applyBackstoreAttribs(ctx, bs); err != nil {
-			return err
-		}
-	}
-
-	// 4. 期望的 ACL 集合。排序后使用，让命令顺序与日志可复现（map 遍历顺序是随机的）。
+	// 3. 期望的 ACL 集合。排序后使用，让命令顺序与日志可复现（map 遍历顺序是随机的）。
+	//
+	// 必须排在 TPG 属性之前：白名单为空与否直接决定 generate_node_acls 的取值（见
+	// EnsureTarget 的说明），属性收敛依赖这个结论。
 	want := make(map[string]struct{}, len(spec.Initiators))
 	wantList := make([]string, 0, len(spec.Initiators))
 	for _, raw := range spec.Initiators {
@@ -130,16 +118,58 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 		wantList = append(wantList, ini)
 	}
 	sort.Strings(wantList)
+	unrestricted := len(wantList) == 0
 
-	// 5. 撤销不再授权的 initiator。
+	m.logger.Info("收敛 iSCSI 目标（LIO）",
+		"target", iqn,
+		"enabled", spec.Enabled,
+		"read_only", spec.ReadOnly,
+		"initiators", len(spec.Initiators),
+		"unrestricted", unrestricted,
+		"chap", chap,
+		"chap_secret", chapSecretLog(chap),
+		"backing_ref", spec.BackingRef)
+
+	// 4. TPG 属性与 TPG 级 CHAP 凭据。
+	if err := m.applyTpgAttribs(ctx, iqn, tpgExpect{
+		chap:         chap,
+		unrestricted: unrestricted,
+		readOnly:     spec.ReadOnly,
+		chapUser:     spec.ChapUser,
+		chapSecret:   spec.ChapSecret,
+	}); err != nil {
+		return err
+	}
+
+	// 5. backstore 及其 attrib（UNMAP 仿真 / SSD 声明）。名字由目标名稳定派生，
+	// 保证重复收敛得到同一个 backstore。
+	bs := ""
+	if strings.TrimSpace(spec.BackingRef) != "" {
+		bs = backstoreNameForTarget(iqn)
+		if err := m.ensureBackstore(ctx, bs, spec.BackingRef); err != nil {
+			return err
+		}
+		if err := m.applyBackstoreAttribs(ctx, bs); err != nil {
+			return err
+		}
+	}
+
+	// 6. ACL 收敛：先撤销集合外的，再建集合内的。
 	//
 	// 这里把失败**当错误返回**（旧实现只记 Warn 就继续）：拆不掉授权意味着某个已被移出
 	// 白名单的 initiator 仍然能登录——这是安全语义上的失败，不能静默放过。
-	for _, ini := range m.listDirs(m.aclsPath(iqn)) {
-		if _, ok := want[ini]; !ok {
-			m.logger.Info("移除不再授权的 initiator", "target", iqn, "initiator", ini)
-			if err := m.removeACL(ctx, iqn, ini); err != nil {
-				return err
+	//
+	// 白名单为空（不限制）时整段跳过：此时 acls/ 里的条目是 LIO 为正在登录的 initiator
+	// 自动建的**动态 ACL**（generate_node_acls=1），删掉等于当场踢掉在线会话、并让客户端
+	// 下次登录重新走一遍建 ACL；管理员在这期间手工加的授权同理不该被抹掉。真要收紧授权，
+	// 正确做法是给目标配上显式白名单——那时这条删除会把这些条目一并清掉。
+	if !unrestricted {
+		for _, ini := range m.listDirs(m.aclsPath(iqn)) {
+			if _, ok := want[ini]; !ok {
+				m.logger.Info("移除不再授权的 initiator", "target", iqn, "initiator", ini)
+				if err := m.removeACL(ctx, iqn, ini); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -154,7 +184,10 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 		}
 	}
 
-	// 6. LUN 映射（TPG 级 + 每个 ACL）。
+	// 7. LUN 映射（TPG 级 + 每个显式 ACL）。
+	// 动态 ACL 不用在这里建映射：内核 core_tpg_check_initiator_node_acl() 会用
+	// core_tpg_add_node_to_devs() 把 TPG 里的 LUN 自动挂上去，其只读与否由
+	// demo_mode_write_protect 决定（见 applyTpgAttribs）。
 	if bs != "" {
 		if err := m.ensureTpgMapping(ctx, iqn, bs); err != nil {
 			return err
@@ -166,7 +199,7 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 		}
 	}
 
-	// 7. 最后才 enable（避免"先开服后配盘"造成客户端看到残缺配置）。
+	// 8. 最后才 enable（避免"先开服后配盘"造成客户端看到残缺配置）。
 	return m.setEnabled(ctx, iqn, spec.Enabled)
 }
 
@@ -422,11 +455,32 @@ func (m *Manager) ensureTargetObject(ctx context.Context, iqn string) error {
 		func() bool { return m.isTarget(iqn) && m.isTPG(iqn) }, cmdCreateTarget(iqn))
 }
 
-// applyTpgAttribs 把 **TPG 自己的**属性逐条收敛到期望值，并在下发后逐条复验。
+// tpgExpect 是一个 TPG 的期望状态（只覆盖 TPG 级属性，不含 backstore / ACL / LUN）。
+type tpgExpect struct {
+	// chap 是否要求 CHAP 认证（TPG 属性 authentication）。
+	chap bool
+	// unrestricted 目标不限制 initiator（白名单为空时的语义，对应 generate_node_acls）。
+	unrestricted bool
+	// readOnly 只读发布。对显式 ACL 走 acls/<iqn> 的 write_protect（见 ensureACLMapping）；
+	// 对动态 ACL 只能走 demo_mode_write_protect，所以这里必须一起收敛，否则"不限制 +
+	// 只读"的目标会以可写身份挂出去。
+	readOnly bool
+	// chapUser / chapSecret TPG 级（demo）CHAP 凭据，供动态 ACL 使用。
+	chapUser   string
+	chapSecret string
+}
+
+// applyTpgAttribs 把 **TPG 自己的**属性逐条收敛到期望值，并在下发后逐条复验；最后按需
+// 补写 TPG 级 CHAP 凭据。
 //
 // 各属性为什么这么设：
 //   - authentication：spec 带 CHAP 时置 1，否则置 0；
-//   - generate_node_acls=0：关闭"自动为任意 initiator 放行"，因为我们按 ACL 精确授权。
+//   - generate_node_acls：白名单为空（不限制 initiator）时置 1、否则置 0。为 1 时 LIO 会为
+//     登录中的 initiator 自动建动态 ACL 并放行，这正是 Windows 后端空列表落成 `IQN:*` 的
+//     等价语义；为 0 时严格按 ACL 精确授权。指成常量 0 的旧实现让"不限制"的目标在 Linux
+//     上谁都无法登录（详见 EnsureTarget）；
+//   - demo_mode_write_protect：只作用于动态 ACL，取目标是否只读。名字里的 demo 是内核
+//     历史命名，与"演示模式"无关，它就是"动态 ACL 的 LUN 是否写保护"。
 //
 // ⚠️ emulate_tpu / emulate_tpws / is_nonrot **不在这里**：它们是 SE_device（backstore）
 // 属性，只存在于 core/<插件>/<名字>/attrib/ 下，TPG 的 attribute 组里没有。曾经把它们
@@ -436,14 +490,17 @@ func (m *Manager) ensureTargetObject(ctx context.Context, iqn string) error {
 // 在本内核上**不存在**的属性直接跳过（不同内核版本属性集不同）。这是有意保留的宽容：
 // 属性名先查 configfs 再下发，比"让 CLI 报错然后忽略报错"更干净，也不会把真实失败
 // 混进噪音里。
-func (m *Manager) applyTpgAttribs(ctx context.Context, iqn string, chap bool) error {
-	auth := "0"
-	if chap {
-		auth = "1"
+func (m *Manager) applyTpgAttribs(ctx context.Context, iqn string, exp tpgExpect) error {
+	boolStr := func(b bool) string {
+		if b {
+			return "1"
+		}
+		return "0"
 	}
 	spec := []struct{ name, value string }{
-		{"authentication", auth},
-		{"generate_node_acls", "0"},
+		{"authentication", boolStr(exp.chap)},
+		{"generate_node_acls", boolStr(exp.unrestricted)},
+		{"demo_mode_write_protect", boolStr(exp.readOnly)},
 	}
 	for _, a := range spec {
 		attrPath := path.Join(m.tpgPath(iqn), "attrib", a.name)
@@ -455,6 +512,14 @@ func (m *Manager) applyTpgAttribs(ctx context.Context, iqn string, chap bool) er
 		if err := m.apply(ctx, "tpg_attr_"+a.name,
 			func() bool { return m.readAttrEquals(attrPath, value) },
 			cmdSetTpgAttr(iqn, a.name, value)); err != nil {
+			return err
+		}
+	}
+	// TPG 级 CHAP 凭据：只有"不限制 initiator + CHAP"才需要——动态 ACL 认证取的是
+	// tpg_demo_auth，显式 ACL 用的是 acls/<iqn>/auth，与这里无关。白名单非空时不会产生
+	// 动态 ACL，写它无用，反而会在缺 auth 组的内核上把本来正常的显式 ACL 目标拖失败。
+	if exp.chap && exp.unrestricted {
+		if err := m.setTpgAuth(ctx, iqn, exp.chapUser, exp.chapSecret); err != nil {
 			return err
 		}
 	}
@@ -559,6 +624,61 @@ func (m *Manager) setACLAuth(ctx context.Context, iqn, ini, user, secret string)
 	if err := m.apply(ctx, "acl_chap", nil, cmdSetACLAuth(iqn, ini, user, secret)); err != nil {
 		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
 			WithArg("field", "chap").WithArg("user", user).WithCause(err)
+	}
+	return nil
+}
+
+// setTpgAuth 设置 TPG 级 CHAP 凭据（内核里的 tpg_demo_auth，configfs 路径 tpgt_1/auth/）。
+//
+// 为什么非写不可：目标不限制 initiator 时 LIO 走**动态 ACL**（generate_node_acls=1），而
+// 动态 ACL 认证时取的凭据是 tpg_demo_auth（内核 iscsi_get_node_auth() 的
+// dynamic_node_acl 分支），不是任何 acls/<iqn>/auth/。该凭据没写时 naf_flags 里的
+// NAF_USERID_SET / NAF_PASSWORD_SET 未置位，chap_server_open() 直接失败，客户端拿到的是
+// ISCSI_LOGIN_STATUS_AUTH_FAILED（Windows 侧显示 "Authorization Failure"）——即使 ACL
+// 已经被自动放行也照样登不上。所以走动态 ACL 的目标，这一条和 generate_node_acls=1
+// 是配套的，缺一个都会失败。
+//
+// 为什么**直写 configfs**、不走 targetcli（这是与 setACLAuth 的唯一分歧）：
+//   - targetcli 的 `set auth` 是 ACL 节点（acls/<iqn>）的命令，tpg1 本体没有这条命令。
+//     若照 ACL 的写法下发，批处理模式既不报错、退出码也正常，结果是**静默没写进去**——
+//     等于用这次要修的故障方式来"修"故障，必须避免。
+//   - 这两个文件的落点由内核固定（tpgt_1/auth/{userid,password} → tpg_demo_auth，见内核
+//     lio_target_tpg_auth_attrs），直写还能让 os.WriteFile 的失败如实返回，没有把错误
+//     吞进 targetcli 输出的余地。
+//
+// 两个细节：
+//   - **不带尾部换行**：内核 auth 的 store 是直接 snprintf(page) 落库，不像 param 那样做
+//     isspace 去尾；带上 '\n' 会让换行成为凭据的一部分。
+//   - 只回读 userid 做复验（非机密）；password 不回读，免得多读一份密钥进内存。
+//
+// 不会牵连发现（SendTargets）阶段：内核 iscsi_get_node_auth() 第一步就按 SessionType 短路
+// 到全局 discovery_acl.node_auth，discovery 会话根本走不到 tpg_demo_auth，写这里不会让
+// 发现阶段开始要求 CHAP。
+func (m *Manager) setTpgAuth(ctx context.Context, iqn, user, secret string) error {
+	dir := m.tpgAuthDir(iqn)
+	for _, c := range []struct{ name, value string }{{"userid", user}, {"password", secret}} {
+		p := path.Join(dir, c.name)
+		if _, err := os.Stat(p); err != nil {
+			// 「不限制 initiator + CHAP」没有这套凭据就登录不了，属配置不可用，不能静默跳过。
+			return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+				WithArg("field", "chap").
+				WithArg("hint", "内核未提供 TPG 级 auth 文件 "+p+"，无法为动态 ACL 下发 CHAP 凭据").
+				WithCause(err)
+		}
+		if err := os.WriteFile(p, []byte(c.value), 0); err != nil {
+			return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+				WithArg("field", "chap").WithArg("user", user).WithCause(err)
+		}
+	}
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	// 写成功不等于写对了（值被内核截断等），回读确认，不做"发出去就算数"。
+	if !m.readAttrEquals(path.Join(dir, "userid"), user) {
+		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+			WithArg("field", "chap").
+			WithArg("hint", "TPG 级 CHAP userid 回读与写入不一致").
+			WithArg("user", user)
 	}
 	return nil
 }
@@ -689,7 +809,15 @@ func (m *Manager) targetInfo(iqn string) platform.TargetInfo {
 	}
 	// Initiators：ACL 目录名即 initiator IQN，**原样返回**（不添加 "IQN:" 前缀，
 	// 那是 Windows 后端的历史约定，Linux 侧保持纯净 IQN）。
+	//
+	// 但"不限制 initiator"的目标（generate_node_acls=1）例外：此时 acls/ 下的条目是 LIO
+	// 为正在登录的 initiator 自动建的**动态 ACL**（见 EnsureTarget），它们是"访问的结果"
+	// 而不是"配置的白名单"。照原样返回会让上层 targetInfoMatches 把它读成"授权多了"→
+	// 判定漂移 → 每次挂载/启动都白白重下发一遍。返回空列表才是这类目标的真实语义。
 	info.Initiators = m.listDirs(m.aclsPath(iqn))
+	if v, err := m.readAttr(path.Join(m.tpgPath(iqn), "attrib", "generate_node_acls")); err == nil && v == "1" {
+		info.Initiators = nil
+	}
 	// Devices：该目标映射到的 backstore 名字集合。
 	// 若调用方需要块设备路径，可进一步读 core/iblock_0/<bs>/udev_path。
 	info.Devices = m.mappedBackstores(iqn)

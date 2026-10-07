@@ -16,7 +16,7 @@
 2. [能力边界（可行性基线）](#2-windows-侧能力边界可行性基线)（§2.1-2.3 Windows / §2.4 **Linux**）
 3. [总体架构](#3-总体架构)
 4. [领域模型与数据模型](#4-领域模型与数据模型)
-5. [核心技术方案](#5-核心技术方案)（§5.14 **Linux：LVM thin + LIO**）
+5. [核心技术方案](#5-核心技术方案)（§5.14 **Linux：LVM thin + LIO**、§5.15 受管 thin LV、§5.16 **磁盘布局与文件系统**）
 6. [服务端实现](#6-服务端实现)
 7. [客户端实现](#7-客户端实现)
 8. [管理页与前端工程](#8-管理页与前端工程)
@@ -50,7 +50,7 @@
 | D2 | 数据库 | **SQLite(WAL) 与 MySQL 双驱动**，默认 SQLite（见 10.2） | 已确认放弃 etcd 方案 |
 | D3 | 客户端外壳 | **Electron**（已定），管理页与客户端**共用同一套 UI 组件** | 见 8.1；Wails 方案作废 |
 | D4 | 服务端是否用 cgo | **不使用**（已核查：本项目零处需要，见 10.4） | 统一 `CGO_ENABLED=0`；注意勿误引入 `mattn/go-sqlite3` |
-| D5 | 卷文件系统 | **仅 NTFS**（已定） | **块克隆不可用** → 复制 VHDX 为全量物理拷贝（见 5.9），需重新设计省空间策略 |
+| D5 | 卷文件系统 | **随客户端 OS**：Windows → NTFS（已实现）、Linux → ext4（预留）；建库时定下并持久化（见 §5.16） | **块克隆不可用** → 复制 VHDX 为全量物理拷贝（见 5.9），需重新设计省空间策略 |
 | D6 | 存储库容量配额 | **应用层记账**，且**母盘占用由 owner 独担** | NTFS 有原生配额，但本系统配额是"按库/按用户"口径，仍走应用层 |
 | D7 | 母盘保护方式 | **应用层状态标记**（不强制只读挂载） | 因母盘需支持更新；需辅以指纹校验兜底（见 5.4） |
 | D8 | 在线状态权威来源 | **客户端心跳 / 租约**（design.md 已补充"心跳"章节） | 服务端无会话枚举 API，唯一可行路径（见 5.7 / 5.8） |
@@ -143,9 +143,9 @@ Linux 后端是 Windows 后端的**并列等价实现**，同一套上层代码�
 | 删除虚拟磁盘 | 卸载 + `os.Remove` | `lvremove` | 删除前**必须先下线 LUN** 并 `lvchange -an`；thin LV **无法**用 `vgcfgrestore` 恢复 |
 | 查询容量 | `Get-Item` / `Get-DiskImage` | `lvs` / `vgs` / `thin_ls` | 配额统计**不能用** `lvs -o data_percent` 相加（共享块会重复计数），须用 `thin_ls` |
 | 发布为 iSCSI | `Import-IscsiVirtualDisk` + target + mapping | LIO：`iblock_0` backstore + TPG `tpgt_1` + `lun` 符号链接 | **写经 `targetcli` 下发**（argv 直传、无 shell），**读与复验直读 configfs**；无自研服务进程 |
-| iSCSI 鉴权 | `-EnableChap -Chap <user,secret>` | TPG `auth` + ACL `chap` | CHAP 密钥**内核硬限制 12–16 字节纯 ASCII**（Base64 后的 16 字符正好落在边界内） |
-| 只读发布（母盘临时共享） | iSCSI 只读映射 | per-ACL `write_protect=1` | 只读是**按 ACL** 而非按 LUN，务必确认 ACL 生效 |
-| 授权（initiator 白名单） | `Set-IscsiServerTarget -InitiatorIds`（全量替换） | ACL 目录即白名单（增删目录 = 增删授权） | 语义一致：一个分配 = 一个 target |
+| iSCSI 鉴权 | `-EnableChap -Chap <user,secret>` | 显式 ACL 用 `acls/<iqn>/auth`，动态 ACL 用 TPG `auth` | **两套凭据都要写**：`authentication=1` 时内核 `chap_server_open()` 分别取 `nacl->node_auth` 与 `tpg->tpg_demo_auth`，缺哪一套对应的客户端就登不上；CHAP 密钥**内核硬限制 12–16 字节纯 ASCII**（Base64 后的 16 字符正好落在边界内） |
+| 只读发布（母盘临时共享） | iSCSI 只读映射 | 显式 ACL 用 per-ACL `write_protect=1`；动态 ACL 用 TPG `demo_mode_write_protect` | 只读是**按 ACL** 而非按 LUN，务必确认 ACL 生效 |
+| 授权（initiator 白名单） | `Set-IscsiServerTarget -InitiatorIds`（全量替换） | 有白名单 = ACL 目录即白名单；**空白名单 = `generate_node_acls=1`**（LIO 为登录中的 initiator 自动建动态 ACL 并放行） | 空列表的语义是"**不限制**"而不是"拒绝所有"：Windows 把它落成通配 `IQN:*`，Linux 侧必须用动态 ACL 复现，否则 `core_tpg_check_initiator_node_acl()` 直接返回 NULL，客户端报 `Authorization Failure`。语义一致：一个分配 = 一个 target |
 | **查询在线会话** | ❌ 不支持 | ✅ `sessions/` 目录可枚举 | 平台能力接口显式暴露（`iscsi_sessions`） |
 | **强制踢下线** | ❌ 不支持（只能停用 target） | ✅ LIO 可强制登出 | 仍保留客户端心跳为主，会话仅作交叉校验 |
 | 缓存加速 | 无原生能力 | **dm-cache / lvmcache**（SSD 加速 HDD） | 只在 thin pool 的 **`_tdata`** 上操作；改 cachemode 也必须针对 `<vg>/<pool>_tdata` |
@@ -1284,9 +1284,21 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 > 无限刷新失败）。因此：
 >   - `unmountLocked` 失败时**恢复到"卸载前状态"**（见 5.5 的状态语义：卸载失败只有
 >     "挂载点还在"一种情形，回滚成卸载前的状态），绝不把记录留在 unmounting；
+>     唯一例外：**卸载前的状态本身就是 unmounting**（脏记录）时回滚成它等于什么都没发生，
+>     界面永远显示"卸载中"、点几次都一样（真实反馈："重启之后客户端一直提示在卸载中，
+>     这种名存实亡的我要能在客户端自己闭环"）—— 这种情形落成 error 并写入失败原因，
+>     界面才有可点的出口（见 `unmountFailureState`）；
 >   - 启动恢复只处理 state=mounted/mounting 的记录；state=unmounting（代理死在卸载中途）
 >     视作用户最后意图是卸载，**补完卸载后删除记录**；state=error/revoked 是
 >     诊断残留，**不自动重挂**（自动重挂只会每次启动都失败一遍），留给用户手动处理。
+>     补完卸载（`finishInterruptedUnmounts`）**与全局 auto_mount 开关、服务端连接都无关**，
+>     代理启动即做一次、会话建立时再做一次：这段逻辑曾被 `if cfg.AutoMount` 挡住 —— 注释
+>     写着"与开关无关"，代码却受它管，于是没开自动挂载的用户重启后那条记录永远停在
+>     "卸载中"。它也不等服务端：卡住这条记录的现场（服务端重装 / 连不上）恰恰等不到
+>     "连上"那一刻；
+>   - "挂载点还在不在"的兜底判据里，**盘符模式的挂载点自己不存在**是最硬的一条（不需要
+>     磁盘号、也不需要发起端，见 `mountLetterGone`）：它让"盘符早没了"的记录在客户端就能
+>     收尾，不必依赖会话实测。
 >
 > **错误只用一个标记展示**：`MountStateCell` 把"本次请求错误"与"本机残留错误"合并成
 > **一个**红色感叹号 + 多行悬浮详情；挂载列表不再单列"最后错误"文本列，`state="error"` 时
@@ -1653,6 +1665,10 @@ create   lvcreate --type thin -V <size>B -T <vg>/<thin_pool> -n <lv>
    ↓
 activate lvchange -ay -K                 ← thin LV 默认 skip-activation（lv_attr 第 10 位为 'k'），必须 -K
    ↓
+layout   parted mklabel gpt + mkpart primary <fs> 1MiB 100%   ← 客户端按"磁盘→分区→卷"识别（见 §5.16）
+   ↓
+format   mkfs.<fs> 建在**分区**上（不是整盘）                        ← 空盘直接建；母盘建完再挂载拷入（见 §5.4）
+   ↓
 publish  LIO：iblock_0 backstore + TPG tpgt_1 + lun/N 符号链接
    ↓
 差异盘   lvcreate -s <vg>/<lv> -n <diff_lv>      ← thin 快照；绝不可带 -L/-V
@@ -2010,6 +2026,85 @@ POST /v1/system/block-devices/release   body: { path: "/dev/sdb" }
 - Linux LV 级孤儿/对账扫描（沿用既有的文件级扫描）。
 - 每存储硬配额强制（thin LV 的 `-V` 只是名义容量，未做写满保护）。
 - 第三方迁移工具。
+
+### 5.16 磁盘布局与文件系统（GPT + 单分区）
+
+> §5.2 的"建盘"在 Linux 上多了一层**必须由服务端提前做完**的布局工作：**整盘写 GPT + 一个占满
+> 全盘的分区，文件系统建在分区上**。这不是审美问题——客户端按"磁盘 → 分区 → 卷"的模型看盘
+> （Windows 的 `Get-Disk` / `Get-Partition` / `Get-Volume` 就是这套），整盘直接 `mkfs` 的盘在客户端上
+> 连分区都读不出来（`no_partition`），文件系统再正确也挂不上。
+>
+> Windows 服务端本来就是这么做的（`Initialize-Disk` + `New-Partition` + `Format-Volume`），
+> 本节是把 **Linux 侧对齐到同一模型**，并补齐"格式随客户端 OS"这一维。
+
+#### 5.16.1 布局
+
+```
+/dev/mapper/<vg>-<lv>             整盘：GPT 分区表
+└── /dev/mapper/<vg>-<lv>1         单分区（起始 1MiB、占满全盘）= **数据设备**
+        └── NTFS / EXT4            文件系统建在分区上（不在整盘上）
+```
+
+- 分区起始 **1MiB** 对齐：给 GPT 头留位，且对 4K 扇区盘同样安全。
+- 分区**类型 GUID** 按文件系统写（`parted -s dev mkpart primary <fs> 1MiB 100%`）：
+  `ntfs` → Microsoft 基本数据分区，`ext4` → Linux 文件系统。写错客户端会把分区显示成"未知分区"。
+- **数据设备 = 分区**：`platform.Volume.Device`、`fstrim`、`ntfslabel --new-serial` 一律针对分区，
+  而不是整盘（整盘上既没有文件系统，也没有"卷"）。
+- 分区设备名由内核/udev 决定（`/dev/dm-N`，udev 再补 `/dev/mapper/<vg>-<lv>N` 软链），
+  因此**用 `lsblk` 的设备树取分区**，不拼 `<dev>1` 后缀。
+
+#### 5.16.2 文件系统由**客户端操作系统**决定（schema v6）
+
+| 客户端 OS | 文件系统 | 状态 |
+| --- | --- | --- |
+| Windows（默认） | `ntfs` | 已实现 |
+| Linux | `ext4` | **预留**：接口与数据模型已就位，Linux 客户端尚未实现 |
+
+- 建库/上传时由 `client_os`（`domain.ClientOS`）推导 `domain.FileSystem`，并**持久化在 `disks.file_system`**
+  （schema v6 新增列；升级前的老盘为空串，`Disk.FileSystemOrDefault()` 按历史行为回填 `ntfs`）。
+- 建盘之后**不可变**：改格式等于重做盘。差异盘/子盘**继承**母盘的格式。
+- Windows 服务端只会建 NTFS：收到 ext4 请求直接返回 `platform.unsupported`，而不是丢给
+  `Format-Volume` 报一个看不懂的错。
+
+#### 5.16.3 幂等与安全边界（Linux 服务端）
+
+`linuxlvm.ensureDiskLayout` 是唯一入口，`EnsureFormatted` 在格式化之前调用它：
+
+| 盘上现状 | 动作 | 返回布局 |
+| --- | --- | --- |
+| 有分区表 + 有分区 | 只查询，复用第一个分区 | `gpt` |
+| 有分区表 + 没有分区 | 重扫一次；仍无则在**原分区表上**补建分区，**绝不 `mklabel`** | `gpt` |
+| 无分区表 + 有文件系统 | 原样使用（升级前的整盘布局，**不做转换**，日志 Warn） | `legacy` |
+| 无分区表 + 无文件系统 | `wipefs -a` → `mklabel gpt` → `mkpart` → `partx -a` → `udevadm settle` | `empty` |
+
+- **`mklabel` 只在确认是空盘之后才执行**：设备不在 `lsblk` 树里（映射未建立），或探不到分区表却
+  看得见子分区（探表结果不可信）时，一律失败退出（`platform.vhd_failed`，`reason=device_not_found` /
+  `partition_table_unreadable`）。分区表一被重写，盘里的数据就再也找不回来，**绝不赌"它大概是空的"**。
+- **格式化只在数据设备上没有文件系统时执行**；已有其它文件系统时报错（`existing_fs`），绝不覆盖。
+- **分区映射必须先摘**：分区是建在 LV **之上**的子设备，父子关系还在时内核会拒绝移除父设备
+  （`Device or resource busy`）。`Deactivate` / `Delete` 在 `lvchange -an` / `lvremove` **之前**先 `partx -d`。
+- 返回 `legacy` 的旧盘数据仍可读写（服务端自己挂载时按整盘处理），但**客户端挂不上**（缺分区表），
+  需要用户重建存储库。**绝不**为了"布局好看"去动有数据的盘。
+
+#### 5.16.4 挂载：ntfs3 优先，ntfs-3g 回退
+
+- Linux 5.15+ 的**内核原生 `ntfs3`** 优先（比 FUSE 快得多）：`mount -t ntfs3`；
+- 内核没有该驱动、或它在个别卷上拒绝挂载时，回退 **`ntfs-3g`**（FUSE）：`mount -t ntfs-3g -o big_writes`；
+- 两者的挂载选项**不通用**（`big_writes` 只有 ntfs-3g 认，传给 ntfs3 会直接报 unknown option），
+  所以必须分开传，不能共用一份选项串；
+- `ext4` 直接走内核驱动。
+
+#### 5.16.5 依赖与 doctor
+
+| 工具 | 必需 | 用途 |
+| --- | --- | --- |
+| `parted` | ✅ | 写 GPT 分区表、建分区（并按文件系统写分区类型 GUID） |
+| `partx` | ✅ | 让内核建立分区设备节点；停用/删除盘前摘掉分区映射 |
+| `mkfs.ntfs`（`ntfs-3g` 包） | ✅ | 建 NTFS 盘 |
+| 内核 `ntfs3` 驱动 **或** `ntfs-3g` | ✅ | 挂载 NTFS，以便把源目录内容拷进母盘 |
+| `wipefs` | 可选 | 建表前清残留签名（缺失只是不做清理，不影响建盘） |
+
+对应 `GET /v1/system/doctor` 的 `disk_tools` 与 `ntfs_tools` 两项；缺任一项都建不出客户端能识别的盘。
 
 ---
 

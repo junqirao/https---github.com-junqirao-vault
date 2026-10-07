@@ -94,6 +94,75 @@ func TestUnmountFailureStateNeverRollsBackAfterTeardown(t *testing.T) {
 	if got := unmountFailureState(true, MountStateMounted); got != MountStateError {
 		t.Fatalf("已拆掉一部分时不得回滚成 mounted（界面会谎报已挂载并弹提示），实际 %q", got)
 	}
+	// 记录本来就卡在"卸载中"（上次进程死在卸载中途留下的脏记录）：回滚成 unmounting 等于
+	// **什么都没发生**，界面永远显示"卸载中"、点几次都一样（真实反馈："这种名存实亡的"）。
+	if got := unmountFailureState(false, MountStateUnmounting); got != MountStateError {
+		t.Fatalf("卸载前的状态就是'卸载中'时必须落成 error（否则用户永远出不来），实际 %q", got)
+	}
+}
+
+// TestFinishInterruptedUnmountsClearsStuckRecord 锁定"重启后自动闭环"。
+//
+// 上次进程死在卸载中途时，记录会停在 unmounting，而它是写在本机状态文件里的 —— 重装服务端
+// 也清不掉。启动收尾必须把它补完、删掉记录，而不是让界面一直显示"卸载中"（真实反馈：
+// "重启之后客户端一直提示在卸载中，这种名存实亡的我要能在客户端自己闭环"）。
+func TestFinishInterruptedUnmountsClearsStuckRecord(t *testing.T) {
+	a := newPhaseTestAgent(t)
+	const alloc = "alloc-stuck"
+	// 现场：会话与挂载点都早已不在（服务端重装过、盘也没了），记录却停在"卸载中"。
+	// 空 MountPath/TargetIQN/LeaseID 等价于"本机确实什么都没有了"。
+	a.store.PutMount(&MountState{
+		AllocationID: alloc,
+		RepoID:       "repo-a",
+		State:        MountStateUnmounting,
+	}, &mountRuntime{})
+
+	a.finishInterruptedUnmounts(context.Background())
+
+	if _, _, ok := a.store.GetMount(alloc); ok {
+		t.Fatal("卡在卸载中的记录应被收尾删掉（否则客户端永远显示'卸载中'，重启多少次都一样）")
+	}
+}
+
+// TestMountPointGoneTreatsMissingLetterAsRemoved 锁定盘符模式的硬证据：
+// 盘符自己没了 ⇒ 挂载点确实已不在。
+//
+// 这条**不需要磁盘号、也不需要发起端** —— 进程重启后磁盘号无从得知（运行时信息只在内存里），
+// 发起端没跑时连会话都问不出来，此时它是唯一的出路；缺了它，一条"盘符早没了"的记录会永远
+// 卡在卸载里（真实反馈："重启之后客户端一直提示在卸载中"）。
+func TestMountPointGoneTreatsMissingLetterAsRemoved(t *testing.T) {
+	a := newPhaseTestAgent(t)
+
+	// 非盘符形态一律不判"已消失"：目录模式必须走磁盘号那条证据（挂载目录本身总是存在，
+	// 从目录上看不出里面有没有挂着卷）。
+	for _, path := range []string{"", "libs", `relative\dir`, "/mnt/libs"} {
+		if mountLetterGone(path) {
+			t.Fatalf("路径 %q 不是盘符形态，不该被判定为'盘符已消失'", path)
+		}
+	}
+
+	letter := unusedDriveLetter()
+	if letter == "" {
+		t.Skip("本机没有空闲盘符可用于模拟'盘符已消失'")
+	}
+	gone := a.engine.mountPointGone(context.Background(), MountState{
+		MountMode: mountModeLetter,
+		MountPath: letter,
+	}, mountRuntime{})
+	if !gone {
+		t.Fatalf("盘符 %s 不存在时应判定挂载点已不在（否则记录永远卡在卸载里）", letter)
+	}
+}
+
+// unusedDriveLetter 返回一个本机不存在的盘符（形如 "Z:"）；全被占用时返回空串。
+func unusedDriveLetter() string {
+	for c := 'D'; c <= 'Z'; c++ {
+		letter := string(c) + ":"
+		if mountLetterGone(letter) {
+			return letter
+		}
+	}
+	return ""
 }
 
 // TestTeardownDiskNumberFallsBackToRecord 锁定"卸载时磁盘号从哪来"。

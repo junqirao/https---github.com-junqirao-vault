@@ -290,6 +290,9 @@ func (m *Manager) Deactivate(ctx context.Context, ref string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// 分区是建在 LV **之上**的子设备：不先摘掉分区映射，内核会拒绝移除父设备
+	// （Device or resource busy），lvchange -an 就白做了。
+	m.dropPartitionMappings(ctx, lvRef(vg, lv))
 	// runQuiet："本就未激活"是本方法的正常出口，不是故障。
 	if _, err := m.runQuiet(ctx, "lvchange", "-an", vg+"/"+lv); err != nil {
 		m.logger.Debug("停用 LV 未成功（可能本就未激活）", "ref", ref, "err", err.Error())
@@ -310,8 +313,10 @@ func (m *Manager) Delete(ctx context.Context, ref string) error {
 		return nil
 	}
 	// 先停用再删除；停用失败忽略（可能本就未激活，用 runQuiet 免得留 ERROR）。
+	// 同样要先摘掉分区映射：分区子设备还在，lvremove 会被内核拒绝。
 	// ⚠️ 说明：LV 若被 iSCSI backstore(iblock) 打开，lvremove 会被内核拒绝，
 	// 所以调用方必须先在 iSCSI 侧下线对应 LUN 再调用本方法。
+	m.dropPartitionMappings(ctx, lvRef(vg, lv))
 	if _, err := m.runQuiet(ctx, "lvchange", "-an", vg+"/"+lv); err != nil {
 		m.logger.Debug("删除前停用 LV 未成功（忽略）", "ref", ref, "err", err.Error())
 	}
@@ -610,10 +615,19 @@ func (m *Manager) Optimize(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	mp, err := mountPointOf(lvRef(vg, lv))
+	dev := lvRef(vg, lv)
+	mp, err := mountPointOf(dev)
 	if err != nil {
 		m.logger.Debug("读取 /proc/mounts 失败，跳过 fstrim", "ref", ref, "err", err.Error())
 		return nil
+	}
+	if mp == "" {
+		// GPT 布局下挂载的是**分区**（数据设备）而不是整盘 LV：再按分区设备查一次。
+		if part, perr := m.firstPartitionDevice(ctx, dev); perr == nil && part != "" {
+			if p, merr := mountPointOf(part); merr == nil {
+				mp = p
+			}
+		}
 	}
 	if mp == "" {
 		m.logger.Debug("LV 未挂载，跳过 fstrim（块层回收靠 iSCSI UNMAP）", "ref", ref)
@@ -640,7 +654,13 @@ func (m *Manager) ResetDiskIdentifier(ctx context.Context, ref string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := m.run(ctx, "ntfslabel", "--new-serial", lvRef(vg, lv)); err != nil {
+	// NTFS 卷在**分区**上（GPT 布局）：整盘序列号没有意义，要改的是数据设备。
+	// 设备未激活或不是分区布局（旧盘）时退回整盘路径，保持既有行为（由 ntfslabel 报错）。
+	dev := lvRef(vg, lv)
+	if part, perr := m.firstPartitionDevice(ctx, dev); perr == nil && part != "" {
+		dev = part
+	}
+	if _, err := m.run(ctx, "ntfslabel", "--new-serial", dev); err != nil {
 		return err
 	}
 	m.logger.Info("已重置 NTFS 序列号", "ref", ref)

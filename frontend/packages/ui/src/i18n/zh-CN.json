@@ -735,7 +735,7 @@
   "err.platform.volume_group_not_found": "卷组 {vg} 不存在",
   "err.platform.pool_in_use": "存储池 {vg}/{thin_pool} 仍在使用中，无法删除",
   "err.platform.pool_in_use.thin_volumes": "该存储池上还有 {count} 个 thin 卷（{names}），请先删除这些存储再删池",
-  "err.platform.pool_in_use.volume_group": "该卷组上仍有 thin pool，无法删除卷组；请先删除卷组上的存储池",
+  "err.platform.pool_in_use.volume_group": "该卷组上还有别的逻辑卷（{names}），无法删除卷组；请先删除它们",
   "err.platform.pool_in_use.storages": "该存储池上还挂着 {count} 个存储，请先删除这些存储再删池",
   "err.platform.pool_protected": "存储池 {vg}/{thin_pool} 受保护，不能删除",
   "err.platform.pool_protected.default_pool": "这是服务端配置的默认存储池，删除后服务将不可用；如需删除请先修改服务端配置",

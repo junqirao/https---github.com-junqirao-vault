@@ -735,7 +735,7 @@
   "err.platform.volume_group_not_found": "Volume group {vg} does not exist",
   "err.platform.pool_in_use": "Storage pool {vg}/{thin_pool} is still in use and cannot be deleted",
   "err.platform.pool_in_use.thin_volumes": "This pool still holds {count} thin volume(s) ({names}) — delete those storages first",
-  "err.platform.pool_in_use.volume_group": "This volume group still holds a thin pool and cannot be deleted; delete the storage pool on it first",
+  "err.platform.pool_in_use.volume_group": "This volume group still holds other logical volumes ({names}) and cannot be deleted — delete them first",
   "err.platform.pool_in_use.storages": "This pool still backs {count} storage(s) — delete those storages first",
   "err.platform.pool_protected": "Storage pool {vg}/{thin_pool} is protected and cannot be deleted",
   "err.platform.pool_protected.default_pool": "This is the default pool configured on the server; deleting it makes the service unusable — change the server configuration first",

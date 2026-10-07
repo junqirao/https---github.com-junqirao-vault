@@ -32,6 +32,10 @@ const (
 	poolDeleteEmptyPool = `{"report":[{"lv":[{"lv_name":"pool1","lv_attr":"twi-aotz--","pool_lv":""},{"lv_name":"pool1_tdata","lv_attr":"twi-ao----","pool_lv":""},{"lv_name":"pool1_tmeta","lv_attr":"ewi-ao----","pool_lv":""}]}]}`
 	// 池里住着两个 thin 卷 = 两个存储的底层卷 / 母盘 / 差异盘。
 	poolDeleteUsedPool = `{"report":[{"lv":[{"lv_name":"pool1","lv_attr":"twi-aotz--","pool_lv":""},{"lv_name":"7f3a","lv_attr":"Vwi-a-tz--","pool_lv":"pool1"},{"lv_name":"9c11","lv_attr":"Vwi-a-tz--","pool_lv":"pool1"}]}]}`
+	// vg1 里的空池**挂着 dm-cache**：cache pool（pool1_cache）是一个独立 LV，其 lv_attr 首字符是
+	// 'C'（不是 't'，所以它不出现在「存储池管理」的列表里），但不带 -a 的 lvs 会把它的名字列出来
+	// ——真机上"删池 + 删卷组"就是被它挡下、报 pool_in_use.volume_group。
+	poolDeleteEmptyPoolWithCache = `{"report":[{"lv":[{"lv_name":"pool1","lv_attr":"twi-aotz--","pool_lv":""},{"lv_name":"pool1_tdata","lv_attr":"twi-ao----","pool_lv":""},{"lv_name":"pool1_tmeta","lv_attr":"ewi-ao----","pool_lv":""},{"lv_name":"pool1_cache","lv_attr":"Cwi---C---","pool_lv":""}]}]}`
 )
 
 // fakePoolEnv 生成一套假的 LVM 工具链并置于 PATH 最前，返回"破坏性命令调用记录"文件路径。
@@ -329,6 +333,33 @@ func mutationNames(steps []platform.DeviceReleaseStep) string {
 	return strings.Join(out, ",")
 }
 
+// TestDeletePoolTreatsCachePoolAsPartOfPool：挂着 dm-cache 的池，"删池 + 删卷组"必须能成功。
+//
+// 真机反馈：这条路径此前报 pool_in_use.volume_group（文案还说"该卷组上仍有 thin pool"），
+// 但挡住它的其实是配对的 cache pool——而「存储池管理」只列 thin pool，页面上根本没有
+// cache pool 这一项，用户被彻底卡死、无处着手。
+// 它不是"别人的东西"：紧随删除的 vgremove 会把它一并带走，放行不会留下半截状态。
+func TestDeletePoolTreatsCachePoolAsPartOfPool(t *testing.T) {
+	logPath := fakePoolEnv(t, poolDeletePVs, poolDeleteCleanTree, poolDeleteEmptyPool, poolDeleteEmptyPoolWithCache)
+	m := newPoolManager()
+
+	rep, err := m.DeletePool(context.Background(), "vg1", "pool1", platform.PoolDeleteOptions{
+		RemoveVolumeGroup: true,
+	})
+	if err != nil {
+		t.Fatalf("带缓存的池应能删池 + 删卷组，实际失败: %v", err)
+	}
+	if !rep.RemovedVolumeGroup {
+		t.Fatal("要求删卷组，报告应如实标注")
+	}
+	if got := mutationNames(rep.Steps); got != "lvremove,vgremove" {
+		t.Fatalf("步骤 = %s，期望 lvremove,vgremove", got)
+	}
+	if got := mutations(t, logPath); len(got) != 2 {
+		t.Fatalf("应确实执行过 lvremove 与 vgremove，记录 = %v", got)
+	}
+}
+
 // TestGoesWithPool：区分"随池消失"与"用户内容"，是删卷组能否成功的分水岭。
 func TestGoesWithPool(t *testing.T) {
 	for _, tc := range []struct {
@@ -343,6 +374,12 @@ func TestGoesWithPool(t *testing.T) {
 		{"scratch", "pool1", false}, // 别的卷：必须能报出来
 		{"pool1", "", false},        // 只删卷组时，池就是用户内容
 		{"pool1_tdata", "", false},
+		// dm-cache：本池的缓存池随本池一起消失（否则带缓存的池永远删不掉卷组）。
+		{"pool1_cache", "pool1", true},
+		{"pool1_cache_cmeta", "pool1", true},
+		{"pool1_cache_cdata", "pool1", true},
+		{"pool10_cache", "pool1", false}, // 不是本池的缓存
+		{"pool1_cache", "", false},       // 只删卷组时，它同样是用户内容
 	} {
 		if got := goesWithPool(tc.name, tc.pool); got != tc.want {
 			t.Fatalf("goesWithPool(%q, %q) = %v，期望 %v", tc.name, tc.pool, got, tc.want)

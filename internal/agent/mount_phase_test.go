@@ -4,18 +4,22 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+
+	"vault/internal/lock"
 )
 
-// newPhaseTestAgent 构造一个只带状态存储与事件总线的代理，用于验证挂载阶段推进。
+// newPhaseTestAgent 构造一个只带状态存储、事件总线与锁表的代理，用于验证挂载阶段推进。
 //
-// 不启 HTTP、不碰 iSCSI：阶段推进是纯状态机 + 事件广播，测试只需这两样。
+// 不启 HTTP、不碰 iSCSI：阶段推进是纯状态机 + 事件广播，测试只需这些。
+// 锁表必须给：卸载走 unmount → lock.Keyed，缺了它会在 nil 上 panic，而 panic 被 safeGo
+// 吞掉之后只表现为"记录一动不动"，比错误本身更难查。
 func newPhaseTestAgent(t *testing.T) *Agent {
 	t.Helper()
 	store, err := NewStateStore(filepath.Join(t.TempDir(), "state.json"), testLogger())
 	if err != nil {
 		t.Fatalf("构造状态存储失败：%v", err)
 	}
-	a := &Agent{logger: testLogger(), store: store, hub: NewEventHub()}
+	a := &Agent{logger: testLogger(), store: store, hub: NewEventHub(), locks: lock.NewKeyed()}
 	a.engine = &mountEngine{a: a}
 	return a
 }

@@ -1273,6 +1273,18 @@ func (s *IscsiService) clearAppliedByName(ctx context.Context, shortName string)
 	s.clearApplied(ctx, target)
 }
 
+// targetSpecLayoutVersion 是"目标下发布局"的版本号，参与指纹计算。
+//
+// 指纹会被持久化（AppliedFingerprint），用于"已下发就跳过"。这意味着平台侧的收敛逻辑
+// 一旦变化（新增或修正某个必须落到设备上的属性、命令），只改 EnsureTarget 是**不够**的：
+// 期望状态本身没变，老指纹仍然命中，重下发被跳过，修复就只能对新建目标生效。
+// 所以每次动平台收敛逻辑都要**递增这个版本**，让所有目标在下次触碰时重新下发一遍
+// （收敛是幂等的，代价只是一次全量下发）。
+//
+// v2：LIO 白名单为空时改为"不限制 initiator"（generate_node_acls=1）并补写 TPG 级 CHAP
+// 凭据——在此之前 Linux 上"不限制 + CHAP"的目标客户端一律登不上（Authorization Failure）。
+const targetSpecLayoutVersion = "2"
+
 // targetSpecFingerprint 计算目标期望状态的指纹（含 CHAP 密钥，但密钥只作为哈希输入）。
 //
 // initiators 排序后参与哈希：授权列表是集合语义，顺序变化不该被当成"状态变了"。
@@ -1285,6 +1297,7 @@ func targetSpecFingerprint(spec platform.TargetSpec) string {
 		}
 	}
 	write(
+		targetSpecLayoutVersion,
 		spec.Name,
 		strconv.FormatBool(spec.Enabled),
 		strconv.FormatBool(spec.ReadOnly),

@@ -37,6 +37,11 @@ type createRepoRequest struct {
 	Group        string `json:"group"`
 	// StorageID 可选的目标存储 ID（留空则在所有启用存储中自动选根）。
 	StorageID string `json:"storage_id"`
+	// ClientOS 可选：将使用该库的客户端操作系统（windows | linux，留空按 windows）。
+	//
+	// 决定建盘时用的文件系统（Windows → NTFS，Linux → ext4）并持久化成盘的标记：
+	// 分区表与格式化都写进盘里了，建完之后**不能**改，只能按客户端系统在建库时定下来。
+	ClientOS string `json:"client_os"`
 }
 
 // updateRepoRequest 是更新存储库请求；nil 表示不修改。
@@ -105,6 +110,7 @@ func (r *Router) handleCreateRepo(w http.ResponseWriter, req *http.Request) {
 		QuotaBytes:   in.QuotaBytes,
 		Group:        in.Group,
 		StorageID:    in.StorageID,
+		ClientOS:     in.ClientOS,
 	})
 	if err != nil {
 		r.writeError(w, req, err)

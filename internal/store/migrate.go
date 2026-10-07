@@ -20,7 +20,11 @@ import (
 //	5 → storage_volumes 新增 pool_ref：记录存储落在哪个**存储池**（"<vg>/<thin_pool>"）。
 //	    一台机器可以有多个存储池，创建存储时用户选择或新建
 //	    （见 docs/implementation.md 5.14 Linux（LVM thin + LIO）/ 5.15 Linux 存储）。
-const currentSchemaVersion = 5
+//	6 → disks 新增 file_system：记录这块盘**分区**上的文件系统（ntfs/ext4）。
+//	    建盘时按"使用该盘的客户端操作系统"决定（Windows→NTFS，Linux→ext4），
+//	    分区表与格式化都写进盘里、事后改不了，所以要把这个标记持久化下来
+//	    （见 docs/implementation.md 5.16 磁盘布局与文件系统）。
+const currentSchemaVersion = 6
 
 // Migrate 建表并记录 schema 版本。
 //
@@ -108,6 +112,9 @@ func addColumns(ctx context.Context, q queryer, dialect Dialect) error {
 		{"storage_volumes", "pool_ref",
 			`ALTER TABLE storage_volumes ADD COLUMN pool_ref TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE storage_volumes ADD COLUMN pool_ref VARCHAR(160) NOT NULL DEFAULT ''`},
+		{"disks", "file_system",
+			`ALTER TABLE disks ADD COLUMN file_system TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE disks ADD COLUMN file_system VARCHAR(16) NOT NULL DEFAULT ''`},
 	}
 	for _, c := range columns {
 		exists, err := columnExists(ctx, q, dialect, c.table, c.column)

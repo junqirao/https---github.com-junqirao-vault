@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -519,12 +520,10 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 		var out *MountState
 		e.a.store.UpdateMount(allocationID, func(m *MountState, _ *mountRuntime) {
 			m.State = target
-			if target != MountStateError {
-				cp := *m
-				out = &cp
-				return
-			}
 			m.Phase = ""
+			// 失败原因**一律**写进记录，包括"回滚成原状态"那一支：回滚分支原先直接 return，
+			// 记录里一点线索都没有，界面上只有一个不动的状态标签，用户点完卸载"什么都没发生"
+			// （真实反馈："这种名存实亡的我要能在客户端自己闭环"）。
 			// 稳定码形如 unmount_mount_point:platform.ps_failed，界面可直接翻译。
 			m.LastError = describeError("unmount_"+stage, cause)
 			m.LastErrorDetail = joinDetail(mountErrorDetailOf(cause))
@@ -666,9 +665,19 @@ func (e *mountEngine) disconnectSession(ctx context.Context, targetIQN string, m
 
 // mountPointGone 判断挂载点是否确实已经不存在（移除报错后的幂等兜底）。
 //
-// 需要磁盘号才能查询（CurrentMountPath 按磁盘号取当前挂载点）；拿不到磁盘号时返回 false ——
-// 保守起见按"移除失败"处理，宁可让用户重试，也不要谎报卸载完成。
+// 两条证据，任一成立即可：
+//
+//  1. 盘符模式的挂载点自己没了 —— 这是本机独立可验的硬事实，**不需要磁盘号，也不需要发起端**。
+//     进程重启后磁盘号无从得知（运行时信息只在内存里），发起端没跑时连会话都问不出来，此时
+//     这条是唯一的出路；缺了它，一条"盘符早没了"的记录会永远卡在卸载里（真实反馈："重启之后
+//     客户端一直提示在卸载中，这种名存实亡的我要能在客户端自己闭环"）；
+//  2. 按磁盘号查到的当前挂载点为空（需要磁盘号，见 CurrentMountPath）。
+//
+// 都拿不到结论时返回 false —— 保守起见按"移除失败"处理，宁可让用户重试，也不要谎报卸载完成。
 func (e *mountEngine) mountPointGone(ctx context.Context, ms MountState, rt mountRuntime) bool {
+	if ms.MountMode != mountModeDirectory && mountLetterGone(ms.MountPath) {
+		return true
+	}
 	diskNumber, known := teardownDiskNumber(ms, rt)
 	if !known {
 		return false
@@ -680,14 +689,34 @@ func (e *mountEngine) mountPointGone(ctx context.Context, ms MountState, rt moun
 	return strings.TrimSpace(current) == ""
 }
 
+// mountLetterGone 判断盘符模式的挂载点是否已经不在了（挂载点形态 = 盘符，如 "Z:"）。
+//
+// 目录模式不适用：挂载目录本身总是存在，"里面有没有挂着卷"从目录上看不出来。
+//
+// 只认 os.ErrNotExist：盘符在、卷没就绪（ERROR_NOT_READY 等）不算 —— 那正是"移除失败、
+// 让用户重试"的正常场景，判成已移除就会谎报卸载完成。
+func mountLetterGone(path string) bool {
+	volume := filepath.VolumeName(strings.TrimSpace(path))
+	if volume == "" {
+		// 非卷名形态（目录模式的路径走这里，Linux 上的 agent 也走这里）：交回给调用方的下一条证据。
+		return false
+	}
+	_, err := os.Stat(volume + string(os.PathSeparator))
+	return errors.Is(err, os.ErrNotExist)
+}
+
 // unmountFailureState 返回卸载阶段失败后，那条记录应该处于什么状态。
 //
 //   - 什么都没拆掉（teardown=false）→ 回滚到卸载前的状态：磁盘确实还挂着，状态如实；
 //   - 已经拆掉一部分（teardown=true）→ error。**不能回滚成 mounted**：回滚等于向界面谎报
 //     "还挂着"，前端收到 mounted 事件还会弹一条"已挂载"提示（真实反馈："点了卸载，然后提示
-//     挂载成功？磁盘状态还是已挂载，但盘符已经不见了"）。
+//     挂载成功？磁盘状态还是已挂载，但盘符已经不见了"）；
+//   - 卸载前本身就是 unmounting（上次进程死在卸载中途留下的脏记录）→ error。回滚成它等于
+//     **什么都没发生**：界面永远显示"卸载中"，用户点几次都一样（真实反馈："重启之后客户端
+//     一直提示在卸载中，这种名存实亡的"）。落成 error 才能给出失败原因和可点的出口，
+//     用户才可能自己闭环。
 func unmountFailureState(teardown bool, prevState string) string {
-	if teardown {
+	if teardown || prevState == MountStateUnmounting {
 		return MountStateError
 	}
 	return prevState

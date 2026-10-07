@@ -311,6 +311,18 @@ func (m *Manager) contentLVsOfVG(ctx context.Context, vg, pool string) ([]string
 //
 // 名字规则由 LVM 保证（见其 *_{tdata,tmeta,pmspare} 约定）；pool 为空表示本次只删卷组，
 // 此时池相关的排除项不适用——卷组里真住着别的池，正是该报出来的内容。
+//
+// ⚠️ 配对的 cache pool（`<pool>_cache`）必须算在内（真机反馈）。漏判的后果是：挂过
+// dm-cache 的池会被自己的缓存卡住——`contentLVsOfVG` 把 `vault_cache` 当成"卷组里还有的
+// 内容"，于是"删池 + 删卷组"永远报 pool_in_use.volume_group；而「存储池管理」只列 thin pool
+// （cache pool 的 lv_attr 首字符是 'C'，不是 't'），页面上**没有**这一项，用户无处着手。
+//
+// 放行它是安全的：cache pool 的名字由 cachePoolName 与本池一一配对（一个卷组只允许一个
+// thin pool，见 poolcatalog.go 顶部约束），不是"别人的东西"；而本函数只在 RemoveVolumeGroup
+// 分支被调用（contentLVsOfVG 的唯一调用点），紧随其后的 `vgremove -y` 会把卷组里的 LV 全部
+// 删掉，包括这个 cache pool——不会留下"池没了、缓存却还在"的半截状态。
+//
+// 隐藏子卷（_cmeta/_cdata）本就不出现在不带 -a 的 lvs 里，这里兜一层防老版本行为差异。
 func goesWithPool(name, pool string) bool {
 	if strings.HasSuffix(name, "_pmspare") {
 		return true
@@ -318,7 +330,11 @@ func goesWithPool(name, pool string) bool {
 	if pool == "" {
 		return false
 	}
-	return name == pool || name == pool+"_tdata" || name == pool+"_tmeta"
+	if name == pool || name == pool+"_tdata" || name == pool+"_tmeta" {
+		return true
+	}
+	cache := cachePoolName(pool)
+	return name == cache || name == cache+"_cmeta" || name == cache+"_cdata"
 }
 
 // poolNameLimit 是错误参数里最多带几个卷名。

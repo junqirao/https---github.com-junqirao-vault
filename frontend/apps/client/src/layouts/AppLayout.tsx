@@ -197,16 +197,20 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   const serverExhausted = agent.available && serverPhase === 'disconnected'
 
   /**
-   * 管理端在未连接到服务端时整体遮罩。
+   * 管理端在**确认连不上**服务端时遮罩管理页内容区（顶栏与侧边栏不遮，见下面 render 里遮罩的位置）。
    *
    * 理由：管理端的每个动作（列表、删除、建池…）都要打服务端，断开时点了必然失败；
    * 让用户对着一个注定报错的界面点，只会换回一串网络错误。
+   *
+   * 为什么**不把"连接中"算进来**：连接中大多是瞬时的（事件流重连、心跳抖动的退避重试），而管理端
+   * 的请求是渲染进程**直连 baseUrl** 的，跟代理这条链路的瞬时抖动没关系。为一次瞬时抖动把内容区
+   * 盖死，用户读到的是"点一下删除就卡死了"（真实反馈："点删除库会卡在连接中"）。
    *
    * 为什么带 agent.available 前置条件：代理没起来时 server 状态是"未知"（快照为空）而不是
    * "未连接"，而服务端 API 是渲染进程直连 baseUrl 的、可能完全正常——不加这个前提，
    * 代理一异常就会把界面凭空锁死。
    */
-  const adminBlocked = mode === 'admin' && agent.available && !server?.connected
+  const adminBlocked = mode === 'admin' && agent.available && !server?.connected && !serverConnecting
 
   const agentTone = !agent.available ? 'default' : server?.connected ? 'green' : serverConnecting ? 'processing' : 'orange'
 
@@ -456,51 +460,55 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
             </Space>
           </Layout.Header>
 
-          <Layout.Content style={{ background: palette.bgPage, overflow: 'auto' }}>
-            {/* 服务端系统依赖缺失（缺 configfs 挂载 / LIO 内核模块 / targetcli 等）：
-                启动时能自动修的已修，修不了的在这里告诉使用者"缺了什么、怎么补"。
-                能装包的项再给个"安装"按钮——但那个接口只有超级管理员能调，
-                非管理员渲染出来只会点了拿 403，所以按角色 gate。 */}
-            <SystemDepsBanner canInstall={isSuperAdmin} />
-            {hostWarning ? (
-              <Alert
-                type="warning"
-                showIcon
-                style={{ margin: `${spacing.md}px ${spacing.md}px 0` }}
-                message={t('agent.host.title')}
-                description={t(hostDescKey, { error: hostWarning.error ?? '' })}
-              />
+          {/* 内容区容器：连接遮罩只盖这一块（见 adminBlocked），顶栏与侧边栏不盖。
+              理由：顶栏上有"服务端切换 / 连接状态标签 / 重试 / 退出登录"，全屏遮住之后一旦卡在
+              "连接中"，用户连退出登录都点不到，只能去杀进程。 */}
+          <div style={{ position: 'relative', display: 'flex', flex: 1, minHeight: 0 }}>
+            <Layout.Content style={{ flex: 1, minWidth: 0, background: palette.bgPage, overflow: 'auto' }}>
+              {/* 服务端系统依赖缺失（缺 configfs 挂载 / LIO 内核模块 / targetcli 等）：
+                  启动时能自动修的已修，修不了的在这里告诉使用者"缺了什么、怎么补"。
+                  能装包的项再给个"安装"按钮——但那个接口只有超级管理员能调，
+                  非管理员渲染出来只会点了拿 403，所以按角色 gate。 */}
+              <SystemDepsBanner canInstall={isSuperAdmin} />
+              {hostWarning ? (
+                <Alert
+                  type="warning"
+                  showIcon
+                  style={{ margin: `${spacing.md}px ${spacing.md}px 0` }}
+                  message={t('agent.host.title')}
+                  description={t(hostDescKey, { error: hostWarning.error ?? '' })}
+                />
+              ) : null}
+              {autoMount ? (
+                <Alert
+                  type="info"
+                  showIcon
+                  style={{ margin: `${spacing.md}px ${spacing.md}px 0` }}
+                  message={t('agent.autoMount.progress', { pending: autoMount.pending, total: autoMount.total })}
+                />
+              ) : null}
+              <Outlet />
+            </Layout.Content>
+            {adminBlocked ? (
+              <div
+                style={{
+                  position: 'absolute',
+                  inset: 0,
+                  // 必须高过 antd 的浮层（Modal/message/notification 都在 1000~1050）：
+                  // 断开时若正好开着某个弹窗，它的 portal 挂在 body 末尾、会浮在低 z-index 的遮罩之上，
+                  // 用户就能继续点一个后端已经不可达的表单。
+                  zIndex: 1200,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: palette.bgPage
+                }}
+              >
+                <LoadingState text={t('agent.gate.hint')} />
+              </div>
             ) : null}
-            {autoMount ? (
-              <Alert
-                type="info"
-                showIcon
-                style={{ margin: `${spacing.md}px ${spacing.md}px 0` }}
-                message={t('agent.autoMount.progress', { pending: autoMount.pending, total: autoMount.total })}
-              />
-            ) : null}
-            <Outlet />
-          </Layout.Content>
-        </Layout>
-        {/* 未连接服务端：整个管理端（含顶栏）盖一层 loading，见 adminBlocked。 */}
-        {adminBlocked ? (
-          <div
-            style={{
-              position: 'fixed',
-              inset: 0,
-              // 必须高过 antd 的浮层（Modal/message/notification 都在 1000~1050）：
-              // 断开时若正好开着某个弹窗，它的 portal 挂在 body 末尾、会浮在低 z-index 的遮罩之上，
-              // 用户就能继续点一个后端已经不可达的表单。
-              zIndex: 1200,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              background: palette.bgPage
-            }}
-          >
-            <LoadingState text={serverConnecting ? t('agent.state.connecting') : t('agent.gate.hint')} />
           </div>
-        ) : null}
+        </Layout>
       </Layout>
     </LayoutModeProvider>
   )

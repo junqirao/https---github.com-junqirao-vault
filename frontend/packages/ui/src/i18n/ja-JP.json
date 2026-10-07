@@ -735,7 +735,7 @@
   "err.platform.volume_group_not_found": "ボリュームグループ {vg} が存在しません",
   "err.platform.pool_in_use": "ストレージプール {vg}/{thin_pool} は使用中のため削除できません",
   "err.platform.pool_in_use.thin_volumes": "このプールにはまだ {count} 個の thin ボリューム（{names}）があります。先にこれらのストレージを削除してください",
-  "err.platform.pool_in_use.volume_group": "このボリュームグループにはまだ thin プールがあります。先にそのストレージプールを削除してください",
+  "err.platform.pool_in_use.volume_group": "このボリュームグループには他の論理ボリューム（{names}）が残っているため削除できません。先にそれらを削除してください",
   "err.platform.pool_in_use.storages": "このプールにはまだ {count} 個のストレージがあります。先にこれらのストレージを削除してください",
   "err.platform.pool_protected": "ストレージプール {vg}/{thin_pool} は保護されているため削除できません",
   "err.platform.pool_protected.default_pool": "これはサーバー設定のデフォルトプールです。削除するとサービスが利用できなくなります。先にサーバー設定を変更してください",
