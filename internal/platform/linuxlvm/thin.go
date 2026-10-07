@@ -165,7 +165,9 @@ func (m *Manager) Exists(ref string) bool {
 func (m *Manager) exists(vg, lv string) bool {
 	ctx, cancel := m.probeCtx()
 	defer cancel()
-	out, err := m.run(ctx, "lvs", "--noheadings", "-o", "lv_name", vg+"/"+lv)
+	// 用 runQuiet：这里的"查不到"就是答案（false），不是故障。建盘的第一步就是探一次
+	// "不存在"，用 run 会每次都在日志里留一条 ERROR（见 RunQuiet）。
+	out, err := m.runQuiet(ctx, "lvs", "--noheadings", "-o", "lv_name", vg+"/"+lv)
 	if err != nil {
 		return false
 	}
@@ -288,7 +290,8 @@ func (m *Manager) Deactivate(ctx context.Context, ref string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, err := m.run(ctx, "lvchange", "-an", vg+"/"+lv); err != nil {
+	// runQuiet："本就未激活"是本方法的正常出口，不是故障。
+	if _, err := m.runQuiet(ctx, "lvchange", "-an", vg+"/"+lv); err != nil {
 		m.logger.Debug("停用 LV 未成功（可能本就未激活）", "ref", ref, "err", err.Error())
 	}
 	return nil
@@ -306,10 +309,10 @@ func (m *Manager) Delete(ctx context.Context, ref string) error {
 		m.logger.Info("LV 不存在，跳过删除（幂等）", "ref", ref)
 		return nil
 	}
-	// 先停用再删除；停用失败忽略（可能本就未激活）。
+	// 先停用再删除；停用失败忽略（可能本就未激活，用 runQuiet 免得留 ERROR）。
 	// ⚠️ 说明：LV 若被 iSCSI backstore(iblock) 打开，lvremove 会被内核拒绝，
 	// 所以调用方必须先在 iSCSI 侧下线对应 LUN 再调用本方法。
-	if _, err := m.run(ctx, "lvchange", "-an", vg+"/"+lv); err != nil {
+	if _, err := m.runQuiet(ctx, "lvchange", "-an", vg+"/"+lv); err != nil {
 		m.logger.Debug("删除前停用 LV 未成功（忽略）", "ref", ref, "err", err.Error())
 	}
 	if _, err := m.run(ctx, "lvremove", "-y", vg+"/"+lv); err != nil {
@@ -588,7 +591,9 @@ func (m *Manager) checkWatermark(ctx context.Context, vg string) error {
 	if err != nil {
 		return err
 	}
-	out, err := m.run(ctx, "lvs", "--reportformat", "json", "-o", "data_percent,metadata_percent", pool)
+	// runQuiet：读不到水位本身就分"池不存在（下面的 ERROR）"和"其它原因（下面的 Warn）"两条路，
+	// 每条都自己写日志；再用 run 的话每条都会先多一条通用 ERROR。
+	out, err := m.runQuiet(ctx, "lvs", "--reportformat", "json", "-o", "data_percent,metadata_percent", pool)
 	if err != nil {
 		// 读不到水位有两类原因，必须分开处理：
 		//

@@ -1425,7 +1425,10 @@ func (s *RepoService) ensureVolumeFreeAt(ctx context.Context, root string, need 
 	if total > 0 && raw.Storage.MinVolumeFreePermille > 0 {
 		permille := free * 1000 / total
 		if permille < raw.Storage.MinVolumeFreePermille {
+			// free_bytes 必须带上：前端文案用 {free} 显示"还剩多少"，
+			// 只给千分比会让界面上留一个没被替换的占位符（真机反馈）。
 			return apperr.New("storage.low_free_space", 507).
+				WithArg("free_bytes", free).
 				WithArg("free_permille", permille).
 				WithArg("min_permille", raw.Storage.MinVolumeFreePermille)
 		}

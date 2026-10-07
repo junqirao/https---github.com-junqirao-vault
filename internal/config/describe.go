@@ -323,6 +323,20 @@ func DescribeFields() []FieldDef {
 			EditableReason: "改动会让已发布的目标 IQN 全部失配（需先卸载所有挂载）",
 			Default:        "iqn.2026-01.com.vault",
 		},
+		{
+			Key: "platform.auto_repair", Section: "platform", Kind: KindBool, path: []string{"Platform", "AutoRepair"},
+			Desc: "启动时自动修复可安全自动化的系统依赖缺项（挂载 configfs、加载/重载 LIO 内核模块、" +
+				"写 /etc/modules-load.d/vault-lio.conf）。未配置视为启用。",
+			Editable: true,
+			Default:  true,
+		},
+		{
+			Key: "platform.auto_install", Section: "platform", Kind: KindBool, path: []string{"Platform", "AutoInstall"},
+			Desc: "缺失 LVM2 / mkfs 等命令行工具时自动安装对应软件包（apt-get/dnf/yum/zypper/apk/pacman）。" +
+				"未配置视为启用；离线环境建议关闭，改为按 doctor 报告人工安装。",
+			Editable: true,
+			Default:  true,
+		},
 
 		// ---- client_compat ----
 		{

@@ -162,8 +162,13 @@ Linux 后端是 Windows 后端的**并列等价实现**，同一套上层代码�
 **Linux 运行前置条件**
 
 ```bash
+# 一键装齐（推荐；发行版通用、幂等，可反复执行：装包 + 补装内核模块包 + modprobe + 挂 configfs + 复检）
+sudo ./scripts/setup.sh
+
 # 内核模块：SCSI target 的 LIO 前端 + iblock 后端
-modprobe target_core_mod iscsi_target_mod target_core_iblock
+# 注意必须逐个 modprobe：`modprobe a b c` 会把 b/c 当成 a 的**模块参数**，只加载 a——
+# 症状是 /proc/modules 里没有 iscsi_target_mod，configfs 里也就没有 target/iscsi。
+modprobe target_core_mod && modprobe iscsi_target_mod && modprobe target_core_iblock
 # 持久化（重启后自动加载）
 echo -e "target_core_mod\niscsi_target_mod\ntarget_core_iblock" > /etc/modules-load.d/vault-lio.conf
 
@@ -180,7 +185,17 @@ firewall-cmd --permanent --add-port=3260/tcp && firewall-cmd --reload
 # 服务端以 systemd 托管（Linux 无双击启动器，--detached/runLauncher 会提示改用 systemd）
 ```
 
-> **启动期只探测、不阻断**：LVM 或 LIO 不可用时仅打 WARN 日志（虚拟磁盘功能降级），
+> ⚠️ **「内核未提供模块文件」是 doctor 修不了、却最常见的一类缺项**：模块文件不存在时
+> `modprobe` 只报 `Module not found`，而自动装包只覆盖"命令行工具对应的包"。
+> Debian/Ubuntu 在 `linux-modules-extra-$(uname -r)` 里，RHEL 系在 `kernel-modules-extra` 里；
+> 容器部署还须共享宿主机的 `/lib/modules`（否则 `modprobe` 报 `Operation not permitted`）。
+> 这类兜底由包内 `scripts/setup.sh` 承担（发布包内容见 §12.3）。
+
+> **启动期自动修复 + 前端横幅**：启动时执行 `sysdeps.Ensure`（挂载 configfs、`modprobe`/重载 LIO 模块、
+> 写 `/etc/modules-load.d/vault-lio.conf`，受 `platform.auto_repair` 控制；缺命令行工具时按
+> `platform.auto_install` 自动装包）。修不了的缺项由 `GET /v1/system/deps` 返回（只读、每次重新探测），
+> 客户端据此在顶部显示横幅——逐条给出"缺了什么、怎么补"，运维补齐后横幅自动消失。
+> 启动期只探测、不阻断：LVM 或 LIO 不可用时仅打 WARN 日志（虚拟磁盘功能降级），
 > 服务端仍可正常启动——避免"工具链缺失导致整个服务不可用"。
 
 ---
@@ -3164,6 +3179,7 @@ dist/
 │   ├── vault-server              # 静态单文件（CGO_ENABLED=0）
 │   ├── config.example.yaml       # platform.lvm.{vg,thin_pool,...} / platform.iscsi.{backend: lio,...}
 │   ├── vault-server.service      # systemd 单元（无双击启动器；停机走 SIGTERM）
+│   ├── scripts/setup.sh          # 依赖一键安装（装包/补内核模块包/modprobe/挂 configfs/复检）
 │   └── README.md                 # 含 LVM2/target 内核模块前置条件（见 §2.4）
 ├── vault-client_<ver>_x64_setup.exe    # NSIS 安装包（resources/agent/ 下随包附带 Vault-Agent.exe）
 ├── vault-client_<ver>_x64_portable.exe # 便携版（若单文件要求）
@@ -3172,7 +3188,9 @@ dist/
 ```
 
 > Linux 侧的「虚拟磁盘 + iSCSI」能力依赖**运行环境**（LVM2 工具链 + LIO 内核模块 + configfs），
-> 因此 tar.gz 内附前置条件说明；服务端启动时只**探测**这些依赖，缺失仅降级并打 WARN（见 §2.4）。
+> 因此 tar.gz 内附前置条件说明与 `scripts/setup.sh`（部署期一键装齐，补上 doctor 修不了的内核模块包）；
+> 服务端启动时会**自动修复**能修的（挂载/模块/持久化/装工具包），仍缺的只降级并打 WARN，
+> 同时在客户端顶部显示横幅（`GET /v1/system/deps`），见 §2.4。
 
 ### 12.4 升级与回滚
 

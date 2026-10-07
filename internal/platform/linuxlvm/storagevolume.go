@@ -4,7 +4,6 @@ package linuxlvm
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -529,25 +528,62 @@ func sameDevice(a, b string) bool {
 	return ea == nil && eb == nil && ra == rb
 }
 
-// vgFreeBytesOf 返回指定 VG 的剩余容量（读不到时返回错误，调用方自行决定是否忽略）。
-func (m *Manager) vgFreeBytesOf(ctx context.Context, vg string) (int64, error) {
-	vg = strings.TrimSpace(vg)
-	if vg == "" {
-		return 0, fmt.Errorf("未配置卷组")
+// thinPoolFreeBytesOf 返回承载该设备的 thin LV 所属**池**还能写进去多少字节。
+//
+// 为什么不能拿卷组剩余（vg_free）当上限：池一旦建好就把卷组空间**整块**划走了，
+// 之后 vg_free 只剩 PE 对齐与 pmspare 留下的几 MB 零头；而往 thin 卷里写数据消耗的是
+// **池**的空间，不是卷组的。真机反馈：16G 的存储卷（池也是 16G），vg_free 只剩 48M，
+// 于是"卷可用空间"恒为 48M —— 新建存储库被判 storage.low_free_space，怎么腾都建不出来。
+//
+// 口径与 checkWatermark 的水位、estimatePhysicalBytes 的估算同源：池数据容量 × 未用比例。
+// 猜不出（不是 /dev/mapper 设备、厚卷、池读不到）时返回 ok=false，
+// 由调用方退回"只看文件系统"的口径——绝不因探测失败而报 0。
+func (m *Manager) thinPoolFreeBytesOf(ctx context.Context, dev string) (int64, bool) {
+	vg, lv, ok := splitMapperRef(dev)
+	if !ok {
+		return 0, false
 	}
-	rows, err := m.vgsRows(ctx)
-	if err != nil {
-		return 0, err
+	rows, err := m.lvsRowsQuiet(ctx, "-o", "pool_lv", vg+"/"+lv)
+	if err != nil || len(rows) == 0 {
+		return 0, false
 	}
-	for _, r := range rows {
-		if strings.TrimSpace(rowStr(r, "vg_name")) == vg {
-			free, ok := rowIntOK(r, "vg_free")
-			if !ok {
-				// 有这一行却读不出容量：当成"读不到"上报，别让 0 冒充真实空余。
-				return 0, fmt.Errorf("读不出卷组 %s 的剩余容量", vg)
-			}
-			return free, nil
-		}
+	pool := strings.TrimSpace(rowStr(rows[0], "pool_lv"))
+	if pool == "" {
+		return 0, false // 厚卷/普通 LV：没有池可算
 	}
-	return 0, fmt.Errorf("未找到卷组 %s", vg)
+	rows, err = m.lvsRowsQuiet(ctx, "--units", "b", "--nosuffix", "-o", "lv_size,data_percent", vg+"/"+pool)
+	if err != nil || len(rows) == 0 {
+		return 0, false
+	}
+	size, ok := rowIntOK(rows[0], "lv_size")
+	if !ok || size <= 0 {
+		return 0, false
+	}
+	if _, ok := rows[0]["data_percent"]; !ok {
+		// 字段缺失（老版本 / 报告被裁剪）时当"算不出来"：宁可不设上限，
+		// 也不要让 0% 冒充"整池都空"。
+		return 0, false
+	}
+	return poolFreeBytesWith(size, rowFloat(rows[0], "data_percent")), true
+}
+
+// splitMapperRef 把 /dev/mapper/<vg>-<lv> 拆成 VG 名与 LV 名；其它形态（/dev/sda2、普通目录）
+// 或拆不出来时返回 ok=false。
+//
+// 只按**第一个**连字符拆：本包的 VG/LV 名都不含 '-'（见包注释与 lvNameRe 的说明），
+// 因此第一个 '-' 即分隔符（与 vgFromPath 同一约定）。
+func splitMapperRef(dev string) (string, string, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(dev), mapperPrefix)
+	if !ok {
+		return "", "", false
+	}
+	i := strings.IndexByte(rest, '-')
+	if i <= 0 || i == len(rest)-1 {
+		return "", "", false
+	}
+	vg, lv := rest[:i], rest[i+1:]
+	if vg == "" || lv == "" {
+		return "", "", false
+	}
+	return vg, lv, true
 }

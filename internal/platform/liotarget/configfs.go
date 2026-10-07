@@ -183,12 +183,14 @@ func (m *Manager) configfsReady() bool {
 
 // loadModules 加载 LIO 所需内核模块。
 //
-// target_core_mod 提供 core 子系统（backstore），iscsi_target_mod 提供 iscsi 子系统。
+// target_core_mod 提供 core 子系统（backstore 根），iscsi_target_mod 提供 iscsi fabric，
+// target_core_iblock 提供 iblock_0 块设备 backstore 插件——**三个都要**：
+// 少了 iblock，服务端与 configfs 就绪判定都没问题，但每次建盘都会失败。
 // 先加载 core 再加载 iscsi（iscsi_target_mod 依赖 target_core_mod）。
-// 返回第一条错误仅供日志参考——两个模块可能因依赖关系而部分"失败"。
+// 返回第一条错误仅供日志参考——模块可能因依赖关系或已加载而部分"失败"。
 func (m *Manager) loadModules(ctx context.Context) error {
 	var firstErr error
-	for _, mod := range []string{"target_core_mod", "iscsi_target_mod"} {
+	for _, mod := range []string{"target_core_mod", "iscsi_target_mod", "target_core_iblock"} {
 		if err := m.modprobe(ctx, mod); err != nil && firstErr == nil {
 			firstErr = err
 		}

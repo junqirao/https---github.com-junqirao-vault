@@ -180,7 +180,25 @@ type PlatformConfig struct {
 	LVM LVMPoolConfig `yaml:"lvm"`
 	// Iscsi iSCSI 目标参数。
 	Iscsi IscsiPlatformConfig `yaml:"iscsi"`
+
+	// AutoRepair 启动时自动修复"可安全自动化"的系统依赖缺项：
+	// 挂载 configfs、加载/重载 LIO 内核模块、写 /etc/modules-load.d/vault-lio.conf。
+	// nil 视为启用；显式设为 false 时启动只探测并告警，不改动宿主机
+	// （适合由 Ansible/镜像构建等外部工具接管依赖的环境）。
+	AutoRepair *bool `yaml:"auto_repair"`
+	// AutoInstall 允许在检测到命令行工具（LVM2 / mkfs 等）缺失时自动安装对应软件包
+	// （apt-get / dnf / yum / zypper / apk / pacman）。nil 视为启用。
+	//
+	// 离线环境、或不允许服务端自行装包的生产环境请显式设为 false——
+	// 此时缺失项仍会在启动日志与 `Vault-Server doctor` 里给出**人工安装命令**。
+	AutoInstall *bool `yaml:"auto_install"`
 }
+
+// AutoRepairEnabled 返回是否允许启动期自动修复系统依赖（未配置视为启用）。
+func (p PlatformConfig) AutoRepairEnabled() bool { return p.AutoRepair == nil || *p.AutoRepair }
+
+// AutoInstallEnabled 返回是否允许自动安装缺失的依赖包（未配置视为启用）。
+func (p PlatformConfig) AutoInstallEnabled() bool { return p.AutoInstall == nil || *p.AutoInstall }
 
 // LVMPoolConfig 是 Linux 侧 LVM thin pool 的目标位置与建池参数。
 //

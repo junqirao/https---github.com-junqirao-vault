@@ -1604,14 +1604,34 @@ DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
 二、环境要求
 ------------------------------------------------------------
 1. 必须以 **root** 运行（LVM、configfs、挂载都需要）。
-2. 内核需支持 LIO（target_core_mod / iscsi_target_mod），并挂载 configfs：
+2. 内核需支持 LIO（target_core_mod / iscsi_target_mod / target_core_iblock），并挂载 configfs：
        modprobe target_core_mod
        modprobe iscsi_target_mod
+       modprobe target_core_iblock                    # 缺它建盘必失败（backstore 插件）
        mount -t configfs none /sys/kernel/config      # 多数发行版已默认挂载
    不需要 targetcli、也不需要 Python —— 服务端直接读写 configfs。
+   ⚠️ 注意 lsmod 里有 iscsi_target_mod ≠ configfs 里已注册成功，
+      要看 /sys/kernel/config/target/iscsi 是否存在——两者 doctor 会分别检查。
 3. 需要 LVM2 工具链（lvm2 包）：pvcreate / vgcreate / lvcreate / lvs / thin 相关命令。
 4. 需要文件系统工具：e2fsprogs（mkfs.ext4）或 xfsprogs（mkfs.xfs）。
 5. 准备一块 **独立的数据盘** 用作 LVM PV（不要用系统盘），例如 /dev/sdb。
+
+★ 上面第 2~4 项**服务端会自己检测**，默认还会自动补齐：
+     · 自动修复：挂载 configfs、加载/重载 LIO 内核模块、写 /etc/modules-load.d/vault-lio.conf；
+     · 自动安装：缺 lvm2/e2fsprogs 等工具时按发行版调 apt-get/dnf/yum/zypper/apk/pacman 装。
+  想让 Ansible/镜像构建等外部工具接管依赖，或处在离线环境，
+  把 config.yaml 里 platform.auto_repair / platform.auto_install 设为 false（只告警不改动）。
+  无论开关如何，随时可手工自检（这才是部署新机器的第一步）：
+       ./vault-server doctor                  # 探测 + 自动修复，逐项给出结果与处置命令
+       ./vault-server doctor -json            # JSON 输出，供脚本/CMDB 消费
+       ./vault-server doctor -install=false   # 只探测不装包（报告里给人工安装命令）
+
+  ⚠️ doctor 修不了"内核根本没提供模块文件"这类问题（模块文件不存在时 modprobe 只会报
+    Module not found）：Debian/Ubuntu 需要 linux-modules-extra-$(uname -r)，RHEL 系需要
+    kernel-modules-extra，Alpine 需要与运行内核匹配的 linux-lts 等。也修不了"连包管理器
+    都没有"的最小化系统。这两种情况用包内的依赖安装脚本兜底（幂等，可反复执行）：
+       sudo ./scripts/setup.sh                # 装齐全部依赖（apt/dnf/yum/zypper/apk/pacman 通用）
+       sudo ./scripts/setup.sh --dry-run      # 只打印它将要执行的命令，不改动系统
 
 ------------------------------------------------------------
 三、部署步骤
@@ -1620,6 +1640,18 @@ DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
        tar -xzf vault-server-{version}-linux-amd64.tar.gz
        cd vault-server-{version}-linux-amd64
        chmod +x vault-server                    # 若解压后丢失了可执行权限
+
+   ★ 解压后先装依赖（一条命令，任何发行版通用；已装过的项会跳过）：
+       sudo ./scripts/setup.sh
+     它做三件事：装齐软件包（lvm2/e2fsprogs/…）、必要时补装内核模块包并加载 LIO 三个模块、
+     挂载 configfs；末尾复检并打印"仍未就绪"与诊断（退出码 0 = 必需项全部就绪）。
+
+   ★ 再跑一次服务端自检（十秒钟）——它会挂载 configfs、加载 LIO 三个内核模块、
+     按需安装缺的命令行工具，并逐项打印结果（退出码 0 = 必需项全部就绪）：
+       ./vault-server doctor
+     机器不允许自动改动时（离线 / 由配置管理工具接管）用：
+       ./vault-server doctor -fix=false -install=false      # 只探测，给出人工处置命令
+     其中"缺内核模块"类问题 doctor 修不了，交给上面的 setup.sh（它只管装，不做探测之外的改动）。
 
 2) 准备 LVM 卷组（两种方式，选其一）：
    方式一（推荐，在管理端做）：先按第 3、4 步起服务，然后在客户端
@@ -1647,6 +1679,8 @@ DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
       platform.lvm.thin_pool     "vault"           ← thin pool 名，**不得含 '-'**
       platform.iscsi.backend     "lio"
       platform.iscsi.configfs_root  "/sys/kernel/config/target"
+      platform.auto_repair       true              ← 启动时自动修复依赖缺项（挂载/模块/持久化）
+      platform.auto_install      true              ← 缺失 lvm2 等工具时自动装包（离线环境设 false）
       http.listen                "0.0.0.0:8443"
       http.tls.enabled           true              ← 证书无需准备，首次启动自动签发
       database.driver            sqlite
@@ -1675,7 +1709,7 @@ DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
     pki/                  自建 CA 与服务端证书（自动生成）
     data/                 SQLite 数据库
     logs/                 日志（按天切分；另有固定文件 logs/vault-server.log）
-    scripts/              systemd 托管脚本
+    scripts/              依赖安装脚本（setup.sh）与 systemd 托管脚本
     updates/              客户端更新分发目录（可选）
 
 ------------------------------------------------------------
@@ -1719,9 +1753,13 @@ DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
 Q: 启动报"单实例锁获取失败"
 A: 已有一个 vault-server 在运行：pgrep -af vault-server
 
-Q: 日志报 "LVM 工具链不可用" / "LIO configfs 不可用"
-A: 分别是 lvm2 未安装、configfs 未挂载或 target 内核模块未加载（见第二节）。
-   这两项只做启动期告警、不阻断启动，但对应功能不可用。
+Q: 日志报 "LVM 工具链不可用" / "LIO configfs 不可用" / "系统依赖自检未通过"
+A: 先跑 ./vault-server doctor —— 它会逐项说明缺什么、能自动修的当场修掉
+   （mount configfs、modprobe/重载内核模块、按需装包），修不了的把「处置」命令打出来照做即可。
+   注意：lsmod 里有 iscsi_target_mod 不等于 configfs 里已注册成功
+   （判据是 /sys/kernel/config/target/iscsi 与 /sys/kernel/config/target/core/iblock_0 是否存在），
+   doctor 会把"模块未加载""模块在但 fabric 未注册""缺 backstore 插件"分开报。
+   这些项只做启动期告警、不阻断启动，但对应功能不可用。
 
 Q: 客户端连不上
 A: 1) ss -lntp | grep 8443      确认监听
@@ -1941,6 +1979,18 @@ def package_server(version: str, include_updates: bool, linux: bool = False) -> 
         _write_text_unix(pkg_dir / "scripts" / "vault-server.service", LINUX_SYSTEMD_UNIT)
         _write_text_unix(pkg_dir / "scripts" / "install-systemd.sh", LINUX_INSTALL_SYSTEMD)
         (pkg_dir / "scripts" / "install-systemd.sh").chmod(0o755)
+
+        # 依赖安装脚本：源文件在仓库根 scripts/setup.sh（不放字面量常量里，避免两处维护）。
+        # 必须显式把 CRLF 归一成 LF —— _write_text_unix 只保证"写出去的换行是 \n"，
+        # 不会清除内容里已有的 \r；而 Windows 上按 autocrlf 检出的源码可能是 CRLF，
+        # 带 \r 的 shell 脚本到 Linux 上会因 `#!/bin/sh\r` 直接执行失败。
+        setup_src = ROOT / "scripts" / "setup.sh"
+        if setup_src.is_file():
+            setup_text = setup_src.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+            _write_text_unix(pkg_dir / "scripts" / "setup.sh", setup_text)
+            (pkg_dir / "scripts" / "setup.sh").chmod(0o755)
+        else:
+            warn("未找到 scripts/setup.sh，包内将不含依赖安装脚本")
     else:
         _write_text(pkg_dir / "部署说明.txt", DEPLOY_README.format(
             version=version,
@@ -1980,7 +2030,7 @@ def package_server(version: str, include_updates: bool, linux: bool = False) -> 
     if linux:
         # tar.gz 由本函数生成：显式写权限位（见 _make_targz 的说明）。
         archive_path = _make_targz(pkg_dir, PACKAGE_DIR / f"{pkg_dir.name}.tar.gz",
-                                   {bin_name, "install-systemd.sh"})
+                                   {bin_name, "install-systemd.sh", "setup.sh"})
     else:
         archive_path = Path(shutil.make_archive(str(PACKAGE_DIR / pkg_dir.name), "zip",
                                                 root_dir=PACKAGE_DIR, base_dir=pkg_dir.name))

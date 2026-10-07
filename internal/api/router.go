@@ -97,6 +97,10 @@ func (r *Router) routes() {
 		// 任何登录用户为自己换取客户端证书（无需超管）。
 		g.Post("/v1/auth/client-certificate", r.handleClientCertificate)
 		g.Get("/v1/system/events", r.handleEvents)
+		// 系统依赖自检（缺 configfs 挂载 / LIO 内核模块 / LVM 工具等）：
+		// 任何登录用户可读——横幅要告诉所有使用者"哪些功能不可用、怎么补"，
+		// 而不是只有超管能看到原因。只读：修复只在启动期与 doctor 里做。
+		g.Get("/v1/system/deps", r.handleSystemDeps)
 		g.Get("/v1/system/settings", r.requireSuperAdmin(r.handleGetSettings))
 		g.Patch("/v1/system/settings", r.requireSuperAdmin(r.handlePatchSettings))
 		// 全量配置表（读）与在线改配置（写回 config.yaml）：仅超级管理员。

@@ -43,6 +43,7 @@ import type {
   ConfigResponse,
   SettingsResponse,
   StorageDTO,
+  SysDepsReport,
   SystemInfo,
   SystemLog,
   UpdateRepoRequest,
@@ -65,6 +66,14 @@ export class VaultApi extends ApiClient {
 
   systemHealth(): Promise<HealthStatus> {
     return this.request<HealthStatus>('GET', '/v1/system/health')
+  }
+
+  /**
+   * 系统依赖自检（需登录）：服务端启动时会自动修复能修的，修不了的在这里返回，
+   * 由前端横幅逐条提示"缺了什么、怎么补"。
+   */
+  systemDeps(): Promise<SysDepsReport> {
+    return this.request<SysDepsReport>('GET', '/v1/system/deps')
   }
 
   clientCheck(body: ClientCheckRequest): Promise<ClientCheckResponse> {

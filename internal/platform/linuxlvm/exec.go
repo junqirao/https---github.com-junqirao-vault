@@ -23,6 +23,30 @@ const logTextLimit = 4096
 // 失败时只把「精简后的输出」写进日志，返回给上层的是平台错误码
 // （原始报错文本不进 API 响应，符合 apperr 的设计约定）。
 func Run(ctx context.Context, logger *slog.Logger, name string, args ...string) (string, error) {
+	return execCmd(ctx, logger, false, name, args...)
+}
+
+// RunQuiet 与 Run 同源，区别只在**非 0 退出不写 ERROR 日志**，由调用方解释这个退出码。
+//
+// 之所以需要它：有一类调用把非 0 退出当作**正常答案**，而不是故障——
+//
+//	lvs  <vg>/<lv>  → "Failed to find logical volume"：判定"这个卷还不存在"
+//	blkid <dev>     → 退出码 2：判定"这个设备上还没有文件系统"
+//	lvchange -an    → 本就未激活，幂等语义下无需处理
+//
+// 这些分支每次建盘、每次删除都会走到（建盘的第一步就是探一次"不存在"），打成 ERROR
+// 会让日志里满是红字，真正的故障反而被淹没（真机反馈：建盘成功了，前后却各跟着一条 ERROR）。
+// 命令输出仍以 Debug 留痕，需要时照样能查。
+//
+// 只在"非 0 退出属于正常分支"的地方用；有副作用的操作（mkfs / mount / lvcreate 等）
+// 失败仍走 Run 记 ERROR，即使调用方只是告警。
+// 超时/被取消也不在此列——那说明 LVM 卡住了，仍然按 ERROR 记录。
+func RunQuiet(ctx context.Context, logger *slog.Logger, name string, args ...string) (string, error) {
+	return execCmd(ctx, logger, true, name, args...)
+}
+
+// execCmd 是 Run / RunQuiet 的共同实现：quiet 只影响"非 0 退出"时的日志级别。
+func execCmd(ctx context.Context, logger *slog.Logger, quiet bool, name string, args ...string) (string, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -37,8 +61,13 @@ func Run(ctx context.Context, logger *slog.Logger, name string, args ...string) 
 			return text, apperr.New(CodeCommandFailed, http.StatusInternalServerError).
 				WithCause(ctx.Err()).WithArg("cmd", name)
 		}
-		logger.Error("命令执行失败",
-			"cmd", name, "err", err.Error(), "output", limitText(text))
+		if quiet {
+			logger.Debug("命令返回非 0（按正常分支处理）",
+				"cmd", name, "err", err.Error(), "output", limitText(text))
+		} else {
+			logger.Error("命令执行失败",
+				"cmd", name, "err", err.Error(), "output", limitText(text))
+		}
 		return text, apperr.New(CodeCommandFailed, http.StatusInternalServerError).
 			WithCause(err).WithArg("cmd", name)
 	}

@@ -36,6 +36,17 @@ func (r *Router) handleSystemInfo(w http.ResponseWriter, req *http.Request) {
 	r.writeJSON(w, http.StatusOK, r.deps.App.SystemInfo(req.Context()))
 }
 
+// handleSystemDeps 返回系统依赖自检报告（前端据此显示"缺了什么"的横幅）。
+//
+// 只读：**不在请求里修复**。修复发生在启动期（受 platform.auto_repair / auto_install 控制）
+// 与 `vault-server doctor`；这里每次都重新探测，运维补齐缺项后横幅刷新即消失。
+//
+// 始终返回 200：报告本身含 ok / supported 字段，缺项是"服务端部分功能不可用"这一事实的
+// 描述，不是这次请求的失败——用 503 会让前端把它当成接口故障而弹错误提示。
+func (r *Router) handleSystemDeps(w http.ResponseWriter, req *http.Request) {
+	r.writeJSON(w, http.StatusOK, r.deps.App.SysDeps(req.Context()))
+}
+
 // handleSystemHealth 健康检查。
 //
 // 全部检查通过返回 200，否则返回 503（响应体始终含 ok 字段与各项结果）。

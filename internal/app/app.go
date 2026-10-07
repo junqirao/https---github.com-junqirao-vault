@@ -57,6 +57,12 @@ type Deps struct {
 	Sessions *SessionStore
 	// Events 事件广播通道（进程内，用于 SSE；见 events.go 说明）。
 	Events EventSink
+
+	// SysDepsProbe 系统依赖实时探测探针（Linux 注入；Windows 为 nil）。
+	//
+	// 由平台层装配（见 internal/platform/sysdeps 与 sysdeps.go 的 SysDepsReport），
+	// 只探测不修复——修复只在启动期与 `vault-server doctor` 里做。
+	SysDepsProbe func(context.Context) *SysDepsReport
 }
 
 // App 聚合全部应用服务。

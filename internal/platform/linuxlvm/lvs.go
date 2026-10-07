@@ -32,8 +32,22 @@ func parseReportRows(out, section string) ([]lvsRow, error) {
 
 // lvsRows 执行 lvs 并返回其 JSON 报告的行集合（args 为 lvs 的其余参数）。
 func (m *Manager) lvsRows(ctx context.Context, args ...string) ([]lvsRow, error) {
+	return m.lvsRowsWith(ctx, false, args...)
+}
+
+// lvsRowsQuiet 与 lvsRows 同源，但把"查不到"当正常结果而非故障（见 RunQuiet）：
+// 给探测用——问一个卷属于哪个池，厚卷、已删掉的卷都会让 lvs 以非 0 退出。
+func (m *Manager) lvsRowsQuiet(ctx context.Context, args ...string) ([]lvsRow, error) {
+	return m.lvsRowsWith(ctx, true, args...)
+}
+
+func (m *Manager) lvsRowsWith(ctx context.Context, quiet bool, args ...string) ([]lvsRow, error) {
 	full := append([]string{"--reportformat", "json"}, args...)
-	out, err := m.run(ctx, "lvs", full...)
+	run := m.run
+	if quiet {
+		run = m.runQuiet
+	}
+	out, err := run(ctx, "lvs", full...)
 	if err != nil {
 		return nil, err
 	}
@@ -79,8 +93,11 @@ func (m *Manager) pvVG(ctx context.Context, dev string) (string, bool) {
 }
 
 // blkidType 探测设备上已有的文件系统类型；无文件系统时 blkid 以非 0 退出，这里归为"空"。
+//
+// 归为"空"是正常语义（刚建出来的 thin LV 本来就没有文件系统），所以用 runQuiet：
+// 真机反馈是建盘成功后紧跟一条 blkid ERROR，看着像失败，其实只是"还没格式化"。
 func (m *Manager) blkidType(ctx context.Context, dev string) (string, error) {
-	out, err := m.run(ctx, "blkid", "-o", "value", "-s", "TYPE", dev)
+	out, err := m.runQuiet(ctx, "blkid", "-o", "value", "-s", "TYPE", dev)
 	if err != nil {
 		return "", nil
 	}

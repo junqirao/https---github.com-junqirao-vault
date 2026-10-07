@@ -1360,9 +1360,12 @@ func runLinux(r *report) {
 	if st, err := os.Stat("/sys/kernel/config/target"); err == nil && st.IsDir() {
 		r.pass("/sys/kernel/config/target", "存在（LIO 内核子系统已就绪）", "")
 	} else {
+		// 处方必须逐个 modprobe：写成 "modprobe target_core_mod iscsi_target_mod" 时，
+		// 第 2 个名字会被当成第 1 个模块的参数（内核日志：unknown parameter ... ignored），
+		// 结果只加载了 target_core_mod，用户照抄后依旧没有 configfs 目录。
 		r.fail("/sys/kernel/config/target 不存在",
-			"说明 target 内核模块未加载；请 modprobe target_core_mod / iscsi_target_mod",
-			"modprobe target_core_mod iscsi_target_mod && ls /sys/kernel/config/target")
+			"说明 target 内核模块未加载；请逐个加载：modprobe target_core_mod && modprobe iscsi_target_mod",
+			"modprobe target_core_mod && modprobe iscsi_target_mod; ls /sys/kernel/config/target")
 	}
 	for _, mod := range []string{"target_core_mod", "iscsi_target_mod"} {
 		if _, err := os.Stat("/sys/module/" + mod); err == nil {

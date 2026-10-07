@@ -445,6 +445,46 @@ export interface HealthStatus {
 }
 
 /**
+ * GET /v1/system/deps：系统依赖自检（服务端启动时自动修复，修不了的用横幅告知）。
+ *
+ * 仅 Linux 会返回 supported=true：探测 configfs 挂载、LIO 内核模块、LVM/mkfs 等命令行工具。
+ * 接口是只读的——修复只在启动期与 `vault-server doctor` 里做；这里每次重新探测，
+ * 因此运维在服务器上补齐缺项后，刷新页面横幅即消失。
+ */
+export interface SysDepsItem {
+  /** 稳定标识，如 configfs_mount / kernel_modules / lvm_tools。 */
+  key: string
+  title: string
+  /** 核心功能必需（缺失即服务端部分功能不可用）。 */
+  required: boolean
+  /** ok | fixed | missing */
+  status: 'ok' | 'fixed' | 'missing'
+  detail?: string
+  fixed?: string
+  /** 人工处置建议（含可直接执行的命令）。 */
+  hint?: string
+}
+
+export interface SysDepsReport {
+  /** 当前平台是否支持系统依赖自检（仅 Linux 为 true）。 */
+  supported: boolean
+  /** 必需项是否全部就绪。 */
+  ok: boolean
+  checked_at: string
+  elapsed_ms: number
+  /** 服务端是否以 root 运行（非 root 无法自动修复）。 */
+  root: boolean
+  repair_enabled: boolean
+  install_enabled: boolean
+  configfs_root?: string
+  items: SysDepsItem[]
+  /** 仍缺失的必需项 key（横幅的核心内容）。 */
+  missing: string[]
+  /** 最近一次自动修复解决的项 key（含启动期）。 */
+  fixed: string[]
+}
+
+/**
  * GET /v1/system/logs：服务端日志（管理端「服务日志」页，仅超级管理员）。
  *
  * 与本地代理的 GET /agent/log 同形（按天切分、一次回一天的文件尾部），差别在于这里的

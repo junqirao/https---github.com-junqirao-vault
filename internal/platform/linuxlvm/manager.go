@@ -75,10 +75,10 @@ type Manager struct {
 
 // 编译期断言：Manager 必须同时满足四个后端接口（含多存储池目录与按池生成引用）。
 var (
-	_ platform.DiskBackend      = (*Manager)(nil)
-	_ platform.VolumeBackend    = (*Manager)(nil)
-	_ platform.StorageAdmin     = (*Manager)(nil)
-	_ platform.PoolCatalog      = (*Manager)(nil)
+	_ platform.DiskBackend       = (*Manager)(nil)
+	_ platform.VolumeBackend     = (*Manager)(nil)
+	_ platform.StorageAdmin      = (*Manager)(nil)
+	_ platform.PoolCatalog       = (*Manager)(nil)
 	_ platform.PooledDiskBackend = (*Manager)(nil)
 )
 
@@ -126,10 +126,24 @@ func (m *Manager) Available(_ context.Context) error {
 
 // run 在单条命令超时约束下执行外部命令。
 func (m *Manager) run(ctx context.Context, name string, args ...string) (string, error) {
+	return m.exec(ctx, false, name, args...)
+}
+
+// runQuiet 与 run 同源，但把非 0 退出当正常答案（见 RunQuiet）：
+// 只给探测类调用和"本就无事可做"的幂等操作使用。
+func (m *Manager) runQuiet(ctx context.Context, name string, args ...string) (string, error) {
+	return m.exec(ctx, true, name, args...)
+}
+
+// exec 给单条命令统一施加超时约束，并按 quiet 决定失败时的日志级别。
+func (m *Manager) exec(ctx context.Context, quiet bool, name string, args ...string) (string, error) {
 	if m.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, m.timeout)
 		defer cancel()
+	}
+	if quiet {
+		return RunQuiet(ctx, m.logger, name, args...)
 	}
 	return Run(ctx, m.logger, name, args...)
 }

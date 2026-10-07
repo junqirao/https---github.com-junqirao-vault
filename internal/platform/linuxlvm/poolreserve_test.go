@@ -75,6 +75,38 @@ func TestPoolMaxBytesWithReservesMetadataBeforeData(t *testing.T) {
 	}
 }
 
+// TestPoolFreeBytesWithIsPoolSpace：thin 卷的"可用空间"= 池数据容量 × 未用比例。
+//
+// 真机反馈：16G 的存储卷（池也是 16G），界面上"可用"只有 48M，新建存储库一律报
+// storage.low_free_space —— 因为这个数当时取自**卷组剩余**（vg_free，池建好时已把卷组空间
+// 整块划走，只剩几十 MB 的零头），而往 thin 卷里写数据消耗的是**池**的空间，不是卷组的。
+func TestPoolFreeBytesWithIsPoolSpace(t *testing.T) {
+	const gb = int64(1) << 30
+	cases := []struct {
+		name string
+		size int64
+		pct  float64
+		want int64
+	}{
+		{"池刚建好（使用率 0）几乎整池可写", 16 * gb, 0, 16 * gb},
+		{"用掉四分之一", 16 * gb, 25, 12 * gb},
+		{"用掉 99%", 16 * gb, 99, 16 * gb / 100},
+		{"使用率越界按 100%（一点也写不进去）", 16 * gb, 130, 0},
+		{"使用率为负按 0% 处理，而不是越算越多", 16 * gb, -5, 16 * gb},
+		{"容量未知时给 0（调用方退回文件系统口径）", 0, 10, 0},
+	}
+	for _, c := range cases {
+		if got := poolFreeBytesWith(c.size, c.pct); got != c.want {
+			t.Fatalf("%s：poolFreeBytesWith(%d, %v) = %d，期望 %d", c.name, c.size, c.pct, got, c.want)
+		}
+	}
+	// 16G 的池用掉 1%：可用必须还在 15G 以上。这条就是"48M"那个量级的反面——
+	// 若哪天又改回按卷组剩余算，这里会立刻失败。
+	if got := poolFreeBytesWith(16*gb, 1); got < 15*gb {
+		t.Fatalf("16G 的池用掉 1%% 后可用 = %d，不足 15G", got)
+	}
+}
+
 // 下面两个用例锁住"发命令前必须对齐扇区"这条口径：
 // lvcreate / lvextend 的 -L/-V 只接受 512 的整数倍，而界面上两位小数的 GB 换算回字节必然带尾数。
 //

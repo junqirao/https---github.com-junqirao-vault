@@ -1,19 +1,20 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Button, Col, Form, Input, InputNumber, Progress, Row, Select, Space, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
+import { StorageOption } from '../../components/StorageOption'
 import { agentApi } from '../../api/agentClient'
 import type { StartUploadInput, UploadState, UploadStatus } from '../../api/agentTypes'
 import { ApiError } from '../../api/errors'
 import { useApi } from '../../api/provider'
-import type { CreateRepoRequest, RepoDTO, RepoMode } from '../../api/types'
+import type { CreateRepoRequest, RepoDTO, RepoMode, StorageDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
 import { useI18n, type I18nApi } from '../../i18n'
 import { CAPACITY_UNIT, capacityNormalize, capacityValueProps, formatBytes } from '../../utils/format'
-import { spacing } from '../../tokens/palette'
+import { fontSize, palette, spacing } from '../../tokens/palette'
 import { SourceDirPicker, type SourceDirValue } from './SourceDirPicker'
 
 export interface RepoCreateFormProps {
@@ -29,6 +30,19 @@ type RepoFormValues = Omit<CreateRepoRequest, 'source_dir'> & { source_dir?: Sou
 
 /** 上传进行中的状态（可取消）。 */
 const ACTIVE_UPLOAD_STATES: readonly UploadStatus[] = ['scanning', 'creating', 'uploading', 'completing']
+
+/**
+ * 存储下拉里进度条的口径：有分配容量（thin 卷）时按"已用 / 分配容量"，
+ * 与存储列表的用量列同一口径（库能写到的上限是分配容量，不是底层卷的总量）；
+ * 目录模式没有分配容量，退化为"卷已用 / 卷容量"（总量 - 可用）。
+ */
+function storageUsage(storage: StorageDTO): { usedBytes: number; totalBytes: number } {
+  if (storage.size_bytes > 0) {
+    return { usedBytes: storage.used_bytes, totalBytes: storage.size_bytes }
+  }
+  const total = storage.total_bytes
+  return { usedBytes: Math.max(0, total - storage.free_bytes), totalBytes: total }
+}
 
 /** 创建存储库表单页（超级管理员可指定所有者）。 */
 export function RepoCreateForm({
@@ -63,12 +77,19 @@ export function RepoCreateForm({
     queryFn: () => api.listStorages()
   })
 
-  const storageOptions = (storagesQuery.data?.items ?? [])
-    .filter((storage) => storage.enabled)
-    .map((storage) => ({
-      value: storage.id,
-      label: `${storage.name} · ${storage.volume_name || '-'} · ${t('storage.available')} ${formatBytes(storage.free_bytes)}`
-    }))
+  // 可选存储：只列启用的（与后端 CreateRepo 的校验一致）。
+  const storages = useMemo(
+    () => (storagesQuery.data?.items ?? []).filter((storage) => storage.enabled),
+    [storagesQuery.data]
+  )
+  // 收起态与搜索只需一个名字；展开后的富选项由 optionRender 画（见下）。
+  const storageOptions = useMemo(
+    () => storages.map((storage) => ({ value: storage.id, label: storage.name })),
+    [storages]
+  )
+  // 下拉里要画的三排（名称/路径/容量条）取自存储记录本身，而 option 里只放 id，
+  // 用这张索引表查回记录：Form 收到的值始终只是一个 id，optionRender 也能拿到完整数据。
+  const storageById = useMemo(() => new Map(storages.map((storage) => [storage.id, storage])), [storages])
 
   const mutation = useMutation({
     mutationFn: (values: CreateRepoRequest) => api.createRepo(values),
@@ -215,6 +236,42 @@ export function RepoCreateForm({
                     loading={storagesQuery.isLoading}
                     placeholder={t('storage.auto')}
                     options={storageOptions}
+                    // 展开项：名称 / 路径 / 容量进度条三排（容量条上的百分比与配色见 StorageOption）。
+                    // 数据按 id 现查，option 仍是轻量的 {value,label}。
+                    optionRender={(option) => {
+                      const storage = storageById.get(String(option.value))
+                      if (!storage) return option.label
+                      const { usedBytes, totalBytes } = storageUsage(storage)
+                      return (
+                        <StorageOption
+                          name={storage.name}
+                          path={storage.path}
+                          usedBytes={usedBytes}
+                          totalBytes={totalBytes}
+                        />
+                      )
+                    }}
+                    // 收起态保持一行，但补回"可用"——富选项只在展开时才看得到。
+                    labelRender={({ value }) => {
+                      const storage = storageById.get(String(value))
+                      // 选中的存储已被停用/删除时列表里没有它：退回原始 id，
+                      // 让"选了个已经不存在的存储"看得出来，而不是显示成空框。
+                      if (!storage) return String(value)
+                      return (
+                        <span>
+                          {storage.name}
+                          <span
+                            style={{
+                              marginInlineStart: spacing.xs,
+                              color: palette.textTertiary,
+                              fontSize: fontSize.xs
+                            }}
+                          >
+                            {`${t('storage.available')} ${formatBytes(storage.free_bytes)}`}
+                          </span>
+                        </span>
+                      )
+                    }}
                   />
                 </Form.Item>
               </Col>

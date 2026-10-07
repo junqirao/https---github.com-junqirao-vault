@@ -195,6 +195,22 @@ platform:
     # 目标 IQN 前缀：完整 IQN = <prefix>:<target_name>。
     iqn_prefix: "iqn.2026-01.com.vault"
 
+  # --- 系统依赖自检与自愈（仅 Linux 有意义；Windows 忽略） ---
+  #
+  # 启动时会探测三类"进程外"依赖：configfs 是否挂载、LIO 三个内核模块
+  # （target_core_mod / iscsi_target_mod / target_core_iblock）是否加载并在 configfs 中
+  # 注册成功（<root>/iscsi、<root>/core/iblock_0）、以及 LVM2/文件系统等命令行工具是否在 PATH。
+  # 也可随时手工执行：Vault-Server doctor（加 -json 便于脚本消费）。
+  #
+  # 自动修复（挂载 configfs、加载/重载模块、写 /etc/modules-load.d/vault-lio.conf）：
+  # 幂等且只动这几样东西，默认开启。想让 Ansible/镜像构建等外部工具接管依赖时设为 false，
+  # 此时启动只探测并打 WARN，不改动宿主机。
+  auto_repair: true
+  # 自动安装（缺失 lvm2 / e2fsprogs 等工具对应的软件包时，按发行版调 apt-get/dnf/yum/zypper/apk/pacman）：
+  # 默认开启；**离线环境或不允许服务端自行装包的生产环境请设为 false**，
+  # 此时缺失项会在日志与 doctor 报告里给出可直接复制的人工安装命令。
+  auto_install: true
+
 # ---------------------------------------------------------------------------
 # 客户端版本兼容区间（见实现文档 3.4.2）
 # ---------------------------------------------------------------------------

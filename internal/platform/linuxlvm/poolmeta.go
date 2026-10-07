@@ -1,6 +1,7 @@
 package linuxlvm
 
 import (
+	"math"
 	"strconv"
 	"strings"
 )
@@ -120,6 +121,29 @@ func alignSectorDown(n int64) int64 {
 		return n
 	}
 	return n - n%lvmSectorBytes
+}
+
+// poolFreeBytesWith 由池数据容量与 data_percent 算出池**还能写进去**多少字节。
+//
+// 这是"这块 thin 卷还能不能用"的正确上限：往 thin 卷里写数据消耗的是**池**的空间，
+// 而池一旦建好就把卷组空间整块划走了，卷组剩余（vg_free）只剩 PE 对齐与 pmspare
+// 留下的几 MB 零头。拿 vg_free 当上限会得出"16G 的存储卷只剩 48M 可用"——
+// 于是新建存储库被判 storage.low_free_space，选根也会跳过这个还空着大半的卷（真机反馈）。
+//
+// data_percent 读歪（NaN / 越界）时按 0% 处理：宁可乐观退回"只看文件系统"的老口径，
+// 也不要因为一个坏百分比把整块盘判成"一点也写不进去"。
+func poolFreeBytesWith(sizeBytes int64, dataPercent float64) int64 {
+	if sizeBytes <= 0 {
+		return 0
+	}
+	pct := dataPercent
+	if math.IsNaN(pct) || pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return int64(float64(sizeBytes) * (100 - pct) / 100)
 }
 
 // parseLVSize 把 LVM 的容量写法（4G / 512m / 8T）换算成字节；解析不了返回 0。

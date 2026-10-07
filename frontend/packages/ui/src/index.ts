@@ -90,7 +90,9 @@ export {
 } from './components/PageShell'
 export { PasswordStrength, type PasswordStrengthProps } from './components/PasswordStrength'
 export { SectionCard, type SectionCardProps } from './components/SectionCard'
+export { StorageOption, type StorageOptionProps } from './components/StorageOption'
 export { StatusTag, type StatusTagProps } from './components/StatusTag'
+export { SystemDepsBanner } from './components/SystemDepsBanner'
 
 // 业务视图
 export { LoginForm, type LoginFormProps, type LoginFormValues } from './features/auth/LoginForm'

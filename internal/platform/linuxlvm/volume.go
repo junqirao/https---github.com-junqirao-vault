@@ -149,8 +149,14 @@ func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, 
 //   - Name 取承载该路径的设备（mountinfo 的 source），供 PathGuardSet 按卷去重——
 //     若回退成 VG 名，多个存储会被去重塌成一条；
 //   - TotalBytes 取 statfs 的总量（存储卷即其 LV 虚拟大小）；
-//   - FreeBytes 取 **min(statfs 可用, VG 剩余)**：thin 卷不自增长，写满虚拟大小即 ENOSPC，
-//     只看 statfs 会让 PathGuardSet.Pick 选到一个已装不下的根。
+//   - FreeBytes 取 **min(statfs 可用, 所属 thin pool 剩余)**：thin 卷不自增长，写满虚拟大小
+//     即 ENOSPC，"虚拟大小里还剩多少"与"池里还剩多少"是两个独立的限制，取小者才不会让
+//     PathGuardSet.Pick 选到一个池已见底的根。
+//
+// ⚠️ 曾经这里取的是**卷组剩余（vg_free）**，那是错的：池建好时就把卷组空间整块划走了，
+// vg_free 只剩零头，而往 thin 卷里写数据消耗的是池的空间。真机反馈：16G 的存储卷配 16G 的池，
+// vg_free 只剩 48M，界面因此显示"16G 的卷、可用 48M"，新建存储库一律被判
+// storage.low_free_space（见 thinPoolFreeBytesOf）。
 func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.VolumeSpace, error) {
 	p := strings.TrimSpace(path)
 	if p == "" {
@@ -163,19 +169,15 @@ func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.Volume
 	}
 
 	name, fsType := p, ""
-	// 剩余容量要按该路径所在**存储池（卷组）**算：多存储池下每个池各算各的，
-	// 用配置的 VG 会导致"池 A 满了却还能往池 B 里选盘"（或反之）。
-	vgOfPath := strings.TrimSpace(m.vg)
 	if e, ok := mountOf(p); ok {
 		name, fsType = e.source, e.fsType
-		if vg, err := vgFromPath(e.source); err == nil {
-			vgOfPath = vg
-		}
 	}
 
 	free := size.freeBytes
-	if vgFree, vgErr := m.vgFreeBytesOf(ctx, vgOfPath); vgErr == nil && vgFree > 0 && vgFree < free {
-		free = vgFree
+	// 该路径落在某个 thin 卷上时，还要看它所属**池**还剩多少（多存储池下各算各的）：
+	// 池见底后这个卷再空也写不进去。猜不出池（厚卷、宿主目录）就只看文件系统本身。
+	if poolFree, ok := m.thinPoolFreeBytesOf(ctx, name); ok && poolFree < free {
+		free = poolFree
 	}
 	return &domain.VolumeSpace{
 		Name:       name,

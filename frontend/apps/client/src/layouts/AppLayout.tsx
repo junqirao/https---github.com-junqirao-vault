@@ -28,6 +28,7 @@ import { CLIENT_VERSION } from '../config'
 import {
   LanguageSwitcher,
   LayoutModeProvider,
+  SystemDepsBanner,
   layout,
   palette,
   roleLabel,
@@ -366,6 +367,9 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
           </Layout.Header>
 
           <Layout.Content style={{ background: palette.bgPage, overflow: 'auto' }}>
+            {/* 服务端系统依赖缺失（缺 configfs 挂载 / LIO 内核模块 / LVM 工具等）：
+                启动时能自动修的已修，修不了的在这里告诉使用者"缺了什么、怎么补"。 */}
+            <SystemDepsBanner />
             {hostWarning ? (
               <Alert
                 type="warning"

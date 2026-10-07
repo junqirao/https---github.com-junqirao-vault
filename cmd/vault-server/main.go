@@ -131,6 +131,8 @@ const (
 	signSubcommand = "sign"
 	// stopSubcommand 是"停止运行中的服务端"的子命令名。
 	stopSubcommand = "stop"
+	// doctorSubcommand 是"系统依赖自检/自愈"的子命令名（仅 Linux；Windows 下给出提示）。
+	doctorSubcommand = "doctor"
 	// backgroundFlagName 是"后台运行"开关名：只有显式指定它才派生后台进程。
 	backgroundFlagName = "background"
 )
@@ -256,7 +258,7 @@ func printStartupSummary(raw config.Config, configPath string) {
 // 返回退出码与 promptHandled：后者为 true 表示"本次运行已自行给出结论或已自行
 // 等待用户输入"，main 不应再补一次暂停（见 main 的注释）。
 func run() (code int, promptHandled bool) {
-	// ---- 子命令派发：第一个参数是 sign / stop 时走对应子命令 ----
+	// ---- 子命令派发：第一个参数是 sign / stop / doctor 时走对应子命令 ----
 	//
 	// ⚠️ 服务端**运行时永不签名**：sign 子命令仅供发布方在构建/发布阶段使用，
 	// 私钥不参与任何 serve 路径。默认（无子命令）行为保持为 serve，
@@ -267,6 +269,8 @@ func run() (code int, promptHandled bool) {
 			return runSign(os.Args[2:]), true
 		case stopSubcommand:
 			return runStop(os.Args[2:]), true
+		case doctorSubcommand:
+			return runDoctor(os.Args[2:]), true
 		}
 	}
 
@@ -518,9 +522,11 @@ func runServe(configPath *string, migrateOnly *bool) int {
 		Platform: plat.Platform,
 		// StorageVol 为 nil 表示平台无存储卷概念（Windows）：存储按目录模式处理。
 		StorageVol: plat.StorageVol,
-		Tokens:     cert.NewTokenStore(security.EnrollmentTokenTTL.Std()),
-		Sessions:   app.NewSessionStore(security.SessionTTL.Std()),
-		Events:     eventSinkAdapter{hub: events},
+		// 系统依赖实时探测（前端横幅）：Linux 注入，Windows 为 nil。
+		SysDepsProbe: plat.SysDepsProbe,
+		Tokens:       cert.NewTokenStore(security.EnrollmentTokenTTL.Std()),
+		Sessions:     app.NewSessionStore(security.SessionTTL.Std()),
+		Events:       eventSinkAdapter{hub: events},
 	})
 	application.RegisterJobHandlers()
 
@@ -814,6 +820,10 @@ type platformDeps struct {
 	// 装配为 nil 表示"平台没有存储卷概念"（Windows）：此时 app 层按**目录模式**处理，
 	// 相关 API 返回 platform.unsupported（501）。见 platform.StorageVolumeBackend。
 	StorageVol platform.StorageVolumeBackend
+	// SysDepsProbe 系统依赖实时探测探针（Linux 注入；Windows 为 nil → Supported=false）。
+	//
+	// 只探测不修复：修复发生在启动期与 `vault-server doctor`。前端据此显示"缺了什么"的横幅。
+	SysDepsProbe func(context.Context) *app.SysDepsReport
 }
 
 // checkPlatformKind 校验配置声明的平台种类与当前构建产物是否一致。
@@ -1159,6 +1169,7 @@ func printUsage(w io.Writer, fs *flag.FlagSet) {
   Vault-Server [选项]           启动服务端（默认 serve，前台运行）
   Vault-Server --background     派生后台子进程运行服务端
   Vault-Server stop [选项]      向正在运行的服务端发送停止请求（优雅停机）
+  Vault-Server doctor [选项]    系统依赖自检/自愈（仅 Linux）
   Vault-Server sign <子命令>    发布方签名工具（构建/发布阶段使用）
 
 serve 选项:
@@ -1170,7 +1181,9 @@ stop 选项:
     Windows：通过全局命名事件通知运行中的服务端优雅停机（等价于 Ctrl+C）。
     Linux  ：读取 PID 文件并向其发送 SIGTERM（同样是优雅停机）。
     配置文件仅用于确认监听地址以便确认停止结果；默认 config.yaml。
-
+`)
+	fmt.Fprint(w, doctorUsage)
+	fmt.Fprint(w, `
 sign 子命令:
   Vault-Server sign keygen  -out-dir ./keys [-force]
   Vault-Server sign release -dir ./release -channel stable -version 0.2.0 \
