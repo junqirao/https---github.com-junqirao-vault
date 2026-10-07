@@ -135,8 +135,27 @@ func (s *Store) CountStorages(ctx context.Context) (int, error) {
 type StorageDiskStat struct {
 	// DiskCount 磁盘记录数。
 	DiskCount int
-	// UsedBytes 占用：优先各盘 physical_bytes（实际占用），未采样（<=0）时回退 size_bytes。
+	// UsedBytes 占用：按 diskAccountedBytes 的统一口径（与配额口径一致）。
 	UsedBytes int64
+}
+
+// diskAccountedBytes 是"这块盘占了多少"的统一口径，必须与 accountedUsageSQL 保持一致
+// （改一处就要改另一处，两处都是给用户看的同一个数）：
+//
+//	1. 有实测物理占用 → 用它；
+//	2. 建盘失败（error）→ 0，盘根本不存在；
+//	3. 已建好（ready/published）→ 实测值，**实测 0 就是 0**（thin 差异盘刚派生时独占块为 0）；
+//	4. 其余（creating/deleting，尚未建好）→ 退回标称容量预留。
+func diskAccountedBytes(state string, physical, size int64) int64 {
+	if physical > 0 {
+		return physical
+	}
+	switch domain.DiskState(state) {
+	case domain.DiskStateError, domain.DiskStateReady, domain.DiskStatePublished:
+		return 0
+	default: // creating / deleting：盘还不存在（或即将不存在），按标称容量预留
+		return size
+	}
 }
 
 // CountDisksUnderPaths 统计每个给定目录下（含子目录、按目录边界、大小写不敏感）
@@ -174,9 +193,10 @@ func (s *Store) CountDisksUnderPaths(ctx context.Context, paths []string) (map[s
 		VHDXPath      string `db:"vhdx_path"`
 		SizeBytes     int64  `db:"size_bytes"`
 		PhysicalBytes int64  `db:"physical_bytes"`
+		State         string `db:"state"`
 	}
 	if err := s.q.SelectContext(ctx, &rows,
-		`SELECT vhdx_path, size_bytes, physical_bytes FROM disks`); err != nil {
+		`SELECT vhdx_path, size_bytes, physical_bytes, state FROM disks`); err != nil {
 		return nil, fmt.Errorf("store: 统计存储磁盘占用失败: %w", err)
 	}
 
@@ -195,11 +215,7 @@ func (s *Store) CountDisksUnderPaths(ctx context.Context, paths []string) (map[s
 		}
 		stat := out[roots[best].key]
 		stat.DiskCount++
-		used := r.PhysicalBytes
-		if used <= 0 {
-			used = r.SizeBytes
-		}
-		stat.UsedBytes += used
+		stat.UsedBytes += diskAccountedBytes(r.State, r.PhysicalBytes, r.SizeBytes)
 		out[roots[best].key] = stat
 	}
 	return out, nil

@@ -60,7 +60,7 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
   const [error, setError] = useState<unknown>(null)
   const [pendingDelete, setPendingDelete] = useState<DiskDTO | null>(null)
   const agent = useAgent()
-  const { active } = useServerConfig()
+  const { servers, active } = useServerConfig()
   const [copyDisk, setCopyDisk] = useState<DiskDTO | null>(null)
   const [copyForm] = Form.useForm<{ target_dir: string; file_name: string }>()
   const { config: agentConfig, downloads, refreshDownloads } = agent
@@ -145,7 +145,7 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
   })
 
   const downloadMutation = useMutation({
-    mutationFn: (input: { disk_id: string; target_dir: string; file_name: string }) =>
+    mutationFn: (input: { disk_id: string; target_dir: string; file_name: string; server_key?: string; server_url?: string }) =>
       agentApi.startDiskDownload(input),
     onSuccess: () => {
       setCopyDisk(null)
@@ -195,7 +195,10 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
   }
 
   // 目录名里的服务端名称，与代理侧同一口径：本地别名优先，其次服务端名称，最后 vault。
-  const mountServerAlias = (agentConfig?.server_alias ?? '').trim() || (active?.serverName ?? '').trim() || 'vault'
+  // 全局 server_alias 只在**本机只有一台**服务端时才作数 —— 多台共用同一个别名，两台下的
+  // `别名_库名` 会撞成同一个目录（代理侧同样是这个规则，见 docs/agent-api.md）。
+  const mountServerAlias =
+    (servers.length <= 1 ? agentConfig?.server_alias : '')?.trim() || (active?.serverName ?? '').trim() || 'vault'
 
   const openMountDialog = (allocation: AllocationDTO): void => {
     // 先预填**这个库自己的**挂载设置（存储库 → 挂载设置），没配过才落回代理的兜底默认值。
@@ -479,7 +482,10 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
             downloadMutation.mutate({
               disk_id: copyDisk.id,
               target_dir: values.target_dir,
-              file_name: values.file_name
+              file_name: values.file_name,
+              // 这块盘属于**当前活动**服务端：多服务端下必须说清从哪台拉，否则可能拉到同名盘。
+              server_key: active?.key,
+              server_url: active?.baseUrl
             })
           )
         }}
@@ -515,7 +521,10 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
               allocation_id: target.id,
               repo_id: repoId,
               mount_mode: mountMode,
-              mount_path: mountMode === 'directory' ? mountPath.trim() : undefined
+              mount_path: mountMode === 'directory' ? mountPath.trim() : undefined,
+              // 归属当前活动服务端：分配 ID 只对那一台有意义，给错台会 404 agent.server_unknown。
+              server_key: active?.key,
+              server_url: active?.baseUrl
             })
           ).then(() => setMountTarget(null))
         }}

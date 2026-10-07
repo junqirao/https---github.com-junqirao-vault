@@ -20,6 +20,13 @@ func newPhaseTestAgent(t *testing.T) *Agent {
 	return a
 }
 
+// mountPhaseTestServerKey 是阶段用例用的服务端键。
+//
+// 阶段推进（服务端发来 progress 事件 → 本机挂载阶段）只按分配 ID 认领，与"是哪台服务端"
+// 无关；这里仍显式给一台，是因为多服务端下的事件入口按台划分（handleServerEvent(key, …)），
+// 事件语义上必须落在某一台上。
+const mountPhaseTestServerKey = "https://10.0.0.1:8443"
+
 // takeMountEvent 非阻塞取出一条事件（Publish 是同步写入带缓冲通道的，调用返回后即可读到）。
 func takeMountEvent(t *testing.T, events <-chan Event) (Event, bool) {
 	t.Helper()
@@ -41,6 +48,7 @@ func TestServerMountPhaseEventsAdvanceLocalPhase(t *testing.T) {
 	const alloc = "alloc-1"
 	a.store.PutMount(&MountState{
 		AllocationID: alloc,
+		ServerKey:    mountPhaseTestServerKey,
 		State:        MountStateMounting,
 		Phase:        MountPhaseRequesting,
 	}, &mountRuntime{})
@@ -60,7 +68,7 @@ func TestServerMountPhaseEventsAdvanceLocalPhase(t *testing.T) {
 	}
 
 	// ① 服务端推进 → 本机阶段跟随，并广播给界面。
-	a.handleServerEvent(serverMountEventType, phaseEvent(MountPhasePreparingDisk))
+	a.handleServerEvent(mountPhaseTestServerKey, serverMountEventType, phaseEvent(MountPhasePreparingDisk))
 	ms, _, ok := a.store.GetMount(alloc)
 	if !ok {
 		t.Fatal("挂载状态丢失")
@@ -73,20 +81,20 @@ func TestServerMountPhaseEventsAdvanceLocalPhase(t *testing.T) {
 	}
 
 	// ② 乱序/迟到的事件不得让阶段回退（界面会出现"阶段倒着走"）。
-	a.handleServerEvent(serverMountEventType, phaseEvent(MountPhaseAllocating))
+	a.handleServerEvent(mountPhaseTestServerKey, serverMountEventType, phaseEvent(MountPhaseAllocating))
 	if ms, _, _ := a.store.GetMount(alloc); ms.Phase != MountPhasePreparingDisk {
 		t.Fatalf("阶段回退了：%q", ms.Phase)
 	}
 
 	// ③ 继续前进。
-	a.handleServerEvent(serverMountEventType, phaseEvent(MountPhaseConfiguringTarget))
-	a.handleServerEvent(serverMountEventType, phaseEvent(MountPhaseConnecting))
+	a.handleServerEvent(mountPhaseTestServerKey, serverMountEventType, phaseEvent(MountPhaseConfiguringTarget))
+	a.handleServerEvent(mountPhaseTestServerKey, serverMountEventType, phaseEvent(MountPhaseConnecting))
 	if ms, _, _ := a.store.GetMount(alloc); ms.Phase != MountPhaseConnecting {
 		t.Fatalf("阶段 = %q，期望 %q", ms.Phase, MountPhaseConnecting)
 	}
 
 	// ④ 非进度动作（action != progress）一律忽略。
-	a.handleServerEvent(serverMountEventType, json.RawMessage(`{"action":"done","allocation_id":"alloc-1"}`))
+	a.handleServerEvent(mountPhaseTestServerKey, serverMountEventType, json.RawMessage(`{"action":"done","allocation_id":"alloc-1"}`))
 	if ms, _, _ := a.store.GetMount(alloc); ms.Phase != MountPhaseConnecting {
 		t.Fatalf("非进度事件不应改变阶段，实际 %q", ms.Phase)
 	}
@@ -100,7 +108,7 @@ func TestServerMountPhaseIgnoresUnknownAllocation(t *testing.T) {
 	a := newPhaseTestAgent(t)
 	_, events := a.hub.Subscribe()
 
-	a.handleServerEvent(serverMountEventType, json.RawMessage(
+	a.handleServerEvent(mountPhaseTestServerKey, serverMountEventType, json.RawMessage(
 		`{"action":"progress","allocation_id":"other-client","phase":"preparing_disk"}`))
 
 	if _, _, ok := a.store.GetMount("other-client"); ok {
@@ -117,8 +125,8 @@ func TestServerMountPhaseIgnoresSettledMount(t *testing.T) {
 	const alloc = "alloc-2"
 
 	for _, state := range []string{MountStateMounted, MountStateError, MountStateRevoked} {
-		a.store.PutMount(&MountState{AllocationID: alloc, State: state}, &mountRuntime{})
-		a.handleServerEvent(serverMountEventType, json.RawMessage(
+		a.store.PutMount(&MountState{AllocationID: alloc, ServerKey: mountPhaseTestServerKey, State: state}, &mountRuntime{})
+		a.handleServerEvent(mountPhaseTestServerKey, serverMountEventType, json.RawMessage(
 			`{"action":"progress","allocation_id":"alloc-2","phase":"preparing_disk"}`))
 		ms, _, _ := a.store.GetMount(alloc)
 		if ms.Phase != "" {

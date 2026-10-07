@@ -7,6 +7,7 @@ import { useApi } from '../../api/provider'
 import type { AgentMountState } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
+import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
 import { MountStateCell, mountSessionLive, openTargetOf } from '../mount/MountControls'
@@ -76,6 +77,8 @@ export interface RepoMountController {
 export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountController {
   const api = useApi()
   const agent = useAgent()
+  // 本库属于**当前活动**服务端：挂载请求必须说清归属台（分配 ID 只对那一台有意义）。
+  const { active } = useServerConfig()
   const { t } = useI18n()
   const queryClient = useQueryClient()
   const [busy, setBusy] = useState(false)
@@ -148,14 +151,20 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
         const created = await api.allocate(repo.id, currentUserId)
         target = created.id
       }
-      await agent.mount({ allocation_id: target, repo_id: repo.id, repo_name: repo.name })
+      await agent.mount({
+        allocation_id: target,
+        repo_id: repo.id,
+        repo_name: repo.name,
+        server_key: active?.key,
+        server_url: active?.baseUrl
+      })
       await invalidate()
     } catch (err) {
       setError(err)
     } finally {
       setBusy(false)
     }
-  }, [agent, allocationId, api, currentUserId, invalidate, repo.id, repo.name])
+  }, [active?.baseUrl, active?.key, agent, allocationId, api, currentUserId, invalidate, repo.id, repo.name])
 
   const unmountRepo = useCallback(async (): Promise<void> => {
     if (!mount) return

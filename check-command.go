@@ -1258,6 +1258,9 @@ func runLinux(r *report) {
 		{"lvs", []string{"--version"}, true},
 		{"vgs", []string{"--version"}, true},
 		{"pvs", []string{"--version"}, true},
+		// targetcli 是 LIO iSCSI 目标的必需执行体（写操作全部经它下发），不是可选工具。
+		// 它不接受 --version，版本用 version 子命令。
+		{"targetcli", []string{"version"}, true},
 		{"lvcreate", []string{"--version"}, true},
 		{"lvchange", []string{"--version"}, true},
 		{"lvextend", []string{"--version"}, true},
@@ -1359,6 +1362,13 @@ func runLinux(r *report) {
 	}
 	if st, err := os.Stat("/sys/kernel/config/target"); err == nil && st.IsDir() {
 		r.pass("/sys/kernel/config/target", "存在（LIO 内核子系统已就绪）", "")
+	} else if _, err := os.Stat("/sys/module/target_core_mod"); err == nil {
+		// 模块在、子系统根却完全没有 ⇒ 不是"模块没加载"，重载也修不好（见下面的说明）。
+		r.fail("/sys/kernel/config/target 不存在（但 target_core_mod 已加载）",
+			"target_core_mod 的 init 必须注册 target 子系统，注册成功才会有该目录（注册失败模块根本加载不进来）；"+
+				"所以这只能是「本进程看到的 configfs 与内核注册 LIO 的那份不是同一个实例」——容器里自己 mount 的 configfs 是空的。\n"+
+				"重载模块修不好这一点，还会拆掉正在给客户端服务的目标，别再试",
+			"mount | grep configfs; ls -la /sys/kernel/config/target/ 2>&1; ls -la /.dockerenv 2>/dev/null")
 	} else {
 		// 处方必须逐个 modprobe：写成 "modprobe target_core_mod iscsi_target_mod" 时，
 		// 第 2 个名字会被当成第 1 个模块的参数（内核日志：unknown parameter ... ignored），
@@ -1382,6 +1392,20 @@ func runLinux(r *report) {
 		} else {
 			r.warn("模块未加载 "+mod, "可加载但当前未加载（服务端启动时会 modprobe）", "modprobe "+mod)
 		}
+	}
+
+	// LIO 是否可用**只看行为**：C 节已经实测过 `targetcli version`，这里只列出子系统里的内容，
+	// 不作判定。
+	//
+	// 刻意不再判 <root>/iscsi 在不在：那是 rtslib 按需创建、内核注册时机也随版本不同的内部
+	// 细节（core/iblock_0 还要等第一个 iblock backstore 建出来才出现），拿它当判据会把好机器
+	// 判成故障，并把人引去反复 `modprobe -r`——那会拆掉正在给客户端服务的整棵目标配置。
+	if entries, err := os.ReadDir("/sys/kernel/config/target"); err == nil {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		r.pass("/sys/kernel/config/target 内容", strings.Join(names, " "), "")
 	}
 
 	// ntfs-3g：Linux 侧建盘要写 NTFS，依赖用户态驱动。

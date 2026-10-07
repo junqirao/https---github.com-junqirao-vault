@@ -5,10 +5,22 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // autoMountConcurrency 是自动挂载的并发上限（避免同时连接过多 iSCSI 目标）。
 const autoMountConcurrency = 2
+
+// autoMountWaitTimeout 是"等服务端连上"的上限：连上之前一律不挂载（见 restoreMountsWhenConnected）。
+//
+// 取 60s 的依据：拿到会话后的首次 SystemInfo 最长 10s，事件流建立与心跳确认都在秒级，
+// 留出充裕余量即可；到期仍连不上就整轮跳过 —— 无会话时的自动重连循环每 30s 会再登录一次，
+// 下一次会话建立时自然会重新走一遍，不需要在这里无限等。
+const autoMountWaitTimeout = 60 * time.Second
+
+// autoMountWaitInterval 是等待连接期间的轮询间隔（连接状态由事件流/心跳/SystemInfo 三处写入，
+// 这里只是低频看一眼，代价可忽略）。
+const autoMountWaitInterval = 500 * time.Millisecond
 
 // manualUnmountGuard 记住"本次运行期间被用户手动卸载过"的存储库：这些库不再参与自动挂载。
 //
@@ -58,7 +70,77 @@ func (g *manualUnmountGuard) blocked(repoID string) bool {
 	return ok
 }
 
-// restoreMounts 在拿到服务端会话后尽力恢复挂载，分三件事：
+// restoreMountsWhenConnected 是自动挂载的**唯一入口**：先确认服务端已连上，再执行挂载。
+//
+// 为什么必须先确认（真实反馈："自动挂载要连接到服务器之后才会执行，否则会报错"）：
+// 拿到会话（setSession）只代表客户端把令牌交给了代理，不代表服务端真的可达 —— 地址不通、
+// 服务端还没起来、证书没被信任时 SystemInfo 就会失败。这时去挂载只会得到一串失败；而按设计，
+// "启动时的自动挂载失败要**保留记录**"（本地记录代表用户希望它保持挂载的意图，见
+// docs/implementation.md 5.5），这些错误记录会长在界面上，并且每次启动再失败一遍。
+//
+// 因此这里阻塞等到"服务端已确认可达"（Connected=true）再挂。三条确认路径都算数：
+// SystemInfo 成功（updateServerFromInfo）、事件流建立、心跳成功（setServerConnected）。
+// 等不到就整轮跳过，等下一次会话建立（客户端推会话 / 证书免密登录 / 令牌续期 / 手动重连）重来。
+func (a *Agent) restoreMountsWhenConnected(ctx context.Context, key string) {
+	session, ok := a.store.Session(key)
+	if !ok {
+		return
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, autoMountWaitTimeout)
+	defer cancel()
+	if !a.waitServerConnected(waitCtx, key) {
+		a.logger.Warn("等待服务端连接超时，本次不执行自动挂载", "server", key)
+		return
+	}
+
+	// 等待期间会话可能被换掉（重新登录 / 退出登录）：那属于另一次会话的意图，
+	// 旧任务不能拿着它动手，否则会被上一份配置插一脚。
+	if !sameSession(a.store, key, session) {
+		a.logger.Info("等待期间会话已更换，跳过本次自动挂载", "server", key)
+		return
+	}
+	a.restoreMounts(ctx, key)
+}
+
+// waitServerConnected 轮询**某台**"服务端已确认可达"：就绪返回 true，ctx 结束返回 false。
+//
+// 先同步查一次：绝大多数情况下客户端推会话时服务端就是通的（SystemInfo 已在同一条链路上
+// 成功过），这里零延迟返回 —— 不给正常启动路径平白加一次等待。
+func (a *Agent) waitServerConnected(ctx context.Context, key string) bool {
+	connected := func() bool {
+		state, ok := a.store.Server(key)
+		return ok && state.Connected
+	}
+	if connected() {
+		return true
+	}
+	ticker := time.NewTicker(autoMountWaitInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			if connected() {
+				return true
+			}
+		}
+	}
+}
+
+// sameSession 判断**某台**的会话是否仍是等待开始时的那一个（服务端地址与令牌都相同才算同一个）。
+//
+// 只比地址不够：在同一台服务端上重新登录会换令牌，那同样是"会话已更换"。
+func sameSession(store *stateStore, key string, want *Session) bool {
+	got, ok := store.Session(key)
+	if !ok || got == nil {
+		return false
+	}
+	return got.ServerURL == want.ServerURL && got.Token == want.Token
+}
+
+// restoreMounts 在服务端确认连上后尽力恢复挂载，分三件事：
 //
 //  1. 全局 auto_mount 打开时，恢复本机状态文件里留下的挂载记录（见 restoreRecordedMounts）；
 //  2. 配置里**显式**为某个库打开"启动后自动挂载"的，把它挂上（见 mountConfiguredRepos）——
@@ -66,12 +148,12 @@ func (g *manualUnmountGuard) blocked(repoID string) bool {
 //  3. 上面两条都要让开"用户本次运行手动卸载过"的库（见 manualUnmountGuard）。
 //
 // 单个失败只记录状态并通过 SSE 通知，不阻塞其他分配。
-func (a *Agent) restoreMounts(ctx context.Context) {
+func (a *Agent) restoreMounts(ctx context.Context, key string) {
 	cfg := a.cfg.Get()
 	if cfg.AutoMount {
-		a.restoreRecordedMounts(ctx, cfg.RepoMounts)
+		a.restoreRecordedMounts(ctx, key, cfg.RepoMounts)
 	}
-	a.mountConfiguredRepos(ctx, cfg.RepoMounts)
+	a.mountConfiguredRepos(ctx, key, cfg.RepoMounts)
 }
 
 // restoreRecordedMounts 依据本地状态文件中记录的分配，尽力恢复挂载（并发上限 2）。
@@ -79,13 +161,15 @@ func (a *Agent) restoreMounts(ctx context.Context) {
 // 注意语义：服务端没有「本机应挂载哪些分配」的清单接口，因此这里只能恢复本代理上次运行
 // 留下的记录（这也是服务端重连后恢复挂载的可行路径）；"从来没挂过的库"由 per-repo 配置
 // 负责（见 mountConfiguredRepos）。
-func (a *Agent) restoreRecordedMounts(ctx context.Context, prefs map[string]RepoMountPref) {
-	pending := a.store.ListMounts()
+func (a *Agent) restoreRecordedMounts(ctx context.Context, key string, prefs map[string]RepoMountPref) {
+	// 只恢复**归属这台服务端**的记录：多服务端下每台各自恢复自己的，互不代劳
+	// （拿 A 的分配 ID 去 B 上恢复必然失败）。
+	pending := a.store.MountsForServer(key)
 	if len(pending) == 0 {
 		return
 	}
 
-	a.logger.Info("开始自动挂载本地记录的分配", "count", len(pending))
+	a.logger.Info("开始自动挂载本地记录的分配", "server", key, "count", len(pending))
 	sem := make(chan struct{}, autoMountConcurrency)
 	var wg sync.WaitGroup
 	for i := range pending {
@@ -152,6 +236,10 @@ func recordedMountRequest(item MountState, prefs map[string]RepoMountPref) (Moun
 		MountPath:    item.MountPath,
 		RepoID:       item.RepoID,
 		RepoName:     item.RepoName,
+		// 记录里的归属带回去：恢复必须打在**当初受理这次挂载的那台**上。
+		ServerKey:  item.ServerKey,
+		ServerURL:  item.ServerURL,
+		ServerName: item.ServerName,
 	}
 	pref, hasPref := prefs[item.RepoID]
 	if !hasPref {
@@ -178,18 +266,19 @@ func recordedMountRequest(item MountState, prefs map[string]RepoMountPref) (Moun
 // ⚠️ 这里正是"手动卸载后马上又被挂回来"的入口：卸载删了记录，于是这个库看起来就是
 // "从来没挂过、但配置要求自动挂载"，任何一次会话建立（含令牌续期）都会重新挂上。
 // 因此必须先让开"用户本次运行手动卸载过"的库（见 manualUnmountGuard）。
-func (a *Agent) mountConfiguredRepos(ctx context.Context, prefs map[string]RepoMountPref) {
+func (a *Agent) mountConfiguredRepos(ctx context.Context, key string, prefs map[string]RepoMountPref) {
 	if len(prefs) == 0 {
 		return
 	}
-	userID := strings.TrimSpace(a.store.User().ID)
+	userID := strings.TrimSpace(a.store.User(key).ID)
 	if userID == "" {
 		return
 	}
 
 	// 已经有本地记录的库交给 restoreRecordedMounts（那边会用同一份配置），这里只补没有记录的。
+	// 记录也只看本台的：别的服务端的库不该挡住这台的同 ID 库（库 ID 全局唯一，但仍按台取更直观）。
 	recorded := make(map[string]struct{})
-	for _, m := range a.store.ListMounts() {
+	for _, m := range a.store.MountsForServer(key) {
 		if m.RepoID != "" {
 			recorded[m.RepoID] = struct{}{}
 		}
@@ -199,18 +288,26 @@ func (a *Agent) mountConfiguredRepos(ctx context.Context, prefs map[string]RepoM
 		return
 	}
 
-	client, err := a.serverClient()
+	client, err := a.serverClientFor(key)
 	if err != nil {
-		a.logger.Warn("自动挂载配置指定的存储库失败：本地没有可用会话", "error", err)
+		a.logger.Warn("自动挂载配置指定的存储库失败：本地没有该服务端的会话", "server", key, "error", err)
 		return
 	}
-	// 库名只用于卷标与目录命名；查不到也照挂（目录名退化为分配 ID，见 resolveMountDir）。
+	// 库名用于卷标与目录命名；同时它还是"这个库是不是这台的"的判据（见下）。
 	names, err := a.repoNames(ctx, client)
 	if err != nil {
-		a.logger.Warn("自动挂载：查询存储库列表失败（将用分配 ID 作为目录名）", "error", err)
+		// 多服务端的关键一步：库级配置是按**库 ID** 存的，而库 ID 只对"它所属的那台服务端"
+		// 有意义。拿 A 的库 ID 去 B 上建分配只会得到一串失败记录，所以查不到列表就不再往下走
+		// （连不上/无权限时也一样：宁可这一轮不挂，也不要在错的台子上瞎试）。
+		a.logger.Warn("自动挂载：查询存储库列表失败，本台跳过自动挂载", "server", key, "error", err)
+		return
+	}
+	todo = filterReposOnServer(todo, names)
+	if len(todo) == 0 {
+		return
 	}
 
-	a.logger.Info("开始自动挂载配置指定的存储库", "count", len(todo))
+	a.logger.Info("开始自动挂载配置指定的存储库", "server", key, "count", len(todo))
 	sem := make(chan struct{}, autoMountConcurrency)
 	var wg sync.WaitGroup
 	for i := range todo {
@@ -221,9 +318,9 @@ func (a *Agent) mountConfiguredRepos(ctx context.Context, prefs map[string]RepoM
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			req, err := a.repoMountRequest(ctx, client, item.repoID, item.pref, userID)
+			req, err := a.repoMountRequest(ctx, client, key, item.repoID, item.pref, userID)
 			if err != nil {
-				a.logger.Warn("自动挂载：准备分配失败", "repo_id", item.repoID, "error", err)
+				a.logger.Warn("自动挂载：准备分配失败", "server", key, "repo_id", item.repoID, "error", err)
 				return
 			}
 			req.RepoName = names[item.repoID]
@@ -274,7 +371,21 @@ func configuredAutoMountTargets(
 	return out
 }
 
-// repoNames 返回"存储库 ID -> 名称"（仅当前会话可见的库）。
+// filterReposOnServer 只保留"确实存在于该服务端"的自动挂载目标。
+//
+// 依据是服务端返回的库列表：库 ID 由服务端生成，只有它认得自己的库。库级自动挂载配置是本地
+// 按库 ID 存的，多服务端下必须这一步过滤，否则会拿 A 的库 ID 去 B 上建分配（必然失败）。
+func filterReposOnServer(targets []autoMountTarget, names map[string]string) []autoMountTarget {
+	out := make([]autoMountTarget, 0, len(targets))
+	for _, item := range targets {
+		if _, ok := names[item.repoID]; ok {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// repoNames 返回"存储库 ID -> 名称"（仅该服务端可见的库）。
 func (a *Agent) repoNames(ctx context.Context, client *serverClient) (map[string]string, error) {
 	repos, err := client.ListRepos(ctx)
 	if err != nil {
@@ -288,7 +399,7 @@ func (a *Agent) repoNames(ctx context.Context, client *serverClient) (map[string
 }
 
 // repoMountRequest 组出自动挂载某个库所需的挂载参数（先确保本人在该库里有可用分配）。
-func (a *Agent) repoMountRequest(ctx context.Context, client *serverClient, repoID string, pref RepoMountPref, userID string) (MountRequest, error) {
+func (a *Agent) repoMountRequest(ctx context.Context, client *serverClient, key, repoID string, pref RepoMountPref, userID string) (MountRequest, error) {
 	allocID, err := a.ensureMyAllocation(ctx, client, repoID, userID)
 	if err != nil {
 		return MountRequest{}, err
@@ -298,6 +409,8 @@ func (a *Agent) repoMountRequest(ctx context.Context, client *serverClient, repo
 		MountMode:    pref.MountMode,
 		MountPath:    pref.MountDir,
 		RepoID:       repoID,
+		// 归属写进请求：挂载记录据此把心跳/回写/释放都发给这台。
+		ServerKey: key,
 	}, nil
 }
 

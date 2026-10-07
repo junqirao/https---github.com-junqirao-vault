@@ -113,7 +113,11 @@ type diskDownloadRequest struct {
 	DiskID    string `json:"disk_id"`
 	TargetDir string `json:"target_dir"`
 	FileName  string `json:"file_name"`
-	// ServerURL 预留字段：下载源始终取本地会话对应的服务端，此字段暂不生效。
+	// ServerKey / ServerURL 指明从**哪台**服务端下载（多服务端下应带上）。
+	//
+	// 都为空时按主服务端兜底（老客户端不带服务端标识）；给了却匹配不上任何已登记服务端
+	// 则明确报 agent.server_unknown —— 绝不能拿 A 的磁盘 ID 去 B 上下载。
+	ServerKey string `json:"server_key"`
 	ServerURL string `json:"server_url"`
 }
 
@@ -262,8 +266,15 @@ func (a *Agent) handleDiskDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 下载源：请求指定的服务端 > 主服务端（老客户端不带标识）。给了标识却匹配不上必须报错，
+	// 绝不改从别的台下载 —— 磁盘 ID 只对"它所属的那台服务端"有意义。
+	serverKey := a.store.ResolveKey(req.ServerKey, req.ServerURL)
+	if serverKey == "" {
+		a.writeError(w, errServerUnknown())
+		return
+	}
 	// 会话与服务端客户端：无会话时明确返回 agent.no_session，绝不静默失败。
-	client, err := a.serverClient()
+	client, err := a.serverClientFor(serverKey)
 	if err != nil {
 		a.writeError(w, err)
 		return

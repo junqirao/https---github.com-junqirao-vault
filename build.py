@@ -1598,7 +1598,7 @@ DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
 
 本包是 Windows 包的**对等产物**：同一版本、同一套 API，只是平台后端不同——
     · Windows：VHDX 文件 + IscsiTarget 角色
-    · Linux  ：LVM thin LV（差异盘 = thin snapshot）+ LIO（直接读写 configfs）
+    · Linux  ：LVM thin LV（差异盘 = thin snapshot）+ LIO（写经 targetcli、读直读 configfs）
 
 ------------------------------------------------------------
 二、环境要求
@@ -1609,7 +1609,8 @@ DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
        modprobe iscsi_target_mod
        modprobe target_core_iblock                    # 缺它建盘必失败（backstore 插件）
        mount -t configfs none /sys/kernel/config      # 多数发行版已默认挂载
-   不需要 targetcli、也不需要 Python —— 服务端直接读写 configfs。
+   需要 targetcli —— 它是 iSCSI 目标的**执行体**（写操作全部经它下发到 configfs），不是可选包装；
+  读与复验则直读 configfs。targetcli 自身依赖 Python3，装好发行版包即可，服务端不复用 rtslib。
    ⚠️ 注意 lsmod 里有 iscsi_target_mod ≠ configfs 里已注册成功，
       要看 /sys/kernel/config/target/iscsi 是否存在——两者 doctor 会分别检查。
 3. 需要 LVM2 工具链（lvm2 包）：pvcreate / vgcreate / lvcreate / lvs / thin 相关命令。

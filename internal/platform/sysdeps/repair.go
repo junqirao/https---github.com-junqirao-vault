@@ -51,8 +51,12 @@ func detectPkgManager() *pkgManager {
 
 // repairAll 按**探测顺序**逐项尝试修复，返回 (各项的修复动作说明, 各项的失败原因)。
 //
-// 顺序很重要：先挂 configfs、再加载模块，最后才可能让 <root>/iscsi 与 core/iblock_0
-// 出现；反过来做只会白试一遍。
+// 顺序很重要：先挂 configfs、再加载缺失模块，最后才是"跑不通/缺包"这类动作；反过来只会白试。
+//
+// 只做**幂等且不会拆掉在线目标**的动作。曾经这里还有一条"重载 iscsi_target_mod 让 configfs
+// 目录重新注册"的修复，现已删除：那类目录是 rtslib 按需创建的内部细节（见 probeLioTools 的说明），
+// 而 modprobe -r iscsi_target_mod 会把**正在给客户端服务的整棵目标配置抹掉**，代价远大于收益。
+// 需要重载时由运维手工执行（scripts/setup.sh 也已不再自动重载），并接受在线目标的短暂中断。
 func repairAll(ctx context.Context, o Options, items []Item) (map[string]string, map[string]string) {
 	fixes := map[string]string{}
 	errs := map[string]string{}
@@ -69,10 +73,8 @@ func repairAll(ctx context.Context, o Options, items []Item) (map[string]string,
 			act, err = repairKernelModules(ctx, o)
 		case "configfs_mount":
 			act, err = repairConfigFSMount(ctx, o)
-		case "lio_iscsi_fabric":
-			act, err = repairFabricDir(ctx, o, "iscsi_target_mod")
-		case "lio_backstore_plugin":
-			act, err = repairFabricDir(ctx, o, "target_core_iblock")
+		case "lio_tools":
+			act, err = repairTools(ctx, o, lioTools)
 		case "lvm_tools":
 			act, err = repairTools(ctx, o, lvmTools)
 		case "fs_tools":
@@ -151,27 +153,6 @@ func repairConfigFSMount(ctx context.Context, o Options) (string, error) {
 	return act, fmt.Errorf("%s 失败: %s", act, firstLine(out))
 }
 
-// repairFabricDir 通过重载模块让 configfs 目录重新注册。
-//
-// 适用场景：模块已加载但对应目录不在（目录被清理脚本 rmdir 过、或注册被回滚）。
-// 先 modprobe -r 再 modprobe——卸载失败不致命，重新 modprobe 本身是幂等的。
-func repairFabricDir(ctx context.Context, o Options, module string) (string, error) {
-	if !isDir(mountPointFor(o.ConfigFSRoot)) {
-		return "", fmt.Errorf("configfs 未挂载，无法注册目录（先挂载 configfs）")
-	}
-	if !readLoadedModules()[module] {
-		return "", fmt.Errorf("%s 未加载（先 modprobe %s）", module, module)
-	}
-	act := fmt.Sprintf("重载 %s（modprobe -r %s && modprobe %s）以重新注册 configfs 目录", module, module, module)
-	if out, _ := runCmd(ctx, o, o.Timeout, "modprobe", "-r", module); out != "" && o.Logger != nil {
-		o.Logger.Debug("卸载模块输出", "module", module, "output", firstLine(out))
-	}
-	if out, err := runCmd(ctx, o, o.Timeout, "modprobe", module); err != nil {
-		return act, fmt.Errorf("modprobe %s 失败: %s", module, firstLine(out))
-	}
-	return act, nil
-}
-
 // repairTools 安装缺失工具对应的软件包（需要 o.Install 与 root）。
 func repairTools(ctx context.Context, o Options, specs []toolSpec) (string, error) {
 	missing := missingTools(specs)
@@ -181,27 +162,35 @@ func repairTools(ctx context.Context, o Options, specs []toolSpec) (string, erro
 	return installPackages(ctx, o, missing)
 }
 
-// repairFSTools 文件系统工具的自愈：**只装够用的一族**。
+// repairFSTools 文件系统工具的自愈（走 fsRepairSpecs 的选族结论）。
+func repairFSTools(ctx context.Context, o Options) (string, error) {
+	return installPackages(ctx, o, missingTools(fsRepairSpecs()))
+}
+
+// fsRepairSpecs 返回"该补哪一族文件系统工具"的清单；机器已够用时返回 nil。
+//
+// 抽成独立函数是因为有两个消费方，判据必须同源：
+//   - 启动期/doctor 的自动修复（repairFSTools）；
+//   - 管理端"安装"按钮的按需安装（installSpecsForKey 的 fs_tools 分支）。
 //
 // 默认文件系统是 ext4，因此优先补 e2fsprogs；已有 xfs 一族时不动它，
 // 免得为了"能建盘"顺手给机器装上并不需要的 xfsprogs。
-func repairFSTools(ctx context.Context, o Options) (string, error) {
+func fsRepairSpecs() []toolSpec {
 	has := func(exe string) bool { _, err := exec.LookPath(exe); return err == nil }
 	if (has("mkfs.ext4") && has("resize2fs")) || (has("mkfs.xfs") && has("xfs_growfs")) {
-		return "", nil
+		return nil
 	}
 	// 哪一族"部分存在"就先补哪一族；都没有时补 e2fsprogs。
-	specs := []toolSpec{
-		{exe: "mkfs.ext4", pkg: "e2fsprogs"},
-		{exe: "resize2fs", pkg: "e2fsprogs"},
-	}
 	if (has("mkfs.xfs") || has("xfs_growfs")) && !has("mkfs.ext4") && !has("resize2fs") {
-		specs = []toolSpec{
+		return []toolSpec{
 			{exe: "mkfs.xfs", pkg: "xfsprogs"},
 			{exe: "xfs_growfs", pkg: "xfsprogs"},
 		}
 	}
-	return installPackages(ctx, o, missingTools(specs))
+	return []toolSpec{
+		{exe: "mkfs.ext4", pkg: "e2fsprogs"},
+		{exe: "resize2fs", pkg: "e2fsprogs"},
+	}
 }
 
 // installPackages 调发行版包管理器安装一批工具（按 pkg 去重）。
@@ -209,15 +198,17 @@ func installPackages(ctx context.Context, o Options, specs []toolSpec) (string, 
 	if len(specs) == 0 {
 		return "", nil
 	}
+	// 前置条件用哨兵错误：文案不变（启动期自动修复直接把 err.Error() 展示给人看），
+	// 同时让"按需安装"路径能 errors.Is 出稳定原因并映射成错误码（见 install.go）。
 	if !o.Install {
-		return "", fmt.Errorf("未开启自动安装（platform.auto_install=false 或 doctor -install=false）")
+		return "", ErrInstallDisabled
 	}
 	if !isRoot() {
-		return "", fmt.Errorf("需要 root 才能安装软件包")
+		return "", ErrInstallNotRoot
 	}
 	pm := detectPkgManager()
 	if pm == nil {
-		return "", fmt.Errorf("未找到受支持的包管理器（apt-get/dnf/yum/zypper/apk/pacman）")
+		return "", ErrInstallNoPkgManager
 	}
 
 	pkgs := uniquePackages(specs, pm.family)

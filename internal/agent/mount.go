@@ -53,6 +53,14 @@ type MountRequest struct {
 	// RepoID / RepoName 可选：服务端 MountSpec 不含存储库信息，前端可顺带带上用于展示与变量注入。
 	RepoID   string `json:"repo_id"`
 	RepoName string `json:"repo_name"`
+	// ServerKey / ServerURL 指明本次挂载归属的服务端（多服务端下二选一必填）。
+	//
+	// 挂载记录会记住这个归属：心跳、挂载点回写、租约释放都发给它（见 Agent.mountClient）。
+	// 都为空时按"本地已有记录 → 主服务端"兜底（重新挂载、启动恢复与老客户端走这条）。
+	ServerKey string `json:"server_key"`
+	ServerURL string `json:"server_url"`
+	// ServerName 是可选的服务端展示名（仅用于把归属带回去，挂载记录里的名称以状态为准）。
+	ServerName string `json:"server_name,omitempty"`
 }
 
 // mountEngine 实现挂载/卸载状态机（含幂等与串行化）。
@@ -104,10 +112,16 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		e.a.logger.Info("记录是已挂载但本机已无活动会话，按实际未挂载重新挂载",
 			"allocation_id", allocationID, "target_iqn", existing.TargetIQN)
 	}
-	client, err := e.a.serverClient()
+	// 归属服务端先定下来：后面的 RequestMount、心跳、挂载点回写、租约释放都发给它。
+	serverKey, err := e.resolveMountServerKey(req, allocationID)
 	if err != nil {
 		return nil, err
 	}
+	client, err := e.a.serverClientFor(serverKey)
+	if err != nil {
+		return nil, err
+	}
+	serverURL, serverName := e.serverMetaOf(serverKey)
 
 	// 先占位一条"挂载中"再调用服务端。
 	//
@@ -120,6 +134,9 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		RepoID:       strings.TrimSpace(req.RepoID),
 		RepoName:     strings.TrimSpace(req.RepoName),
 		AllocationID: allocationID,
+		ServerKey:    serverKey,
+		ServerURL:    serverURL,
+		ServerName:   serverName,
 		State:        MountStateMounting,
 		Phase:        MountPhaseRequesting,
 	}
@@ -148,6 +165,9 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		// 请求里没有时用服务端下发值兜底：自动重挂/重装后恢复也能拿到库名。
 		RepoName:     repoNameOf(req, spec),
 		AllocationID: allocationID,
+		ServerKey:    serverKey,
+		ServerURL:    serverURL,
+		ServerName:   serverName,
 		LeaseID:      spec.LeaseID,
 		TargetIQN:    spec.TargetIQN,
 		Portal:       net.JoinHostPort(spec.PortalAddress, strconv.Itoa(portalPort(spec))),
@@ -302,14 +322,14 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	}
 
 	e.setPhase(allocationID, MountPhaseMountPoint)
-	mountPath, err := e.mountAt(ctx, diskNumber, mode, req, spec)
+	mountPath, err := e.mountAt(ctx, diskNumber, mode, req, spec, serverKey)
 	if err != nil {
 		return fail("mount_point", err)
 	}
 
 	// post_script 失败不阻塞挂载（见 5.5 步骤 h）。
 	e.setPhase(allocationID, MountPhasePostScript)
-	e.runPostScript(ctx, spec.PostScript, spec, mountPath, ms.RepoName)
+	e.runPostScript(ctx, spec.PostScript, spec, serverKey, mountPath, ms.RepoName)
 
 	if err := client.ReportMounted(ctx, spec.LeaseID, e.a.store.ClientID(), mountPath); err != nil {
 		// 回写失败不撤销挂载（磁盘已可用），仅记录告警。
@@ -592,8 +612,10 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 	}
 
 	// ⑤ 回写 release（失败不影响本地已卸载的事实）。
+	// 发给**这条件挂载所属的那台**服务端（见 Agent.mountClient）：拿 A 的租约去 B 上释放，
+	// B 只会告诉你"没这条租约"，而 A 那边要到租约自然过期才回收。
 	if ms.LeaseID != "" {
-		if client, err := e.a.serverClient(); err == nil {
+		if client, err := e.a.mountClient(ms); err == nil {
 			if err := client.Release(ctx, ms.LeaseID, e.a.store.ClientID()); err != nil {
 				e.a.logger.Warn("回写租约释放失败（本地已卸载）", "allocation_id", allocationID, "error", err)
 			}
@@ -722,7 +744,40 @@ func (e *mountEngine) remount(ctx context.Context, allocationID string) (*MountS
 		MountPath:    ms.MountPath,
 		RepoID:       ms.RepoID,
 		RepoName:     ms.RepoName,
+		// 归属原样带回：重挂必须打在原来那台上。
+		ServerKey: ms.ServerKey,
+		ServerURL: ms.ServerURL,
 	}, false)
+}
+
+// resolveMountServerKey 解析本次挂载归属的服务端键。
+//
+// 优先级：请求显式指定（server_key / server_url）> 本地已有记录（重挂/启动恢复）> 主服务端
+// （老客户端不带服务端标识时的兜底）。请求给的引用**匹配不上任何已登记服务端时报错** ——
+// 宁可明确失败，也不要把这次挂载记到别的服务端名下（那会让心跳打到错的台，租约被判过期）。
+func (e *mountEngine) resolveMountServerKey(req MountRequest, allocationID string) (string, error) {
+	key, rawURL := strings.TrimSpace(req.ServerKey), strings.TrimSpace(req.ServerURL)
+	if key != "" || rawURL != "" {
+		if resolved := e.a.store.ResolveKey(key, rawURL); resolved != "" {
+			return resolved, nil
+		}
+		return "", errServerUnknown()
+	}
+	if ms, _, ok := e.a.store.GetMount(allocationID); ok && strings.TrimSpace(ms.ServerKey) != "" {
+		return ms.ServerKey, nil
+	}
+	if primary := e.a.primaryServerKey(); primary != "" {
+		return primary, nil
+	}
+	return "", errNoSession()
+}
+
+// serverMetaOf 返回某台服务端的地址与名称（用于写进挂载记录，多服务端下界面据此分台展示）。
+func (e *mountEngine) serverMetaOf(key string) (url, name string) {
+	if state, ok := e.a.store.Server(key); ok {
+		return state.URL, state.Name
+	}
+	return "", ""
 }
 
 // restore 恢复本地记录中的挂载：先清理残留状态，再走完整挂载流程。
@@ -746,7 +801,7 @@ func (e *mountEngine) restore(ctx context.Context, req MountRequest) (*MountStat
 //   - 盘符模式：Windows 只肯给一个盘符（E:、F:…），没有"用库名做盘符"这回事，
 //     于是把库名写到**卷标**上 —— 资源管理器里该盘就显示存储库名称；
 //   - 目录模式：目录名就是 `<服务端名称>_<存储库名称>`（见 resolveMountDir 与 3.4.5）。
-func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, req MountRequest, spec *MountSpec) (string, error) {
+func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, req MountRequest, spec *MountSpec, serverKey string) (string, error) {
 	if mode != mountModeDirectory {
 		letter, err := e.a.vol.MountToDriveLetter(ctx, diskNumber)
 		if err != nil {
@@ -755,7 +810,7 @@ func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, 
 		e.labelVolume(ctx, diskNumber, repoNameOf(req, spec))
 		return letter, nil
 	}
-	dir, err := e.resolveMountDir(req, spec)
+	dir, err := e.resolveMountDir(req, spec, serverKey)
 	if err != nil {
 		return "", err
 	}
@@ -847,9 +902,9 @@ func repoNameOf(req MountRequest, spec *MountSpec) string {
 // 幂等：父目录末段已经等于 `<服务端名称>_<存储库名称>` 时原样返回。重挂与恢复
 // （remount / restore）会把**上次的最终挂载点**当请求传回来（见 recordedMountRequest），
 // 没有这条兜底，每重挂一次就会多套一层目录（D:\Vault\a_b\a_b\a_b…）。
-func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec) (string, error) {
+func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec, serverKey string) (string, error) {
 	base := strings.TrimSpace(e.a.cfg.Get().DefaultMountDir)
-	leaf := mountDirLeaf(e.serverAlias(spec), repoNameOf(req, spec), req.AllocationID)
+	leaf := mountDirLeaf(e.serverAlias(spec, serverKey), repoNameOf(req, spec), req.AllocationID)
 
 	local := strings.TrimSpace(req.MountPath)
 	if local == "" {
@@ -922,10 +977,23 @@ func sanitizePathSegment(name string) string {
 	return strings.Trim(replaced, " .")
 }
 
-// serverAlias 返回目录模式使用的服务端别名（本地配置优先，其次服务端名称）。
-func (e *mountEngine) serverAlias(spec *MountSpec) string {
-	if alias := strings.TrimSpace(e.a.cfg.Get().ServerAlias); alias != "" {
-		return alias
+// serverAlias 返回目录模式使用的服务端别名（这台服务端的别名优先，其次服务端名称）。
+//
+// 多服务端下的取舍：别名是"本机为服务端起的名字"，必须**按台**取，否则两台服务端的库会挤进
+// 同一个目录命名空间（`别名_库名` 撞车）。因此顺序是：
+//  1. 客户端为这台下发的别名（会话里的 alias，落在该台的状态里）；
+//  2. 单服务端时代的本地全局别名：只在确实只有一台时沿用（老配置的既有效果不被破坏）；
+//  3. 服务端名称（MountSpec 随身带回，重挂/恢复也拿得到）。
+func (e *mountEngine) serverAlias(spec *MountSpec, serverKey string) string {
+	if state, ok := e.a.store.Server(serverKey); ok {
+		if alias := strings.TrimSpace(state.Alias); alias != "" {
+			return alias
+		}
+	}
+	if len(e.a.store.ServerKeys()) <= 1 {
+		if alias := strings.TrimSpace(e.a.cfg.Get().ServerAlias); alias != "" {
+			return alias
+		}
 	}
 	if spec != nil && strings.TrimSpace(spec.ServerName) != "" {
 		return strings.TrimSpace(spec.ServerName)
@@ -934,8 +1002,8 @@ func (e *mountEngine) serverAlias(spec *MountSpec) string {
 }
 
 // runPostScript 渲染并执行挂载后置脚本；失败只记录告警，不阻塞挂载。
-func (e *mountEngine) runPostScript(ctx context.Context, script string, spec *MountSpec, mountPath, repoName string) {
-	rendered := strings.TrimSpace(e.renderPostScript(script, spec, mountPath, repoName))
+func (e *mountEngine) runPostScript(ctx context.Context, script string, spec *MountSpec, serverKey, mountPath, repoName string) {
+	rendered := strings.TrimSpace(e.renderPostScript(script, spec, serverKey, mountPath, repoName))
 	if rendered == "" {
 		return
 	}
@@ -952,7 +1020,7 @@ func (e *mountEngine) runPostScript(ctx context.Context, script string, spec *Mo
 // renderPostScript 先做变量替换，再由调用方执行（见 5.5：脚本中的路径必须用注入变量）。
 //
 // 支持的变量：{MOUNT_PATH} / {REPO_NAME} / {SERVER_ALIAS} / {SERVER_NAME}。
-func (e *mountEngine) renderPostScript(script string, spec *MountSpec, mountPath, repoName string) string {
+func (e *mountEngine) renderPostScript(script string, spec *MountSpec, serverKey, mountPath, repoName string) string {
 	if strings.TrimSpace(script) == "" {
 		return ""
 	}
@@ -963,7 +1031,7 @@ func (e *mountEngine) renderPostScript(script string, spec *MountSpec, mountPath
 	replacer := strings.NewReplacer(
 		"{MOUNT_PATH}", mountPath,
 		"{REPO_NAME}", repoName,
-		"{SERVER_ALIAS}", e.serverAlias(spec),
+		"{SERVER_ALIAS}", e.serverAlias(spec, serverKey),
 		"{SERVER_NAME}", serverName,
 	)
 	return replacer.Replace(script)

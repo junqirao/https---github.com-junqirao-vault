@@ -34,7 +34,7 @@ import {
 
 import { PhaseView, type CertLoginFailure } from './flow/PhaseView'
 import { useStartupFlow } from './flow/useStartupFlow'
-import { selectActiveServer, useAppStore } from './store/appStore'
+import { normalizeUrl, selectActiveServer, useAppStore } from './store/appStore'
 
 /** antd 语言包映射（key 为 @vault/ui 的 ANTD_LOCALE_NAME 取值）。 */
 const ANTD_LOCALES: Record<string, typeof zhCN> = {
@@ -78,7 +78,7 @@ export function App(): JSX.Element {
   const upsertServer = useAppStore((state) => state.upsertServer)
   const removeServer = useAppStore((state) => state.removeServer)
   const updateActiveServer = useAppStore((state) => state.updateActiveServer)
-  const updateActiveToken = useAppStore((state) => state.updateActiveToken)
+  const updateServerToken = useAppStore((state) => state.updateServerToken)
 
   const volatileSessionRef = useRef<VolatileSession | null>(null)
   const unauthorizedRef = useRef<() => void>(() => undefined)
@@ -152,39 +152,49 @@ export function App(): JSX.Element {
   }, [active])
 
   /**
-   * 把当前会话推送给本地代理（代理据此访问服务端）。
+   * 把本机已登录服务端的会话**逐台**推送给本地代理（代理据此访问服务端）。
+   *
+   * 为什么必须推全部而不是只推当前这台：多服务端下代理为每台各自维护会话、事件流、
+   * 心跳与自动挂载（见 docs/agent-api.md「认证与会话」）。只推活动服务端，其余几台就永远
+   * 停在"未连接/未自动挂载"——用户切过去才发现什么都没挂上。
    *
    * 失败不得阻塞登录流程：仅记录错误码（绝不记录令牌），顶栏依据代理状态提示。
    */
   const pushAgentSession = useCallback(async (): Promise<void> => {
-    const current = selectActiveServer(useAppStore.getState())
-    if (!current) return
+    const targets = useAppStore.getState().servers
+    if (targets.length === 0) return
     const volatile = volatileSessionRef.current
-    const sameKey = volatile && volatile.key === current.key
-    const token = current.token ?? (sameKey ? volatile.token : undefined)
-    const user: SessionUser | null = sameKey
-      ? volatile.user
-      : current.userId && current.username && current.role
-        ? { id: current.userId, username: current.username, role: current.role }
-        : null
-    if (!token || !user) return
-    const expiresAt = current.tokenExpiresAt ?? (sameKey ? volatile.expiresAt : undefined)
-    try {
-      await agentApi.pushSession({
-        server_url: current.baseUrl,
-        server_instance_id: current.instanceId ?? current.key,
-        server_name: current.serverName || current.baseUrl,
-        token,
-        user_id: user.id,
-        username: user.username,
-        expires_at: expiresAt ?? Date.now() + 12 * 60 * 60 * 1000,
-        // 代理据此固定服务端证书指纹（自签 CA 场景）；未探测过则为空，退回默认链路校验。
-        cert_sha256: current.certSha256
+    await Promise.all(
+      targets.map(async (entry): Promise<void> => {
+        const sameKey = volatile?.key === entry.key
+        const token = entry.token ?? (sameKey ? volatile?.token : undefined)
+        const user: SessionUser | null = sameKey
+          ? (volatile?.user ?? null)
+          : entry.userId && entry.username && entry.role
+            ? { id: entry.userId, username: entry.username, role: entry.role }
+            : null
+        if (!token || !user) return
+        const expiresAt = entry.tokenExpiresAt ?? (sameKey ? volatile?.expiresAt : undefined)
+        try {
+          await agentApi.pushSession({
+            // 明确归属：同一台的两种键（地址 / 实例 ID）会在代理内合并，代理回传实际键。
+            server_key: entry.key,
+            server_url: entry.baseUrl,
+            server_instance_id: entry.instanceId ?? entry.key,
+            server_name: entry.serverName || entry.baseUrl,
+            token,
+            user_id: user.id,
+            username: user.username,
+            expires_at: expiresAt ?? Date.now() + 12 * 60 * 60 * 1000,
+            // 代理据此固定服务端证书指纹（自签 CA 场景）；未探测过则为空，退回默认链路校验。
+            cert_sha256: entry.certSha256
+          })
+        } catch (error) {
+          const code = isApiError(error) ? error.code : error instanceof Error ? error.name : 'unknown'
+          console.warn(`[agent] session push failed: ${code}`)
+        }
       })
-    } catch (error) {
-      const code = isApiError(error) ? error.code : error instanceof Error ? error.name : 'unknown'
-      console.warn(`[agent] session push failed: ${code}`)
-    }
+    )
   }, [])
 
   /**
@@ -195,7 +205,18 @@ export function App(): JSX.Element {
    */
   const applyRenewedSession = useCallback(
     (session: AgentSessionState): void => {
-      const current = selectActiveServer(useAppStore.getState())
+      const state = useAppStore.getState()
+      // 多服务端：代理会为**每台**各自续期并广播带 server_key 的 session 事件 ——
+      // 不按键定位，B 的令牌就会被写到活动服务端 A 名下（A 从此拿错令牌，请求全 401）。
+      //
+      // 键对不上时按地址兜底：代理会把"地址键"合并成"实例 ID 键"（反之亦然），本地条目可能
+      // 还停在另一种写法上，只按 key 找会把这次续期整个丢掉（令牌不更新，下次请求 401）。
+      const current =
+        (session.server_key ? state.servers.find((item) => item.key === session.server_key) : undefined) ??
+        (session.server_url
+          ? state.servers.find((item) => normalizeUrl(item.baseUrl) === normalizeUrl(session.server_url))
+          : undefined) ??
+        selectActiveServer(state)
       if (!current) return
       const volatile = volatileSessionRef.current
       const user: SessionUser = {
@@ -214,9 +235,9 @@ export function App(): JSX.Element {
         return
       }
       if (current.token === session.token && current.tokenExpiresAt === session.expires_at) return
-      updateActiveToken(session.token, session.expires_at)
+      updateServerToken(current.key, session.token, session.expires_at)
     },
-    [updateActiveToken]
+    [updateServerToken]
   )
 
   /**
@@ -241,6 +262,8 @@ export function App(): JSX.Element {
           instance_id: current.instanceId
         })
         applyRenewedSession({
+          // 明确归属，避免续期结果被写到另一台名下。
+          server_key: current.key,
           server_url: current.baseUrl,
           token: response.token,
           expires_at: response.expires_at,
@@ -270,11 +293,12 @@ export function App(): JSX.Element {
   // 代理自动续期后经 session 事件同步最新令牌到活动服务端会话。
   useEffect(() => subscribeAgentSession(applyRenewedSession), [applyRenewedSession])
 
-  // 登录态或服务端变化后同步会话到本地代理（代理不可用时静默失败）。
+  // 登录态或服务端变化后，把**每台**已登录服务端的会话同步到本地代理（代理不可用时静默失败）。
+  // 依赖 servers：新增/移除服务端、各台令牌变化都要重新预热，否则新加的那台不会自动登录+自动挂载。
   useEffect(() => {
     if (!hydrated) return
     void pushAgentSession()
-  }, [hydrated, activeKey, sessionUser, pushAgentSession])
+  }, [hydrated, activeKey, sessionUser, servers, pushAgentSession])
 
   const handleConfigure = useCallback(
     async (baseUrl: string): Promise<void> => {
@@ -375,8 +399,11 @@ export function App(): JSX.Element {
     autoLoginTriedRef.current = true
     setSessionExpired(false)
     setCertLoginFailure(null)
+    // 只登出**活动那一台**：代理为每台独立维护会话，其余几台的会话与自动挂载不受影响
+    // （见 docs/agent-api.md「认证与会话」）。没有活动服务端时退回"清全部"，语义同旧版。
+    const activeKeyToClear = useAppStore.getState().activeKey
     void api.logout().catch(() => undefined)
-    void agentApi.clearSession().catch(() => undefined)
+    void agentApi.clearSession(activeKeyToClear ?? undefined).catch(() => undefined)
     clearSession()
     setPhase({ kind: 'login' })
   }, [api, clearSession, setPhase])

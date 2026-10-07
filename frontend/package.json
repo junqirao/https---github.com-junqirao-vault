@@ -1,6 +1,6 @@
 {
   "name": "vault-frontend",
-  "version": "0.1.85",
+  "version": "0.1.91",
   "private": true,
   "description": "Vault 桌面客户端（内含用户功能与管理功能）前端工程",
   "scripts": {

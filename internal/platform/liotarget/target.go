@@ -6,7 +6,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
-	"fmt"
+	"errors"
 	"net/http"
 	"os"
 	"path"
@@ -23,37 +23,35 @@ var _ platform.IscsiBackend = (*Manager)(nil)
 // Kind 返回平台种类。
 func (m *Manager) Kind() platform.Kind { return platform.KindLinux }
 
-// Available 探测 LIO configfs 是否可用。
+// Available 探测 iSCSI 目标能力是否可用。
 //
-// <root> 可访问且 <root>/iscsi 可写即视为可用；否则尝试 modprobe 一次后重试，
-// 仍失败返回 system.unavailable（component=lio）。
+// 必须同时满足**内核侧**（configfs 已挂载）与**用户态**（targetcli 可执行且能跑通）
+// 两个条件；两者缺失时返回的 component 不同，便于直接判断该修哪边。
+// configfs 缺失是 targetcli 无法补救的，故探测顺序是内核在前。
+//
+// 刻意不断言 <root>/iscsi 这类子目录存在：那是 rtslib 按需创建的内部细节，拿它当门禁会把
+// 列目标、查会话这类**只读**接口一起锁死（现场表现就是"一大批功能全不可用"）；真缺时由
+// rtslib 在对应写操作上报出准确错误。详见 configfsReady 的说明。
 func (m *Manager) Available(ctx context.Context) error {
-	if m.configfsReady() {
-		return nil
+	if err := m.ensureReady(ctx); err != nil {
+		return err
 	}
-	if err := m.loadModules(ctx); err != nil {
-		m.logger.Warn("加载 LIO 内核模块失败", "error", err)
-	}
-	if m.configfsReady() {
-		m.logger.Info("LIO configfs 可用", "root", m.root)
-		return nil
-	}
-	return apperr.New(apperr.CodeUnavailable, http.StatusInternalServerError).
-		WithArg("component", "lio")
+	m.logger.Debug("iSCSI 目标后端可用", "root", m.root, "targetcli", m.tcl.bin)
+	return nil
 }
 
 // EnsureTarget 幂等地把目标收敛到 spec 描述的**完整期望状态**（全量语义）。
 //
-// 收敛顺序（每一步都幂等）：
+// 收敛顺序（每一步都幂等，且每次下发后都回读 configfs 复验后置条件）：
 //  1. 归一化 IQN（转小写，必要时补前缀）；
-//  2. mkdir <root>/iscsi/<iqn>；
-//  3. mkdir <root>/iscsi/<iqn>/tpgt_1（LIO 会随之自动创建 enable/attrib/acls/lun 等）；
-//  4. 写 TPG attrib（必须在建 ACL 前写好 auto_add_mapped_luns=0，否则已存在的 LUN 会被
-//     自动挂到每个新 ACL 上，导致 per-ACL 的 write_protect 失效）；
-//  5. 建/更新 backstore（若指定 BackingRef）；
-//  6. ACL 全量收敛：建集合内的、删集合外的（先删其 mapped_lun_*）；
-//  7. LUN 映射：TPG 级 lun/lun_0 与每个 ACL 的 mapped_lun_0；
-//  8. 最后才写 enable（避免"先开服后配盘"造成客户端看到残缺配置）。
+//  2. 目标对象（targetcli 建目标时一并建立 tpg1）；缺 tpg1 的半成品残骸直接重建；
+//  3. TPG attrib（authentication / generate_node_acls；"不要把已有 LUN 自动挂到新 ACL 上"
+//     是靠建 ACL 时带 add_mapped_luns=false 实现的，见 cmdCreateACL，它不是 TPG 属性）；
+//  4. 建/更新 backstore 及其 attrib（emulate_tpu/tpws、is_nonrot 属于 backstore，
+//     不属于 TPG）；
+//  5. ACL 全量收敛：建集合内的、删集合外的；
+//  6. LUN 映射：TPG 级 lun0 与每个 ACL 的映射 lun0（只读只在 ACL 层落实）；
+//  7. 最后才 enable（避免"先开服后配盘"造成客户端看到残缺配置）。
 func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) error {
 	if strings.TrimSpace(spec.Name) == "" {
 		return apperr.InvalidParam("target_name")
@@ -93,30 +91,31 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 		"chap_secret", chapSecretLog(chap),
 		"backing_ref", spec.BackingRef)
 
-	// 2. 目标目录。
-	if err := m.mkdirIfMissing(m.targetPath(iqn)); err != nil {
+	// 1. 目标对象（targetcli 建目标时会一并建立 tpg1）。
+	if err := m.ensureTargetObject(ctx, iqn); err != nil {
 		return err
 	}
-	// 3. tpgt_1。
-	if err := m.mkdirIfMissing(m.tpgPath(iqn)); err != nil {
-		return err
-	}
-	// 4. TPG 属性。
-	if err := m.writeTpgAttribs(iqn, chap); err != nil {
+	// 2. TPG 属性。
+	if err := m.applyTpgAttribs(ctx, iqn, chap); err != nil {
 		return err
 	}
 
-	// 5. backstore。名字由目标名稳定派生，保证重复收敛得到同一个 backstore。
+	// 3. backstore 及其 attrib（UNMAP 仿真 / SSD 声明）。名字由目标名稳定派生，
+	// 保证重复收敛得到同一个 backstore。
 	bs := ""
 	if strings.TrimSpace(spec.BackingRef) != "" {
 		bs = backstoreNameForTarget(iqn)
-		if err := m.ensureBackstore(bs, spec.BackingRef); err != nil {
+		if err := m.ensureBackstore(ctx, bs, spec.BackingRef); err != nil {
+			return err
+		}
+		if err := m.applyBackstoreAttribs(ctx, bs); err != nil {
 			return err
 		}
 	}
 
-	// 6. ACL 全量收敛。
+	// 4. 期望的 ACL 集合。排序后使用，让命令顺序与日志可复现（map 遍历顺序是随机的）。
 	want := make(map[string]struct{}, len(spec.Initiators))
+	wantList := make([]string, 0, len(spec.Initiators))
 	for _, raw := range spec.Initiators {
 		ini, ok := initiatorName(raw)
 		if !ok {
@@ -124,61 +123,59 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 			m.logger.Warn("暂不支持的 initiator 类型，已跳过授权", "target", iqn, "initiator", raw)
 			continue
 		}
+		if _, dup := want[ini]; dup {
+			continue
+		}
 		want[ini] = struct{}{}
+		wantList = append(wantList, ini)
 	}
+	sort.Strings(wantList)
+
+	// 5. 撤销不再授权的 initiator。
+	//
+	// 这里把失败**当错误返回**（旧实现只记 Warn 就继续）：拆不掉授权意味着某个已被移出
+	// 白名单的 initiator 仍然能登录——这是安全语义上的失败，不能静默放过。
 	for _, ini := range m.listDirs(m.aclsPath(iqn)) {
 		if _, ok := want[ini]; !ok {
 			m.logger.Info("移除不再授权的 initiator", "target", iqn, "initiator", ini)
-			m.removeACL(iqn, ini)
+			if err := m.removeACL(ctx, iqn, ini); err != nil {
+				return err
+			}
 		}
 	}
-	for ini := range want {
-		aclDir := path.Join(m.aclsPath(iqn), ini)
-		if err := m.mkdirIfMissing(aclDir); err != nil {
+	for _, ini := range wantList {
+		if err := m.ensureACL(ctx, iqn, ini); err != nil {
 			return err
 		}
 		if chap {
-			// userid/password 是 kernel 为每个 ACL 生成的属性文件（单向 CHAP）。
-			if err := m.writeAttr(path.Join(aclDir, "userid"), spec.ChapUser); err != nil {
-				return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-					WithArg("field", "chap_user").WithCause(err)
-			}
-			if err := m.writeAttr(path.Join(aclDir, "password"), spec.ChapSecret); err != nil {
-				return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-					WithArg("field", "chap_secret").WithCause(err)
-			}
-		}
-	}
-
-	// 7. LUN 映射（TPG 级 + 每个 ACL）。
-	if bs != "" {
-		if err := m.ensureMapping(m.tpgLunDir(iqn), bs, spec.ReadOnly); err != nil {
-			return err
-		}
-		for ini := range want {
-			if err := m.ensureMapping(m.aclMappedLunDir(iqn, ini), bs, spec.ReadOnly); err != nil {
+			if err := m.setACLAuth(ctx, iqn, ini, spec.ChapUser, spec.ChapSecret); err != nil {
 				return err
 			}
 		}
 	}
 
-	// 8. 最后写 enable。
-	en := "0"
-	if spec.Enabled {
-		en = "1"
+	// 6. LUN 映射（TPG 级 + 每个 ACL）。
+	if bs != "" {
+		if err := m.ensureTpgMapping(ctx, iqn, bs); err != nil {
+			return err
+		}
+		for _, ini := range wantList {
+			if err := m.ensureACLMapping(ctx, iqn, ini, bs, spec.ReadOnly); err != nil {
+				return err
+			}
+		}
 	}
-	if err := m.writeAttr(path.Join(m.tpgPath(iqn), "enable"), en); err != nil {
-		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-			WithArg("stage", "enable").WithCause(err)
-	}
-	return nil
+
+	// 7. 最后才 enable（避免"先开服后配盘"造成客户端看到残缺配置）。
+	return m.setEnabled(ctx, iqn, spec.Enabled)
 }
 
 // RemoveTarget 删除目标及其名下全部授权与映射。幂等（目标不存在视为成功）。
 //
-// configfs 目录删除必须用 rmdir 语义（os.Remove），**绝不能**用 os.RemoveAll——
-// RemoveAll 会逐个删除内核生成的属性文件，那些文件无法 unlink，最终留下半删除的
-// 残骸并让后续 rmdir 持续失败。
+// 拆除交给 targetcli 的 delete：它会按内核要求的顺序解除 LUN 映射 → ACL → TPG → 目标。
+// 旧实现自己按 rmdir 语义逐层拆，还必须严格避开 os.RemoveAll（内核生成的属性文件无法
+// unlink，RemoveAll 会留下半删除残骸并让后续 rmdir 持续失败）——这类"顺序与语义约束"
+// 正是交给 rtslib 维护的收益。
 func (m *Manager) RemoveTarget(ctx context.Context, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return apperr.InvalidParam("target_name")
@@ -199,39 +196,24 @@ func (m *Manager) RemoveTarget(ctx context.Context, name string) error {
 		return nil // 幂等：不存在即成功
 	}
 
-	// 1. 先停用。
-	if err := m.writeAttr(path.Join(m.tpgPath(iqn), "enable"), "0"); err != nil {
-		m.logger.Debug("停用目标失败（忽略，继续拆除）", "target", iqn, "error", err)
+	// 1. 先停用：正在被访问的目标不应在拆盘过程中继续接受写请求。
+	if err := m.setEnabled(ctx, iqn, false); err != nil {
+		m.logger.Warn("停用目标失败（继续拆除）", "target", iqn, "error", err)
 	}
 
-	// 2. ACL：先删其下 mapped_lun_*，再删 ACL 目录。
-	for _, ini := range m.listDirs(m.aclsPath(iqn)) {
-		m.removeACL(iqn, ini)
+	// 2. 删除目标对象（连同其 TPG / ACL / LUN 映射）。
+	if err := m.apply(ctx, "delete_target", func() bool { return !m.isTarget(iqn) },
+		cmdDeleteTarget(iqn)); err != nil {
+		return err
 	}
 
-	// 3. TPG lun/ 下的映射。
-	if entries, err := os.ReadDir(path.Join(m.tpgPath(iqn), "lun")); err == nil {
-		for _, e := range entries {
-			m.removeMappingDir(path.Join(m.tpgPath(iqn), "lun", e.Name()))
-		}
-	}
-
-	// 4. backstore。
+	// 3. backstore。
 	//
 	// 只删除**由本目标派生**的 backstore（即 EnsureTarget 为 spec.BackingRef 创建的那个）。
-	// 通过 AttachLun 挂上来的 backstore 名字由 ref 派生、可能被多个目标共享，
-	// 属于"虚拟盘登记"，应由 RemoveVirtualDisk 负责回收，这里不动它。
-	m.removeBackstore(backstoreNameForTarget(iqn))
-
-	// 5. tpgt_1（内核会随之清理 enable/attrib/acls/lun 等）。
-	if err := os.Remove(m.tpgPath(iqn)); err != nil {
-		m.logger.Warn("删除 tpgt_1 失败", "target", iqn, "error", err)
-	}
-	// 6. iqn 目录。
-	if err := os.Remove(m.targetPath(iqn)); err != nil {
-		m.logger.Warn("删除 iqn 目录失败", "target", iqn, "error", err)
-		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-			WithArg("stage", "rmdir_iqn").WithCause(err)
+	// 经 AttachLun 挂上来的 backstore 名字由 ref 派生、可能被多个目标共享，属于
+	// "虚拟盘登记"，应由 RemoveVirtualDisk 负责回收，这里不动它。
+	if err := m.removeBackstore(ctx, backstoreNameForTarget(iqn)); err != nil {
+		return err
 	}
 	m.logger.Info("已删除 iSCSI 目标（LIO）", "target", iqn)
 	return nil
@@ -303,7 +285,7 @@ func (m *Manager) EnsureVirtualDisk(ctx context.Context, ref, description string
 	}
 
 	name := virtualDiskName(ref)
-	if err := m.ensureBackstore(name, ref); err != nil {
+	if err := m.ensureBackstore(ctx, name, ref); err != nil {
 		return err
 	}
 	m.logger.Info("已登记 iSCSI 虚拟盘（LIO backstore）",
@@ -328,15 +310,17 @@ func (m *Manager) RemoveVirtualDisk(ctx context.Context, ref string) error {
 		return err
 	}
 
-	m.removeBackstore(virtualDiskName(ref))
+	if err := m.removeBackstore(ctx, virtualDiskName(ref)); err != nil {
+		return err
+	}
 	m.logger.Info("已移除 iSCSI 虚拟盘登记（LIO backstore，未删除底层数据）", "ref", ref)
 	return nil
 }
 
 // AttachLun 建立「虚拟磁盘 ↔ 目标」映射。幂等。
 //
-// ref 对应的 backstore 若不存在则先登记；随后映射到 TPG 级 lun/lun_0 与目标的每个 ACL。
-// 与 EnsureTarget 第 7 步共用同一段映射逻辑（ensureMapping）。
+// ref 对应的 backstore 若不存在则先登记；随后映射到 TPG 级 lun0 与目标的每个 ACL。
+// 与 EnsureTarget 第 6 步共用同一段映射逻辑（ensureTpgMapping / ensureACLMapping）。
 func (m *Manager) AttachLun(ctx context.Context, targetName, ref string, readOnly bool) error {
 	if strings.TrimSpace(targetName) == "" {
 		return apperr.InvalidParam("target_name")
@@ -362,14 +346,14 @@ func (m *Manager) AttachLun(ctx context.Context, targetName, ref string, readOnl
 	}
 
 	bs := virtualDiskName(ref)
-	if err := m.ensureBackstore(bs, ref); err != nil {
+	if err := m.ensureBackstore(ctx, bs, ref); err != nil {
 		return err
 	}
-	if err := m.ensureMapping(m.tpgLunDir(iqn), bs, readOnly); err != nil {
+	if err := m.ensureTpgMapping(ctx, iqn, bs); err != nil {
 		return err
 	}
 	for _, ini := range m.listDirs(m.aclsPath(iqn)) {
-		if err := m.ensureMapping(m.aclMappedLunDir(iqn, ini), bs, readOnly); err != nil {
+		if err := m.ensureACLMapping(ctx, iqn, ini, bs, readOnly); err != nil {
 			return err
 		}
 	}
@@ -404,9 +388,13 @@ func (m *Manager) DetachLun(ctx context.Context, targetName, ref string) error {
 	}
 
 	bs := virtualDiskName(ref)
-	m.removeMapping(m.tpgLunDir(iqn), bs)
+	if err := m.detachTpgMapping(ctx, iqn, bs); err != nil {
+		return err
+	}
 	for _, ini := range m.listDirs(m.aclsPath(iqn)) {
-		m.removeMapping(m.aclMappedLunDir(iqn, ini), bs)
+		if err := m.detachACLMapping(ctx, iqn, ini, bs); err != nil {
+			return err
+		}
 	}
 	m.logger.Info("已解除 iSCSI LUN 映射（LIO）", "target", iqn, "backstore", bs, "ref", ref)
 	return nil
@@ -414,233 +402,277 @@ func (m *Manager) DetachLun(ctx context.Context, targetName, ref string) error {
 
 // ---- 内部辅助 ----
 
-// writeTpgAttribs 写 TPG 属性目录下的各个属性文件。
+// ensureTargetObject 确保目标对象存在且形状完整（含 tpg1）。
 //
-// 每个属性单独写；属性文件不存在时**忽略并记 Debug**——不同内核版本的属性集并不相同
-// （例如较老内核没有 emulate_tpws / is_nonrot）。其它写入错误则视为真失败并返回。
+// 若目标目录在、tpg1 不在，说明此前某次收敛中途失败留下了残骸：这种半成品里不可能有
+// 有效的 LUN/ACL，直接删掉重建最可靠（targetcli"在已有目标上补建 tpg"的语法涉及 tpg
+// 命名细节，不值得为这条异常路径去猜）。
+func (m *Manager) ensureTargetObject(ctx context.Context, iqn string) error {
+	if m.isTarget(iqn) && m.isTPG(iqn) {
+		return nil
+	}
+	if m.isTarget(iqn) {
+		m.logger.Warn("目标目录存在但缺少 tpg1，按残骸处理并重建", "target", iqn)
+		if err := m.apply(ctx, "recreate_target",
+			func() bool { return !m.isTarget(iqn) }, cmdDeleteTarget(iqn)); err != nil {
+			return err
+		}
+	}
+	return m.apply(ctx, "create_target",
+		func() bool { return m.isTarget(iqn) && m.isTPG(iqn) }, cmdCreateTarget(iqn))
+}
+
+// applyTpgAttribs 把 **TPG 自己的**属性逐条收敛到期望值，并在下发后逐条复验。
 //
 // 各属性为什么这么设：
 //   - authentication：spec 带 CHAP 时置 1，否则置 0；
-//   - generate_node_acls=0：关闭"自动为任意 initiator 放行"，因为我们按 ACL 精确授权；
-//   - auto_add_mapped_luns=0：**关键**。若为 1，新建 ACL 会把已存在的 LUN 自动映射进去，
-//     我们为只读目标写的 write_protect 会被自动映射覆盖（新映射默认可写）而失效；
+//   - generate_node_acls=0：关闭"自动为任意 initiator 放行"，因为我们按 ACL 精确授权。
+//
+// ⚠️ emulate_tpu / emulate_tpws / is_nonrot **不在这里**：它们是 SE_device（backstore）
+// 属性，只存在于 core/<插件>/<名字>/attrib/ 下，TPG 的 attribute 组里没有。曾经把它们
+// 写在 TPG 上，靠"属性不存在就跳过"的宽容逻辑变成了静默无效——恰恰是最关键的那几个
+// 开关（UNMAP 仿真、SSD 声明）从来没生效过。现在挪到 applyBackstoreAttribs。
+//
+// 在本内核上**不存在**的属性直接跳过（不同内核版本属性集不同）。这是有意保留的宽容：
+// 属性名先查 configfs 再下发，比"让 CLI 报错然后忽略报错"更干净，也不会把真实失败
+// 混进噪音里。
+func (m *Manager) applyTpgAttribs(ctx context.Context, iqn string, chap bool) error {
+	auth := "0"
+	if chap {
+		auth = "1"
+	}
+	spec := []struct{ name, value string }{
+		{"authentication", auth},
+		{"generate_node_acls", "0"},
+	}
+	for _, a := range spec {
+		attrPath := path.Join(m.tpgPath(iqn), "attrib", a.name)
+		if _, err := os.Stat(attrPath); err != nil {
+			m.logger.Debug("TPG 属性在本内核上不存在，跳过", "target", iqn, "attr", a.name)
+			continue
+		}
+		value := a.value
+		if err := m.apply(ctx, "tpg_attr_"+a.name,
+			func() bool { return m.readAttrEquals(attrPath, value) },
+			cmdSetTpgAttr(iqn, a.name, value)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyBackstoreAttribs 把 backstore（存储对象）属性逐条收敛到期望值，并在下发后逐条复验。
+//
+// 各属性为什么这么设：
 //   - emulate_tpu=1：**关键**。开启 TPU（Thin Provisioning Unmap）仿真后，客户端才会下发
 //     UNMAP；Windows 客户端在未开启时不会发 UNMAP，thin pool 的空间就永远无法回收；
 //   - emulate_tpws=1：同理，支持 Write Same(UNMAP) 的瘦盘仿真，配合 emulate_tpu；
 //   - is_nonrot=1：声明为**非旋转设备**。Windows 客户端据此把该盘当作 SSD：
 //     关闭碎片整理/预读等机械盘优化（避免用 NULL 写把 thin pool 撑满），且默认不再自动
 //     挂载为可写卷。
-func (m *Manager) writeTpgAttribs(iqn string, chap bool) error {
-	attribDir := path.Join(m.tpgPath(iqn), "attrib")
-	auth := "0"
-	if chap {
-		auth = "1"
-	}
-	attrs := []struct{ name, value string }{
-		{"authentication", auth},
-		{"generate_node_acls", "0"},
-		{"auto_add_mapped_luns", "0"},
+//
+// 必须等 backstore 建好之后才能设，所以调用点在 ensureBackstore 之后。
+// 属性名先查 configfs 再下发，本内核上不存在的直接跳过（较老内核没有 emulate_tpws /
+// is_nonrot），避免把真实失败混进噪音里。
+func (m *Manager) applyBackstoreAttribs(ctx context.Context, name string) error {
+	spec := []struct{ name, value string }{
 		{"emulate_tpu", "1"},
 		{"emulate_tpws", "1"},
 		{"is_nonrot", "1"},
 	}
-	for _, a := range attrs {
-		p := path.Join(attribDir, a.name)
-		if err := m.writeAttr(p, a.value); err != nil {
-			if os.IsNotExist(err) {
-				m.logger.Debug("TPG 属性在本内核上不存在，跳过", "target", iqn, "attr", a.name)
-				continue
-			}
-			return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-				WithArg("attr", a.name).WithCause(err)
+	for _, a := range spec {
+		attrPath := path.Join(m.backstorePath(name), "attrib", a.name)
+		if _, err := os.Stat(attrPath); err != nil {
+			m.logger.Debug("backstore 属性在本内核上不存在，跳过", "backstore", name, "attr", a.name)
+			continue
+		}
+		value := a.value
+		if err := m.applyStorage(ctx, "backstore_attr_"+a.name,
+			func() bool { return m.readAttrEquals(attrPath, value) },
+			func(alias string) []string {
+				return []string{cmdSetBackstoreAttr(alias, name, a.name, value)}
+			}); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// ensureBackstore 幂等地创建（或更新）一个 iblock backstore。
+// ensureBackstore 幂等地创建（或校验）一个 iblock backstore。
 //
-// 目录已存在时：udev_path 的改写可能因设备已被启用而失败（内核返回 EBUSY），
-// 此时记 Warn 并继续（不致命）；enable=1 同样容忍已启用的情况。
-func (m *Manager) ensureBackstore(name, ref string) error {
+// 创建交给 targetcli（/backstores/<插件> create name=.. dev=..）：udev_path 与 enable 的
+// 先后顺序（必须先设 udev_path、再 enable，且启用后不得再改 udev_path）由 rtslib 维护。
+//
+// 已存在时**只校验不修改**，不一致时记 Warn 而不报错：内核在 backstore 启用后拒绝改写
+// udev_path，此时唯一办法是删掉重建；而读回的字符串有可能是内核规范化后的设备路径
+// （如 /dev/dm-3）而非我们写入的 /dev/mapper/<vg>-<lv>，硬失败会让正常环境也收敛不了。
+// 但如果确实挂错了盘，这条 Warn 是唯一线索，因此必须打出来（旧实现只在写失败时记日志）。
+func (m *Manager) ensureBackstore(ctx context.Context, name, ref string) error {
 	dir := m.backstorePath(name)
-	existed := false
 	if fi, err := os.Stat(dir); err == nil {
 		if !fi.IsDir() {
 			return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
 				WithArg("backstore", name).WithCause(os.ErrExist)
 		}
-		existed = true
-	} else if err != nil && !os.IsNotExist(err) {
-		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).WithCause(err)
-	}
-
-	if !existed {
-		if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
-			return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-				WithArg("backstore", name).WithCause(err)
+		if got, rErr := m.readAttr(path.Join(dir, "udev_path")); rErr == nil && got != "" && got != ref {
+			m.logger.Warn("backstore 已存在且指向的设备与期望不同，沿用原值",
+				"backstore", name, "expected", ref, "actual", got)
 		}
-	}
-
-	// udev_path：真正指向 /dev/mapper/<vg>-<lv> 的块设备。
-	if err := m.writeAttr(path.Join(dir, "udev_path"), ref); err != nil {
-		if existed {
-			m.logger.Warn("更新 backstore udev_path 失败（设备可能已启用），沿用旧值",
-				"backstore", name, "ref", ref, "error", err)
-		} else {
-			return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-				WithArg("field", "udev_path").WithCause(err)
-		}
-	}
-
-	// enable=1 激活 backstore。
-	if err := m.writeAttr(path.Join(dir, "enable"), "1"); err != nil {
-		if existed {
-			m.logger.Warn("启用 backstore 失败（可能已启用）", "backstore", name, "error", err)
-		} else {
-			return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-				WithArg("field", "enable").WithCause(err)
-		}
-	}
-	return nil
-}
-
-// removeBackstore 停用并删除一个 backstore（**不删除底层块设备数据**）。幂等。
-func (m *Manager) removeBackstore(name string) {
-	dir := m.backstorePath(name)
-	if _, err := os.Stat(dir); err != nil {
-		return // 不存在即成功
-	}
-	// 先停用，再 rmdir。
-	if err := m.writeAttr(path.Join(dir, "enable"), "0"); err != nil {
-		m.logger.Debug("停用 backstore 失败（忽略，继续删除）", "backstore", name, "error", err)
-	}
-	if err := os.Remove(dir); err != nil {
-		m.logger.Warn("删除 backstore 失败（可能仍被 LUN 引用）", "backstore", name, "error", err)
-	}
-}
-
-// ensureMapping 在映射目录 dir 下建立「指向 backstore bs」的映射，并（可选）设置只读。
-//
-// ⚠️ 待真机验证：LUN 映射在 configfs 中的表示随内核/targetcli 版本略有差异，本函数
-// 对下列形态都做兼容，以"先成功者为准"：
-//
-//	A) dir 本身就是一个指向 backstore 的符号链接（targetcli 常见形态）——视为已映射；
-//	B) dir 是普通目录，需在其中创建符号链接（符号链接名 = backstore 名）；
-//	C) 回退：向 dir/backstore 属性文件写入 "iblock_0/<bs>"（B 的符号链接不被支持时）。
-//
-// 只读属性 write_protect 写在**映射目录内**；若该文件不可写（部分内核布局把它放在别处），
-// 只读不会生效——此情形记 Warn，绝不静默。
-func (m *Manager) ensureMapping(dir, bs string, readOnly bool) error {
-	fi, err := os.Lstat(dir)
-	switch {
-	case os.IsNotExist(err):
-		if mkErr := os.Mkdir(dir, 0o755); mkErr != nil && !os.IsExist(mkErr) {
-			return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-				WithArg("stage", "mkdir_mapping").WithCause(mkErr)
-		}
-	case err != nil:
-		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).WithCause(err)
-	case fi.Mode()&os.ModeSymlink != 0:
-		// 形态 A：目录本身就是符号链接，视为已映射。待真机验证。
-		m.logger.Debug("映射目录本身即符号链接，视为已映射（待真机验证）", "dir", dir)
-		m.applyWriteProtect(dir, readOnly)
 		return nil
 	}
+	return m.applyStorage(ctx, "create_backstore",
+		func() bool { return m.isBackstore(name) },
+		func(alias string) []string { return []string{cmdCreateBackstore(alias, name, ref)} })
+}
 
-	// 形态 B：在 dir 内创建指向 backstore 的符号链接。
-	link := path.Join(dir, bs)
-	if _, lErr := os.Lstat(link); os.IsNotExist(lErr) {
-		if sErr := os.Symlink(m.backstorePath(bs), link); sErr != nil {
-			// 形态 C：回退为写 backstore 属性文件。
-			if wErr := m.writeAttr(path.Join(dir, "backstore"), iblockPlugin+"/"+bs); wErr != nil {
-				return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-					WithArg("stage", "map_lun").
-					WithCause(fmt.Errorf("symlink 失败: %w; backstore 属性文件也失败: %v", sErr, wErr))
-			}
-			m.logger.Debug("符号链接方式不可用，已回退为 backstore 属性文件（待真机验证）",
-				"dir", dir, "backstore", bs)
-		}
+// removeBackstore 删除一个 backstore（**不删除底层块设备数据**）。幂等。
+//
+// 无需自行先写 enable=0：停用与解除引用由 targetcli delete 负责。
+func (m *Manager) removeBackstore(ctx context.Context, name string) error {
+	if !m.isBackstore(name) {
+		return nil // 不存在即成功
 	}
-	m.applyWriteProtect(dir, readOnly)
+	return m.applyStorage(ctx, "delete_backstore",
+		func() bool { return !m.isBackstore(name) },
+		func(alias string) []string { return []string{cmdDeleteBackstore(alias, name)} })
+}
+
+// ensureACL 幂等地创建（授权）一个 ACL。
+func (m *Manager) ensureACL(ctx context.Context, iqn, ini string) error {
+	// initiator 名会被拼进 targetcli 命令行，先拒绝含空白/斜杠的值，避免参数被拆开。
+	if ini == "" || strings.ContainsAny(ini, " \t\n/") {
+		return apperr.InvalidParam("initiator")
+	}
+	aclDir := path.Join(m.aclsPath(iqn), ini)
+	return m.apply(ctx, "create_acl",
+		func() bool { return m.isDir(aclDir) }, cmdCreateACL(iqn, ini))
+}
+
+// setACLAuth 设置单向 CHAP 凭据。
+//
+// ⚠️ 密钥只经 stdin 下发（见 execRunner.Run），日志里只出现用户名，绝不含密钥。
+//
+// 这里不做幂等判断、每次都下发：LIO 的 password 属性读回来不可靠（掩码/空），
+// 无法据此判断"是否已设对"。每次多执行一条 set 的代价，远低于"以为设了其实没设"
+// 导致客户端登录被拒且无从排查的代价。
+func (m *Manager) setACLAuth(ctx context.Context, iqn, ini, user, secret string) error {
+	if err := m.apply(ctx, "acl_chap", nil, cmdSetACLAuth(iqn, ini, user, secret)); err != nil {
+		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+			WithArg("field", "chap").WithArg("user", user).WithCause(err)
+	}
 	return nil
 }
 
-// applyWriteProtect 为只读映射写 write_protect=1。
+// removeACL 删除一个 ACL。幂等（不存在视为成功）。
 //
-// write_protect 是否位于 mapped_lun_0 目录内、抑或属于 LUN 目标属性，取决于具体内核布局
-// （待真机验证）。写不进去时只读无法生效，必须显式 Warn，不能假装成功。
-func (m *Manager) applyWriteProtect(dir string, readOnly bool) {
-	if !readOnly {
-		return
-	}
-	if err := m.writeAttr(path.Join(dir, "write_protect"), "1"); err != nil {
-		m.logger.Warn("写入 write_protect 失败，只读映射可能未生效（待真机验证）",
-			"dir", dir, "error", err)
-	}
-}
-
-// removeMapping 移除 dir 下与指定 backstore bs 相关的映射。幂等。
-func (m *Manager) removeMapping(dir, bs string) {
-	fi, err := os.Lstat(dir)
-	if err != nil {
-		return // 不存在视为成功
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		// 形态 A：目标是符号链接，需核对它确实指向该 backstore 再删。
-		if dst, rErr := os.Readlink(dir); rErr == nil && path.Base(dst) == bs {
-			_ = os.Remove(dir)
-		}
-		return
-	}
-	if !fi.IsDir() {
-		return
-	}
-	_ = os.Remove(path.Join(dir, bs)) // 删除形态 B 中我们创建的符号链接
-	// 仅当目录已空时才 rmdir 成功；若其中仍有内核属性/其它映射则会失败，忽略即可。
-	if err := os.Remove(dir); err != nil {
-		m.logger.Debug("保留映射目录（非空或含内核属性，待真机验证）", "dir", dir, "error", err)
-	}
-}
-
-// removeMappingDir 删除一个映射目录下的**全部**映射（用于 RemoveTarget）。幂等。
-func (m *Manager) removeMappingDir(entry string) {
-	fi, err := os.Lstat(entry)
-	if err != nil {
-		return
-	}
-	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-		_ = os.Remove(entry)
-		return
-	}
-	// 目录形态：先删内部我们创建的符号链接，再尝试 rmdir。
-	if entries, rdErr := os.ReadDir(entry); rdErr == nil {
-		for _, e := range entries {
-			if e.Type()&os.ModeSymlink != 0 {
-				_ = os.Remove(path.Join(entry, e.Name()))
-			}
-		}
-	}
-	if err := os.Remove(entry); err != nil {
-		m.logger.Warn("删除映射目录失败（可能含内核属性，待真机验证）", "dir", entry, "error", err)
-	}
-}
-
-// removeACL 删除一个 ACL：先删其下 mapped_lun_*，再 rmdir ACL 目录。幂等。
-func (m *Manager) removeACL(iqn, ini string) {
+// 与旧实现的差别：不再自行"先删 mapped_lun_*、再 rmdir"，该顺序约束由 targetcli delete 承担。
+func (m *Manager) removeACL(ctx context.Context, iqn, ini string) error {
 	aclDir := path.Join(m.aclsPath(iqn), ini)
-	entries, err := os.ReadDir(aclDir)
-	if err != nil {
-		return
+	if !m.isDir(aclDir) {
+		return nil
 	}
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "mapped_lun_") {
-			m.removeMappingDir(path.Join(aclDir, e.Name()))
+	return m.apply(ctx, "delete_acl",
+		func() bool { return !m.isDir(aclDir) }, cmdDeleteACL(iqn, ini))
+}
+
+// ensureTpgMapping 幂等地建立 TPG 级 lun0 → backstore 的映射。
+//
+// 只读**不在这里**落实：write_protect 是 per-ACL 层的属性，TPG 级 LUN 没有这个开关。
+// 旧实现对 TPG 级映射也写了一次 write_protect，写不进去时只记 Warn——那是一句必然
+// 无效的噪音，现已去掉。
+func (m *Manager) ensureTpgMapping(ctx context.Context, iqn, bs string) error {
+	return m.applyStorage(ctx, "map_lun",
+		func() bool { return m.mappingPointsTo(m.tpgLunDir(iqn), bs) },
+		func(alias string) []string {
+			return []string{cmdCreateLun(iqn, m.backstoreObjectPath(alias, bs))}
+		})
+}
+
+// ensureACLMapping 幂等地建立 ACL 内 mapped lun0 → backstore 的映射，并落实只读。
+//
+// 建映射与设只读分成两次下发、各自复验：合成一步的话，在"映射已存在但只读没生效"时
+// 无法判断该补哪一步。只读是安全属性，**设不成就是错误**，绝不降级为 Warn。
+func (m *Manager) ensureACLMapping(ctx context.Context, iqn, ini, bs string, readOnly bool) error {
+	dir := m.aclMappedLunDir(iqn, ini)
+	if err := m.applyStorage(ctx, "map_mapped_lun",
+		func() bool { return m.mappingPointsTo(dir, bs) },
+		func(alias string) []string {
+			return []string{cmdCreateMappedLun(iqn, ini, m.backstoreObjectPath(alias, bs))}
+		}); err != nil {
+		return err
+	}
+	if !readOnly {
+		return nil
+	}
+	wp := path.Join(dir, "write_protect")
+	if _, err := os.Stat(wp); err != nil {
+		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+			WithArg("stage", "write_protect").
+			WithArg("path", wp).
+			WithCause(errors.New("该内核的映射目录没有 write_protect 属性，只读无法落实"))
+	}
+	return m.apply(ctx, "write_protect",
+		func() bool { return m.readAttrEquals(wp, "1") }, cmdSetWriteProtect(iqn, ini, true))
+}
+
+// setEnabled 启用 / 停用 TPG，并复验 enable 属性。
+func (m *Manager) setEnabled(ctx context.Context, iqn string, enabled bool) error {
+	enablePath := path.Join(m.tpgPath(iqn), "enable")
+	want := "0"
+	if enabled {
+		want = "1"
+	}
+	if _, err := os.Stat(enablePath); err != nil {
+		// enable 属性不存在（目标或 TPG 已被拆除）：此时"停用"无事可做即为满足。
+		if !enabled {
+			return nil
 		}
+		return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+			WithArg("stage", "enable").WithArg("path", enablePath).WithCause(err)
 	}
-	if err := os.Remove(aclDir); err != nil {
-		m.logger.Warn("删除 ACL 目录失败", "target", iqn, "initiator", ini, "error", err)
+	return m.apply(ctx, "enable",
+		func() bool { return m.readAttrEquals(enablePath, want) }, cmdSetEnabled(iqn, enabled))
+}
+
+// isBackstore 判断 backstore 目录是否存在。
+func (m *Manager) isBackstore(name string) bool { return m.isDir(m.backstorePath(name)) }
+
+// isTPG 判断目标的 tpg1 目录是否存在。
+func (m *Manager) isTPG(iqn string) bool { return m.isDir(m.tpgPath(iqn)) }
+
+// isDir 判断路径存在且是目录。
+func (m *Manager) isDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+// mappingPointsTo 判断映射目录 dir 是否确实指向 backstore bs。
+//
+// 这是"是否已映射"的唯一判据，也是幂等收敛的支点：满足即一条命令都不下发。
+func (m *Manager) mappingPointsTo(dir, bs string) bool {
+	return m.mappingBackstore(dir) == bs
+}
+
+// detachTpgMapping 解除 TPG 级 lun0 映射。幂等（未映射或指向别的盘视为无事可做）。
+//
+// 先核对指向再删：虽然一个目标只挂一个 backstore，但删之前确认"删的确实是这一个"
+// 是极廉价的保险，可避免将来支持多 LUN 时误伤。
+func (m *Manager) detachTpgMapping(ctx context.Context, iqn, bs string) error {
+	if !m.mappingPointsTo(m.tpgLunDir(iqn), bs) {
+		return nil
 	}
+	return m.apply(ctx, "unmap_lun",
+		func() bool { return !m.mappingPointsTo(m.tpgLunDir(iqn), bs) }, cmdDeleteLun(iqn))
+}
+
+// detachACLMapping 解除 ACL 内 mapped lun0 映射。幂等。
+func (m *Manager) detachACLMapping(ctx context.Context, iqn, ini, bs string) error {
+	dir := m.aclMappedLunDir(iqn, ini)
+	if !m.mappingPointsTo(dir, bs) {
+		return nil
+	}
+	return m.apply(ctx, "unmap_mapped_lun",
+		func() bool { return !m.mappingPointsTo(dir, bs) }, cmdDeleteMappedLun(iqn, ini))
 }
 
 // isTarget 判断目标目录是否存在。
@@ -664,16 +696,20 @@ func (m *Manager) targetInfo(iqn string) platform.TargetInfo {
 	return info
 }
 
-// mappedBackstores 收集目标当前映射的 backstore 名字（TPG 级 lun/ 与各 ACL 的 mapped_lun_*）。
+// mappedBackstores 收集目标当前映射的 backstore 名字（TPG 级 lun/ 与各 ACL 的 lun_*）。
 func (m *Manager) mappedBackstores(iqn string) []string {
 	seen := make(map[string]struct{})
+	// 只认 lun 开头的条目：ACL 目录下还有 attrib/auth/param 等同级子树，没必要逐个去探。
 	collect := func(container string) {
 		entries, err := os.ReadDir(container)
 		if err != nil {
 			return
 		}
 		for _, e := range entries {
-			if name := backstoreNameOf(path.Join(container, e.Name())); name != "" {
+			if !strings.HasPrefix(e.Name(), "lun") {
+				continue
+			}
+			if name := m.mappingBackstore(path.Join(container, e.Name())); name != "" {
 				seen[name] = struct{}{}
 			}
 		}
@@ -690,43 +726,101 @@ func (m *Manager) mappedBackstores(iqn string) []string {
 	return out
 }
 
-// backstoreNameOf 从一个映射条目中提取它引用的 backstore 名；识别不出时返回 ""。
+// mappingMaxDepth 沿符号链接链向下解析的最大层数（正常最多两层：ACL→TPG LUN→backstore）。
+const mappingMaxDepth = 8
+
+// mappingBackstore 从一个映射条目出发，沿符号链接链解析出它最终引用的 backstore 名；
+// 识别不出时返回 ""。
 //
-// 兼容三种形态（见 ensureMapping）：条目本身是符号链接；条目是含符号链接的目录；
-// 条目是含 backstore 属性文件（值为 "iblock_0/<bs>"）的目录。
-func backstoreNameOf(entry string) string {
-	fi, err := os.Lstat(entry)
+// 必须**多级**解析，因为 LIO 的映射是层层链接，且 ACL 层的链接并不直接指向 backstore：
+//
+//	ACL 层  .../acls/<ini>/lun_0/<uuid>  ──▶ .../tpgt_1/lun/lun_0
+//	TPG 层  .../tpgt_1/lun/lun_0/<uuid>  ──▶ .../core/iblock_0/<bs>   ← 到这里才是 backstore
+//
+// 也就是说，若在 ACL 层直接取 path.Base(链接目标)，拿到的是 "lun_0" 而**不是** backstore
+// 名，mappingPointsTo 会永远为假：于是每次收敛都重复下发 create，被 CLI 以"已存在/已映射"
+// 拒绝，最终表现为"怎么配都配不对"。所以这里一路走到 core/ 下的对象为止。
+//
+// 兼容保留两种旧形态：条目本身就是链接（手工配置/老版本），或条目是含 "backstore"
+// 属性文件（内容形如 "iblock_0/<bs>"）的目录。
+//
+// 注意读不出来的后果：mappingPointsTo 返回 false，于是下一条 targetcli 命令会被发出，
+// 由 CLI 去拒绝或修正——只读宽容不会造成静默错误。
+func (m *Manager) mappingBackstore(entry string) string {
+	cur := path.Clean(entry)
+	for depth := 0; depth < mappingMaxDepth; depth++ {
+		if m.isBackstoreObject(cur) {
+			return path.Base(cur)
+		}
+		if next := symlinkTarget(cur); next != "" {
+			cur = next
+			continue
+		}
+		return backstoreAttrName(cur)
+	}
+	return ""
+}
+
+// isBackstoreObject 判断路径是否就是 core/<插件>/<名字> 这个 backstore 对象本身。
+//
+// 用"祖父目录是否等于 <root>/core"而非写死 iblock_0，是为了对 rd_mcp/fileio 等其它
+// 插件也成立。
+func (m *Manager) isBackstoreObject(p string) bool {
+	return path.Base(p) != "" && path.Dir(path.Dir(p)) == path.Join(m.root, "core")
+}
+
+// symlinkTarget 取条目的链接目标（已规整为绝对路径）：条目本身是链接就取它，条目是目录
+// 就取目录内的第一个链接；都不是时返回 ""。
+func symlinkTarget(p string) string {
+	fi, err := os.Lstat(p)
 	if err != nil {
 		return ""
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
-		dst, rErr := os.Readlink(entry)
-		if rErr != nil {
-			return ""
-		}
-		return path.Base(dst)
+		return resolveLink(p)
 	}
 	if !fi.IsDir() {
 		return ""
 	}
-	entries, rdErr := os.ReadDir(entry)
-	if rdErr == nil {
-		for _, e := range entries {
-			if e.Type()&os.ModeSymlink != 0 {
-				if dst, rErr := os.Readlink(path.Join(entry, e.Name())); rErr == nil {
-					return path.Base(dst)
-				}
-			}
-		}
+	entries, err := os.ReadDir(p)
+	if err != nil {
+		return ""
 	}
-	if b, rErr := os.ReadFile(path.Join(entry, "backstore")); rErr == nil {
-		v := strings.TrimSpace(string(b))
-		if i := strings.LastIndex(v, "/"); i >= 0 {
-			return v[i+1:]
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink == 0 {
+			continue
 		}
-		return v
+		if dst := resolveLink(path.Join(p, e.Name())); dst != "" {
+			return dst
+		}
 	}
 	return ""
+}
+
+// resolveLink 读链接目标并规整为绝对路径（configfs 里 rtslib 写的是绝对路径，但手工配置
+// 可能写相对路径）。
+func resolveLink(p string) string {
+	dst, err := os.Readlink(p)
+	if err != nil || dst == "" {
+		return ""
+	}
+	if !path.IsAbs(dst) {
+		dst = path.Join(path.Dir(p), dst)
+	}
+	return path.Clean(dst)
+}
+
+// backstoreAttrName 读旧形态的 backstore 属性文件（内容形如 "iblock_0/<bs>"）。
+func backstoreAttrName(dir string) string {
+	b, err := os.ReadFile(path.Join(dir, "backstore"))
+	if err != nil {
+		return ""
+	}
+	v := strings.TrimSpace(string(b))
+	if i := strings.LastIndex(v, "/"); i >= 0 {
+		return v[i+1:]
+	}
+	return v
 }
 
 // backstoreNameForTarget 由 IQN 派生一个稳定的 backstore 短名。

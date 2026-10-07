@@ -428,6 +428,35 @@ export interface InitializePoolRequest {
   cache_mode?: string
 }
 
+/** POST /v1/system/pools/delete 的请求体：删除一个存储池（可选连带删除卷组与释放磁盘）。 */
+export interface PoolDeleteRequest {
+  vg: string
+  /** 传空串表示"只删这个空卷组"（此时 remove_volume_group 必须为 true）。 */
+  thin_pool: string
+  /** 是否一并删除卷组（该卷组上只剩这一个池时才有意义，由服务端校验）。 */
+  remove_volume_group: boolean
+  /**
+   * 是否释放组成卷组的磁盘（执行 pvremove 清掉 PV 标签，让盘重新可选作卷组设备）。
+   *
+   * 注意**不抹文件系统签名**：盘上旧数据仍在，更深的清理是「释放设备」入口的职责。
+   * 且仅在 `remove_volume_group=true` 时生效——卷组没删就没有 PV 可清，服务端会忽略它。
+   */
+  release_devices: boolean
+}
+
+/** POST /v1/system/pools/delete 的响应：一次"删除存储池"的结果与逐步明细。 */
+export interface PoolDeleteResult {
+  vg: string
+  /** 池名；只删卷组时后端 omitempty，该字段不会出现。 */
+  thin_pool?: string
+  /** 卷组是否被一并删除。 */
+  removed_volume_group: boolean
+  /** 被释放（已执行 pvremove）的设备全路径；无释放时后端 omitempty。 */
+  released_devices?: string[]
+  /** 释放设备过程中的逐步结果（与 block-devices/release 同结构）。 */
+  steps: DeviceReleaseStepDTO[]
+}
+
 export interface SystemInfo {
   server_instance_id: string
   server_name: string
@@ -463,6 +492,14 @@ export interface SysDepsItem {
   fixed?: string
   /** 人工处置建议（含可直接执行的命令）。 */
   hint?: string
+  /**
+   * 该项此刻能否由服务端"一键安装"（POST /v1/system/deps/install）。
+   *
+   * 服务端已把"是否 root、platform.auto_install 开关、该项是否属于可装包的工具类"
+   * 一并判定完，前端只看这一个布尔——两边各判一次迟早会出现"按钮可点、一点就失败"。
+   * 注意它**不含权限信息**：调用该接口还需超级管理员，界面另需按当前用户角色 gate。
+   */
+  installable: boolean
 }
 
 export interface SysDepsReport {

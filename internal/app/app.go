@@ -61,8 +61,13 @@ type Deps struct {
 	// SysDepsProbe 系统依赖实时探测探针（Linux 注入；Windows 为 nil）。
 	//
 	// 由平台层装配（见 internal/platform/sysdeps 与 sysdeps.go 的 SysDepsReport），
-	// 只探测不修复——修复只在启动期与 `vault-server doctor` 里做。
+	// 只探测不修复——自动修复只在启动期与 `vault-server doctor` 里做。
 	SysDepsProbe func(context.Context) *SysDepsReport
+	// SysDepsInstall 按需安装系统依赖（Linux 注入；Windows 为 nil）。
+	//
+	// 与 SysDepsProbe 的分工：探测是只读的、任何人可看；安装会真的调用宿主机包管理器，
+	// 因此只经"超级管理员的显式点击"触发，且受 platform.auto_install 开关约束。
+	SysDepsInstall SysDepsInstaller
 }
 
 // App 聚合全部应用服务。
@@ -272,13 +277,14 @@ func (d Deps) compat() config.ResolvedCompat {
 	return config.ResolvedCompat{}
 }
 
-// RegisterJobHandlers 把磁盘、iSCSI 与上传相关任务注册到 worker。
+// RegisterJobHandlers 把磁盘、iSCSI、上传与系统依赖安装相关任务注册到 worker。
 //
 // 由 main 在启动阶段调用，保证 worker 启动前处理器已就绪。
 func (a *App) RegisterJobHandlers() {
 	a.disk.RegisterHandlers(a.Jobs)
 	a.iscsi.RegisterHandlers(a.Jobs)
 	a.upload.RegisterHandlers(a.Jobs)
+	a.registerSysDepsHandlers(a.Jobs)
 }
 
 // Reconcile 执行一次对账（服务端启动后与定时触发，见 docs/implementation.md 5.11）。

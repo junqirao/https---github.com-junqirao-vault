@@ -19,15 +19,19 @@ import {
 } from '@ant-design/icons'
 import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Typography } from 'antd'
 import type { MenuProps } from 'antd'
+import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 
 // 侧边栏品牌处展示的版本号取自 package.json（构建期注入），与发布包版本同源。
 import { CLIENT_VERSION } from '../config'
+// 与本地条目比对服务端地址用同一口径：代理回传的 url 与本地 baseUrl 可能差一个尾斜杠。
+import { normalizeUrl } from '../store/appStore'
 
 import {
   LanguageSwitcher,
   LayoutModeProvider,
+  LoadingState,
   SystemDepsBanner,
   layout,
   palette,
@@ -37,6 +41,7 @@ import {
   useAgent,
   useAgentEventNotifier,
   useAgentVersion,
+  useApi,
   useAuth,
   useI18n,
   useServerConfig,
@@ -55,6 +60,15 @@ export interface AppLayoutProps {
   autoMount?: { total: number; pending: number } | null
 }
 
+/**
+ * 切换服务端后、整页重载前的等待（毫秒）。
+ *
+ * activeKey 的持久化走的是异步 IPC（Electron 下写 %APPDATA%/Vault/config.json），
+ * 立刻 `location.reload()` 会读回**旧**的服务端，表现为"切了等于没切"。
+ * 300ms 足够一次本地写盘落地，用户也感知不到延迟。
+ */
+const SERVER_SWITCH_RELOAD_DELAY_MS = 300
+
 /** 主界面布局：按 mode 渲染应用端或管理端两套菜单，顶栏元素两模式一致。 */
 export function AppLayout({ mode, language, onLanguageChange, onManageServers, autoMount }: AppLayoutProps): JSX.Element {
   const { t } = useI18n()
@@ -70,18 +84,38 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   // 手动重连进行中（按钮转圈）：只影响按钮，不参与任何状态判定。
   const [serverRetrying, setServerRetrying] = useState(false)
 
+  /**
+   * 平台能力（匿名接口，管理端才查）：目前只用它判断「孤儿磁盘」这项菜单该不该出现。
+   *
+   * 孤儿磁盘 = 存储根 disks/ 下"未登记却真实存在"的 .vhdx，这个布局只对 Windows 成立；
+   * Linux 上磁盘是 LVM thin LV（不在存储根目录里），扫描永远是空的。未取到平台信息时
+   * 按"不支持"处理——宁可在 Windows 上晚一拍出现，也不要在 Linux 上先闪出再消失。
+   */
+  const api = useApi()
+  const infoQuery = useQuery({
+    queryKey: ['system-info'],
+    queryFn: () => api.systemInfo(),
+    enabled: mode === 'admin'
+  })
+  const orphansSupported = infoQuery.data?.capabilities.platform_kind === 'windows'
+
   const appMenuItems: MenuProps['items'] = [
     { key: '/my-repos', icon: <CloudOutlined />, label: t('nav.myRepos') },
     { key: '/logs', icon: <FileTextOutlined />, label: t('nav.logs') },
     { key: '/settings', icon: <SettingOutlined />, label: t('nav.settings') }
   ]
 
+  // 紧挨「存储」：孤儿磁盘就是存储根里"未登记却真实存在"的 VHDX，属于存储侧清理入口；
+  // 非 Windows 服务端不显示（见 orphansSupported 的说明）。
+  const orphansMenuItem: MenuProps['items'] = orphansSupported
+    ? [{ key: '/admin/orphans', icon: <FileSearchOutlined />, label: t('nav.orphans') }]
+    : []
+
   const adminMenuItems: MenuProps['items'] = [
     { key: '/admin/users', icon: <TeamOutlined />, label: t('nav.users') },
     { key: '/admin/repos', icon: <AppstoreOutlined />, label: t('nav.repos') },
     { key: '/admin/storages', icon: <DatabaseOutlined />, label: t('nav.storages') },
-    // 紧挨「存储」：孤儿磁盘就是存储根里"未登记却真实存在"的 VHDX，属于存储侧清理入口。
-    { key: '/admin/orphans', icon: <FileSearchOutlined />, label: t('nav.orphans') },
+    ...orphansMenuItem,
     { key: '/admin/leases', icon: <HddOutlined />, label: t('nav.leases') },
     { key: '/admin/jobs', icon: <DashboardOutlined />, label: t('nav.jobs') },
     { key: '/admin/audit', icon: <AuditOutlined />, label: t('nav.audit') },
@@ -103,8 +137,17 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
     selectable: true,
     selectedKeys: activeKey ? [activeKey] : [],
     onClick: ({ key }) => {
-      if (key === '__manage__') onManageServers()
-      else setActive(key)
+      if (key === '__manage__') {
+        onManageServers()
+        return
+      }
+      // 点当前这台不用刷新（否则等于无故重载一次）。
+      if (key === activeKey) return
+      setActive(key)
+      // 换服务端后整页重载：hash 路由保留（仍停在当前页面），但 React Query 缓存与页面内部
+      // 状态全部重建。只改 activeKey 是不够的——查询缓存键里没有服务端标识，
+      // 列表会短暂显示上一台服务端的数据，且已打开的表单还握着旧对象的 ID。
+      window.setTimeout(() => window.location.reload(), SERVER_SWITCH_RELOAD_DELAY_MS)
     }
   }
 
@@ -129,7 +172,22 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   // 服务端连接阶段：phase 是代理侧的权威取值（connecting / connected / disconnected），
   // 但**不能让 phase 覆盖掉 connected** —— 旧版代理不带 phase，而心跳恢复连接时会先
   // 把 connected 置真；这里以 connected 为准做一次归一。
-  const server = agent.state?.server
+  //
+  // 取的是**当前活动服务端**那一台：多服务端下每台各发各的 server 事件，compat `server`
+  // 只指主服务端，直接用会出现"切到 B 了，顶栏还在看 A 连没连上"。按活动键取不到时
+  // 退回 compat（旧版代理 / 客户端刚启动还没拿到 servers[]）。
+  //
+  // 键对不上时按地址兜底：代理会把"地址键"合并成"实例 ID 键"（反之亦然），本地条目可能还停在
+  // 另一种写法上（老配置迁移过来的条目尤其如此），只按 key 找会退回主服务端那一份。
+  const server =
+    (activeKey
+      ? (agent.state?.servers?.find((item) => item.server_key === activeKey) ??
+        (active?.baseUrl
+          ? agent.state?.servers?.find((item) => normalizeUrl(item.url) === normalizeUrl(active.baseUrl))
+          : undefined))
+      : undefined) ?? agent.state?.server
+  // 排障面板逐台列出：新代理给 servers[]，旧代理退回兼容的 health.server（只有一台）。
+  const serverList = agent.state?.servers?.length ? agent.state.servers : agent.health?.servers ?? []
   const serverPhase = server?.connected ? 'connected' : server?.phase
   // "连接中"：代理正在连/自动重连。此时**不显示"未连接"**，改显示转圈的"连接中"
   // （真实诉求：连接过程中一直挂着"未连接"，用户读到的是"连不上服务端"）。
@@ -137,6 +195,18 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   // "未连接"只在代理**明确**说"自动重连已放弃"（phase=disconnected）时才算数：这样旧版代理
   // （不带 phase）不会被误判成失败，也就不会挂出一个注定 404 的"重试"按钮。
   const serverExhausted = agent.available && serverPhase === 'disconnected'
+
+  /**
+   * 管理端在未连接到服务端时整体遮罩。
+   *
+   * 理由：管理端的每个动作（列表、删除、建池…）都要打服务端，断开时点了必然失败；
+   * 让用户对着一个注定报错的界面点，只会换回一串网络错误。
+   *
+   * 为什么带 agent.available 前置条件：代理没起来时 server 状态是"未知"（快照为空）而不是
+   * "未连接"，而服务端 API 是渲染进程直连 baseUrl 的、可能完全正常——不加这个前提，
+   * 代理一异常就会把界面凭空锁死。
+   */
+  const adminBlocked = mode === 'admin' && agent.available && !server?.connected
 
   const agentTone = !agent.available ? 'default' : server?.connected ? 'green' : serverConnecting ? 'processing' : 'orange'
 
@@ -167,7 +237,8 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
     setServerRetrying(true)
     void (async () => {
       try {
-        await agent.reconnectServer()
+        // 只重连活动那一台：代理可能同时连着好几台，替别的台重试没有意义。
+        await agent.reconnectServer(activeKey ?? undefined)
       } catch {
         // 失败原因已由 useAgent 落进 agent.error（排障面板可见），这里只负责恢复按钮。
       } finally {
@@ -198,16 +269,35 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
           <Typography.Text>
             {`${t('agent.admin')}: ${agent.health.admin ? t('agent.admin.yes') : t('agent.admin.no')}`}
           </Typography.Text>
-          <Typography.Text>{`${t('agent.server.url')}: ${agent.health.server.url || '-'}`}</Typography.Text>
-          <Typography.Text>{`${t('agent.server.name')}: ${agent.health.server.name || '-'}`}</Typography.Text>
-          <Typography.Text>
-            {`${t('agent.server.connected')}: ${agent.health.server.connected ? t('common.yes') : t('common.no')}`}
-          </Typography.Text>
-          {agent.health.server.last_error ? (
-            <Typography.Text type="warning">
-              {`${t('agent.server.lastError')}: ${agent.health.server.last_error}`}
-            </Typography.Text>
-          ) : null}
+          {serverList.length > 0
+            ? serverList.map((item) => (
+                <Space direction="vertical" size={0} key={item.server_key ?? item.url}>
+                  <Typography.Text>{`${t('agent.server.url')}: ${item.url || '-'}`}</Typography.Text>
+                  <Typography.Text>{`${t('agent.server.name')}: ${item.name || '-'}`}</Typography.Text>
+                  <Typography.Text>
+                    {`${t('agent.server.connected')}: ${item.connected ? t('common.yes') : t('common.no')}`}
+                  </Typography.Text>
+                  {item.last_error ? (
+                    <Typography.Text type="warning">
+                      {`${t('agent.server.lastError')}: ${item.last_error}`}
+                    </Typography.Text>
+                  ) : null}
+                </Space>
+              ))
+            : (
+                <>
+                  <Typography.Text>{`${t('agent.server.url')}: ${agent.health.server.url || '-'}`}</Typography.Text>
+                  <Typography.Text>{`${t('agent.server.name')}: ${agent.health.server.name || '-'}`}</Typography.Text>
+                  <Typography.Text>
+                    {`${t('agent.server.connected')}: ${agent.health.server.connected ? t('common.yes') : t('common.no')}`}
+                  </Typography.Text>
+                  {agent.health.server.last_error ? (
+                    <Typography.Text type="warning">
+                      {`${t('agent.server.lastError')}: ${agent.health.server.last_error}`}
+                    </Typography.Text>
+                  ) : null}
+                </>
+              )}
         </>
       ) : null}
       {lastMountFailure ? (
@@ -367,9 +457,11 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
           </Layout.Header>
 
           <Layout.Content style={{ background: palette.bgPage, overflow: 'auto' }}>
-            {/* 服务端系统依赖缺失（缺 configfs 挂载 / LIO 内核模块 / LVM 工具等）：
-                启动时能自动修的已修，修不了的在这里告诉使用者"缺了什么、怎么补"。 */}
-            <SystemDepsBanner />
+            {/* 服务端系统依赖缺失（缺 configfs 挂载 / LIO 内核模块 / targetcli 等）：
+                启动时能自动修的已修，修不了的在这里告诉使用者"缺了什么、怎么补"。
+                能装包的项再给个"安装"按钮——但那个接口只有超级管理员能调，
+                非管理员渲染出来只会点了拿 403，所以按角色 gate。 */}
+            <SystemDepsBanner canInstall={isSuperAdmin} />
             {hostWarning ? (
               <Alert
                 type="warning"
@@ -390,6 +482,25 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
             <Outlet />
           </Layout.Content>
         </Layout>
+        {/* 未连接服务端：整个管理端（含顶栏）盖一层 loading，见 adminBlocked。 */}
+        {adminBlocked ? (
+          <div
+            style={{
+              position: 'fixed',
+              inset: 0,
+              // 必须高过 antd 的浮层（Modal/message/notification 都在 1000~1050）：
+              // 断开时若正好开着某个弹窗，它的 portal 挂在 body 末尾、会浮在低 z-index 的遮罩之上，
+              // 用户就能继续点一个后端已经不可达的表单。
+              zIndex: 1200,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: palette.bgPage
+            }}
+          >
+            <LoadingState text={serverConnecting ? t('agent.state.connecting') : t('agent.gate.hint')} />
+          </div>
+        ) : null}
       </Layout>
     </LayoutModeProvider>
   )

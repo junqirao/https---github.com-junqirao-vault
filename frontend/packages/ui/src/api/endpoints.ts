@@ -39,6 +39,8 @@ import type {
   OrphanDeleteResultDTO,
   OrphanScanDTO,
   ParentAction,
+  PoolDeleteRequest,
+  PoolDeleteResult,
   RepoDTO,
   ConfigResponse,
   SettingsResponse,
@@ -74,6 +76,16 @@ export class VaultApi extends ApiClient {
    */
   systemDeps(): Promise<SysDepsReport> {
     return this.request<SysDepsReport>('GET', '/v1/system/deps')
+  }
+
+  /**
+   * 按需安装系统依赖（仅超级管理员）。
+   *
+   * 立刻返回 202 + 任务对象，装包在服务端后台跑（同步等待会顶到 HTTP 超时）：
+   * 调用方拿到 job.id 后轮询 getJob() 直到终态，再刷新 systemDeps()。
+   */
+  installSystemDeps(key: string): Promise<JobDTO> {
+    return this.request<JobDTO>('POST', '/v1/system/deps/install', { key })
   }
 
   clientCheck(body: ClientCheckRequest): Promise<ClientCheckResponse> {
@@ -185,6 +197,16 @@ export class VaultApi extends ApiClient {
   /** 新建一个存储池（幂等：同名池已存在时跳过）。 */
   createPool(body: InitializePoolRequest): Promise<LvmPoolStatusDTO> {
     return this.request<LvmPoolStatusDTO>('POST', '/v1/system/pools', body)
+  }
+
+  /**
+   * 删除一个存储池（可选连带删除卷组并释放磁盘）。
+   *
+   * 破坏性操作：调用前必须由用户显式确认。返回逐步结果，已完成的步骤不会回滚。
+   * `thin_pool` 传空串表示"只删这个空卷组"（此时 `remove_volume_group` 必须为 true）。
+   */
+  deletePool(body: PoolDeleteRequest): Promise<PoolDeleteResult> {
+    return this.request<PoolDeleteResult>('POST', '/v1/system/pools/delete', body)
   }
 
   /**

@@ -7,9 +7,10 @@
 //
 //  1. 内核能力：configfs 已挂载，且 LIO 三个模块已加载
 //     （target_core_mod / iscsi_target_mod / target_core_iblock）；
-//     ⚠️ lsmod 里有模块 ≠ configfs 里注册成功——模块在、fabric 目录不在是真实发生过的故障；
-//  2. configfs 目录树：<configfs_root>/iscsi（iSCSI fabric）与
-//     <configfs_root>/core/iblock_0（块设备 backstore 插件）；
+//  2. LIO 执行体：targetcli 在 PATH 里、且能跑通（`targetcli version`）——这是 iSCSI
+//     就绪与否的**唯一行为判据**。刻意不判 <configfs_root>/iscsi、<configfs_root>/core/iblock_0
+//     这类目录是否存在：它们由 rtslib 按需创建（core/iblock_0 要等第一个 iblock backstore
+//     建出来才出现），内核注册时机也随版本不同，当判据会把好机器判成故障；
 //  3. 命令行工具：LVM2（lvm/lvcreate/lvs/dmsetup）、文件系统工具
 //     （mkfs.ext4|mkfs.xfs、resize2fs|xfs_growfs）等。
 //

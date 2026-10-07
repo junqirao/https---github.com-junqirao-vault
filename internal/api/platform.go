@@ -214,19 +214,9 @@ func (r *Router) handleReleaseBlockDevice(w http.ResponseWriter, req *http.Reque
 		r.writeError(w, req, err)
 		return
 	}
-	steps := make([]deviceReleaseStepDTO, 0, len(rep.Steps))
-	for _, s := range rep.Steps {
-		steps = append(steps, deviceReleaseStepDTO{
-			Step:    s.Step,
-			Target:  s.Target,
-			OK:      s.OK,
-			Skipped: s.Skipped,
-			Detail:  s.Detail,
-		})
-	}
 	r.writeJSON(w, http.StatusOK, deviceReleaseReportDTO{
 		Path:     rep.Path,
-		Steps:    steps,
+		Steps:    toDeviceReleaseStepDTOs(rep.Steps),
 		Released: rep.Released,
 		Reason:   rep.Reason,
 	})
@@ -292,6 +282,74 @@ func (r *Router) handleInitializePool(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	r.writeJSON(w, http.StatusOK, toPoolStatusDTO(st))
+}
+
+// deletePoolRequest 是"删除存储池"请求。
+type deletePoolRequest struct {
+	// VG 目标卷组；ThinPool 留空表示只删卷组（此时 RemoveVolumeGroup 必须为 true）。
+	VG       string `json:"vg"`
+	ThinPool string `json:"thin_pool"`
+	// RemoveVolumeGroup 连卷组一起删除（卷组里还有别的逻辑卷时会被拒）。
+	RemoveVolumeGroup bool `json:"remove_volume_group"`
+	// ReleaseDevices 删掉卷组后把物理卷标签清回"可选"状态，磁盘可再次被选作卷组设备。
+	ReleaseDevices bool `json:"release_devices"`
+}
+
+// poolDeleteReportDTO 是一次"删除存储池"的结果。
+type poolDeleteReportDTO struct {
+	VG       string `json:"vg"`
+	ThinPool string `json:"thin_pool,omitempty"`
+	// RemovedVolumeGroup 卷组是否也一并删掉了。
+	RemovedVolumeGroup bool `json:"removed_volume_group"`
+	// ReleasedDevices 被清回可用状态的设备全路径（未要求释放时为空）。
+	ReleasedDevices []string `json:"released_devices,omitempty"`
+	// Steps 逐步执行结果（lvremove / vgremove / pvremove / udevadm）。
+	Steps []deviceReleaseStepDTO `json:"steps"`
+}
+
+// handleDeletePool 删除存储池（可选连带删除卷组，仅超级管理员）。
+//
+// ⚠️ 破坏性：池里的 thin 卷就是各存储的底层卷、母盘与差异盘，前端必须二次确认后再调。
+// 服务端另有三道拦截（默认池 / 池里还有 thin 卷 / 卷组里还有别的卷），见 app.PoolService.DeletePool。
+func (r *Router) handleDeletePool(w http.ResponseWriter, req *http.Request) {
+	var in deletePoolRequest
+	if err := r.decodeJSON(req, &in); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	rep, err := r.deps.App.Pools().DeletePool(req.Context(), app.DeletePoolInput{
+		VG:                in.VG,
+		ThinPool:          in.ThinPool,
+		RemoveVolumeGroup: in.RemoveVolumeGroup,
+		ReleaseDevices:    in.ReleaseDevices,
+	})
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusOK, poolDeleteReportDTO{
+		VG:                 rep.VG,
+		ThinPool:           rep.ThinPool,
+		RemovedVolumeGroup: rep.RemovedVolumeGroup,
+		ReleasedDevices:    rep.ReleasedDevices,
+		Steps:              toDeviceReleaseStepDTOs(rep.Steps),
+	})
+}
+
+// toDeviceReleaseStepDTOs 把内部的逐步结果映射为 API DTO（释放设备与删池共用同一形状，
+// 前端复用同一套步骤展示；两处各写一份必然漂移）。
+func toDeviceReleaseStepDTOs(steps []platform.DeviceReleaseStep) []deviceReleaseStepDTO {
+	out := make([]deviceReleaseStepDTO, 0, len(steps))
+	for _, s := range steps {
+		out = append(out, deviceReleaseStepDTO{
+			Step:    s.Step,
+			Target:  s.Target,
+			OK:      s.OK,
+			Skipped: s.Skipped,
+			Detail:  s.Detail,
+		})
+	}
+	return out
 }
 
 // toBlockDeviceDTO 把内部结构映射为 API DTO。

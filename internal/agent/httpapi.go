@@ -28,6 +28,8 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/state", a.handleState)
 	mux.HandleFunc("GET /agent/log", a.handleLog)
 
+	// 会话推送/清除：**按台**操作（多服务端下每台各自一份会话，见 docs/agent-api.md）。
+	// POST 可带 server_key / primary；DELETE 可带 ?server_key=（省略 = 清全部会话）。
 	mux.HandleFunc("POST /agent/session", a.handleSetSession)
 	mux.HandleFunc("DELETE /agent/session", a.handleClearSession)
 
@@ -66,7 +68,8 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/events", a.handleEvents)
 
 	mux.HandleFunc("POST /agent/server/test", a.handleServerTest)
-	// 界面"重试"按钮：清零自动重连的失败计数并立即重连一次（见 server_connect.go）。
+	// 界面"重试"按钮：清零该台自动重连的失败计数并立即重连一次（见 server_connect.go）。
+	// 请求体/查询参数可带 server_key 指明重试哪一台；省略时针对主服务端。
 	mux.HandleFunc("POST /agent/server/reconnect", a.handleServerReconnect)
 
 	mux.HandleFunc("POST /agent/update/check", a.handleUpdateCheck)
@@ -179,8 +182,24 @@ func normalizeLogDay(raw string) string {
 // 可选查询参数 expected_version：调用方（Electron 主进程）传入自身期望的代理版本号，
 // 服务端据此计算 version_mismatch，用于向界面提示"代理版本与客户端不一致"
 // （陈旧代理的典型特征，见 frontend/apps/client/electron/agent.ts 的说明）。
+//
+// 多服务端：servers 逐台给出连通状态；server（单数）是**主服务端**那一台的兼容字段
+// ——老客户端只读它，行为不变（见 serverView 的说明）。
 func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {
-	server := a.store.Server()
+	primary := a.store.PrimaryKey()
+	snapshots := a.store.Servers()
+	servers := make([]map[string]any, 0, len(snapshots))
+	var primaryView map[string]any
+	for _, snap := range snapshots {
+		view := serverView(snap, snap.Key == primary, false)
+		servers = append(servers, view)
+		if snap.Key == primary {
+			primaryView = view
+		}
+	}
+	if primaryView == nil {
+		primaryView = serverView(ServerSnapshot{}, false, false)
+	}
 	payload := map[string]any{
 		"ok":            true,
 		"agent_version": a.version,
@@ -189,12 +208,10 @@ func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 		// 本机 iSCSI 发起端就绪状态（见 /agent/state 的 host）：Electron 主进程与
 		// 渲染层都能据此在启动时给出横幅提示。
 		"host": a.hostState(),
-		"server": map[string]any{
-			"connected":  server.Connected,
-			"url":        server.URL,
-			"name":       server.Name,
-			"last_error": server.LastError,
-		},
+		// servers 是全部已登记服务端（多服务端：逐台一份）；主服务端在前。
+		"servers":     servers,
+		"primary_key": primary,
+		"server":      primaryView,
 	}
 	if expected := strings.TrimSpace(r.URL.Query().Get("expected_version")); expected != "" {
 		payload["expected_version"] = expected
@@ -203,73 +220,145 @@ func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, payload)
 }
 
+// serverView 组装一台服务端的对外状态。
+//
+// withSession=true 时附带登录用户与会话（供 /agent/state）；false 时只给连通状态
+// （供 /agent/health）—— 健康检查没有必要顺带吐出会话令牌。
+func serverView(snap ServerSnapshot, primary, withSession bool) map[string]any {
+	view := map[string]any{
+		// server_key 是这台服务端的本地键（与前端 ServerEntry.key 同算法：实例 ID 优先，
+		// 其次规范化地址，见 serverKeyOf）；界面/事件用它把状态、挂载与会话归到台。
+		"server_key":  snap.Key,
+		"primary":     primary,
+		"url":         snap.State.URL,
+		"instance_id": snap.State.InstanceID,
+		"name":        snap.State.Name,
+		"alias":       snap.State.Alias,
+		"connected":   snap.State.Connected,
+		// phase / fail_count 是"连接阶段与连续失败次数"：界面据此在连接中显示转圈的
+		// "连接中"（而不是"未连接"），并在失败达上限后给出"重试"按钮（见 state.go）。
+		"phase":      snap.State.Phase,
+		"fail_count": snap.State.FailCount,
+		"last_error": snap.State.LastError,
+	}
+	if !withSession {
+		return view
+	}
+	view["user"] = map[string]any{"id": snap.User.ID, "username": snap.User.Username}
+	if snap.Session != nil {
+		view["session"] = sessionView(snap.Session)
+	}
+	return view
+}
+
 // handleState 返回完整本地状态。
+//
+// 多服务端：servers 逐台给出完整状态（含该台的登录用户与会话）；server / user / session
+// 是**主服务端**的兼容字段 —— 老客户端（单服务端语义）无需改动即可继续工作。
 func (a *Agent) handleState(w http.ResponseWriter, _ *http.Request) {
-	server := a.store.Server()
-	user := a.store.User()
+	primary := a.store.PrimaryKey()
+	snapshots := a.store.Servers()
+	servers := make([]map[string]any, 0, len(snapshots))
+	var primarySnap ServerSnapshot
+	for _, snap := range snapshots {
+		servers = append(servers, serverView(snap, snap.Key == primary, true))
+		if snap.Key == primary {
+			primarySnap = snap
+		}
+	}
 	payload := map[string]any{
-		"server": map[string]any{
-			"url":         server.URL,
-			"instance_id": server.InstanceID,
-			"name":        server.Name,
-			"connected":   server.Connected,
-			// phase / fail_count 是"连接阶段与连续失败次数"：界面据此在连接中显示转圈的
-			// "连接中"（而不是"未连接"），并在失败达上限后给出"重试"按钮（见 state.go）。
-			"phase":      server.Phase,
-			"fail_count": server.FailCount,
-			"last_error": server.LastError,
-		},
-		"user":       map[string]any{"id": user.ID, "username": user.Username},
-		"mounts":     a.store.ListMounts(),
-		"auto_mount": a.cfg.Get().AutoMount,
+		"servers":     servers,
+		"primary_key": primary,
+		"mounts":      a.store.ListMounts(),
+		"auto_mount":  a.cfg.Get().AutoMount,
 		// host 是本机就绪状态（当前只有 iSCSI 发起端）：界面据此在启动时挂横幅，
 		// 而不是等挂载失败（阶段：connect）才知道 MSiSCSI 没启动。
 		"host":       a.hostState(),
 		"update":     a.updateInfo(),
 		"web_update": a.webUpdateState(),
 	}
+	// 兼容字段：单服务端时代的形状，一律取主服务端那一台。
+	payload["server"] = serverView(primarySnap, true, false)
+	payload["user"] = map[string]any{"id": primarySnap.User.ID, "username": primarySnap.User.Username}
 	// 本机 127.0.0.1 本地接口：透出当前会话（含令牌），渲染进程据此在续期后更新自己的令牌。
-	if sess, ok := a.store.Session(); ok {
-		payload["session"] = sessionView(sess)
+	if primarySnap.Session != nil {
+		payload["session"] = sessionView(primarySnap.Session)
 	}
 	a.writeJSON(w, http.StatusOK, payload)
 }
 
 // ---- 会话 ----
 
-// handleSetSession 接收前端推送的服务端会话。
+// sessionPushRequest 是前端推送的服务端会话。
+//
+// 多服务端：server_key 指明这段会话属于**哪一台**服务端（与前端 ServerEntry.key 同算法：
+// 实例 ID 优先，其次规范化地址，见 serverKeyOf）；省略时按会话自身字段推导
+// （老客户端只推一个服务端，行为不变）。primary=true 表示把该台设为主服务端
+// （更新源等"无服务端上下文"的操作默认用它，见 Agent.primaryServerKey）。
+//
+// 逐台推送即可实现"全部自动登录"：客户端启动时为 servers[] 里每个条目各推一次，
+// 代理会为每台各自建立会话、事件流、心跳与自动挂载。
+type sessionPushRequest struct {
+	Session
+	ServerKey string `json:"server_key,omitempty"`
+	Primary   bool   `json:"primary,omitempty"`
+}
+
+// handleSetSession 接收前端推送的服务端会话（可逐台多次调用，见 sessionPushRequest）。
 func (a *Agent) handleSetSession(w http.ResponseWriter, r *http.Request) {
-	var in Session
+	var in sessionPushRequest
 	if err := decodeJSON(r, &in); err != nil {
 		a.writeError(w, err)
 		return
 	}
-	if strings.TrimSpace(in.ServerURL) == "" {
+	session := in.Session
+	if strings.TrimSpace(session.ServerURL) == "" {
 		a.writeError(w, apperr.InvalidParam("server_url"))
 		return
 	}
-	if strings.TrimSpace(in.Token) == "" {
+	if strings.TrimSpace(session.Token) == "" {
 		a.writeError(w, apperr.InvalidParam("token"))
 		return
 	}
 	// 校验地址与证书指纹合法性（不要求此刻可达：服务端暂时离线时仍允许推送会话）。
-	if _, err := newServerClient(in.ServerURL, in.Token, in.CertSHA256, a.logger); err != nil {
+	if _, err := newServerClient(session.ServerURL, session.Token, session.CertSHA256, a.logger); err != nil {
 		a.writeError(w, err)
 		return
 	}
 
-	a.setSession(&in)
-	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// server_key 回传会话实际归属的服务端：同一台的两种键（地址 / 实例 ID）在代理内会被合并，
+	// 调用方据此对齐自己记的键。
+	serverKey := a.setSession(in.ServerKey, &session, in.Primary)
+	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "server_key": serverKey})
 }
 
 // handleClearSession 退出登录：停止心跳并解除订阅（不卸载已有挂载）。
-func (a *Agent) handleClearSession(w http.ResponseWriter, _ *http.Request) {
-	before := a.store.Server()
-	a.store.ClearSession()
+//
+// 多服务端：查询参数 server_key 指定只清**哪一台**（逐一登出）；省略时清全部会话
+// （单服务端时代等价于清唯一那台，老客户端行为不变）。服务端条目本身保留 ——
+// 退出登录只是不再持有令牌，本机的客户端证书身份仍在（见 stateStore.ClearSession）。
+func (a *Agent) handleClearSession(w http.ResponseWriter, r *http.Request) {
+	if key := strings.TrimSpace(r.URL.Query().Get("server_key")); key != "" {
+		resolved := a.store.ResolveKey(key, "")
+		if resolved == "" {
+			a.writeError(w, errServerUnknown())
+			return
+		}
+		before := a.serverStateBefore(resolved)
+		a.store.ClearSession(resolved)
+		a.publishServerIfChanged(resolved, before)
+		a.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "server_key": resolved})
+		return
+	}
 	// 退出后连接状态改成"未连接且不再自动重连"（见 stateStore.ClearSession）：
-	// 这是界面要立刻看到的状态变化，必须主动推一次 server 事件。
-	a.publishServerIfChanged(before)
-	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	// 这是界面要立刻看到的状态变化，必须逐台主动推一次 server 事件。
+	cleared := a.store.ServerKeys()
+	for _, key := range cleared {
+		before := a.serverStateBefore(key)
+		a.store.ClearSession(key)
+		a.publishServerIfChanged(key, before)
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": cleared})
 }
 
 // ---- 挂载与卸载 ----

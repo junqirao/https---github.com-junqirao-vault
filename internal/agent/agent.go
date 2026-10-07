@@ -130,17 +130,22 @@ type Agent struct {
 	// （挂载由 updater 重启后的自动挂载恢复，见 update.go 的说明）。
 	updateStarted atomic.Bool
 
-	subMu             sync.Mutex
-	subRunning        bool
-	eventsUnsupported atomic.Bool
+	subMu sync.Mutex
+	// subRunning 记录"哪些服务端已经在订阅事件流"：多服务端**每台一条** SSE 长连接，
+	// 各自独立重连/降级（见 sse.go）。
+	subRunning map[string]bool
+	// eventsUnsupported 记录"哪些服务端不支持事件流"（404/501 等）：按台降级，不互相牵连 ——
+	// 一台老服务端不支持 SSE 不该让其它台的挂载阶段事件也全丢。
+	eventsUnsupported map[string]bool
 
-	// 客户端证书会话自动续期状态（见 session_renew.go）。
+	// 客户端证书会话自动续期状态（见 session_renew.go）。逐台一份：一台服务端返回
+	// "需要重新登录"不该把其它台的续期也停掉。
 	renewMu      sync.Mutex
-	renewLastAt  int64
-	renewBlocked bool
-	// authRetryLastAt / authRetryInFlight 是"401 触发的证书重登录"的节流与单飞状态。
-	authRetryLastAt   int64
-	authRetryInFlight *authRetryCall
+	renewLastAt  map[string]int64
+	renewBlocked map[string]bool
+	// authRetryLastAt / authRetryInFlight 是"401 触发的证书重登录"的节流与单飞状态（逐台一份）。
+	authRetryLastAt   map[string]int64
+	authRetryInFlight map[string]*authRetryCall
 }
 
 // New 构造 Agent。
@@ -184,6 +189,13 @@ func New(opt Options) (*Agent, error) {
 
 		downloads: newDownloadManager(),
 		uploads:   newUploadManager(filepath.Join(filepath.Dir(state.Path()), uploadsFileName)),
+
+		subRunning:        make(map[string]bool),
+		eventsUnsupported: make(map[string]bool),
+		renewLastAt:       make(map[string]int64),
+		renewBlocked:      make(map[string]bool),
+		authRetryLastAt:   make(map[string]int64),
+		authRetryInFlight: make(map[string]*authRetryCall),
 	}
 	a.web = newWebUpdateManager(a)
 	a.engine = &mountEngine{a: a}
@@ -364,50 +376,66 @@ func (a *Agent) UnmountAll(ctx context.Context) {
 	}
 }
 
-// setSession 保存会话并触发服务端信息刷新、事件订阅与自动挂载。
-func (a *Agent) setSession(session *Session) {
-	a.store.SetSession(session)
+// setSession 保存**某台**服务端的会话，并触发该台的信息刷新、事件订阅与自动挂载。
+//
+// key 为空时按会话自身字段推导（实例 ID/地址）。primary=true 表示客户端把该台指定为主服务端
+// （更新源等"没有服务端上下文"的操作默认用它，见 primaryServerKey）。
+// 返回会话实际归属的服务端键（可能与传入的 key 不同：同一台的两种键会被合并）。
+func (a *Agent) setSession(key string, session *Session, primary bool) string {
+	if session == nil {
+		return ""
+	}
+	serverKey := a.store.SetSession(key, session)
+	if primary {
+		a.store.SetPrimary(serverKey)
+	}
 	// 这里只表示"拿到会话了"，真正连上要等 onSessionEstablished 的 SystemInfo 或事件流确认，
 	// 因此把阶段显式置回 connecting：若整体覆盖成零值 ServerState（Phase 归空），界面会从
 	// "连接中"闪一下"未连接"（真实观感问题）。
-	before := a.store.Server()
-	a.store.SetServer(ServerState{
-		URL:        session.ServerURL,
-		InstanceID: session.ServerInstanceID,
-		Name:       session.ServerName,
-		Connected:  false,
-		Phase:      ServerPhaseConnecting,
+	before := a.serverStateBefore(serverKey)
+	a.store.UpdateServer(serverKey, func(state *ServerState) {
+		state.URL = session.ServerURL
+		state.InstanceID = session.ServerInstanceID
+		state.Name = session.ServerName
+		state.Alias = session.Alias
+		state.Connected = false
+		state.Phase = ServerPhaseConnecting
 	})
-	a.publishServerIfChanged(before)
-	a.store.SetUser(UserState{ID: session.UserID, Username: session.Username})
-	a.eventsUnsupported.Store(false)
-	// 新会话已建立：解除"需要重新登录"标记，重新允许自动续期。
+	a.publishServerIfChanged(serverKey, before)
+	a.store.SetUser(serverKey, UserState{ID: session.UserID, Username: session.Username})
+	a.setEventsSupported(serverKey, true)
+	// 新会话已建立：解除"需要重新登录"标记，重新允许自动续期（只解这一台）。
 	a.renewMu.Lock()
-	a.renewBlocked = false
+	delete(a.renewBlocked, serverKey)
 	a.renewMu.Unlock()
 
-	safeGo(a.logger, "session_established", a.onSessionEstablished)
+	safeGo(a.logger, "session_established", func() { a.onSessionEstablished(serverKey) })
+	return serverKey
 }
 
-// onSessionEstablished 在拿到会话后刷新服务端信息、拉起事件订阅并尝试自动挂载。
-func (a *Agent) onSessionEstablished() {
+// onSessionEstablished 在拿到会话后刷新**该台**服务端信息、拉起事件订阅并尝试自动挂载。
+func (a *Agent) onSessionEstablished(key string) {
 	ctx, cancel := context.WithTimeout(a.bgContext(), sessionProbeTimeout)
 	defer cancel()
 
-	if client, err := a.serverClient(); err == nil {
+	if client, err := a.serverClientFor(key); err == nil {
 		clientCtx, clientCancel := context.WithTimeout(ctx, 10*time.Second)
 		info, infoErr := client.SystemInfo(clientCtx)
 		clientCancel()
 		if infoErr != nil {
-			a.store.SetServerConnected(false, describeError("system_info", infoErr))
-			a.logger.Warn("刷新服务端信息失败", "error", infoErr)
+			a.setServerConnected(key, false, describeError("system_info", infoErr))
+			a.logger.Warn("刷新服务端信息失败", "server", key, "error", infoErr)
 		} else {
-			a.updateServerFromInfo(info)
+			a.updateServerFromInfo(key, info)
 		}
+	} else if !errors.Is(err, errNoSession()) {
+		a.logger.Warn("构造服务端客户端失败", "server", key, "error", err)
 	}
 
-	a.ensureEventSubscriber()
-	safeGo(a.logger, "restore_mounts", func() { a.restoreMounts(a.bgContext()) })
+	a.ensureEventSubscriber(key)
+	// 自动挂载必须等"服务端确认连上"（见 restoreMountsWhenConnected）：拿到会话不等于连得上，
+	// 系统还没连上就挂只会留下一串失败记录。
+	safeGo(a.logger, "restore_mounts", func() { a.restoreMountsWhenConnected(a.bgContext(), key) })
 	// 静默热更：会话就绪即检查一次渲染层资源（客户端每次启动都会推会话）。
 	//
 	// 语义：完全静默 —— 后台拉清单 → 下载 → 校验 → 激活，全程只经 web_update 事件
@@ -415,48 +443,74 @@ func (a *Agent) onSessionEstablished() {
 	// （见 electron/main.ts 的 applyWebLayer），无需用户手动"立即重启"。
 	// 只有比本机应用版本更新的资源才会被激活（见 webTargetApplies），因此重复启动
 	// 只会命中"已是目标版本"的幂等分支，不重复下载。
-	a.startWebUpdate()
+	//
+	// 多服务端：渲染层资源只能有一个来源（更新源 = 主服务端，见 docs/implementation.md §7.4.1），
+	// 因此只有主服务端推来会话时才检查；否则后推会话的那台会把资源层换成它的版本。
+	if key == a.store.PrimaryKey() {
+		a.startWebUpdate()
+	}
 }
 
-// updateServerFromInfo 用系统信息补全服务端展示字段并标记已连接。
-func (a *Agent) updateServerFromInfo(info *SystemInfo) {
-	before := a.store.Server()
-	current := before
-	if info.ServerInstanceID != "" {
-		current.InstanceID = info.ServerInstanceID
-	}
-	if info.ServerName != "" {
-		current.Name = info.ServerName
-	}
-	current.Connected = true
-	current.LastError = ""
-	a.store.SetServer(current)
-	a.publishServerIfChanged(before)
+// updateServerFromInfo 用系统信息补全**某台**服务端的展示字段并标记已连接。
+func (a *Agent) updateServerFromInfo(key string, info *SystemInfo) {
+	before := a.serverStateBefore(key)
+	a.store.UpdateServer(key, func(state *ServerState) {
+		if info.ServerInstanceID != "" {
+			state.InstanceID = info.ServerInstanceID
+		}
+		if info.ServerName != "" {
+			state.Name = info.ServerName
+		}
+		state.Connected = true
+		state.LastError = ""
+		state.Phase = ServerPhaseConnected
+		state.FailCount = 0
+	})
+	a.publishServerIfChanged(key, before)
 }
 
-// setServerConnected 更新"服务端连接状态"，并仅在状态真正变化时广播 server 事件。
+// serverStateBefore 取某台服务端的状态快照（用于"变更前后比较"；不存在时为零值）。
+func (a *Agent) serverStateBefore(key string) ServerState {
+	state, _ := a.store.Server(key)
+	return state
+}
+
+// setServerConnected 更新**某台**的"服务端连接状态"，并仅在状态真正变化时广播 server 事件。
 //
 // 集中在这里做"变化比较 + 发布"，避免 sse.go / lease.go 等调用点各自判断（值未变时不发，
 // 防止心跳/事件重连把 server 事件刷成风暴）。
-func (a *Agent) setServerConnected(connected bool, lastError string) {
-	before := a.store.Server()
-	a.store.SetServerConnected(connected, lastError)
-	a.publishServerIfChanged(before)
+func (a *Agent) setServerConnected(key string, connected bool, lastError string) {
+	before := a.serverStateBefore(key)
+	a.store.SetServerConnected(key, connected, lastError)
+	a.publishServerIfChanged(key, before)
 }
 
-// publishServerIfChanged 比较状态快照，仅在 connected / phase / fail_count / last_error
-// 任一变化时广播 server 事件。
+// setServerPhase 更新某台的连接阶段并广播 server 事件（值未变时不发）。
+func (a *Agent) setServerPhase(key, phase string) {
+	before := a.serverStateBefore(key)
+	a.store.SetServerPhase(key, phase)
+	a.publishServerIfChanged(key, before)
+}
+
+// publishServerIfChanged 比较**某台**服务端的状态快照，仅在 connected / phase / fail_count /
+// last_error 任一变化时广播 server 事件（事件带 server_key，界面据此只更新那一台）。
 //
 // 为什么把 phase 与 fail_count 也算进"变化"：界面靠它们区分"正在连"与"连不上"
 // （connecting 显示转圈的"连接中"，fail_count 达上限才显示"未连接 + 重试"）。
 // 只比 connected 的话，一个"没连上、但一直在重连"的代理在界面上永远不动。
-func (a *Agent) publishServerIfChanged(before ServerState) {
-	after := a.store.Server()
+func (a *Agent) publishServerIfChanged(key string, before ServerState) {
+	after, ok := a.store.Server(key)
+	if !ok {
+		return
+	}
 	if before.Connected == after.Connected && before.LastError == after.LastError &&
 		before.Phase == after.Phase && before.FailCount == after.FailCount {
 		return
 	}
 	a.hub.Publish(Event{Type: "server", Data: map[string]any{
+		"server_key": key,
+		"url":        after.URL,
+		"name":       after.Name,
 		"connected":  after.Connected,
 		"phase":      after.Phase,
 		"fail_count": after.FailCount,
@@ -569,33 +623,54 @@ func (a *Agent) runHostRecheckLoop(ctx context.Context) {
 	}
 }
 
-// ensureEventSubscriber 确保只有一个服务端事件订阅协程在运行。
-func (a *Agent) ensureEventSubscriber() {
+// ensureEventSubscriber 确保**该台**服务端有一个事件订阅协程在运行（每台各自一条 SSE）。
+func (a *Agent) ensureEventSubscriber(key string) {
+	if key == "" {
+		return
+	}
 	a.subMu.Lock()
-	if a.subRunning {
+	if a.subRunning[key] || a.eventsUnsupported[key] {
 		a.subMu.Unlock()
 		return
 	}
-	a.subRunning = true
+	a.subRunning[key] = true
 	a.subMu.Unlock()
 
 	safeGo(a.logger, "server_events", func() {
 		defer func() {
 			a.subMu.Lock()
-			a.subRunning = false
+			delete(a.subRunning, key)
 			a.subMu.Unlock()
 		}()
-		a.runServerEvents(a.bgContext())
+		a.runServerEvents(a.bgContext(), key)
 	})
 }
 
-// serverClient 返回当前会话对应的服务端客户端；无会话时返回 agent.no_session。
+// eventsUnsupportedBy 返回该台服务端是否已确认不支持事件流。
+func (a *Agent) eventsUnsupportedBy(key string) bool {
+	a.subMu.Lock()
+	defer a.subMu.Unlock()
+	return a.eventsUnsupported[key]
+}
+
+// setEventsSupported 记录该台服务端对事件流的支持情况（false 即停止订阅，见 sse.go）。
+func (a *Agent) setEventsSupported(key string, supported bool) {
+	a.subMu.Lock()
+	defer a.subMu.Unlock()
+	if supported {
+		delete(a.eventsUnsupported, key)
+		return
+	}
+	a.eventsUnsupported[key] = true
+}
+
+// serverClientFor 返回**指定服务端**的客户端；该台没有会话时返回 agent.no_session。
 //
-// 返回的客户端带"会话失效即重登录"的兜底：服务端重启会清空内存会话表，
-// 此后所有带令牌的请求都会 401；有本地证书身份时会自动用证书换一个新会话并重试一次
-// （见 serverClient.do 与 Agent.refreshSessionToken）。
-func (a *Agent) serverClient() (*serverClient, error) {
-	session, ok := a.store.Session()
+// 返回的客户端带"会话失效即重登录"的兜底：服务端重启会清空内存会话表，此后所有带令牌的
+// 请求都会 401；有本地证书身份时会自动用证书换一个新会话并重试一次（见 serverClient.do 与
+// Agent.refreshSessionTokenFor）—— 重登录必须发回**同一台**，否则会拿 A 的会话去顶 B。
+func (a *Agent) serverClientFor(key string) (*serverClient, error) {
+	session, ok := a.store.Session(key)
 	if !ok || strings.TrimSpace(session.ServerURL) == "" {
 		return nil, errNoSession()
 	}
@@ -603,12 +678,33 @@ func (a *Agent) serverClient() (*serverClient, error) {
 	if err != nil {
 		return nil, err
 	}
-	return client.withAuthRetry(a.refreshSessionToken), nil
+	resolved := key
+	if resolved == "" {
+		resolved = a.store.ResolveKey("", session.ServerURL)
+	}
+	return client.withAuthRetry(func(ctx context.Context) (string, error) {
+		return a.refreshSessionTokenFor(ctx, resolved)
+	}), nil
 }
 
-// serverDisplayName 返回服务端展示名（无名称时退回 URL）。
-func (a *Agent) serverDisplayName() string {
-	server := a.store.Server()
+// primaryServerKey 返回主服务端键：更新源、自更新产物下载等"没有服务端上下文"的操作用它。
+//
+// 都没有时返回空串（调用方按"无会话"处理）。
+func (a *Agent) primaryServerKey() string {
+	return a.store.PrimaryKey()
+}
+
+// primaryServerClient 返回主服务端的客户端（无主服务端时退化为"唯一的那台"，再没有就报无会话）。
+func (a *Agent) primaryServerClient() (*serverClient, error) {
+	return a.serverClientFor(a.primaryServerKey())
+}
+
+// serverDisplayName 返回**某台**服务端的展示名（无名称时退回 URL）。
+func (a *Agent) serverDisplayName(key string) string {
+	server, ok := a.store.Server(key)
+	if !ok {
+		return ""
+	}
 	if strings.TrimSpace(server.Name) != "" {
 		return server.Name
 	}

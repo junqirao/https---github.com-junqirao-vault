@@ -19,7 +19,7 @@ import (
 // buildPlatform 装配 Linux 侧的平台后端。
 //
 // 抽象映射：虚拟磁盘 = LVM thin LV（差异盘 = thin snapshot）；
-// iSCSI 目标 = LIO（直接读写 configfs，无需 targetcli/Python）；
+// iSCSI 目标 = LIO（状态读 configfs，变更下发经 targetcli）；
 // 存储池管理（建 VG/thin pool、挂 dm-cache）由 linuxlvm 的 StorageAdmin 实现承担；
 // 每个"存储"各自的底层卷（thin LV + 文件系统 + 挂载点）由 StorageVolumeBackend 承担。
 func buildPlatform(ctx context.Context, raw config.Config, log *slog.Logger) (platformDeps, error) {
@@ -89,14 +89,39 @@ func buildPlatform(ctx context.Context, raw config.Config, log *slog.Logger) (pl
 		log.Warn("LVM 工具链不可用，虚拟磁盘功能将不可用", "error", err)
 	}
 	if err := lio.Available(ctx); err != nil {
-		log.Warn("LIO configfs 不可用，iSCSI 目标功能将不可用（需 root 且已加载 target_core_mod/iscsi_target_mod）", "error", err)
+		log.Warn("iSCSI 目标后端不可用，iSCSI 目标功能将不可用"+
+			"（需 root、已加载 target_core_mod/iscsi_target_mod，且已安装 targetcli）", "error", err)
 	}
 
 	backend := linuxbackend.New(lvm, lio, log)
 	return platformDeps{
 		Disk: backend, Vol: backend, Iscsi: backend, Platform: backend, StorageVol: backend,
-		SysDepsProbe: sysdepsProbe,
+		SysDepsProbe:   sysdepsProbe,
+		SysDepsInstall: sysDepsInstallerAdapter{opt: sysdepsOpts},
 	}, nil
+}
+
+// sysDepsInstallerAdapter 把 sysdeps 的按需安装能力适配为 app.SysDepsInstaller。
+//
+// 适配层存在的理由同 sysDepsReport：sysdeps 是 `//go:build linux` 的包，
+// app/api 必须保持跨平台可编译，不能让 app 直接依赖它。
+//
+// Check 与 Install 共用**同一个 sysdepsOpts 快照**（也就是上面喂给 sysdepsProbe 的那份），
+// 这是刻意的：横幅上"能不能装"（installable）与实际装包的前置判据必须同源，
+// 各自现读一次配置就可能出现"横幅说能装、点下去说被关掉"的自相矛盾。
+//
+// 顺带说明快照本身不是新增限制：buildPlatform 只在启动时调用一次，
+// 平台层（LVM/LIO/sysdeps 探针）整体都是启动期配置快照，改配置需重启服务端。
+type sysDepsInstallerAdapter struct {
+	opt sysdeps.Options
+}
+
+func (a sysDepsInstallerAdapter) Check(key string) error {
+	return sysdeps.CheckInstallable(a.opt, key)
+}
+
+func (a sysDepsInstallerAdapter) Install(ctx context.Context, key string) (string, error) {
+	return sysdeps.InstallByKey(ctx, a.opt, key)
 }
 
 // sysDepsReport 把 sysdeps.Report 转成 app 层的平台中立 DTO。
@@ -119,6 +144,11 @@ func sysDepsReport(ctx context.Context, o sysdeps.Options, fixedKeys []string) *
 			Detail:   it.Detail,
 			Fixed:    it.Fixed,
 			Hint:     it.Hint,
+			// 只在**缺失**时才谈"能不能装"：已就绪的项不该出现安装按钮。
+			// 同时带上 root 与开关，判据与 sysdeps.CheckInstallable 一致，
+			// 否则前端会渲染出一个必然被拒的按钮（点下去才知道自己没权限）。
+			Installable: it.Status == sysdeps.StatusMissing &&
+				sysdeps.Installable(it.Key) && o.Install && r.Root,
 		})
 		if it.Required && it.Status == sysdeps.StatusMissing {
 			missing = append(missing, it.Key)

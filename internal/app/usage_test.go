@@ -235,15 +235,15 @@ func TestRecomputeUsageRepairsNegative(t *testing.T) {
 	}
 }
 
-// TestRecomputeUsageFallsBackToLogicalSize 物理占用尚未测出（0）时按逻辑大小计费，
-// 与"分配时按逻辑预留"的口径保持一致（否则会在建盘完成前把用量算成 0）。
+// TestRecomputeUsageFallsBackToLogicalSize 尚未建好的盘（creating）按逻辑大小预留计费，
+// 与"分配时按逻辑预留"的口径保持一致（否则会在建盘完成前把用量算成 0，并发分配直接超卖）。
 func TestRecomputeUsageFallsBackToLogicalSize(t *testing.T) {
 	ctx := context.Background()
 	st := openAppTestStore(t)
 	repoID, userID := seedRepoWithOwner(t, st)
 
 	const size int64 = 3 << 30
-	createDiffDisk(t, st, repoID, userID, size, 0) // 物理未知
+	createPendingDiffDisk(t, st, repoID, userID, size) // 盘还没建好，物理占用无从谈起
 
 	if _, err := st.RecomputeUsage(ctx); err != nil {
 		t.Fatalf("重算失败：%v", err)
@@ -253,8 +253,30 @@ func TestRecomputeUsageFallsBackToLogicalSize(t *testing.T) {
 		t.Fatalf("回查用户失败：%v", err)
 	}
 	if user.UsedBytes != size {
-		t.Fatalf("物理未知时应按逻辑大小 %d 计费，实际=%d", size, user.UsedBytes)
+		t.Fatalf("尚未建好时应按逻辑大小 %d 预留计费，实际=%d", size, user.UsedBytes)
 	}
+}
+
+// TestUsageMeasuredZeroIsNotUnknown 已建好的盘实测物理占用为 0 时按 0 计费。
+//
+// 关键回归（真实反馈）：新建的库一上线就"已用 100%"。thin 差异盘刚派生出来时独占块
+// 本来就是 0（所有块都与母盘共享），而旧口径把 physical_bytes == 0 一律当成"尚未采样"
+// 退回标称容量 —— 库容量恰好等于那块盘的容量，进度条于是直接拉满。
+func TestUsageMeasuredZeroIsNotUnknown(t *testing.T) {
+	ctx := context.Background()
+	st := openAppTestStore(t)
+	repoID, userID := seedRepoWithOwner(t, st)
+
+	const size int64 = 3 << 30
+	disk := createDiffDisk(t, st, repoID, userID, size, 0) // 建好了，实测独占占用就是 0
+	if disk.State != domain.DiskStateReady {
+		t.Fatalf("前置条件：该盘应是 ready，实际=%s", disk.State)
+	}
+
+	if _, err := st.RecomputeUsage(ctx); err != nil {
+		t.Fatalf("重算失败：%v", err)
+	}
+	assertUsage(t, st, repoID, userID, 0)
 }
 
 // TestRepoCapacityDerivedFromStartDisk 守住存储库卡片进度条的**分母**（库容量）。

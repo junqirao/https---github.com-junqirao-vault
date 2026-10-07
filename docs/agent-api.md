@@ -15,18 +15,42 @@ iSCSI 挂载涉及：连接 iSCSI 目标、把磁盘上线、分配盘符或目�
 前端完成「服务端配置 → 初始化 / 登录」后，把会话推给代理；代理据此调用服务端 API。
 代理**不参与登录流程**，只消费前端已有的会话。
 
+**多服务端：一台机器可同时登录多台服务端**（即客户端 `servers[]` 里的每一台），代理为**每台**
+各自维护一份独立状态：会话与令牌、证书身份、事件订阅、租约心跳、自动挂载、令牌续期、
+断线重连。所有带服务端上下文的操作都以 `server_key` 定位到具体某一台，互不覆盖、互不串台。
+`server_key` 的算法与前端 `ServerEntry.key` 一致：**实例 ID 优先，其次规范化地址**
+（小写、去首尾空白与末尾斜杠）。
+
+客户端启动时为 `servers[]` 里的每一项各推一次会话（顺序不限）即完成"全部自动登录"：
+代理收到后各自建流并自动挂载该台的库，无需用户逐台点击。
+
 ```
 POST   /agent/session
-  ↓ {server_url, server_instance_id, server_name, token, user_id, username, expires_at,
-     cert_sha256}
-  ↑ {ok:true}
+  ↓ {server_url, server_instance_id, server_name,
+     alias?,             # 可选：客户端为**本机**给该台起的别名（目录模式的挂载点命名用）
+     token, user_id, username, expires_at, cert_sha256,
+     server_key?,        # 可选：指明这是哪一台（省略时按 instance_id / server_url 推导）
+     primary?}           # 可选：把该台设为主服务端（见下）；首台注册时自动成为主服务端
+  ↑ {ok:true, server_key}   # 回传该会话实际归属的服务端键（同一台的两种键在代理内会合并）
 
-DELETE /agent/session          # 退出登录时调用，代理停止心跳并解除订阅
-  ↑ {ok:true}
+DELETE /agent/session              # 退出登录：不带参数 = 清**全部**会话（逐台停止心跳、解除订阅）
+  ↑ {ok:true, cleared:[server_key...]}
+DELETE /agent/session?server_key=… # 只登出**这一台**
+  ↑ {ok:true, server_key}          # 键匹配不上任何已登记服务端 → 404 agent.server_unknown
+# 退出登录只丢令牌，不卸载已有挂载，也不删该台的服务端条目（本机客户端证书身份仍在）。
 
-POST   /agent/server/reconnect # 界面"重试"按钮：清零自动重连失败计数并立即重连一次
-  ↑ AgentServerState
+POST   /agent/server/reconnect     # 界面"重试"按钮：清零自动重连失败计数并立即重连一次
+  ↓ {server_key?}                  # 省略时针对主服务端
+  ↑ AgentServerState               # 不可归属 → 404 agent.server_unknown
 ```
+
+**主服务端（primary）**：多台之中只有一台是"主"，供**没有服务端上下文**的操作使用 ——
+自更新与渲染层资源热更的**更新源**（`update` / `web_update` 只认一台，混用会让版本判定自相矛盾，
+见 implementation.md 7.4.1）。首台注册时自动成为主服务端，之后由 `primary:true` 显式指定。
+`/agent/state` 的 `primary_key` 与每台的 `primary` 字段可查当前是哪一台。
+
+**兼容**：以上 `server_key` / `primary` / `alias` 都是可选字段。只推一台会话的老客户端
+行为完全不变（那台即主服务端，`DELETE /agent/session` 不带参数也只清它一台）。
 
 `cert_sha256` 是服务端证书 DER 的 SHA-256（小写十六进制），由前端在「测试连接」时经
 `POST /agent/server/test` 得到并固化（TOFU 首次信任）。服务端使用自建 CA，代理无法用公信
@@ -113,24 +137,45 @@ AgentIdentity = {
 GET /agent/health
   ↑ {ok:true, agent_version, platform, admin:true|false,
      host:HostState,
-     server:{connected:bool, url, name, last_error}}
+     servers:[AgentServerState...],   # 全部已登记服务端（多服务端：逐台一份，主服务端在前）
+     primary_key,                     # 主服务端的 server_key
+     server:AgentServerState}         # 主服务端那一台（单服务端时代的兼容字段；未登记时为空值）
+# health 里的每台**不含** user / session：健康检查没必要顺带吐出会话令牌。
 
 GET /agent/state
   ↑ {
-      # phase / fail_count：连接阶段与**连续**失败次数。界面据此区分"正在连"与"连不上" ——
-      #   connecting   ：正在连接/自动重连（界面显示转圈的"连接中"，**不显示**"未连接"）；
-      #   connected    ：已连接；
-      #   disconnected ：自动重连次数已用尽（界面显示"未连接" + 手动重试按钮）。
-      # fail_count 达上限后代理不再自动重连，等界面调 POST /agent/server/reconnect。
-      server:{url, instance_id, name, connected, phase, fail_count, last_error},
+      servers:[AgentServerState...],   # 逐台完整状态（含该台的登录用户与会话）
+      primary_key,
+      # 以下三个是单服务端时代的**兼容字段**，一律取主服务端那一台：
+      server:{url, instance_id, name, connected, phase, fail_count, last_error,
+              server_key, primary, alias},
       user:{id, username},
+      session:SessionView,             # 可选：主服务端会话（未推送会话时缺省）
       mounts:[MountState...],
       auto_mount:bool,
       host:HostState,
       update:UpdateInfo,
-      web_update:WebUpdateState,
-      session:SessionView            # 可选：当前服务端会话（未推送会话时缺省）
+      web_update:WebUpdateState
     }
+
+AgentServerState = {
+  server_key,                        # 该台的本地键（实例 ID 优先，其次规范化地址）
+  primary:bool,                      # 是否主服务端（更新源等无上下文操作的默认目标）
+  url, instance_id, name,
+  alias,                             # 本机给该台起的别名（挂载目录命名用），可空
+  # phase / fail_count：连接阶段与**连续**失败次数。界面据此区分"正在连"与"连不上" ——
+  #   connecting   ：正在连接/自动重连（界面显示转圈的"连接中"，**不显示**"未连接"）；
+  #   connected    ：已连接；
+  #   disconnected ：自动重连次数已用尽（界面显示"未连接" + 手动重试按钮）。
+  # fail_count 达上限后代理不再自动重连，等界面调 POST /agent/server/reconnect。
+  connected, phase, fail_count, last_error,
+  user:{id, username},               # 仅 /agent/state 返回
+  session:SessionView                # 仅 /agent/state 返回；未推送会话时缺省
+}
+```
+
+**界面必须逐台渲染**：`server_key` 是状态、挂载、事件三者的归属键。一条 `server` 事件只更新
+**它那一台**（事件负载也带 `server_key`），否则两台服务端的状态会互相覆盖。
 
 # 日志模块：日志按天切分，一次回一天的文件尾部。
 # day=YYYY-MM-DD 指定日期（省略或非法一律按当天）；tail 为读取字节数（默认 256KiB，上限 8MiB）。
@@ -167,6 +212,11 @@ UpdateInfo = {
 
 MountState = {
   repo_id, repo_name,
+  # server_key / server_url / server_name：**这条挂载归属哪台服务端**。
+  #   心跳、挂载点回写（/v1/leases/{id}/mounted）、租约释放都发给它 ——
+  #   多服务端下绝不能把 A 的租约回写到 B。
+  #   老状态文件里没有该字段的记录，加载时归给"当时唯一/主服务端"。
+  server_key, server_url, server_name,
   allocation_id, lease_id,
   target_iqn, portal, mount_mode:"letter"|"directory",
   mount_path,                 # letter 模式为 "E:"；directory 模式为 "C:\\Vault\\home\\game-x"
@@ -240,7 +290,9 @@ MountState = {
 
 ```
 POST /agent/mount
-  ↓ {allocation_id, mount_mode?: "letter"|"directory", mount_path?: string}
+  ↓ {allocation_id, mount_mode?: "letter"|"directory", mount_path?: string,
+     server_key?, server_url?}     # 归属服务端：省略时按"本机既有记录 → 主服务端"兜底；
+                                   # 给了却匹配不上任何已登记服务端 → 404 agent.server_unknown
   ↑ {mount:MountState}
   # 代理内部：POST {server}/v1/allocations/{id}/mount 取 MountSpec
   #          → New-IscsiTargetPortal（幂等）→ Connect-IscsiTarget（含 CHAP）
@@ -281,6 +333,7 @@ POST /agent/unmount
 POST /agent/remount
   ↓ {allocation_id}
   ↑ {mount:MountState}
+  # 归属跟随既有挂载记录里的 server_key（重挂不会换台）。
 
 GET  /agent/mounts
   ↑ {items:[MountState...]}
@@ -293,12 +346,14 @@ GET  /agent/mounts
 
 ```
 POST /agent/disks/download
-  ↓ {disk_id, target_dir?, file_name?, server_url?}
+  ↓ {disk_id, target_dir?, file_name?, server_key?, server_url?}
   ↑ 202 {download:DownloadState}
   # target_dir 省略时用 config.default_download_dir；必须是绝对路径。
   # file_name 省略时由服务端 Content-Disposition 推导，推导失败回退 disk-<id>.vhdx；
   #           文件名必须是单个纯文件名（拒绝路径穿越、绝对路径与 \ / : 等分隔符）。
-  # server_url 为预留字段，当前不生效：下载源始终取本地会话对应的服务端。
+  # server_key / server_url 指明从**哪台**服务端下载；都省略时按主服务端兜底（老客户端）。
+  # 磁盘 ID 只对"它所属的那台服务端"有意义：给了标识却匹配不上 → 404 agent.server_unknown，
+  # 绝不改从别的台下载。
   # 同一 disk 同时只允许一个进行中的任务：重复请求返回既有任务（202），不重复下载。
   # 无会话时返回 409 agent.no_session（绝不静默失败）。
 
@@ -395,13 +450,16 @@ POST /agent/fs/scan
   # 不返回完整文件清单（可能几十万条；清单只在代理内部使用）。
 
 POST /agent/uploads/start
-  ↓ {local_dir, repo_name, repo_mode?, storage_id?, quota_bytes?, source_mode?}
+  ↓ {local_dir, repo_name, repo_mode?, storage_id?, quota_bytes?, source_mode?,
+     server_key?, server_url?}
   ↑ 202 {upload:UploadState}
   # local_dir 必须是非空绝对路径且存在、是目录。
   # repo_mode："shared"（默认）| "exclusive"。
   # storage_id 省略时由服务端按可用空间自动选根；给定时校验该存储存在且启用。
   # quota_bytes 省略/0 表示不限。
   # source_mode："copy"（默认）| "move"；move 仅在建库成功后删除本地源目录。
+  # server_key / server_url 指明把库建到**哪台**服务端；都省略时按主服务端兜底（老客户端）。
+  # 存储 ID 只对"它所属的那台服务端"有意义：给了标识却匹配不上 → 404 agent.server_unknown。
   # 无会话 → 409 agent.no_session（绝不静默失败）。
   # 同一 local_dir 同时只允许一个进行中的上传：重复请求返回既有任务（202），不重复上传。
 
@@ -428,7 +486,8 @@ UploadState = {
 
 服务端契约：`POST /v1/uploads`、`PUT /v1/uploads/{id}/chunks/{index}`、`GET /v1/uploads/{id}`、
 `POST /v1/uploads/{id}/complete`、`GET /v1/jobs/{id}`、`GET /v1/repos`（需登录，Bearer 会话令牌）。
-所有调用都走当前会话对应的服务端，并沿用连接指纹固定。
+所有调用都走**本次上传所属的那台服务端**（见请求体的 `server_key` / `server_url`），
+并沿用该台的连接指纹固定。
 
 代理实现要点：
 
@@ -481,18 +540,31 @@ POST  /agent/repo-mounts/{repo_id}
   （只接受 GET/POST/PATCH/DELETE），PUT 会被挡在代理之外并向上报成 `network.error`。
 - `mount_mode` 为空串表示跟随 `default_mount_mode`；非法值返回
   `system.invalid_param`（args.field=mount_mode），空 `repo_id` 返回 args.field=repo_id。
+- `server_alias` 是**全局**别名，只在多服务端改造前/单服务端场景下作为兜底生效。
+  多服务端下别名**按台**下发（`POST /agent/session` 的 `alias`，落在 `/agent/state` 里该台的
+  `alias` 字段）：全局那一个名字已不足以标识"是哪一台"，继续沿用会让两台服务端的不同库
+  挤进同一个命名空间（同名目录）。
 - `mount_dir` 是目录模式下的**父目录**（绝对路径，或相对 `default_mount_dir` 的相对路径）：
-  真正的挂载点是它下面一层 `<服务端名称>_<存储库名称>` 子目录，界面上把算好的最终路径
-  如实显示给用户。服务端下发的 `mount_path`：**绝对路径**（管理员的显式指定）原样使用；
-  **相对路径**（服务端自动拼的 `<服务端名称>\<库名>`）也归一到同一命名，同一个库不会因为
-  "从哪挂"得到两种目录名。父目录末段已经就是那一层时不再追加（重挂/恢复会把上次的最终挂载点
-  当请求传回来，否则每重挂一次就多套一层目录）。
+  真正的挂载点是它下面一层 `<服务端别名>_<存储库名称>` 子目录，界面上把算好的最终路径
+  如实显示给用户。`<服务端别名>` 的取用顺序：**该台下发的 `alias`** → 全局 `server_alias`
+  （**仅当本机至多登记了一台服务端时**）→ 服务端名称。服务端下发的 `mount_path`：
+  **绝对路径**（管理员的显式指定）原样使用；**相对路径**（服务端自动拼的
+  `<服务端名称>\<库名>`）也归一到同一命名，同一个库不会因为"从哪挂"得到两种目录名。
+  父目录末段已经就是那一层时不再追加（重挂/恢复会把上次的最终挂载点当请求传回来，
+  否则每重挂一次就多套一层目录）。
 - 语义与全局 `auto_mount` 的区别：全局开关只管"恢复本机上次留下的挂载记录"；
-  某库 `auto_mount=true` 时即使本机没有记录（甚至还没有分配）也会在会话就绪后自动挂载
-  （没有可用分配时由代理调用 `POST /v1/repos/{id}/allocations` 建一个），
+  某库 `auto_mount=true` 时即使本机没有记录（甚至还没有分配）也会在**该台服务端确认连上**后
+  自动挂载（没有可用分配时由代理调用 `POST /v1/repos/{id}/allocations` 建一个），
   `auto_mount=false` 时不恢复该库的记录。
+- **自动挂载必须等服务端连上，且按台各自进行**：拿到会话（`POST /agent/session`）只表示令牌
+  已交给代理，不代表服务端可达。因此代理会**逐台**等该台 `Connected=true`（SystemInfo 成功 /
+  事件流建立 / 心跳成功三者之一）后**才开始**挂载该台的库，每台最多等 60s；等不到就跳过该台
+  （该台下一次会话建立或连接确认会重来），避免"没连上就挂"留下一串失败记录
+  （启动时的自动挂载失败按设计会保留记录）。
+  等待期间**该台**的会话被换掉（重新登录 / 退出登录）同样跳过；另一台推来会话**不算**
+  更换，不影响本台的等待与挂载。
 - **用户手动卸载压过自动挂载（本次运行内）**：`POST /agent/unmount` 成功后，该库进代理内存里
-  的"本次运行手动卸载过"名单，之后不再被自动挂载 —— 否则卸载删掉记录后，下一次会话就绪
+  的"本次运行手动卸载过"名单，之后不再被自动挂载 —— 否则卸载删掉记录后，下一次会话连上
   （客户端推会话 / 证书免密登录 / 令牌定时续期都会触发）会把它当成"从没挂过的自动挂载库"
   立刻挂回来。名单只活在代理进程内存里，重启即清空（客户端退出会结束代理），
   即"本次运行不再自动挂载，直到下次启动"；它只挡自动挂载，用户手动点"挂载"照常可用。
@@ -506,7 +578,7 @@ POST  /agent/repo-mounts/{repo_id}
 从配置文件读取到越界值时按「<=0 取默认 4、>8 取 8」归一化。
 
 > 客户端资源热更（client_web）**没有独立的本地配置项**：它使用与自更新相同的更新通道
-> （`update_channel`）与更新源（当前会话的服务端）；激活状态以磁盘上的
+> （`update_channel`）与更新源（**主服务端**，见「认证与会话」的 primary）；激活状态以磁盘上的
 > `%ProgramData%\Vault\webapp\current.json` 为准，查询状态用 `GET /agent/update/web`。
 >
 > **静默热更（默认行为）**：会话建立后（客户端每次启动都会推送会话）代理自动检查并激活一次，
@@ -527,18 +599,19 @@ GET /agent/events
                        # 因此界面不得把"收到 state=mounted"当成"刚挂上"：只有**亲眼看到它从
                        # 非 mounted 变成 mounted** 才提示"已挂载"（会话实测不会产生这种变化）。
      event: unmount     data: {allocation_id}
-     event: revoked     data: {allocation_id, reason}   # 服务端踢下线，代理已自行卸载
-     event: server      data: {connected, phase, fail_count, last_error}
-                      # connected / phase / fail_count / last_error **任一变化**时才发（值未变不发）。
+     event: revoked     data: {allocation_id, reason, server_key}   # 服务端踢下线，代理已自行卸载
+     event: server      data: {server_key, url, name, connected, phase, fail_count, last_error}
+                      # **按台发**：connected / phase / fail_count / last_error 任一变化时发（值未变不发）。
+                      # server_key 指这条状态属于哪一台，界面必须据此只更新那一台。
                       # phase 必须一起发：只推 connected 的话，"没连上、但一直在重连"的代理在界面上
                       # 永远停在"未连接"，用户分不清"还在连"和"连不上"。
     event: host        data: HostState                 # 本机就绪状态（iSCSI 发起端）变化时才发：
                                                        # 启动探测完成、管理员启动 MSiSCSI 后自动转就绪
-     event: session     data: SessionView               # 客户端证书会话自动续期成功（新令牌）
+     event: session     data: SessionView + {server_key} # 某台客户端证书会话自动续期成功（新令牌）
      event: update      data: {available_version, downloading, received_bytes, total_bytes}
-                                                         # 自更新下载进度
+                                                         # 自更新下载进度（更新源 = 主服务端）
      event: web_update  data: WebUpdateState             # 渲染层资源热更状态/进度
-     event: heartbeat   data: {at}                       # 可用于界面上展示"在线"
+     event: heartbeat   data: {at, allocation_id, server_key}  # 可用于界面上展示"在线"
      event: download    data: DownloadState              # 磁盘下载进度/开始/完成/失败/取消
      event: upload      data: UploadState                # 本地目录上传建库进度/开始/完成/失败/取消
 ```
@@ -660,7 +733,8 @@ POST /agent/shutdown       ↑ {ok:true}   # 托盘"退出"使用；代理会先
 | code | 含义 |
 | --- | --- |
 | `agent.token_invalid` | 本地令牌缺失或不匹配（401） |
-| `agent.no_session` | 尚未推送服务端会话（409） |
+| `agent.no_session` | 尚未推送服务端会话（409；按台判断：该台没有会话时也算） |
+| `agent.server_unknown` | 请求里指定的服务端（`server_key` / `server_url`）在本机匹配不上任何已登记服务端（404）。**多服务端下的防串台护栏**：绝不"猜"一台替你执行，尤其是磁盘/存储 ID 这类只对某台有意义的标识 |
 | `agent.admin_required` | 代理未以管理员权限运行（403） |
 | `agent.mount_failed` | 挂载失败（500，args.stage 指明阶段）。**connect / wait_connected 阶段**还会带诊断参数：`args.portal`（门户地址:端口）、`args.target_iqn`、`args.auth_mode`、`args.tcp`（门户 TCP 可达性探测结论：reachable/timeout/refused/unreachable），以及 `args.detail`（**原始报错**，如 Connect-IscsiTarget 的 .NET 异常 —— 失败记录会被抹掉，这是界面唯一能看到的真因）。**绝不含 CHAP 密钥** |
 | `agent.unmount_failed` | 卸载失败（500，args.stage 指明阶段；统一卸载后只剩 `mount_point`：该盘仍被程序占用，界面会附"关掉占用它的程序再重试"的提示） |

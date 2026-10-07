@@ -142,7 +142,7 @@ Linux 后端是 Windows 后端的**并列等价实现**，同一套上层代码�
 | 创建差异盘 | VHDX 差异盘（`MaximumSize=0`） | `lvcreate -s`（**thin 快照**） | 快照命令**绝不能带 `-L/-V`**；thin 快照天然省空间 |
 | 删除虚拟磁盘 | 卸载 + `os.Remove` | `lvremove` | 删除前**必须先下线 LUN** 并 `lvchange -an`；thin LV **无法**用 `vgcfgrestore` 恢复 |
 | 查询容量 | `Get-Item` / `Get-DiskImage` | `lvs` / `vgs` / `thin_ls` | 配额统计**不能用** `lvs -o data_percent` 相加（共享块会重复计数），须用 `thin_ls` |
-| 发布为 iSCSI | `Import-IscsiVirtualDisk` + target + mapping | LIO：`iblock_0` backstore + TPG `tpgt_1` + `lun` 符号链接 | 直接写 `/sys/kernel/config/target/`，**无需 targetcli / 无需服务进程** |
+| 发布为 iSCSI | `Import-IscsiVirtualDisk` + target + mapping | LIO：`iblock_0` backstore + TPG `tpgt_1` + `lun` 符号链接 | **写经 `targetcli` 下发**（argv 直传、无 shell），**读与复验直读 configfs**；无自研服务进程 |
 | iSCSI 鉴权 | `-EnableChap -Chap <user,secret>` | TPG `auth` + ACL `chap` | CHAP 密钥**内核硬限制 12–16 字节纯 ASCII**（Base64 后的 16 字符正好落在边界内） |
 | 只读发布（母盘临时共享） | iSCSI 只读映射 | per-ACL `write_protect=1` | 只读是**按 ACL** 而非按 LUN，务必确认 ACL 生效 |
 | 授权（initiator 白名单） | `Set-IscsiServerTarget -InitiatorIds`（全量替换） | ACL 目录即白名单（增删目录 = 增删授权） | 语义一致：一个分配 = 一个 target |
@@ -191,9 +191,31 @@ firewall-cmd --permanent --add-port=3260/tcp && firewall-cmd --reload
 > 容器部署还须共享宿主机的 `/lib/modules`（否则 `modprobe` 报 `Operation not permitted`）。
 > 这类兜底由包内 `scripts/setup.sh` 承担（发布包内容见 §12.3）。
 
-> **启动期自动修复 + 前端横幅**：启动时执行 `sysdeps.Ensure`（挂载 configfs、`modprobe`/重载 LIO 模块、
+> ⚠️ **LIO 的就绪判据是"行为"，不是"configfs 里某个目录在不在"**。`<configfs_root>/iscsi`、
+> `<configfs_root>/core/iblock_0` 这类路径一度被当成就绪条件，实战中证明是错的：它们都是 rtslib
+> **按需创建**、内核注册时机也随版本不同的内部细节——`core/iblock_0` 要等第一个 iblock backstore
+> 建出来才出现——于是好机器被判成缺项、报告长期报红，用户看到的就是"装了还是不可用"。
+> 现在的判据只有一条：**`targetcli` 能不能跑通**（`sysdeps` 用 `targetcli version` 探针，`setup.sh`
+> 同样实测）。targetcli 启动时就会构造 `RTSRoot()` 读整棵 configfs 树，"能跑通"已经覆盖
+> 「configfs 挂上了 + rtslib 能读到 LIO 树」两件事。真缺目录时由 rtslib 在对应操作上报出准确错误，
+> 比预先编造一句"fabric 缺失"更贴近事实。
+>
+> 连带删掉的还有两处**有害**动作：① 启动期/doctor 里"重载 `iscsi_target_mod` 让 configfs 目录重新
+> 注册"的自动修复——它会拆掉**正在给客户端服务的整棵目标配置**（LIO 的目标配置就是内核里的活对象），
+> 而它能修的那个"目录不见了"并不是判据；② 对只读操作的预检阻断——`configfsReady` 不再断言
+> `<root>/iscsi` 存在，否则列目标、查会话这些只读接口会被一起锁死（现场表现正是"一大批功能全不可用"）。
+> 需要重载模块时，由运维在 `setup.sh` 之外显式执行，并接受短暂中断。
+>
+> 仅作**辅助判据**保留一条：若 `/sys/kernel/config` 已挂载、`/proc/modules` 里有 `target_core_mod`，
+> 但 `/sys/kernel/config/target` **整个目录都不存在**，且 `targetcli` 确实跑不通，则说明本进程看到的
+> configfs 与内核注册 LIO 的那一份**不是同一个实例**（容器里自己 `mount -t configfs` 的那份是空的）：
+> `target_core_mod` 注册失败时模块根本加载不进来，所以"模块在、目录却完全没有"只能是这个原因。
+> 处置是让服务端共享宿主机的 configfs（`docker run --privileged -v /sys/kernel/config:/sys/kernel/config:rslave`
+> 与 `/lib/modules`），或直接把服务端装在宿主机（裸机/虚拟机）上——容器/编排部署不在本项目范围内（§1.1）。
+
+> **启动期自动修复 + 前端横幅**：启动时执行 `sysdeps.Ensure`（挂载 configfs、`modprobe` 缺失的 LIO 模块、
 > 写 `/etc/modules-load.d/vault-lio.conf`，受 `platform.auto_repair` 控制；缺命令行工具时按
-> `platform.auto_install` 自动装包）。修不了的缺项由 `GET /v1/system/deps` 返回（只读、每次重新探测），
+> `platform.auto_install` 自动装包；**不做**模块重载，理由见上一段）。修不了的缺项由 `GET /v1/system/deps` 返回（只读、每次重新探测），
 > 客户端据此在顶部显示横幅——逐条给出"缺了什么、怎么补"，运维补齐后横幅自动消失。
 > 启动期只探测、不阻断：LVM 或 LIO 不可用时仅打 WARN 日志（虚拟磁盘功能降级），
 > 服务端仍可正常启动——避免"工具链缺失导致整个服务不可用"。
@@ -1643,11 +1665,22 @@ delete   lvremove <vg>/<lv>                       ← 必须先下线；thin LV 
 > **发布前必须先激活**：`linuxbackend` 在 `EnsureTarget` / `EnsureVirtualDisk` / `AttachLun` 前统一调用 `Activate`，
 > 否则 LIO 的 backstore 会指向一个未激活的 dm 节点而失败。
 
+> **量测同样必须在激活态下做**：`thin_ls` 要先从 `dmsetup table` 取 thin id，`Fingerprint` 要读
+> `/dev/mapper` 节点，未激活的 LV 两者都拿不到，只能退化成 `lvs data_percent` 估算
+> （数值偏大，且会被调用方当作实测占用落库）。因此 `linuxlvm.PhysicalSize` / `Fingerprint`
+> 在量测前若发现设备未激活，会临时 `lvchange -ay -K`、量完立即 `-an` 还原
+> （`activateForMeasure`），不改调用方既有的激活顺序。
+
 **配额统计（对照 §5.11 / ⑬）**
 
 - ❌ **不能**把 `lvs -o data_percent` 相加：thin 池内多个 LV 共享块，重复计数会虚高。
 - ✅ 用 **`thin_ls`** 读取每个 thin LV 的 `MAPPED_BLOCKS` 得到**真实物理占用**。
 - 因此"库配额 / 用户占用"的统一口径是**物理占用**，与 Windows 侧按 VHDX 文件大小记账的语义对齐。
+- 记账口径（`store.accountedUsageSQL`，唯一真源是 `disks` 表）：`physical_bytes > 0` → 按实测物理占用；
+  `creating` / `deleting`（尚未建好）→ 退回逻辑大小预留，防并发分配超卖；
+  `ready` / `published` → **按实测值记账，实测 0 就是 0**。
+  差异盘刚派生时独占块本来就是 0（所有块都与母盘共享），这不是"没测到"：若把这份 0 当成
+  "尚未采样"而退回标称容量，而库容量恰好等于那块盘的容量，新建的库一上线就"已用 100%"（真实反馈）。
 
 **dm-cache（缓存加速）**
 
@@ -1675,6 +1708,7 @@ POST /v1/system/lvm/initialize      # 幂等初始化：建 VG → 建 thin pool
 GET  /v1/system/pools               # 多池目录：全部池 + 卷组 + 默认池（创建存储时"选择或新建"，见 §5.15.8）
 POST /v1/system/pools               # 新建一个池（与 lvm/initialize 同一动作，但响应返回**刚建的那个池**）
 POST /v1/system/pools/estimate      # 新建卷组前估算可建池容量（见 §5.15.8"容量口径"）
+POST /v1/system/pools/delete        # 删除一个池（可连带删卷组并把物理卷清回可选，见 §5.15.8）
 ```
 
 以上**仅超级管理员**可访问；Windows 后端整体返回 `501 platform.unsupported`（`GET /v1/system/pools`
@@ -1860,6 +1894,38 @@ POST /v1/system/pools/estimate
 `POST /v1/storages` 的 `pool_ref?` 指定落到哪个池（留空 = 后端默认池）；
 `POST /v1/system/pools` 的响应是**刚建好的那个池**（含 `key`），前端拿它作为后续建存储的 `pool_ref`。
 
+**存储池管理（删除）**：管理端「存储」页的「存储池管理」面板列出 `GET /v1/system/pools` 的池
+（含各池上的存储数、剩余容量），并提供新建（复用 `POST /v1/system/pools`）与删除：
+
+```
+POST /v1/system/pools/delete
+  body: {vg, thin_pool?, remove_volume_group?, release_devices?}
+        thin_pool 留空 = 只删卷组（此时 remove_volume_group 必须为 true，否则 400 invalid_param）
+        release_devices 仅当 remove_volume_group=true 生效（pvremove 把盘清回"可入卷组"）
+  200:  {vg, thin_pool?, removed_volume_group, released_devices[]?, steps[]}
+        steps 与「释放设备」同形状（lvremove / vgremove / pvremove / udevadm）
+```
+
+> 删池是**不可逆**的破坏性操作（池里的 thin 卷正是各存储的底层卷、母盘与差异盘），
+> 因此服务端**先验后做**，任一条不满足都在执行任何 LVM 命令**之前**拒绝：
+>
+> | 拦截条件 | 错误码 | reason / 参数 |
+> | --- | --- | --- |
+> | 平台无此能力（Windows） | `501 platform.unsupported` | 前端据此隐藏入口 |
+> | 是后端默认池（`platform.lvm.vg/thin_pool`） | `409 platform.pool_protected` | `reason=default_pool` |
+> | 卷组的物理卷上挂着根/引导/swap | `409 platform.pool_protected` | `reason=system_vg`，带 `mounts` |
+> | 池里还有 thin 卷（含绕过数据库直接建的） | `409 platform.pool_in_use` | `reason=thin_volumes`，带 `count` / `names` |
+> | 卷组里还有别的逻辑卷 | `409 platform.pool_in_use` | `reason=volume_group`，带 `names` |
+> | 数据库里该池上还挂着存储 | `409 platform.pool_in_use` | `reason=storages`，带 `count` |
+> | 池/卷组不存在 | `404 platform.pool_not_found` | 带 `vg` / `thin_pool` |
+>
+> "哪个存储会被这次删除带走"的判据（`volumeOnPool`）分两种记录：有 `pool_ref` 的直接比池键
+> （**不**顺带用卷引用反解卷组，否则同 VG 里另一个池上的存储会把本次删除误挡下来——
+> 用户按提示去删又发现不在这个池上）；`pool_ref` 为空的旧记录只能靠 `ref` 反解卷组，
+> 卷组相同即拦下（它可能正住在这个池里）。`thin_pool` 留空（删卷组）时，该卷组**任何**池上的存储都要拦。
+>
+> `names` 最多点 3 个卷名（`a, b, c 等 5 个`），让用户知道"还剩什么"而不必自己去敲 LVM 命令。
+
 **前端形态**：创建存储是**独立页面** `/admin/storages/new`（`StorageCreateForm`），不再是弹窗——
 内联建池要带块设备表格与卷组水位，弹窗既装不下也看不清；页面内的顺序为
 **选/建池 → 设定存储**，保存成功后 `replace` 跳回 `/admin/storages`。
@@ -1964,7 +2030,7 @@ POST /v1/system/block-devices/release   body: { path: "/dev/sdb" }
 | 加密 | `crypto/aes` GCM |
 | PowerShell 调用 | `os/exec` + 模板化脚本 + JSON 输出（Windows） |
 | LVM 调用 | `os/exec` 调 `lvm2` 工具链（`lvcreate/lvconvert/lvs/vgs/thin_ls/lsblk`），**argv 传参、无 shell**（Linux） |
-| LIO 调用 | 直接读写 `/sys/kernel/config/target/`（configfs），**无 targetcli、无守护进程**（Linux） |
+| LIO 调用 | **写**：`os/exec` 调 `targetcli`（argv 直传、无 shell）下发到 configfs；**读/复验**：直读 `/sys/kernel/config/target/`（configfs）。**无自研守护进程**（Linux） |
 | 前端资源 | `embed.FS` 内嵌，单端口提供 |
 
 ### 6.2 目录结构
@@ -2174,6 +2240,11 @@ POST   /v1/system/lvm/initialize         幂等初始化：建 VG → 建 thin p
                                          body: {vg?, thin_pool?, hdd_devices[], chunk_size?,
                                                 metadata_size?, cache_devices[], cache_chunk_size?,
                                                 cache_policy?, cache_mode?}
+POST   /v1/system/pools/delete           删除池（可连带删卷组；先验后做，见 §5.15.8）
+                                         body: {vg, thin_pool?, remove_volume_group?, release_devices?}
+                                         → {vg, thin_pool?, removed_volume_group, released_devices[]?, steps[]}
+                                         错误码：platform.pool_protected(409) / pool_in_use(409) /
+                                                 pool_not_found(404) / unsupported(501)
 ```
 
 > 池**不存在不是错误**：`GET /v1/system/lvm` 返回 `exists: false`，由前端引导执行一次初始化。
@@ -2378,17 +2449,22 @@ Vault-Agent (Go)
 ```
 启动序列：
   1. 读本地配置 + 从服务端拉取用户配置（见 design.md 服务端-本地用户-4）
-  2. 全局 auto_mount 打开时：恢复状态文件里本机上次留下的挂载记录
+  2. **先等服务端确认连上**再挂载（restoreMountsWhenConnected）：拿到会话（setSession）只表示
+     客户端把令牌交给了代理，不代表服务端可达（地址不通 / 服务端没起来 / 证书没被信任时
+     SystemInfo 就失败）。连接由 SystemInfo 成功、事件流建立或心跳成功三者之一确认
+     （Connected=true）；最多等 60s，等不到就整轮跳过 —— 下一次会话建立（含自动重连）会重来。
+     等待期间会话被换掉（切服务端 / 重新登录）也跳过：那是另一次会话的活
+  3. 全局 auto_mount 打开时：恢复状态文件里本机上次留下的挂载记录
      （服务端没有"本机应挂载哪些分配"的清单接口，只能按本地记录恢复）
-  3. 每库独立的 repo_mounts[<repo_id>].auto_mount：
+  4. 每库独立的 repo_mounts[<repo_id>].auto_mount：
      - =true  → 即使本机没有记录（甚至还没有分配）也要挂上
                 （先 GET /v1/repos/{id}/allocations 找我在该库里的可用分配，
                   没有则 POST /v1/repos/{id}/allocations 建一个，再挂载）
      - =false → 连记录都不恢复（用户明确关掉了这个库的自动挂载）
-  4. 每次挂载：POST /allocations/{id}/mount → 连会话 → 挂载 → 执行 post_script；
+  5. 每次挂载：POST /allocations/{id}/mount → 连会话 → 挂载 → 执行 post_script；
      失败保留一条 error 记录（下次启动仍会重试），不阻塞其它库
-  5. 并发限制：同时最多 2 个挂载任务（避免网络/磁盘争抢）
-  6. 上面 2/3 都要让开"本次运行被用户手动卸载过"的库（内存黑名单，见下）
+  6. 并发限制：同时最多 2 个挂载任务（避免网络/磁盘争抢）
+  7. 上面 3/4 都要让开"本次运行被用户手动卸载过"的库（内存黑名单，见下）
   开机启动：注册 HKCU\...\Run 或计划任务（后者可提权，推荐）
   ```
 
@@ -2399,7 +2475,8 @@ Vault-Agent (Go)
   > **手动卸载压过自动挂载（本次运行内）**：卸载成功会连本地挂载记录一起删掉，于是
   > `auto_mount=true` 的库在配置眼里又变回"从来没挂过"，而"会话就绪"这件事并不只发生在启动
   > ——客户端推会话、证书免密登录、令牌定时续期都会走 `setSession → onSessionEstablished →
-  > restoreMounts`，所以用户在界面点了"卸载"后，快则几秒就会被自动挂回来，看起来像"卸载没用"。
+  > restoreMountsWhenConnected`（连上后）→ `restoreMounts`，所以用户在界面点了"卸载"后，
+  > 快则几秒就会被自动挂回来，看起来像"卸载没用"。
   > 因此卸载成功后把该库记进内存黑名单（`agent.manualUnmounts`），本次运行内不再自动挂载它：
   >
   > - 只挡**自动**挂载，用户手动点"挂载"照常可用；
@@ -2525,7 +2602,7 @@ Vault-Server sign verify -dir .\release -pub .\keys\update-public.txt
 
 | 项 | 现状 | 原因 |
 | --- | --- | --- |
-| 多服务端更新源回退（§7.4.1） | 仅用当前会话的服务端；失败即 `server_unreachable` | 代理只持有单会话，缺候选列表（依赖前端推送或新增 `GET /agent/servers`） |
+| 多服务端更新源回退（§7.4.1） | 代理已为每台各持一份会话（见 docs/agent-api.md），但更新源仍**只取主服务端**，失败即 `server_unreachable`，不自动回退到其他台 | 回退要连带处理"签名同一发布方、版本单调性、镜像可达性"三重校验，且主服务端离线时的候选选择需产品先定（当前仅保留主服务端语义，避免静默换源） |
 | Authenticode 强制校验 | `Get-AuthenticodeSignature` 已接入，失败仅 WARN | 无代码签名证书时会挡死所有更新；完整性已由 Ed25519 + SHA256 保证 |
 | Electron 本体更新 | 由 `electron-updater` 负责；服务端已能镜像 `kind=client` 产物 | 按 §7.4 的分工 |
 | 代理侧审计落库 | 以 ERROR 级结构化日志（`action=self_update.verify` / `self_update.rollback`）留痕 | 审计表属服务端，代理无审计存储 |
@@ -3624,7 +3701,7 @@ design.md 新增的「多服务端」方向没问题，但原表述有 **3 处�
 | 12 | 多服务端 · 更新包签名 | **统一发布方签名**，客户端编译期内置公钥；服务端仅 mirror。见 3.4.4 |
 | 13 | 多服务端 · 分组与来源 | 分组数据位置不变；客户端**加来源标识**，**同名分组可聚合**。见 3.4.6 |
 | 14 | D1 服务端平台 | **Windows 与 Linux 并列共存**：同一代码库，`internal/platform` 双后端 + `buildPlatform` 分平台构建；上层零改动。见 2.4 / 5.14 |
-| 15 | Linux 侧 iSCSI 后端 | **LIO**（configfs 直控，零外部依赖、零 cgo）；不使用 targetcli / tgt / ietd |
+| 15 | Linux 侧 iSCSI 后端 | **LIO**（内核 configfs，零 cgo）；**写经 `targetcli` 下发、读与复验直读 configfs**；不使用 tgt / ietd |
 | 16 | Linux 侧虚拟磁盘 | **LVM thin 逻辑卷**；差异盘 = **thin 快照**（天然省空间） |
 | 17 | Linux 侧缓存加速 | **用 LVM 原生 dm-cache**，系统**只提供"块设备选择器 + 状态展示"**，**不自行实现任何缓存层** |
 | 18 | 缓存设备是否进配置 | **不进**：由 LVM 自身持久持有；配置只描述 VG / thin pool 与建池参数 |

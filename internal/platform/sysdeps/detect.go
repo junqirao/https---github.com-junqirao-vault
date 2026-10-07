@@ -3,10 +3,10 @@
 package sysdeps
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,6 +26,9 @@ const (
 
 	// defaultTimeout 单条外部命令（mount/modprobe）的超时。
 	defaultTimeout = 30 * time.Second
+	// probeCmdTimeout 只读探针命令的超时；targetcli version 正常是毫秒级，
+	// 卡住时必须很快放弃，不能让 /v1/system/deps 跟着一起卡。
+	probeCmdTimeout = 10 * time.Second
 	// defaultInstallTimeout 单次装包的超时（apt/dnf 首次装包可能很慢）。
 	defaultInstallTimeout = 5 * time.Minute
 )
@@ -62,6 +65,18 @@ var lvmTools = []toolSpec{
 	{exe: "dmsetup", pkg: "lvm2"},
 }
 
+// LIO iSCSI 目标的命令行工具：**必需**。
+//
+// targetcli（及其 rtslib）是本后端实际的执行体：建目标/ACL/LUN 映射、写 TPG 属性与
+// 只读属性，全部由它下发到 configfs。它**不是**可有可无的便利包装——缺了它 iSCSI 目标
+// 功能完全不可用，所以列为必需项，让 doctor 与前端横幅能提前把它报出来，
+// 而不是等业务路径上才失败。
+//
+// 包名跨发行版不同：Debian/Ubuntu 走 targetcli-fb（上游自由分支），RHEL/Fedora 走 targetcli。
+var lioTools = []toolSpec{
+	{exe: "targetcli", pkg: "targetcli-fb", pkgRPM: "targetcli"},
+}
+
 // 可选工具：只在特定场景用到（NTFS 卷、thin 元数据检查），缺失不影响主流程。
 var miscTools = []toolSpec{
 	{exe: "thin_ls", pkg: "thin-provisioning-tools", pkgRPM: "device-mapper-persistent-data"},
@@ -73,14 +88,13 @@ var miscTools = []toolSpec{
 }
 
 // probeAll 按固定顺序探测所有项。顺序有意义：修复时也按此顺序执行，
-// 保证"先挂 configfs、再加载模块、最后看 fabric 目录"。
+// 保证"先挂 configfs、再加载模块、最后看 LIO 执行体能不能跑通"。
 func probeAll(o Options) []Item {
 	return []Item{
 		probeRoot(o),
 		probeKernelModules(o),
 		probeConfigFSMount(o),
-		probeIscsiFabricDir(o),
-		probeBackstoreDir(o),
+		probeLioTools(o),
 		probeTools("lvm_tools", "LVM2 工具链", lvmTools, true),
 		probeFSTools(),
 		probeTools("misc_tools", "其它辅助工具", miscTools, false),
@@ -164,41 +178,134 @@ func probeConfigFSMount(o Options) Item {
 	return it
 }
 
-// probeIscsiFabricDir 检查 <root>/iscsi（iSCSI fabric）是否已注册。
+// configfsInstanceMismatch 判定"configfs 已挂载，但连 <configfs_root> 这个 LIO 子系统根都不存在"。
 //
-// 这一项是"模块在、fabric 目录不在"这类真实故障的判据：模块加载成功不等于
-// configfs 里注册成功（目录可能被清理脚本删掉过，或注册被回滚）。
-func probeIscsiFabricDir(o Options) Item {
-	dir := path.Join(o.ConfigFSRoot, "iscsi")
-	it := Item{Key: "lio_iscsi_fabric", Title: "iSCSI fabric 目录", Required: true, Status: StatusOK}
-	if isDir(dir) {
-		it.Detail = dir + " 存在"
+// 这一条能**直接定性**：target_core_mod 的 init 会向内核注册 target 子系统，注册成功才会
+// 出现 <configfs_root>（注册失败模块就加载不进来，modprobe 会报错）。因此
+// 「模块在 /proc/modules 里 + configfs 已挂载 + <configfs_root> 整个不存在」只有一个解释：
+// 本进程看到的 configfs 与内核注册 LIO 的那一份**不是同一个实例**——容器里自己 mount 的
+// 那份 configfs 是空的，宿主机那份才有 target。
+//
+// 这类故障重载模块永远修不好（注册一直是成功的，只是落在另一份实例上），反而会把宿主机
+// 正在对外服务的目标一并拆掉。因此它只作为 targetcli 跑不通时的**辅助判据**出现在 hint 里，
+// 不再作为任何一项的就绪条件，也没有任何自动修复动作。
+func configfsInstanceMismatch(o Options) bool {
+	if isDir(o.ConfigFSRoot) {
+		return false
+	}
+	_, fstype, ok := findMountFor(o.ConfigFSRoot)
+	return ok && fstype == "configfs"
+}
+
+// hintInstanceMismatch 给出"configfs 实例错位"的处置建议。
+//
+// 刻意把"重载模块没用"写进文案：现场最容易的误判就是按旧提示反复 modprobe -r / 重跑脚本，
+// 而那一步在宿主机正在服务 iSCSI 时是**破坏性**的（会拆掉正在被客户端使用的目标）。
+func hintInstanceMismatch(o Options) string {
+	mp := mountPointFor(o.ConfigFSRoot)
+	return "configfs 已挂载、target_core_mod 也已加载，但连 " + o.ConfigFSRoot +
+		" 都不存在——模块注册是成功的（否则该目录不会出现），所以这不是内核模块或 targetcli 的问题：" +
+		"本进程看到的 configfs 与内核注册 LIO 的那一份不是同一个实例（容器里自己 mount 的那份是空的，宿主机那份才有 target）。" +
+		"重载模块修不好这一点，且会拆掉宿主机正在服务的目标，请勿再试。" +
+		"处置：容器以 --privileged 运行并把宿主机的 " + mp + " bind 进容器（docker run -v " + mp + ":" + mp + ":rslave），" +
+		"或把服务端直接装在宿主机（裸机/虚拟机）上；非容器时确认只有一份 configfs 挂载（mount | grep configfs）"
+}
+
+// probeLioTools 检查 LIO iSCSI 目标的执行体：targetcli 既要在 PATH 里，也要能真正跑通。
+//
+// 判据刻意选"行为"，而不是"configfs 里的某个路径在不在"。
+// 曾经检查 <configfs_root>/iscsi 与 <configfs_root>/core/iblock_0 是否存在，结果是把正常机器
+// 当成缺项：这两个目录都是靶场外的内部细节——core/iblock_0 要等第一个 iblock backstore 建出来
+// 才由 rtslib 创建，内核注册时机也随版本不同——拿它们当就绪条件，横幅就会一直报红，
+// 而 targetcli 明明是好的。用户看到的"装了还是不可用"有一半来自这里。
+//
+// targetcli 启动时就会构造 RTSRoot() 读整棵 configfs 树，所以"它能跑通"已经覆盖了
+// 「configfs 挂上了 + rtslib 能读到 LIO 树」两件事——它才是这套栈的真正判据。
+func probeLioTools(o Options) Item {
+	it := Item{Key: "lio_tools", Title: "LIO 目标命令行（targetcli）", Required: true, Status: StatusOK}
+	exe, err := exec.LookPath("targetcli")
+	if err != nil {
+		it.Status = StatusMissing
+		it.Detail = "PATH 中没有 targetcli"
+		it.Hint = "安装 targetcli（Debian/Ubuntu: targetcli-fb，RHEL/Fedora/SUSE: targetcli）后重试"
 		return it
 	}
-	it.Status = StatusMissing
-	it.Detail = dir + " 不存在"
-	if readLoadedModules()["iscsi_target_mod"] {
-		it.Hint = "iscsi_target_mod 已加载但 fabric 未注册：modprobe -r iscsi_target_mod && modprobe iscsi_target_mod 可重新注册；" +
-			"若无效说明模块与当前内核不匹配"
-	} else {
-		it.Hint = "先挂载 configfs 并加载 iscsi_target_mod（modprobe iscsi_target_mod）"
+	out, err := probeCmd(o, exe, "version")
+	if err != nil {
+		it.Status = StatusMissing
+		it.Detail = "targetcli 存在但跑不通：" + textOrNone(lastMeaningfulLine(out))
+		if configfsInstanceMismatch(o) {
+			it.Hint = hintInstanceMismatch(o)
+		} else {
+			mp := filepath.Dir(o.ConfigFSRoot)
+			it.Hint = "确认 configfs 已挂载（mount -t configfs none " + mp + "），再按 targetcli 自己的报错修" +
+				"（rtslib 缺失、Python 环境损坏、权限不足等）；iSCSI 就绪与否只看它能不能跑通"
+		}
+		return it
 	}
+	it.Detail = "targetcli 可执行且能读到 configfs：" + textOrNone(meaningfulLine(out))
 	return it
 }
 
-// probeBackstoreDir 检查 <root>/core/iblock_0（块设备 backstore 插件）是否已注册。
-// 缺它时服务端能起来、也能建 iSCSI 目标，但每次建盘都会失败。
-func probeBackstoreDir(o Options) Item {
-	dir := path.Join(o.ConfigFSRoot, "core", "iblock_0")
-	it := Item{Key: "lio_backstore_plugin", Title: "块设备 backstore 插件", Required: true, Status: StatusOK}
-	if isDir(dir) {
-		it.Detail = dir + " 存在"
-		return it
+// meaningfulLine 从探针输出里挑一行**有信息量**的：跳过空行与 rtslib 的无害告警。
+//
+// 必须跳过的原因（现场实测）：targetcli 首次运行会往 stderr 打
+//
+//	Warning: Could not load preferences file /root/.targetcli/prefs.bin.
+//
+// 它与"能不能用"毫无关系，却排在版本号前面——直接取首行等于把这句噪声当成检测结果贴给用户，
+// 报告里那行 ok 看着像警告，反而让人以为 targetcli 有问题。
+func meaningfulLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(line); line == "" || probeNoise(line) {
+			continue
+		}
+		return line
 	}
-	it.Status = StatusMissing
-	it.Detail = dir + " 不存在"
-	it.Hint = "modprobe target_core_iblock；若模块已加载仍不出现，说明模块与当前内核不匹配（重载：modprobe -r target_core_iblock && modprobe target_core_iblock）"
-	return it
+	return ""
+}
+
+// lastMeaningfulLine 取**最后**一行有信息量的输出。
+//
+// 失败路径用它：Python 异常栈的结论（异常类与消息）在末尾，首行只有 "Traceback (most recent call last):"。
+func lastMeaningfulLine(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := strings.TrimSpace(lines[i]); line != "" && !probeNoise(line) {
+			return line
+		}
+	}
+	return ""
+}
+
+// probeNoise 判断输出行是否只是无害的告警（rtslib 的 prefs/deprecation 之类）。
+func probeNoise(line string) bool {
+	l := strings.ToLower(line)
+	return strings.HasPrefix(l, "warning:") || strings.HasPrefix(l, "warn:") ||
+		strings.HasPrefix(l, "deprecationwarning:")
+}
+
+// probeCmd 在超时约束下**静默**执行一条只读命令，返回合并输出（已 TrimSpace）。
+//
+// 与 repair.go 的 runCmd 刻意分开：探针是只读动作，不该产生"系统依赖修复命令失败/成功"
+// 这类修复语义的日志，也不该因为一次探测把日志刷红。
+func probeCmd(o Options, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeCmdTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	if err != nil {
+		o.Logger.Debug("依赖探针命令失败", "cmd", name, "args", args,
+			"error", err.Error(), "output", limitText(string(out)))
+	}
+	return strings.TrimSpace(string(out)), err
+}
+
+// textOrNone 让空输出在 Detail 里也读得懂。
+func textOrNone(s string) string {
+	if s == "" {
+		return "(无输出)"
+	}
+	return limitText(s)
 }
 
 // probeTools 检查一组外部命令是否都在 PATH 中。

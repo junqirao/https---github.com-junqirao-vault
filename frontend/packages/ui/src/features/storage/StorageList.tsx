@@ -13,6 +13,7 @@ import type { StorageDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
 import { formatBytes } from '../../utils/format'
+import { StoragePoolsPanel } from './StoragePoolsPanel'
 
 const BYTES_PER_GB = 1024 ** 3
 
@@ -54,9 +55,16 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
   const [pendingDelete, setPendingDelete] = useState<StorageDTO | null>(null)
   const [pendingUnmount, setPendingUnmount] = useState<StorageDTO | null>(null)
   const [resizeTarget, setResizeTarget] = useState<StorageDTO | null>(null)
+  // 「存储池管理」面板：受控弹窗而不是新路由——管理池是列表页的顺手操作，开路由会把列表状态丢掉。
+  const [poolsOpen, setPoolsOpen] = useState(false)
 
   const storagesQuery = useQuery({ queryKey: ['storages', 'list'], queryFn: () => api.listStorages() })
   const storages = storagesQuery.data?.items ?? []
+
+  // 能力探测：lvm=true（Linux）才有卷组/存储池这回事，否则连入口都不该出现。
+  // 与 StorageCreateForm 共用 ['system-info'] 缓存，不会多发一次请求。
+  const infoQuery = useQuery({ queryKey: ['system-info'], queryFn: () => api.systemInfo() })
+  const supportsVolumes = Boolean(infoQuery.data?.capabilities.lvm)
 
   const invalidate = (): void => {
     void queryClient.invalidateQueries({ queryKey: ['storages'] })
@@ -304,6 +312,9 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
       title={t('storage.title')}
       extra={
         <>
+          {supportsVolumes ? (
+            <Button onClick={() => setPoolsOpen(true)}>{t('storage.pools.manage')}</Button>
+          ) : null}
           <Button onClick={() => void storagesQuery.refetch()}>{t('common.refresh')}</Button>
           <Button type="primary" onClick={onCreate}>
             {t('storage.create')}
@@ -446,6 +457,8 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
         }}
         onCancel={() => setPendingDelete(null)}
       />
+
+      <StoragePoolsPanel open={poolsOpen} onClose={() => setPoolsOpen(false)} />
     </PageShell>
   )
 }

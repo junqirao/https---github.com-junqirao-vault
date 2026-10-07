@@ -103,12 +103,18 @@ func (m *Manager) ForceLogout(ctx context.Context, name, sessionID string) error
 	}
 
 	// 降级动作 1：停用 TPG。
-	if err := m.writeAttr(path.Join(m.tpgPath(iqn), "enable"), "0"); err != nil {
+	if err := m.setEnabled(ctx, iqn, false); err != nil {
 		m.logger.Warn("停用目标失败", "target", iqn, "error", err)
 	}
 	// 降级动作 2：拆除该 initiator 的 ACL（ACL 目录名统一为小写 IQN）。
+	//
+	// 失败只记 Warn、不返回错误：本方法已是**降级**语义（见上方说明），其主要效果是
+	// "阻止后续登录"，停用 TPG 已达成；ACL 拆除失败不应把整次调用判为失败。
 	if initiator != "" {
-		m.removeACL(iqn, strings.ToLower(initiator))
+		if err := m.removeACL(ctx, iqn, strings.ToLower(initiator)); err != nil {
+			m.logger.Warn("拆除 initiator ACL 失败",
+				"target", iqn, "initiator", initiator, "error", err)
+		}
 	}
 
 	m.logger.Warn("已执行 LIO 会话强制登出的**降级动作**：LIO 无服务端精确登出能力，"+

@@ -16,6 +16,11 @@ type UsageDrift struct {
 // diskStateErrorSQL 是"建盘终态失败"在 SQL 里的字面量。
 const diskStateErrorSQL = string(domain.DiskStateError)
 
+// diskStateUnbuiltSQL 是"盘还没建好 / 正在回收"在 SQL 里的状态字面量：
+// 这些盘子还不存在（或即将不存在），用量按逻辑大小预留。
+const diskStateUnbuiltSQL = `'` + string(domain.DiskStateCreating) + `', '` +
+	string(domain.DiskStateDeleting) + `'`
+
 // accountedUsageSQL 是"单个差异盘计入配额的量"的 SQL 表达式。
 //
 // 口径（唯一真源是 disks 表，见 RecomputeUsage / RecomputeRepoUsage）：
@@ -23,11 +28,17 @@ const diskStateErrorSQL = string(domain.DiskStateError)
 //  1. 有实测物理占用 → 用它，这才是"实际占了多少"；
 //  2. 建盘终态失败（state=error）且没测到占用 → 计 0。这份盘根本不存在，
 //     若按标称容量计费就是永久挂账（真实反馈："我一点空间都没用就占了 1G"）；
-//  3. 其余（creating / 尚未采样）→ 退回逻辑大小，与"分配时按逻辑预留"的口径一致。
-//     否则会在建盘完成前把用量算成 0，并发分配直接超卖。
+//  3. 尚未建好的盘（creating / deleting）→ 退回逻辑大小，与"分配时按逻辑预留"的口径一致。
+//     否则会在建盘完成前把用量算成 0，并发分配直接超卖；
+//  4. 已建好的盘（ready / published）→ 按实测值记账，**实测 0 就是 0**。
+//
+// 第 4 条是踩过坑的：thin 差异盘刚派生出来时独占块本来就是 0（所有块都与母盘共享），
+// 这不是"没测到"。早先靠 physical_bytes > 0 判"测没测到"，于是这份 0 被当成"尚未采样"
+// 退回标称容量，而库容量恰好等于那块盘的容量 —— 新建的库一上来就显示"已用 100%"。
 const accountedUsageSQL = `CASE WHEN d.physical_bytes > 0 THEN d.physical_bytes
 	       WHEN d.state = '` + diskStateErrorSQL + `' THEN 0
-	       ELSE d.size_bytes END`
+	       WHEN d.state IN (` + diskStateUnbuiltSQL + `) THEN d.size_bytes
+	       ELSE d.physical_bytes END`
 
 // repoUsageSQL 是"单个存储库已用量"的派生表达式（只有一个 ? ：存储库 ID）。
 const repoUsageSQL = `SELECT COALESCE(SUM(` + accountedUsageSQL + `), 0)

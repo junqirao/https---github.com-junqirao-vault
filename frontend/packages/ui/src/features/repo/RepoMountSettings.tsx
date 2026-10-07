@@ -46,7 +46,7 @@ export interface RepoMountSettingsState {
 export function useRepoMountSettings(repoId: string, repoName: string): RepoMountSettingsState {
   const agent = useAgent()
   const { t } = useI18n()
-  const { active } = useServerConfig()
+  const { servers, active } = useServerConfig()
   const config = agent.config
   const saved = config?.repo_mounts?.[repoId]
 
@@ -56,7 +56,9 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
   const effectiveAuto = saved ? saved.auto_mount : Boolean(config?.auto_mount)
 
   // 目录名里的"服务端名称"与代理侧同一口径：本地别名优先，其次服务端名称，最后 vault。
-  const serverAlias = (config?.server_alias ?? '').trim() || (active?.serverName ?? '').trim() || 'vault'
+  // 全局 server_alias 只在**本机只有一台**时作数：多台共用会让两台下的 `别名_库名` 撞成同一目录。
+  const serverAlias =
+    (servers.length <= 1 ? config?.server_alias : '')?.trim() || (active?.serverName ?? '').trim() || 'vault'
 
   const [mode, setMode] = useState<AgentMountMode>(effectiveMode)
   const [dir, setDir] = useState(effectiveDir)

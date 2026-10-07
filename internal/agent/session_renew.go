@@ -27,6 +27,9 @@ const (
 	//
 	// 服务端重启后令牌立即失效，心跳/事件流/挂载等多个调用会**同时**撞上 401；
 	// 没有这道闸门就会并发重登录 N 次。
+	//
+	// 闸门按服务端各算一份（见 refreshSessionTokenFor）：A 台的 401 风暴不该让 B 台的
+	// 重登录请求被拒。
 	authRetryMinInterval = 10 * time.Second
 )
 
@@ -40,35 +43,36 @@ func errCertRenewBlocked() error {
 	return apperr.New("agent.cert_unusable", http.StatusUnauthorized)
 }
 
-// refreshSessionToken 用本地客户端证书重新登录一次，返回新令牌。
+// refreshSessionTokenFor 用本地客户端证书为**指定服务端**重新登录一次，返回新令牌。
 //
 // 触发场景：服务端重启清空了内存会话表，此前签发的 Bearer 令牌全部失效（401）。
 // 此时证书登录的客户端应**自愈**——用本地证书重新换一个会话，而不是把用户踢回登录页。
 //
-// 并发与节流：
+// 并发与节流（逐台各一份，见 authRetryMinInterval）：
 //   - 单飞：并发调用共享同一次重登录（只发一个 cert-login 请求）；
 //   - 节流：两次重登录至少间隔 authRetryMinInterval，服务端持续 401 时不会被打爆；
-//   - 确定性错误（证书被吊销/过期等）走 handleRenewFailure 停止后续自动续期。
+//   - 确定性错误（证书被吊销/过期等）走 handleRenewFailure 停止该台的后续自动续期。
 //
-// 前置条件：本机必须装有**当前会话所属服务端**的客户端证书身份；否则直接返回"未安装身份"
+// 前置条件：本机必须装有**该台服务端**的客户端证书身份；否则直接返回"未安装身份"
 // （调用方回落为要求登录）。
-func (a *Agent) refreshSessionToken(ctx context.Context) (string, error) {
-	// 按服务端挑证书：多服务端下"活动身份"可能属于另一个服务端，用它去重登录必然失败。
-	authURL, authInstanceID := "", ""
-	if current, ok := a.store.Session(); ok {
-		authURL, authInstanceID = current.ServerURL, current.ServerInstanceID
+func (a *Agent) refreshSessionTokenFor(ctx context.Context, key string) (string, error) {
+	current, ok := a.store.Session(key)
+	if !ok {
+		return "", errNoSession()
 	}
+	// 按服务端挑证书：多服务端下"活动身份"可能属于另一个服务端，用它去重登录必然失败。
+	authURL, authInstanceID := current.ServerURL, current.ServerInstanceID
 	if _, ok := a.resolveIdentity(authInstanceID, authURL); !ok {
 		return "", errIdentityNotInstalled()
 	}
 
 	a.renewMu.Lock()
-	if a.renewBlocked {
+	if a.renewBlocked[key] {
 		a.renewMu.Unlock()
 		// 证书已被认定为不可用（吊销/过期/未登记）：重试无意义。
 		return "", errCertRenewBlocked()
 	}
-	if call := a.authRetryInFlight; call != nil {
+	if call := a.authRetryInFlight[key]; call != nil {
 		a.renewMu.Unlock()
 		select {
 		case <-call.done:
@@ -78,26 +82,26 @@ func (a *Agent) refreshSessionToken(ctx context.Context) (string, error) {
 		}
 	}
 	now := time.Now().UnixMilli()
-	if a.authRetryLastAt > 0 && now-a.authRetryLastAt < authRetryMinInterval.Milliseconds() {
+	if lastAt := a.authRetryLastAt[key]; lastAt > 0 && now-lastAt < authRetryMinInterval.Milliseconds() {
 		a.renewMu.Unlock()
 		return "", authRetryTooSoon()
 	}
-	a.authRetryLastAt = now
+	a.authRetryLastAt[key] = now
 	call := &authRetryCall{done: make(chan struct{})}
-	a.authRetryInFlight = call
+	a.authRetryInFlight[key] = call
 	a.renewMu.Unlock()
 
 	session, _, err := a.certLogin(ctx, authURL, authInstanceID)
 	if err != nil {
-		a.noteAuthRetryFailure(err)
+		a.noteAuthRetryFailure(key, err)
 		call.err = err
 	} else {
 		call.token = session.Token
-		a.applyRefreshedSession(session)
+		a.applyRefreshedSession(key, session)
 	}
 
 	a.renewMu.Lock()
-	a.authRetryInFlight = nil
+	delete(a.authRetryInFlight, key)
 	a.renewMu.Unlock()
 	close(call.done)
 	return call.token, call.err
@@ -114,9 +118,9 @@ type authRetryCall struct {
 //
 // 刻意**不**调用 setSession：那条路径会触发刷新服务端信息、重拉事件订阅与恢复挂载，
 // 而这里只是"换一个令牌"，环境都已就绪，重跑一遍只会带来无谓的抖动。
-func (a *Agent) applyRefreshedSession(session *Session) {
+func (a *Agent) applyRefreshedSession(key string, session *Session) {
 	// certLogin 的响应不含服务端展示字段：沿用现有会话的名称/实例 ID，避免被清空。
-	if prev, ok := a.store.Session(); ok {
+	if prev, ok := a.store.Session(key); ok {
 		if session.ServerName == "" {
 			session.ServerName = prev.ServerName
 		}
@@ -127,31 +131,33 @@ func (a *Agent) applyRefreshedSession(session *Session) {
 			session.CertSHA256 = prev.CertSHA256
 		}
 	}
-	a.store.SetSession(session)
-	a.store.SetUser(UserState{ID: session.UserID, Username: session.Username})
+	// 用写回后的键：同一台若因拿到实例 ID 而改键，后续的节流/阻断状态也要跟着它。
+	resolved := a.store.SetSession(key, session)
+	a.store.SetUser(resolved, UserState{ID: session.UserID, Username: session.Username})
 	a.renewMu.Lock()
-	a.renewBlocked = false
+	delete(a.renewBlocked, resolved)
 	a.renewMu.Unlock()
 	// 渲染进程据此更新自己持有的令牌（本机 127.0.0.1 本地接口）。
-	a.publishSessionEvent(session)
+	a.publishSessionEvent(resolved, session)
 	// 日志只出现服务端地址与用户名，绝不出现令牌。
 	a.logger.Info("服务端会话已失效（可能由服务端重启导致），已用本地证书自动重新登录",
-		"server_url", session.ServerURL, "username", session.Username, "new_expires_at", session.ExpiresAt)
+		"server", resolved, "server_url", session.ServerURL, "username", session.Username,
+		"new_expires_at", session.ExpiresAt)
 }
 
-// noteAuthRetryFailure 记录一次"401 触发的证书重登录"失败。
-func (a *Agent) noteAuthRetryFailure(err error) {
-	if sess, ok := a.store.Session(); ok {
-		a.handleRenewFailure(sess, err)
+// noteAuthRetryFailure 记录**某台**一次"401 触发的证书重登录"失败。
+func (a *Agent) noteAuthRetryFailure(key string, err error) {
+	if sess, ok := a.store.Session(key); ok {
+		a.handleRenewFailure(key, sess, err)
 		return
 	}
-	a.logger.Warn("用本地证书重新登录失败", "error", err)
+	a.logger.Warn("用本地证书重新登录失败", "server", key, "error", err)
 }
 
 // runSessionRenewalLoop 后台定期检查并续期客户端证书会话，直到上下文结束。
 //
 // 为什么由代理（而非渲染进程）做续期：代理进程常驻、界面关掉也能续，
-// 是"会话权威方"。仅在【已安装客户端证书身份】且【当前有会话】时才尝试。
+// 是"会话权威方"。仅在【已安装客户端证书身份】且【该台有会话】时才尝试。
 func (a *Agent) runSessionRenewalLoop(ctx context.Context) {
 	ticker := time.NewTicker(sessionRenewCheckInterval)
 	defer ticker.Stop()
@@ -165,25 +171,31 @@ func (a *Agent) runSessionRenewalLoop(ctx context.Context) {
 	}
 }
 
-// maybeRenewSession 判断是否需要续期，需要则用本地证书换取新会话并写回本地状态。
+// maybeRenewSession 逐台检查会话是否需要续期（多服务端各自独立判断）。
+func (a *Agent) maybeRenewSession(ctx context.Context) {
+	for key, session := range a.store.Sessions() {
+		a.renewSessionIfNeeded(ctx, key, session)
+	}
+}
+
+// renewSessionIfNeeded 判断**某台**服务端的会话是否需要续期，需要则用本地证书换取新会话并写回。
 //
 // 续期时机：剩余时间 < max(5min, 观测到的会话寿命 * 25%)；两次尝试之间至少间隔 5 分钟。
-// 失败绝不清除现有会话、绝不影响挂载：确定性错误停止自动续期并要求重新登录，其余退避重试。
-func (a *Agent) maybeRenewSession(ctx context.Context) {
-	session, ok := a.store.Session()
-	if !ok || strings.TrimSpace(session.ServerURL) == "" || session.ExpiresAt <= 0 {
+// 失败绝不清除现有会话、绝不影响挂载：确定性错误停止该台自动续期并要求重新登录，其余退避重试。
+func (a *Agent) renewSessionIfNeeded(ctx context.Context, key string, session *Session) {
+	if session == nil || strings.TrimSpace(session.ServerURL) == "" || session.ExpiresAt <= 0 {
 		return
 	}
-	// 只有**当前会话所属服务端**装了客户端证书身份才自动续期：
-	// 多服务端下"活动身份"可能属于另一个服务端，拿它去续期只会白失败一轮。
+	// 只有**该台服务端**装了客户端证书身份才自动续期：身份按服务端归属，
+	// 拿另一台的身份去续期只会白失败一轮。
 	if _, ok := a.resolveIdentity(session.ServerInstanceID, session.ServerURL); !ok {
 		return
 	}
 
 	now := time.Now()
 	a.renewMu.Lock()
-	blocked := a.renewBlocked
-	lastAt := a.renewLastAt
+	blocked := a.renewBlocked[key]
+	lastAt := a.renewLastAt[key]
 	a.renewMu.Unlock()
 	if blocked {
 		return
@@ -207,7 +219,7 @@ func (a *Agent) maybeRenewSession(ctx context.Context) {
 
 	// 记录本次尝试时刻：既是"两次续期至少间隔 5 分钟"的闸门，也避免并发重复续期。
 	a.renewMu.Lock()
-	a.renewLastAt = now.UnixMilli()
+	a.renewLastAt[key] = now.UnixMilli()
 	a.renewMu.Unlock()
 
 	callCtx, cancel := context.WithTimeout(ctx, sessionProbeTimeout)
@@ -215,7 +227,7 @@ func (a *Agent) maybeRenewSession(ctx context.Context) {
 
 	renewed, _, err := a.certLogin(callCtx, session.ServerURL, session.ServerInstanceID)
 	if err != nil {
-		a.handleRenewFailure(session, err)
+		a.handleRenewFailure(key, session, err)
 		return
 	}
 	// 续期响应不含服务端展示字段：沿用当前会话的名称/实例 ID，避免写回时被清空。
@@ -227,32 +239,33 @@ func (a *Agent) maybeRenewSession(ctx context.Context) {
 	}
 
 	// 与 POST /agent/session 一致地写回本地会话状态（token / expires_at / user 全部刷新）。
-	a.setSession(renewed)
+	// 不置 primary：主服务端是客户端的显式选择，续期不该改变它。
+	a.setSession(key, renewed, false)
 	a.logger.Info("客户端证书会话已自动续期",
-		"server_url", renewed.ServerURL, "username", renewed.Username,
+		"server", key, "server_url", renewed.ServerURL, "username", renewed.Username,
 		"old_expires_at", session.ExpiresAt, "new_expires_at", renewed.ExpiresAt)
 	// 通知渲染进程更新它持有的令牌（本机 127.0.0.1 本地接口，与 /agent/state 同信任级别）。
-	a.publishSessionEvent(renewed)
+	a.publishSessionEvent(key, renewed)
 }
 
-// handleRenewFailure 分类处理续期失败。
+// handleRenewFailure 分类处理**某台**的续期失败。
 //
-//   - 确定性错误（证书被吊销/过期/未知、auth.forbidden 等）：停止自动续期并标记"需要重新登录"，
+//   - 确定性错误（证书被吊销/过期/未知、auth.forbidden 等）：停止该台自动续期并标记"需要重新登录"，
 //     绝不静默无限重试；
 //   - 其余（网络/服务端暂时不可用）：按既有最小间隔退避重试，不清会话、不影响挂载。
 //
 // 日志只出现 server_url / username / 错误码，绝不出现 token 原文。
-func (a *Agent) handleRenewFailure(session *Session, err error) {
+func (a *Agent) handleRenewFailure(key string, session *Session, err error) {
 	if isDeterministicRenewalFailure(err) {
 		a.renewMu.Lock()
-		a.renewBlocked = true
+		a.renewBlocked[key] = true
 		a.renewMu.Unlock()
-		a.logger.Warn("客户端证书会话续期失败，已停止自动续期（需要重新登录）",
-			"server_url", session.ServerURL, "username", session.Username, "error", err)
+		a.logger.Warn("客户端证书会话续期失败，已停止该服务端的自动续期（需要重新登录）",
+			"server", key, "server_url", session.ServerURL, "username", session.Username, "error", err)
 		return
 	}
 	a.logger.Warn("客户端证书会话续期失败，稍后重试",
-		"server_url", session.ServerURL, "username", session.Username, "error", err)
+		"server", key, "server_url", session.ServerURL, "username", session.Username, "error", err)
 }
 
 // isDeterministicRenewalFailure 判断续期失败是否属"证书类确定性错误"（重试无意义）。
@@ -269,9 +282,13 @@ func isDeterministicRenewalFailure(err error) bool {
 	return false
 }
 
-// publishSessionEvent 广播 session 事件（续期成功后调用），携带最新会话。
-func (a *Agent) publishSessionEvent(session *Session) {
-	a.hub.Publish(Event{Type: "session", Data: sessionView(session)})
+// publishSessionEvent 广播某台的 session 事件（续期成功后调用），携带最新会话与服务端键。
+func (a *Agent) publishSessionEvent(key string, session *Session) {
+	view := sessionView(session)
+	if view != nil {
+		view["server_key"] = key
+	}
+	a.hub.Publish(Event{Type: "session", Data: view})
 }
 
 // sessionView 是 GET /agent/state 的 session 字段与 session 事件的负载。

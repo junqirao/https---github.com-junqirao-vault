@@ -34,6 +34,15 @@ export type AgentMountPhase =
 export interface AgentMountState {
   repo_id: string
   repo_name: string
+  /**
+   * 这条挂载归属**哪台**服务端（与 ServerEntry.key 同算法：实例 ID 优先，其次规范化地址）。
+   *
+   * 多服务端下心跳、挂载点回写、租约释放都必须发给"当初受理这次挂载的那台"。
+   * 老状态文件里没有该字段的记录，代理加载时归给"当时唯一/主服务端"（因此可能缺省）。
+   */
+  server_key?: string
+  server_url?: string
+  server_name?: string
   allocation_id: string
   lease_id: string
   target_iqn: string
@@ -99,9 +108,20 @@ export interface DownloadState {
 export type AgentServerPhase = 'connecting' | 'connected' | 'disconnected'
 
 export interface AgentServerState {
+  /**
+   * 该台的本地键（实例 ID 优先，其次规范化地址）：与前端 ServerEntry.key 同算法。
+   *
+   * 状态、挂载、事件三者的归属键 —— 一条 `server` 事件只更新它那一台。
+   * 旧版代理不带该字段。
+   */
+  server_key?: string
+  /** 是否为主服务端（自更新 / 渲染层热更的更新源；无服务端上下文的操作默认用它）。 */
+  primary?: boolean
   url: string
   instance_id?: string
   name?: string
+  /** 本机给该台起的别名（目录模式的挂载点命名 `<别名>_<库名>` 优先用它），可空。 */
+  alias?: string
   connected: boolean
   /**
    * 连接阶段：`connecting` 表示正在连接/重连（界面显示转圈的"连接中"，而不是"未连接"）；
@@ -113,6 +133,10 @@ export interface AgentServerState {
   /** 连续连接失败次数；达到上限后代理停止自动重连（手动重试会清零）。 */
   fail_count?: number
   last_error?: string
+  /** 仅 /agent/state 的 servers[] 逐台附带：该台的登录用户。 */
+  user?: AgentUserState
+  /** 仅 /agent/state 的 servers[] 逐台附带：该台的会话（未推送会话时缺省）。 */
+  session?: AgentSessionState
 }
 
 export interface AgentUserState {
@@ -141,6 +165,13 @@ export interface AgentUpdateState {
  * 因此会返回 token：渲染进程据此在代理自动续期后更新自己持有的令牌。
  */
 export interface AgentSessionState {
+  /**
+   * 该会话归属的服务端键（与 ServerEntry.key 同算法）。
+   *
+   * 宿主应用据此把续期后的新令牌写回**对应那一台**的服务端条目，而不是活动服务端。
+   * 旧版代理不带该字段（等价于"唯一的那台"）。
+   */
+  server_key?: string
   server_url: string
   token: string
   expires_at: number
@@ -185,6 +216,17 @@ export interface AgentLog {
 
 /** GET /agent/state。 */
 export interface AgentState {
+  /**
+   * 全部已登记服务端（多服务端：逐台完整状态，含该台的登录用户与会话）。
+   *
+   * 客户端启动时为每一项各推一次会话即完成"全部自动登录"（见 ServerSession.server_key）。
+   */
+  servers: AgentServerState[]
+  /** 主服务端的 server_key（更新源等无服务端上下文操作的目标）。 */
+  primary_key?: string
+  /**
+   * 主服务端那一台（单服务端时代的**兼容字段**；多服务端下界面应改用 servers[] 逐台渲染）。
+   */
   server: AgentServerState
   user: AgentUserState
   mounts: AgentMountState[]
@@ -192,7 +234,7 @@ export interface AgentState {
   /** 本机就绪状态（iSCSI 发起端）；代理尚未探测完时字段可能缺省。 */
   host?: AgentHostState
   update: AgentUpdateState
-  /** 当前会话；未登录（未推送会话）时缺省。 */
+  /** 主服务端会话；未登录（未推送会话）时缺省。 */
   session?: AgentSessionState
 }
 
@@ -204,10 +246,15 @@ export interface AgentHealth {
   admin: boolean
   /** 本机就绪状态（同 AgentState.host）。 */
   host?: AgentHostState
+  /** 全部已登记服务端（逐台一份，主服务端在前）；旧版代理不带该字段。 */
+  servers?: AgentServerState[]
+  /** 主服务端的 server_key；旧版代理不带该字段。 */
+  primary_key?: string
   /** 仅在调用方传入 expected_version 查询参数时返回。 */
   expected_version?: string
   /** 代理版本与调用方期望是否不一致（仅在传入 expected_version 时返回）。 */
   version_mismatch?: boolean
+  /** 主服务端那一台（兼容字段）。 */
   server: {
     connected: boolean
     url: string
@@ -314,6 +361,16 @@ export interface AgentIdentityLoginResponse {
 
 /** POST /agent/session 的请求体（会话令牌只在传输中使用，不进入日志）。 */
 export interface ServerSession {
+  /**
+   * 指明这段会话属于**哪一台**服务端（与 ServerEntry.key 同算法：实例 ID 优先，其次规范化地址）。
+   *
+   * 省略时由代理按 server_instance_id / server_url 推导；响应回传实际归属键。
+   */
+  server_key?: string
+  /** 把该台设为主服务端（更新源等无服务端上下文操作的目标）；首台注册时自动成为主服务端。 */
+  primary?: boolean
+  /** 客户端为**本机**给该台起的别名；目录模式挂载点命名 `<别名>_<库名>` 优先用它。 */
+  alias?: string
   server_url: string
   server_instance_id: string
   server_name: string
@@ -441,18 +498,41 @@ export interface StartUploadInput {
   storage_id?: string
   quota_bytes?: number
   source_mode: 'copy' | 'move'
+  /**
+   * 把库建到**哪台**服务端（二选一即可）。
+   *
+   * 存储 ID 只对"它所属的那台服务端"有意义：给了标识却匹配不上任何已登记服务端会得到
+   * `agent.server_unknown`；都省略时按主服务端兜底（老客户端）。
+   */
+  server_key?: string
+  server_url?: string
 }
 
 /** 事件流（GET /agent/events）解析结果。 */
 export type AgentEvent =
   | { type: 'mount'; mount: AgentMountState }
   | { type: 'unmount'; allocation_id: string }
-  | { type: 'revoked'; allocation_id: string; reason?: string }
-  | { type: 'server'; connected: boolean; phase?: AgentServerPhase; fail_count?: number; last_error?: string }
+  /** server_key 标识这条挂载归属哪台（旧版代理不带）。 */
+  | { type: 'revoked'; allocation_id: string; reason?: string; server_key?: string }
+  /**
+   * 一条 server 事件只更新**它那一台**（server_key 为归属键，旧版代理不带）。
+   *
+   * 不带 server_key 时按"主服务端那一台"处理，兼容单服务端语义。
+   */
+  | {
+      type: 'server'
+      server_key?: string
+      url?: string
+      name?: string
+      connected: boolean
+      phase?: AgentServerPhase
+      fail_count?: number
+      last_error?: string
+    }
   | { type: 'host'; host: AgentHostState }
   | { type: 'session'; session: AgentSessionState }
   | { type: 'update'; available_version?: string; downloading: boolean; received_bytes: number; total_bytes: number }
   | { type: 'web_update'; web_update: WebUpdateState }
   | { type: 'download'; download: DownloadState }
   | { type: 'upload'; upload: UploadState }
-  | { type: 'heartbeat'; at: number }
+  | { type: 'heartbeat'; at: number; allocation_id?: string; server_key?: string }

@@ -258,6 +258,12 @@ const (
 	// 池化存储库（见 RepoMeta.Pool）不用 JobDeleteDisk：把盘删掉池子就少一格，
 	// 下一次分配又要现建（用户重新回到"挂载要等很久"）。
 	JobResetDiff JobType = "reset_diff"
+	// JobInstallDeps 按需安装系统依赖包（管理端"安装"按钮触发，见 app.InstallSysDeps）。
+	//
+	// 与其他任务的区别：它**不碰业务数据**，只调发行版包管理器装包（Linux 专有；
+	// Windows 侧没有这类"进程外依赖"，提交时直接返回 platform.unsupported）。
+	// RefID 与 Payload 都带依赖项 Key（如 lio_tools）——RefID 便于按引用检索，Payload 供 handler 读取。
+	JobInstallDeps JobType = "install_deps"
 )
 
 // JobState 任务状态。

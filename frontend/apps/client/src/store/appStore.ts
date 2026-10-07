@@ -29,6 +29,13 @@ export interface AppState extends PersistedConfig {
   updateActiveServer: (patch: Partial<ServerEntry>) => void
   /** 用代理自动续期得到的新令牌更新活动服务端会话（仅更新令牌与过期时间）。 */
   updateActiveToken: (token: string, expiresAt: number) => void
+  /**
+   * 用代理自动续期得到的新令牌更新**指定**服务端会话（仅更新令牌与过期时间）。
+   *
+   * 代理会为**每一台**各自续期并广播带 server_key 的 session 事件：不按键写回的话，
+   * 续期后的令牌会被记到活动服务端名下（另一台仍是旧令牌，下一个请求就 401）。
+   */
+  updateServerToken: (key: string, token: string, expiresAt: number) => void
 }
 
 const persistence = createPersistence()
@@ -47,8 +54,13 @@ function isServerEntry(value: unknown): value is ServerEntry {
   return typeof entry.key === 'string' && typeof entry.baseUrl === 'string'
 }
 
-/** 规范化地址（用于"是否同一服务端"的比较）：去空白、去尾部斜杠、主机名大小写不敏感。 */
-function normalizeUrl(url: string): string {
+/**
+ * 规范化地址（用于"是否同一服务端"的比较）：去空白、去尾部斜杠、主机名大小写不敏感。
+ *
+ * 导出给界面用：多服务端下要拿代理回传的 `server_key` / `session.server_url` 去对上本地条目，
+ * 而同一台的两种键（地址 / 实例 ID）在代理内会被合并，只按 key 比会漏。
+ */
+export function normalizeUrl(url: string): string {
   return url.trim().replace(/\/+$/, '').toLowerCase()
 }
 
@@ -182,6 +194,14 @@ export const useAppStore = create<AppState>()((set, get) => {
       if (!activeKey) return
       const servers = get().servers.map((item) =>
         item.key === activeKey ? { ...item, token, tokenExpiresAt: expiresAt } : item
+      )
+      update({ servers })
+    },
+
+    updateServerToken: (key, token, expiresAt) => {
+      if (!key) return
+      const servers = get().servers.map((item) =>
+        item.key === key ? { ...item, token, tokenExpiresAt: expiresAt } : item
       )
       update({ servers })
     }

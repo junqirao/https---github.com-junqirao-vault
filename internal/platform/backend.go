@@ -549,6 +549,47 @@ type DeviceReleaser interface {
 	ReleaseDevice(ctx context.Context, path string) (*DeviceReleaseReport, error)
 }
 
+// PoolDeleteOptions 是删除存储池时的可选动作。
+type PoolDeleteOptions struct {
+	// RemoveVolumeGroup 连卷组一起删除（卷组里还有别的逻辑卷时拒绝，见 PoolInUse）。
+	//
+	// 为什么和删池分开：池可以单独删（卷组留着以后建新池），而删卷组会把承载它的物理卷
+	// 全部放回可选状态，是更强的动作，必须由用户显式勾选。
+	RemoveVolumeGroup bool
+	// ReleaseDevices 删掉卷组后把它的物理卷标签清掉（pvremove），让磁盘回到"可再次选作卷组设备"。
+	//
+	// 只清 LVM 标签、不抹文件系统签名：再深的清理属于"释放设备"（DeviceReleaser）的职责，
+	// 那里有逐步骤回报，用户能看清做了什么。
+	ReleaseDevices bool
+}
+
+// PoolDeleteReport 是一次"删除存储池"的结果。
+type PoolDeleteReport struct {
+	// VG / ThinPool 被删除的卷组与池（ThinPool 为空表示只删了卷组）。
+	VG       string
+	ThinPool string
+	// RemovedVolumeGroup true 表示卷组也一并删掉了。
+	RemovedVolumeGroup bool
+	// ReleasedDevices 被清回可用状态的设备全路径（未要求释放时为空）。
+	ReleasedDevices []string
+	// Steps 逐步执行结果（删除池 / 删卷组 / 清各物理卷），便于前端逐步展示与排障。
+	Steps []DeviceReleaseStep
+}
+
+// PoolAdmin 是"存储池运维管理（删除池/卷组）"的可选能力（目前仅 Linux 实现）。
+//
+// 为什么是可选能力而不是并入 StorageAdmin：Windows 后端没有 LVM，也没有"池"这个概念，
+// 为它实现一个永远返回 unsupported 的方法没有意义；app 层用类型断言探测，
+// 未实现时返回 platform.unsupported，前端据此隐藏"存储池管理"入口。
+//
+// ⚠️ 破坏性：删池会把池里的所有 thin 卷一起带走——那正是存储的底层卷、母盘与差异盘。
+// 因此实现必须"先验后做"：池里还有卷、卷组还有别的卷、是默认池、PV 上挂着系统挂载点，
+// 一律拒绝（PoolInUse / PoolProtected），绝不为了"删得掉"而强删。
+type PoolAdmin interface {
+	// DeletePool 删除一个存储池；thinPool 为空表示只处理卷组（此时必须 RemoveVolumeGroup）。
+	DeletePool(ctx context.Context, vg, thinPool string, opts PoolDeleteOptions) (*PoolDeleteReport, error)
+}
+
 // PooledDiskBackend 是"按存储池创建虚拟磁盘"的可选能力（目前仅 Linux 实现）。
 //
 // 为什么要它：默认的 DiskRef 只能推导出"后端配置的那个池"的引用。

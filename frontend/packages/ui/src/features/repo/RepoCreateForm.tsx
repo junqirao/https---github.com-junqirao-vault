@@ -12,6 +12,7 @@ import { ApiError } from '../../api/errors'
 import { useApi } from '../../api/provider'
 import type { CreateRepoRequest, RepoDTO, RepoMode, StorageDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
+import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n, type I18nApi } from '../../i18n'
 import { CAPACITY_UNIT, capacityNormalize, capacityValueProps, formatBytes } from '../../utils/format'
 import { fontSize, palette, spacing } from '../../tokens/palette'
@@ -53,6 +54,8 @@ export function RepoCreateForm({
 }: RepoCreateFormProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
+  // 新建的库留在**当前活动**服务端上：本地目录上传必须带上归属台。
+  const { active } = useServerConfig()
   const queryClient = useQueryClient()
   const [form] = Form.useForm<RepoFormValues>()
   // 独享库没有差异盘（整块盘直接给用户），服务端会把共享数量静默归零：
@@ -159,7 +162,10 @@ export function RepoCreateForm({
         repo_mode: values.mode,
         storage_id: values.storage_id || undefined,
         // 不传 quota_bytes：库没有"配额"，建库只需要**容量**（容量即它占用的配额）。
-        source_mode: 'copy'
+        source_mode: 'copy',
+        // 存储 ID 只对**它所属的那台**服务端有意义：多服务端下必须说清建到哪台。
+        server_key: active?.key,
+        server_url: active?.baseUrl
       })
       return
     }
@@ -279,7 +285,8 @@ export function RepoCreateForm({
                 <Form.Item
                   name="size_bytes"
                   label={t('field.size')}
-                  extra={t('repo.create.capacityHint')}
+                  // 不需要这个提示了
+                  // extra={t('repo.create.capacityHint')}
                   getValueProps={capacityValueProps}
                   normalize={capacityNormalize}
                 >

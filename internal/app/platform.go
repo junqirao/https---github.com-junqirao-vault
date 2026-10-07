@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"vault/internal/apperr"
+	"vault/internal/domain"
 	"vault/internal/platform"
 )
 
@@ -163,6 +164,135 @@ func (s *PoolService) ReleaseBlockDevice(ctx context.Context, path string) (*pla
 		return nil, unsupportedAsApperr(err)
 	}
 	return rep, nil
+}
+
+// DeletePoolInput 是"删除存储池"的入参（管理端"存储池管理"面板）。
+type DeletePoolInput struct {
+	// VG 卷组名；ThinPool 留空表示只删卷组（此时 RemoveVolumeGroup 必须为 true）。
+	VG       string
+	ThinPool string
+	// RemoveVolumeGroup 连卷组一起删除（卷组里还有别的逻辑卷时被拒）。
+	RemoveVolumeGroup bool
+	// ReleaseDevices 删掉卷组后把物理卷标签清回"可选"状态，磁盘可再次被选作卷组设备。
+	ReleaseDevices bool
+}
+
+// DeletePool 删除一个存储池（可选连带删除卷组），是"存储池管理"面板唯一的写操作。
+//
+// ⚠️ 破坏性：池里的 thin 卷就是各存储的底层卷、母盘与差异盘。三道防线缺一不可：
+//
+//  1. 能力探测：只有实现了 platform.PoolAdmin 的平台（Linux）能删，其余返回 platform.unsupported，
+//     前端据此不显示入口（Windows 没有"池"这个概念）；
+//  2. 默认池：先按配置拦下（platform.lvm.vg/thin_pool）——它是所有建库/建存储的落脚点，
+//     删掉服务随即不可用；"这是默认池，要删先改配置"比"删完才发现"好懂得多；
+//  3. 数据库引用：该池上还挂着存储（storage_volumes.pool_ref，或卷所在的 VG 就是它）时拒绝，
+//     并带上"还剩几个"。平台层的"池里还有 thin 卷"是最后一道——它连绕过数据库直接建的卷也能挡住。
+func (s *PoolService) DeletePool(ctx context.Context, in DeletePoolInput) (*platform.PoolDeleteReport, error) {
+	if s.Platform == nil {
+		return nil, apperr.PlatformUnsupported()
+	}
+	admin, ok := s.Platform.(platform.PoolAdmin)
+	if !ok {
+		return nil, apperr.PlatformUnsupported()
+	}
+	vg, pool := strings.TrimSpace(in.VG), strings.TrimSpace(in.ThinPool)
+	if vg == "" {
+		return nil, apperr.InvalidParam("vg")
+	}
+	if pool == "" && !in.RemoveVolumeGroup {
+		// 只有卷组名、又不让删卷组：没有可执行的动作，拒绝比"静默成功"诚实。
+		return nil, apperr.InvalidParam("thin_pool")
+	}
+	if def, ok := s.Platform.(interface {
+		DefaultPool() (string, string)
+	}); ok {
+		if dvg, dpool := def.DefaultPool(); dvg == vg && (pool == "" || pool == dpool) {
+			return nil, apperr.PoolProtected("default_pool").
+				WithArg("vg", vg).WithArg("thin_pool", pool)
+		}
+	}
+	if err := s.assertPoolUnreferenced(ctx, vg, pool); err != nil {
+		return nil, err
+	}
+	rep, err := admin.DeletePool(ctx, vg, pool, platform.PoolDeleteOptions{
+		RemoveVolumeGroup: in.RemoveVolumeGroup,
+		ReleaseDevices:    in.ReleaseDevices,
+	})
+	if err != nil {
+		return nil, unsupportedAsApperr(err)
+	}
+	return rep, nil
+}
+
+// assertPoolUnreferenced 拒绝"池上还有存储"的删除。
+//
+// 为什么在应用层再查一遍库，而不是只信平台层的"池里还有 thin 卷"：
+// 平台层只能报出"还剩 N 个卷（名字是 UUID 串）"，而用户真正能操作的对象是**存储**；
+// 先查库才能给出"该池上还有 2 个存储，请先删掉它们"这种可行动的提示。
+// 磁盘不必单独查：盘都住在存储目录下，池里还有盘时平台层的 thin 卷判定会兜住。
+// 判据本身见 volumeOnPool（"哪个卷会被这次删除带走"是这里唯一的难点）。
+func (s *PoolService) assertPoolUnreferenced(ctx context.Context, vg, thinPool string) error {
+	if s.Store == nil {
+		return nil
+	}
+	vols, err := s.Store.ListStorageVolumes(ctx)
+	if err != nil {
+		return err
+	}
+	count := 0
+	for _, v := range vols {
+		if volumeOnPool(v, vg, thinPool) {
+			count++
+		}
+	}
+	if count > 0 {
+		return apperr.PoolInUse("storages").WithArg("count", count).WithArg("vg", vg)
+	}
+	return nil
+}
+
+// volumeOnPool 判断一个存储的底层卷会不会被"删除 vg/thinPool"一起带走。
+//
+// 判据按记录的新旧分两种，混用会两头出错：
+//
+//   - 有 PoolRef（多池之后登记的）：直接比对池键。**不能**顺带用卷引用反解卷组——
+//     同一卷组里另一个池上的存储会被误算成"在目标池上"，于是"删 pool2"被 pool1 的存储挡住，
+//     用户按提示去删又删不掉（错法本身自相矛盾）；
+//   - PoolRef 为空（多池之前登记的，未知落在哪个池）：只能靠卷引用反解卷组。
+//     此时卷组相同就拦下：它可能就住在这个池里，而"删掉还在用的存储"是不可逆的。
+//
+// thinPool 为空表示只删卷组：卷组里任何池上的存储都会被一起带走。
+func volumeOnPool(v domain.StorageVolume, vg, thinPool string) bool {
+	if ref := strings.TrimSpace(v.PoolRef); ref != "" {
+		pvg, ppool, err := platform.SplitPoolKey(ref)
+		if err != nil {
+			// 库里的池键坏了，无从判断它落在哪：宁可拦下（多拦一次可解释，误删不可逆）。
+			return true
+		}
+		if pvg != vg {
+			return false
+		}
+		return thinPool == "" || ppool == thinPool
+	}
+	return vgOfDeviceRef(v.Ref) == vg
+}
+
+// vgOfDeviceRef 从 /dev/mapper/<vg>-<lv> 反解卷组名；不是这种形态时返回空串。
+//
+// VG/LV 名被 linuxlvm.lvNameRe 限制在 [A-Za-z0-9_+.]，不含 '-'，因此第一个 '-' 就是分隔符。
+// （真实 LVM 会把名字里的 '-' 转义成 '--'，那种名字本系统不会创建；真遇到时这里解不出来，
+// 由平台层的 thin 卷判定兜底，绝不会因为"解不出来"就误删。）
+func vgOfDeviceRef(ref string) string {
+	const prefix = "/dev/mapper/"
+	ref = strings.TrimSpace(ref)
+	if !strings.HasPrefix(ref, prefix) {
+		return ""
+	}
+	name := ref[len(prefix):]
+	if i := strings.IndexByte(name, '-'); i > 0 {
+		return name[:i]
+	}
+	return ""
 }
 
 // InitializePool 幂等地初始化存储池（含可选的缓存设备），返回初始化后的现状。

@@ -1,10 +1,97 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+// TestWaitServerConnected 锁定"服务端连上之前不执行自动挂载"的等待语义。
+//
+// 真实反馈："自动挂载要连接到服务器之后才会执行，否则会报错"。拿到会话 ≠ 连得上
+// （SystemInfo 还没成功、事件流还没建立），此时挂载只会留下一串失败记录。
+func TestWaitServerConnected(t *testing.T) {
+	t.Run("已连接时零延迟就绪", func(t *testing.T) {
+		a := newServerConnectTestAgent(t, nil)
+		key := seedTestServer(t, a, Session{ServerURL: "https://10.0.0.1:8443", Token: "t"})
+		a.store.SetServerConnected(key, true, "")
+
+		start := time.Now()
+		if !a.waitServerConnected(context.Background(), key) {
+			t.Fatal("已连接时应判定为就绪")
+		}
+		if elapsed := time.Since(start); elapsed > autoMountWaitInterval {
+			t.Fatalf("已连接时不该再等待，实际耗时 %v", elapsed)
+		}
+	})
+
+	t.Run("等待期间连上则就绪", func(t *testing.T) {
+		a := newServerConnectTestAgent(t, nil)
+		key := seedTestServer(t, a, Session{ServerURL: "https://10.0.0.1:8443", Token: "t"})
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		go func() {
+			time.Sleep(autoMountWaitInterval / 2)
+			a.store.SetServerConnected(key, true, "")
+		}()
+
+		if !a.waitServerConnected(ctx, key) {
+			t.Fatal("等待期间服务端连上后应判定为就绪")
+		}
+	})
+
+	t.Run("始终连不上则超时未就绪", func(t *testing.T) {
+		a := newServerConnectTestAgent(t, nil)
+		key := seedTestServer(t, a, Session{ServerURL: "https://10.0.0.1:8443", Token: "t"})
+		ctx, cancel := context.WithTimeout(context.Background(), autoMountWaitInterval*2)
+		defer cancel()
+
+		if a.waitServerConnected(ctx, key) {
+			t.Fatal("从未连上时不应判定为就绪（否则又会在没连上时去挂载）")
+		}
+	})
+}
+
+// TestSameSessionDuringWait 锁定"等待期间会话被换掉就不再动手"：同一台重新登录 / 退出登录
+// 都属于会话已更换，旧任务的自动挂载不该插一脚。
+//
+// 多服务端下"另一台推来会话"**不算**更换：本台没变，等待任务该照常继续 —— 这是本次改造的
+// 关键点之一，早先"全局只有一个会话"的判定会把别人的登录当成自己的会话被换掉。
+func TestSameSessionDuringWait(t *testing.T) {
+	a := newServerConnectTestAgent(t, nil)
+	key := a.store.SetSession("", &Session{ServerURL: "https://10.0.0.1:8443", Token: "t1"})
+	want, ok := a.store.Session(key)
+	if !ok {
+		t.Fatal("推送会话后应能读回")
+	}
+	if !sameSession(a.store, key, want) {
+		t.Fatal("未被更换的会话应判定为同一个")
+	}
+
+	// 另一台服务端推来会话：本台会话未变，等待任务应继续。
+	other := a.store.SetSession("", &Session{ServerURL: "https://10.0.0.2:8443", Token: "t9"})
+	if other == key || other == "" {
+		t.Fatalf("另一台服务端应各自一把键，实际 %q vs %q", other, key)
+	}
+	if !sameSession(a.store, key, want) {
+		t.Fatal("另一台推来会话不该让本台的等待任务失效")
+	}
+
+	// 同一台服务端重新登录：地址没变但令牌换了，同样是"会话已更换"。
+	a.store.SetSession(key, &Session{ServerURL: "https://10.0.0.1:8443", Token: "t2"})
+	if sameSession(a.store, key, want) {
+		t.Fatal("换了令牌的会话不该被判定为同一个")
+	}
+
+	// 退出登录后会话被清除：更不该继续挂着。
+	a.store.ClearSession(key)
+	if sameSession(a.store, key, want) {
+		t.Fatal("会话被清除后不该判定为同一个")
+	}
+}
 
 // TestRecordedMountRequestPrefPolicy 锁定"本地记录 + 每库配置"的处置规则：
 //

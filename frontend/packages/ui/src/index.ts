@@ -115,7 +115,9 @@ export { MyRepos, type MyReposProps } from './features/repo/MyRepos'
 export { RepoList, type RepoListProps } from './features/repo/RepoList'
 export { RepoCreateForm, type RepoCreateFormProps } from './features/repo/RepoCreateForm'
 export {
+  ServerDirBrowser,
   SourceDirPicker,
+  type ServerDirBrowserProps,
   type SourceDirKind,
   type SourceDirPickerProps,
   type SourceDirValue

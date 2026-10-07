@@ -71,6 +71,8 @@ const (
 	CodeTokenInvalid = "agent.token_invalid"
 	// CodeNoSession 尚未推送服务端会话（409）。
 	CodeNoSession = "agent.no_session"
+	// CodeServerUnknown 请求里指明的服务端没有登记（404）——多服务端下客户端传错了键/地址。
+	CodeServerUnknown = "agent.server_unknown"
 	// CodeAdminRequired 代理未以管理员权限运行（403）。
 	CodeAdminRequired = "agent.admin_required"
 	// CodeMountFailed 挂载失败（500，args.stage 指明阶段）。
@@ -129,6 +131,11 @@ func errTokenInvalid() *apperr.Error { return apperr.New(CodeTokenInvalid, http.
 
 // errNoSession 尚未推送服务端会话。
 func errNoSession() *apperr.Error { return apperr.New(CodeNoSession, http.StatusConflict) }
+
+// errServerUnknown 请求里指明的服务端没有登记（既不是键、也不是实例 ID 或地址）。
+func errServerUnknown() *apperr.Error {
+	return apperr.New(CodeServerUnknown, http.StatusNotFound)
+}
 
 // errAdminRequired 代理未以管理员权限运行。
 func errAdminRequired() *apperr.Error { return apperr.New(CodeAdminRequired, http.StatusForbidden) }

@@ -179,7 +179,8 @@ platform:
     watermark_percent: 90
 
   iscsi:
-    # 后端实现名。Linux 目前只支持 lio（直接读写 configfs，无需 targetcli/Python）。
+    # 后端实现名。Linux 目前只支持 lio。
+    # 下发走 targetcli（iSCSI 目标的执行体，需已安装），读与复验直读 configfs。
     backend: "lio"
     # LIO 在 configfs 中的挂载点（仅 Linux）。
     configfs_root: "/sys/kernel/config/target"

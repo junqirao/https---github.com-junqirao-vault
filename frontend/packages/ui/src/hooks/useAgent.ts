@@ -35,6 +35,14 @@ export interface AgentMountInput {
   /** 可选：随挂载状态落库用于展示与脚本变量注入（挂载参数本身由服务端下发）。 */
   repo_id?: string
   repo_name?: string
+  /**
+   * 归属服务端（多服务端下二选一必填）：省略时按"本机既有记录 → 主服务端"兜底。
+   *
+   * 分配 ID 只对"它所属的那台服务端"有意义，给错台会 404 agent.server_unknown。
+   */
+  server_key?: string
+  server_url?: string
+  server_name?: string
 }
 
 /** 卸载入参。没有 force：代理侧只剩一种卸载语义（一次尽力清理干净）。 */
@@ -65,7 +73,7 @@ export interface UseAgentResult {
    * 代理会清零自动重连的失败计数并立即重试一次：成功后自动重连循环重新获得
    * maxServerConnectAttempts 次机会（对应"手动重试会刷新计数"）。
    */
-  reconnectServer: () => Promise<AgentServerState>
+  reconnectServer: (serverKey?: string) => Promise<AgentServerState>
   refresh: () => Promise<void>
   /** 拉取一次下载任务列表（用于页面挂载时恢复进行中/历史状态）。 */
   refreshDownloads: () => Promise<void>
@@ -181,8 +189,23 @@ async function probe(): Promise<void> {
       uploads = []
     }
     setSnapshot({ available: true, health, state, config, webUpdate, uploads, error: null })
-    // 代理侧已有会话（含自动续期后的最新令牌）：同步给宿主应用。
-    if (state?.session) publishSession(state.session)
+    // 代理侧已有会话（含自动续期后的最新令牌）：**逐台**同步给宿主应用 ——
+    // 快照里的 session 只有主服务端那一份，多服务端下必须遍历 servers[] 才能都拿到。
+    //
+    // 嵌套会话不带自己的 server_key（父条目就是归属，见 docs/agent-api.md 的 AgentServerState），
+    // 这里补上：宿主应用靠它把令牌写回**对应那一台**，缺了就会全部落到活动服务端名下。
+    const sessions: AgentSessionState[] = []
+    for (const item of state?.servers ?? []) {
+      if (!item.session) continue
+      const key = item.session.server_key ?? item.server_key
+      sessions.push(key ? { ...item.session, server_key: key } : item.session)
+    }
+    if (sessions.length > 0) {
+      for (const session of sessions) publishSession(session)
+    } else if (state?.session) {
+      // 旧版代理不带 servers[]：退回单服务端的兼容字段。
+      publishSession(state.session)
+    }
   } catch (error) {
     if (isAgentUnavailableError(error)) {
       // 代理不在运行，其内存态下载/上传任务与热更状态一并消失，清空避免展示陈旧进度。
@@ -272,6 +295,65 @@ function mountName(allocationId: string): string {
   return found?.repo_name || allocationId
 }
 
+/**
+ * 主服务端的 server_key（缺失时回退到兼容字段，再回退到数组首项——代理保证主服务端在前）。
+ *
+ * 用于把不带 server_key 的事件（旧版代理）归到正确的那一台。
+ */
+function primaryServerKey(state: AgentState | null): string | undefined {
+  if (!state) return undefined
+  return state.primary_key ?? state.server?.server_key ?? state.servers?.[0]?.server_key
+}
+
+/** 解析一条事件归属的服务端键；事件不带键时归给主服务端（旧版代理语义）。 */
+function resolveEventServerKey(state: AgentState | null, eventKey?: string): string | undefined {
+  if (eventKey) return eventKey
+  return primaryServerKey(state)
+}
+
+/**
+ * 这条归属键是否就是"主服务端那一台"（兼容字段 `server` 只反映它）。
+ *
+ * 键不可解析时返回 true：那就是旧版代理 / 单服务端的情形，兼容字段是界面的唯一来源，
+ * 不更新它顶栏就会冻在初始值上。
+ */
+function isPrimaryServerKey(state: AgentState | null, key: string | undefined): boolean {
+  if (key === undefined) return true
+  return key === primaryServerKey(state)
+}
+
+/**
+ * 把一条 server 事件**只**应用到它那一台（旧版代理不带 server_key 时归给主服务端）。
+ *
+ * 为什么必须逐台：两台服务端各发各的 server 事件，一律写 compat `server` 会让它们互相覆盖
+ * —— 界面于是在两台之间来回闪。
+ */
+function applyServerEvent(current: AgentState, event: Extract<AgentEvent, { type: 'server' }>): AgentState {
+  const key = resolveEventServerKey(current, event.server_key)
+  const previous = (current.servers ?? []).find((item) => item.server_key === key) ?? current.server
+  const next: AgentServerState = {
+    ...previous,
+    connected: event.connected,
+    // 旧版代理不带这两个字段：缺省时保留原值，别把"连接中"抹成未知状态。
+    phase: event.phase ?? previous.phase,
+    fail_count: event.fail_count ?? previous.fail_count,
+    last_error: event.last_error
+  }
+  const servers = (current.servers ?? []).map((item) => (item.server_key === key ? next : item))
+  // 兼容字段 server 一律指主服务端：只有这条事件属于主服务端时才更新它。
+  const isPrimary = isPrimaryServerKey(current, key)
+  const server = isPrimary
+    ? {
+        ...current.server,
+        connected: next.connected,
+        phase: next.phase,
+        fail_count: next.fail_count,
+        last_error: next.last_error
+      }
+    : current.server
+  return { ...current, servers, server }
+}
+
 function applyEvent(event: AgentEvent): void {
   const current = snapshot.state
   switch (event.type) {
@@ -333,33 +415,30 @@ function applyEvent(event: AgentEvent): void {
       return
     }
     case 'server': {
-      if (current) {
-        setSnapshot({
-          state: {
-            ...current,
-            server: {
-              ...current.server,
-              connected: event.connected,
-              // 旧版代理不带这两个字段：缺省时保留原值，别把"连接中"抹成未知状态。
-              phase: event.phase ?? current.server.phase,
-              fail_count: event.fail_count ?? current.server.fail_count,
-              last_error: event.last_error
-            }
-          }
-        })
-      }
+      const key = resolveEventServerKey(current, event.server_key)
       // 只在"连接状态真的翻转"时提示：phase 变化（connecting → disconnected）本身不是
       // 用户事件，每次都弹提示会把顶栏的自动重连刷成一串通知。还没有快照时按"未连接"看待
       // （于是只会在"连上"时提示，不会为一条 connecting → disconnected 弹"已断开"）。
-      const wasConnected = current?.server.connected ?? false
+      const wasConnected =
+        ((current?.servers ?? []).find((item) => item.server_key === key) ?? current?.server)?.connected ?? false
+      if (current) setSnapshot({ state: applyServerEvent(current, event) })
       if (wasConnected !== event.connected) {
         notify(event.connected ? t('agent.event.serverConnected') : t('agent.event.serverDisconnected'))
       }
       return
     }
     case 'session': {
-      // 代理侧自动续期成功：更新快照中的会话并通知宿主应用切换令牌。
-      if (current) setSnapshot({ state: { ...current, session: event.session } })
+      // 代理侧自动续期成功：按 server_key 更新**对应那一台**的会话并通知宿主应用切换令牌。
+      if (current) {
+        const key = resolveEventServerKey(current, event.session.server_key)
+        const isPrimary = isPrimaryServerKey(current, key)
+        const servers = (current.servers ?? []).map((item) =>
+          item.server_key === key ? { ...item, session: event.session } : item
+        )
+        setSnapshot({
+          state: { ...current, servers, session: isPrimary ? event.session : current.session }
+        })
+      }
       publishSession(event.session)
       return
     }
@@ -575,13 +654,21 @@ export function useAgent(): UseAgentResult {
     [refresh]
   )
 
-  const reconnectServer = useCallback(async (): Promise<AgentServerState> => {
+  const reconnectServer = useCallback(async (serverKey?: string): Promise<AgentServerState> => {
     try {
       // 代理已把失败计数清零并把阶段置回 connecting，这里落一次快照让标签立刻变回"连接中"
-      // （不等下一次 GET /agent/state 轮询）。
-      const server = await agentApi.reconnectServer()
+      // （不等下一次 GET /agent/state 轮询）。多服务端下只更新**该台**那一份。
+      const server = await agentApi.reconnectServer(serverKey)
       const latest = snapshot.state
-      if (latest) setSnapshot({ state: { ...latest, server }, error: null })
+      if (latest) {
+        const key = server.server_key ?? serverKey ?? primaryServerKey(latest)
+        const servers = (latest.servers ?? []).map((item) => (item.server_key === key ? { ...item, ...server } : item))
+        const isPrimary = isPrimaryServerKey(latest, key)
+        setSnapshot({
+          state: { ...latest, servers, server: isPrimary ? { ...latest.server, ...server } : latest.server },
+          error: null
+        })
+      }
       return server
     } catch (error) {
       // 重试本身失败（证书过期、服务端不可达、代理正在退出…）：原因落到 agent.error，

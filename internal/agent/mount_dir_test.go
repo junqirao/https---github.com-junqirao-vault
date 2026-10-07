@@ -6,10 +6,14 @@ import (
 	"testing"
 )
 
-// newMountDirEngine 构造一个只带本地配置的引擎：目录解析是纯计算，不碰 iSCSI。
+// newMountDirEngine 构造一个只带本地配置与空状态存储的引擎：目录解析是纯计算，不碰 iSCSI。
+//
+// 状态存储是必须的：目录名里的服务端那段来自"这台服务端在本机的别名"（见 serverAlias），
+// 而别名按 server_key 记在状态里 —— 没有存储就无从判断"本机只有一台服务端"。
 func newMountDirEngine(t *testing.T, cfgJSON string) *mountEngine {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "agent-config.json")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agent-config.json")
 	if cfgJSON != "" {
 		if err := os.WriteFile(path, []byte(cfgJSON), 0o600); err != nil {
 			t.Fatalf("准备配置失败：%v", err)
@@ -19,7 +23,11 @@ func newMountDirEngine(t *testing.T, cfgJSON string) *mountEngine {
 	if err != nil {
 		t.Fatalf("加载配置失败：%v", err)
 	}
-	a := &Agent{logger: testLogger(), cfg: store}
+	state, err := NewStateStore(filepath.Join(dir, "state.json"), testLogger())
+	if err != nil {
+		t.Fatalf("构造状态存储失败：%v", err)
+	}
+	a := &Agent{logger: testLogger(), cfg: store, store: state}
 	a.engine = &mountEngine{a: a}
 	return a.engine
 }
@@ -31,9 +39,13 @@ func TestResolveMountDirAddsServerRepoLevel(t *testing.T) {
 	cases := []struct {
 		name string
 		cfg  string
-		req  MountRequest
-		spec *MountSpec
-		want string
+		// sessions 是要预先登记的服务端（多服务端下别名按台记在状态里）。
+		sessions []Session
+		req      MountRequest
+		spec     *MountSpec
+		// serverKey 是本次挂载归属的服务端键（空串 = 未指定/单服务端）。
+		serverKey string
+		want      string
 	}{
 		{
 			name: "对话框/每库配置填绝对目录 → 作为父目录再加一层",
@@ -73,11 +85,39 @@ func TestResolveMountDirAddsServerRepoLevel(t *testing.T) {
 			spec: &MountSpec{ServerName: "vault-server"},
 			want: `D:\Vault\my-nas_game-x`,
 		},
+		{
+			// 多服务端下"本机别名"是**每台**一个：全局那个名字已经不足以标识是哪一台，
+			// 继续沿用会让两台服务端的不同库挤进同一个命名空间（同名目录）。
+			name: "多服务端下不再用全局别名 → 用该台的服务端名称",
+			cfg:  `{"server_alias":"my-nas","repo_mounts":{"repo-a":{"mount_mode":"directory","mount_dir":"D:\\Vault"}}}`,
+			sessions: []Session{
+				{ServerURL: "https://10.0.0.1:8443", Token: "t1"},
+				{ServerURL: "https://10.0.0.2:8443", Token: "t2"},
+			},
+			req:       MountRequest{RepoID: "repo-a", RepoName: "game-x"},
+			spec:      &MountSpec{ServerName: "vault-server"},
+			serverKey: serverKeyOf("", "https://10.0.0.1:8443"),
+			want:      `D:\Vault\vault-server_game-x`,
+		},
+		{
+			name: "该台自带别名 → 优先于全局别名与服务端名称",
+			cfg:  `{"server_alias":"my-nas","repo_mounts":{"repo-a":{"mount_mode":"directory","mount_dir":"D:\\Vault"}}}`,
+			sessions: []Session{
+				{ServerURL: "https://10.0.0.1:8443", Token: "t1", Alias: "nas-1"},
+			},
+			req:       MountRequest{RepoID: "repo-a", RepoName: "game-x"},
+			spec:      &MountSpec{ServerName: "vault-server"},
+			serverKey: serverKeyOf("", "https://10.0.0.1:8443"),
+			want:      `D:\Vault\nas-1_game-x`,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			e := newMountDirEngine(t, c.cfg)
-			got, err := e.resolveMountDir(c.req, c.spec)
+			for _, sess := range c.sessions {
+				e.a.store.SetSession("", &sess)
+			}
+			got, err := e.resolveMountDir(c.req, c.spec, c.serverKey)
 			if err != nil {
 				t.Fatalf("解析挂载目录失败：%v", err)
 			}
@@ -96,13 +136,13 @@ func TestResolveMountDirIsIdempotentForRemount(t *testing.T) {
 	spec := &MountSpec{ServerName: "vault-server"}
 	req := MountRequest{RepoID: "repo-a", RepoName: "game-x", MountPath: `D:\Vault`}
 
-	first, err := e.resolveMountDir(req, spec)
+	first, err := e.resolveMountDir(req, spec, "")
 	if err != nil {
 		t.Fatalf("首次解析失败：%v", err)
 	}
 	// 把上次结果当作本次请求（remount 的真实做法）：必须原样返回。
 	req.MountPath = first
-	second, err := e.resolveMountDir(req, spec)
+	second, err := e.resolveMountDir(req, spec, "")
 	if err != nil {
 		t.Fatalf("重挂解析失败：%v", err)
 	}
@@ -112,7 +152,7 @@ func TestResolveMountDirIsIdempotentForRemount(t *testing.T) {
 
 	// Windows 文件系统不区分大小写：大小写不同也要认出"已经是最终挂载点"。
 	req.MountPath = `D:\vault\VAULT-SERVER_game-x`
-	third, err := e.resolveMountDir(req, spec)
+	third, err := e.resolveMountDir(req, spec, "")
 	if err != nil {
 		t.Fatalf("重挂解析失败：%v", err)
 	}
@@ -127,7 +167,7 @@ func TestResolveMountDirSanitizesLeaf(t *testing.T) {
 	e := newMountDirEngine(t, "")
 	got, err := e.resolveMountDir(MountRequest{
 		RepoID: "repo-a", RepoName: `..\..\evil`, MountPath: `D:\Vault`,
-	}, &MountSpec{ServerName: "srv/../x"})
+	}, &MountSpec{ServerName: "srv/../x"}, "")
 	if err != nil {
 		t.Fatalf("解析挂载目录失败：%v", err)
 	}

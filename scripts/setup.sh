@@ -36,9 +36,10 @@ set -u
 
 # ---- 与 internal/platform/sysdeps 保持一致的常量（改这里必须同步改 Go 侧）----
 MODULES="target_core_mod iscsi_target_mod target_core_iblock"
-# 卸载顺序与加载顺序相反：iscsi_target_mod / target_core_iblock 都依赖 target_core_mod，
-# 先卸被依赖方会失败（used by）。仅在"要重注册 configfs 组"时用（见 4.5 节）。
-MODULES_UNLOAD="target_core_iblock iscsi_target_mod target_core_mod"
+# 本脚本只做 modprobe（对已加载的模块是空操作），**不做** modprobe -r 重载：
+# 重载会拆掉正在给客户端服务的整棵目标配置，而它能修的"configfs 组不见了"并不是就绪判据
+# （见 4.5 节）。真需要重载时人工按逆序执行：
+#   modprobe -r iscsi_target_mod target_core_iblock && modprobe target_core_mod iscsi_target_mod target_core_iblock
 MODULES_LOAD_FILE=/etc/modules-load.d/vault-lio.conf
 MODULES_LOAD_HEADER='# 由 vault-server 生成：LIO（iSCSI target）所需内核模块，请勿删改本文件。'
 CONFIGFS_DIR=/sys/kernel/config
@@ -170,23 +171,27 @@ else
 fi
 
 # 包名映射（按族）。REQUIRED 缺失会让服务端功能不可用；OPTIONAL 只在特定场景用得到。
+#
+# targetcli 属 REQUIRED：它是 iSCSI 目标的**执行体**（写操作全部经它下发到 configfs），
+# 不是可有可无的便利包装，缺了它 iSCSI 目标功能完全不可用。
+# 包名跨发行版不同：Debian/Ubuntu 为 targetcli-fb，RHEL/Fedora/SUSE 为 targetcli。
 case "$PM_FAMILY" in
     apt)
-        PKG_REQUIRED='kmod lvm2 util-linux e2fsprogs parted'
+        PKG_REQUIRED='kmod lvm2 util-linux e2fsprogs parted targetcli-fb'
         PKG_OPTIONAL='xfsprogs thin-provisioning-tools ntfs-3g'
         PKG_EXTRA='mdadm nvme-cli smartmontools sg3-utils' ;;
     rpm)
         # thin 元数据工具：RHEL 系叫 device-mapper-persistent-data，SUSE 叫 thin-provisioning-tools。
         # 两个都列上，装不上的那个由"逐个重试"逻辑忽略。
-        PKG_REQUIRED='kmod lvm2 util-linux e2fsprogs parted'
+        PKG_REQUIRED='kmod lvm2 util-linux e2fsprogs parted targetcli'
         PKG_OPTIONAL='xfsprogs device-mapper-persistent-data thin-provisioning-tools ntfs-3g'
         PKG_EXTRA='mdadm nvme-cli smartmontools sg3_utils' ;;
     apk)
-        PKG_REQUIRED='kmod lvm2 util-linux e2fsprogs parted'
+        PKG_REQUIRED='kmod lvm2 util-linux e2fsprogs parted targetcli'
         PKG_OPTIONAL='xfsprogs thin-provisioning-tools ntfs-3g'
         PKG_EXTRA='mdadm nvme-cli smartmontools sg3-utils' ;;
     pacman)
-        PKG_REQUIRED='kmod lvm2 util-linux e2fsprogs parted'
+        PKG_REQUIRED='kmod lvm2 util-linux e2fsprogs parted targetcli'
         PKG_OPTIONAL='xfsprogs thin-provisioning-tools ntfs-3g'
         PKG_EXTRA='mdadm nvme-cli smartmontools sg3_utils' ;;
     *)
@@ -244,7 +249,7 @@ if [ "$PM_FAMILY" = apt ] && [ "$DO_INSTALL" = 1 ] && [ "$DO_UPDATE" = 1 ]; then
 fi
 
 if [ -n "$PKG_REQUIRED" ]; then
-    step "安装必需软件包（LVM2 / util-linux / kmod / 文件系统工具）"
+    step "安装必需软件包（targetcli / LVM2 / util-linux / kmod / 文件系统工具）"
     install_pkgs "必需" $PKG_REQUIRED || warn "有必需包未装上，见上面逐条警告"
 fi
 
@@ -344,24 +349,6 @@ modprobe_each() {
     return $rc
 }
 
-# 反向卸载（顺序见 MODULES_UNLOAD）。已经不在 /proc/modules 里的直接跳过：
-# modprobe -r 对未加载的模块会报 "not currently loaded" 并返回非 0，那是噪声不是故障。
-modprobe_rm_each() {
-    for m in "$@"; do
-        if [ "$DRY_RUN" = 0 ] && ! grep -q "^$m " /proc/modules 2>/dev/null; then
-            dim "$m 本就未加载，跳过"
-            continue
-        fi
-        if run_capture modprobe -r "$m"; then
-            dim "已卸载 $m"
-        else
-            warn "modprobe -r $m 失败：$OUT"
-            return 1
-        fi
-    done
-    return 0
-}
-
 MODPROBE_FAIL=''
 if [ "$DRY_RUN" = 1 ]; then
     modprobe_each $MODULES || true   # 预览：逐个打印将要执行的 modprobe，不判定失败
@@ -421,34 +408,75 @@ if [ "$DO_FSTAB" = 1 ]; then
 fi
 
 # ============================================================
-# 4.5) configfs 组校验：必要时重载 LIO 模块
+# 4.5) LIO 就绪验收：只看 targetcli 能不能跑通
 # ============================================================
-# 为什么必须有这一段：modprobe 对"已加载"的模块是**空操作**。如果模块上一次是在
-# configfs 还没挂、或换了挂载/命名空间的状态下加载的，就会出现
-#   /proc/modules 里有它  &&  /sys/kernel/config/target/iscsi 不存在
-# 这种自相矛盾的状态，用户看到的就是"装了还是不可用"。
-# 不重启的唯一补救是卸载再加载（重新注册 configfs 组）——与 sysdeps 自动修复同一思路。
-# 注意：这是 configfs 目录，不是磁盘文件，`whereis`/`find` 永远找不到。
-configfs_group_missing() {
-    [ -d "$CONFIGFS_TARGET/iscsi" ] && [ -d "$CONFIGFS_TARGET/core/iblock_0" ] || return 0
+# 判据是**行为**，不是"configfs 里某个目录在不在"。
+# 曾经检查 $CONFIGFS_TARGET/iscsi 与 $CONFIGFS_TARGET/core/iblock_0 是否存在，结果把正常机器
+# 判成缺项：这两个目录都是 rtslib 按需创建、内核注册时机也随版本不同的内部细节——
+# core/iblock_0 要等第一个 iblock backstore 建出来才出现——于是报告长期报红（用户看到的就是
+# "装了还是不可用"），而 targetcli 明明是好的。
+# targetcli 启动时就会读整棵 configfs 树，所以"它能跑通"已经覆盖了「configfs 挂上了 +
+# rtslib 能读到 LIO 树」这两件事，这才是 iSCSI 就绪与否的真正判据。
+TARGETCLI_MISSING=0
+TARGETCLI_PROBE_ERR=''
+# probe_line 从 $OUT 里挑一行有信息量的：跳过空行与 rtslib 的无害告警。
+# 必须跳过（实测）：targetcli 首次运行会往 stderr 打
+#   Warning: Could not load preferences file /root/.targetcli/prefs.bin.
+# 它与"能不能用"无关，却排在版本号前面——直接 head -n1 等于把这句噪声当成检测结果贴出来。
+# first：成功时取版本行；last：失败时取异常栈末尾（结论在最后一行）。
+probe_line() {
+    if [ "$1" = last ]; then
+        printf '%s\n' "$OUT" | grep -viE '^[[:space:]]*(warning|warn|deprecationwarning):' |
+            grep -v '^[[:space:]]*$' | tail -n1 || true
+    else
+        printf '%s\n' "$OUT" | grep -viE '^[[:space:]]*(warning|warn|deprecationwarning):' |
+            grep -v '^[[:space:]]*$' | head -n1 || true
+    fi
+}
+
+targetcli_probe() {
+    if ! command -v targetcli >/dev/null 2>&1; then
+        TARGETCLI_PROBE_ERR='PATH 中没有 targetcli'
+        return 1
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+        dim "[dry-run] targetcli version"
+        return 0
+    fi
+    if run_capture targetcli version; then
+        ok "targetcli 可用：$(probe_line first)"
+        return 0
+    fi
+    TARGETCLI_PROBE_ERR="$(probe_line last)"
+    [ -n "$TARGETCLI_PROBE_ERR" ] || TARGETCLI_PROBE_ERR='(targetcli 无输出，退出码非 0)'
     return 1
 }
 
-if configfs_group_missing; then
-    step "configfs 里没有 LIO 组，重载内核模块以重新注册"
-    # 卸载失败不致命也不意外：有正在使用的 target 时内核会拒绝卸载（in use），
-    # 那就只能停掉服务端/清理 target 后重试，或直接 reboot。
-    if ! modprobe_rm_each $MODULES_UNLOAD; then
-        dim "卸载未完全成功（模块 in use，或是内核内置的卸不掉）——仍尝试把模块补回去"
+if ! targetcli_probe; then
+    warn "targetcli 跑不通 —— iSCSI 能不能用只看它，与 configfs 里的具体目录无关"
+    dim "    targetcli 报错：$TARGETCLI_PROBE_ERR"
+    if configfs_instance_mismatch; then
+        dim "    连 $CONFIGFS_TARGET 整个不存在：本进程看到的 configfs 与内核注册 LIO 的那份不是同一个实例"
+        dim "    （容器里自己 mount 了一份空的）——见末尾「诊断」第 1 条"
     fi
-    # 无论卸载结果如何都要走加载：它会把"上一个坏状态"里丢掉的模块补齐（已加载的是空操作）。
-    modprobe_each $MODULES || true
-    if configfs_group_missing; then
-        warn "$CONFIGFS_TARGET 下仍没有 iscsi/core 组 —— 见末尾「诊断」（容器命名空间 / 精简内核）"
-    else
-        ok "已重新注册 configfs 组"
-    fi
+    TARGETCLI_MISSING=1
 fi
+
+# 说明：这里刻意**不再**做 modprobe -r 重载（旧版 4.5 会做）。它唯一的用途是让上面那两个
+# 目录重新出现，而那并不是判据；代价却是把正在给客户端服务的整棵目标配置一并拆掉。
+# 真需要重载时人工执行（会短暂中断在线目标）：
+#   modprobe -r iscsi_target_mod && modprobe iscsi_target_mod
+
+# configfs_instance_mismatch 只作**辅助判据**：configfs 已挂载、target_core_mod 已加载，
+# 但连 $CONFIGFS_TARGET 都没有。依据是 target_core_mod 的 init 必须注册 target 子系统，
+# 注册成功才会有该目录（注册失败模块根本加载不进来）——所以这组合指向"看到的不是同一份
+# configfs"（容器里自己 mount 了一份空的），而不是模块问题。它不再参与任何缺项判定。
+configfs_instance_mismatch() {
+    [ -d "$CONFIGFS_TARGET" ] && return 1
+    grep -qs " $CONFIGFS_DIR configfs " /proc/mounts || return 1
+    grep -q '^target_core_mod ' /proc/modules 2>/dev/null || return 1
+    return 0
+}
 
 # ============================================================
 # 5) 复检：与 sysdeps 的判据保持一致
@@ -489,6 +517,8 @@ opt_cmds() {
 req_cmds "LVM2 工具链" lvm lvcreate lvchange lvs dmsetup
 req_cmds "块设备/挂载工具" mount umount blkid lsblk wipefs
 req_cmds "内核模块工具" modprobe
+# targetcli：LIO iSCSI 目标的必需执行体（写操作经它下发）。缺它则 iSCSI 目标不可用。
+req_cmds "LIO 目标命令行（targetcli）" targetcli
 
 # 文件系统工具：ext4 与 xfs 任意一族齐全即可（与 sysdeps.probeFSTools 同判据）。
 if command -v mkfs.ext4 >/dev/null 2>&1 && command -v resize2fs >/dev/null 2>&1; then
@@ -504,25 +534,13 @@ fi
 opt_cmds "LVM 扩展命令" pvcreate vgcreate vgextend pvs vgs lvremove lvextend lvconvert pvremove
 opt_cmds "辅助工具" thin_ls thin_check fstrim ntfsfix ntfslabel
 
-# 缺项名刻意与 sysdeps 的 Item.Key 对齐，便于和 doctor -json 的报告对照。
-# 注意：这两个路径是 configfs **虚拟目录**，由内核模块在加载时注册出来，不是磁盘文件——
-# `whereis`/`find`/`ls /lib/modules` 都找不到它们，只能看 /sys/kernel/config/target/。
-check_dir() {
-    if [ -d "$1" ]; then
-        ok "$1"
-        return 0
-    fi
-    warn "$1 不存在（configfs 虚拟目录，不是磁盘文件）"
-    if grep -qs " $CONFIGFS_DIR configfs " /proc/mounts; then
-        dim "    configfs 已挂载，但内核没注册出这个组 → 模块加载/注册失败（见下方诊断）"
-    else
-        dim "    configfs 没有挂载在 $CONFIGFS_DIR → 先解决挂载"
-    fi
-    dim "    当前已加载的 LIO 模块：$(grep -E '^(target_core_mod|iscsi_target_mod|target_core_iblock) ' /proc/modules 2>/dev/null | cut -d' ' -f1 | tr '\n' ' ')"
-    MISSING_REQUIRED="$MISSING_REQUIRED $2"
-}
-check_dir "$CONFIGFS_TARGET/iscsi" lio_iscsi_fabric
-check_dir "$CONFIGFS_TARGET/core/iblock_0" lio_backstore_plugin
+# LIO 侧只看行为（4.5 节已实测），缺项名与 sysdeps 的 Item.Key 对齐，便于和 doctor -json 对照。
+# 刻意**不**再把 $CONFIGFS_TARGET/iscsi、$CONFIGFS_TARGET/core/iblock_0 这类 configfs 目录当缺项：
+# 它们是 rtslib 按需创建的内部细节（core/iblock_0 要等第一个 iblock backstore 建出来才出现），
+# 拿它们当判据会把好机器判成故障，报告长期报红而 targetcli 其实是好的。
+if [ "$TARGETCLI_MISSING" = 1 ]; then
+    MISSING_REQUIRED="$MISSING_REQUIRED lio_tools"
+fi
 
 # 去重后输出，便于直接贴给别人看。
 MISSING_REQUIRED=$(uniq_words "$MISSING_REQUIRED")
@@ -563,7 +581,8 @@ err "仍未就绪：$MISSING_REQUIRED"
 [ -n "$LAST_FAILED" ] && err "有软件包装不上：$(uniq_words "$LAST_FAILED")"
 
 printf '\n%s诊断（"装了还是不可用"的常见原因）%s\n' "$BOLD" "$RST"
-if in_container; then
+# targetcli 跑不通时下面会给出更具体的 docker 提法，这里不重复。
+if in_container && [ "$TARGETCLI_MISSING" = 0 ]; then
     warn "当前环境像是容器/沙箱：加载内核模块与挂载需要特权，且必须用宿主机的内核与模块——"
     dim "   docker run --privileged -v /lib/modules:/lib/modules:ro -v /sys/kernel/config:/sys/kernel/config:rslave ..."
     dim "   更稳妥的做法：把服务端直接装在宿主机上（裸机或虚拟机），而不是容器里。"
@@ -575,22 +594,37 @@ fi
 if ! grep -qs " $CONFIGFS_DIR configfs " /proc/mounts; then
     warn "configfs 未挂载成功：容器需 bind 宿主机的 /sys/kernel/config，或给足 mount 权限。"
 fi
-# 最费解的一种形态：configfs 挂上了、模块也在 /proc/modules 里，却没有 configfs 组。
-if grep -qs " $CONFIGFS_DIR configfs " /proc/mounts && configfs_group_missing; then
-    warn "configfs 已挂载，但内核没有注册出 $CONFIGFS_TARGET/iscsi 与 .../core/iblock_0 —— 逐条排除："
-    dim "   1) 某个模块根本没加载（最容易被「另两个已加载」骗过去）："
-    dim "      确认：grep -E '^(target_core_mod|iscsi_target_mod|target_core_iblock) ' /proc/modules"
-    dim "      若 dmesg 里出现「target_core_mod: unknown parameter 'iscsi_target_mod' ignored」，"
-    dim "      说明有脚本把多个模块名写进了同一条 modprobe（后面的名字被当成参数吃掉了）。"
-    dim "      本脚本已改成逐模块 modprobe（4.5 节会卸载重载补齐），重跑即可；手工修：逐个 modprobe。"
-    dim "   2) 容器/命名空间错位：/proc/modules 是宿主机的，/sys 却是自己的 → --privileged 并共享 /sys/kernel/config。"
-    dim "   3) 内核没编译 LIO（缺 CONFIG_TARGET_CORE/CONFIG_ISCSI_TARGET）→ dmesg 里搜 target/iscsi。"
-    dim "   4) 模块 in use 卸不掉（本脚本 4.5 节已试过重载）→ 停服务端清空 target 后重跑，或 reboot。"
-    dim "   把下面几条的输出一起提供："
-    dim "     grep -E 'target|iscsi' /proc/modules"
-    dim "     ls -la $CONFIGFS_TARGET/ $CONFIGFS_TARGET/core/ 2>&1"
-    dim "     mount | grep configfs"
-    dim "     dmesg | grep -iE 'target|iscsi|configfs' | tail -20"
+# 唯一判据：targetcli 能不能跑通（4.5 节实测）。
+# 注意 $CONFIGFS_TARGET 下有没有 iscsi/core/iblock_0 **不代表**故障：那些目录是 rtslib 按需
+# 创建的内部细节（core/iblock_0 要等第一个 iblock backstore 建出来才出现），它们不在时不必做
+# 任何处理，更不要为了它们去重载模块——重载会拆掉正在给客户端服务的整棵目标配置。
+if [ "$TARGETCLI_MISSING" = 1 ]; then
+    if configfs_instance_mismatch; then
+        # 辅助判据（能定性）：configfs 已挂载、target_core_mod 已加载，却连 $CONFIGFS_TARGET 都没有。
+        # 依据：target_core_mod 的 init 必须注册 target 子系统，注册成功才会有该目录（注册失败模块
+        # 根本加载不进来）——所以这只能说明看到的不是内核注册进的那一份 configfs。
+        warn "targetcli 跑不通，且连 $CONFIGFS_TARGET 都不存在 —— configfs 实例错位："
+        dim "   内核注册是成功的（否则该目录不会出现），所以不是模块、也不是 targetcli 的问题，"
+        dim "   而是本进程看到的 configfs 与内核注册 LIO 的那一份不是同一个实例"
+        dim "   （容器里自己 mount 的那份是空的，宿主机那份才有 target）。"
+        dim "   重载模块永远修不好，还会拆掉正在服务的目标 —— 别反复 modprobe -r / 重跑本脚本。"
+        dim "   处置：容器改成共享宿主机的 configfs 后重启服务端："
+        dim "     docker run --privileged -v /lib/modules:/lib/modules:ro -v $CONFIGFS_DIR:$CONFIGFS_DIR:rslave ..."
+        dim "   或把服务端直接装在宿主机（裸机/虚拟机）上跑。"
+    else
+        warn "targetcli 跑不通（报错见上）—— 逐条排除："
+        dim "   1) LIO 模块没加载：grep -E '^(target_core_mod|iscsi_target_mod|target_core_iblock) ' /proc/modules"
+        dim "      若 dmesg 里出现「target_core_mod: unknown parameter 'iscsi_target_mod' ignored」，"
+        dim "      说明有脚本把多个模块名写进了同一条 modprobe（后面的名字被当成参数吃掉了）。"
+        dim "      本脚本已改成逐模块 modprobe，重跑即可；手工修：逐个 modprobe。"
+        dim "   2) configfs 没挂：mount -t configfs none $CONFIGFS_DIR（容器需 bind 宿主机的 $CONFIGFS_DIR）。"
+        dim "   3) 内核没编译 LIO（缺 CONFIG_TARGET_CORE/CONFIG_ISCSI_TARGET）：dmesg | grep -iE 'target|iscsi'。"
+        dim "   4) rtslib/Python 环境损坏，或权限不足（targetcli 写 configfs 需 root）。"
+        dim "   把这几条的输出一起提供："
+        dim "     targetcli version ; grep -E 'target|iscsi' /proc/modules"
+        dim "     mount | grep configfs"
+        dim "     dmesg | grep -iE 'target|iscsi|configfs' | tail -20"
+    fi
 fi
 dim "Secure Boot：未签名的内核模块会被拒绝（dmesg 里报 Key was rejected by service），"
 dim "   用发行版签名的模块，或在 BIOS 里关掉 Secure Boot。"

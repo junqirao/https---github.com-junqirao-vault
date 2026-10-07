@@ -24,12 +24,14 @@ doctor 子命令（仅 Linux）:
     1. 是否以 root 运行（挂载、modprobe、装包都需要）；
     2. configfs 是否已挂载在 <configfs_root> 的父目录上；
     3. LIO 三个内核模块是否已加载：target_core_mod / iscsi_target_mod / target_core_iblock；
-    4. configfs 里 iSCSI fabric（<root>/iscsi）与块设备 backstore 插件（<root>/core/iblock_0）
-       是否注册成功 —— ⚠️ "lsmod 里有模块"不等于"已在 configfs 中注册成功"；
-    5. LVM2 与文件系统等命令行工具是否在 PATH。
+    4. LIO 执行体 targetcli 是否能跑通（targetcli version）—— 这是 iSCSI 就绪的**行为判据**，
+       刻意不判 <root>/iscsi、<root>/core/iblock_0 这类目录：它们由 rtslib 按需创建
+       （core/iblock_0 要等第一个 iblock backstore 建出来才出现），当判据会把好机器判成故障；
+    5. 其余命令行工具是否在 PATH：LVM2、文件系统工具等。
 
-  自动修复（-fix=true，默认）：mount -t configfs、modprobe / 重载模块、
-  写 /etc/modules-load.d/vault-lio.conf；动作幂等，重复执行安全。
+    自动修复（-fix=true，默认）：mount -t configfs、modprobe 缺失的内核模块、
+    写 /etc/modules-load.d/vault-lio.conf；动作幂等，重复执行安全。
+    刻意**不**重载已加载的模块：那会拆掉正在给客户端服务的整棵 iSCSI 目标配置。
   自动装包（-install=true，默认）：按发行版调用 apt-get/dnf/yum/zypper/apk/pacman
   安装缺失工具对应的包；离线环境请用 -install=false，报告里会给出人工安装命令。
 
@@ -40,7 +42,7 @@ doctor 子命令（仅 Linux）:
 func runDoctor(args []string) int {
 	fs := flag.NewFlagSet("Vault-Server "+doctorSubcommand, flag.ContinueOnError)
 	configPath := fs.String("config", "config.yaml", "配置文件路径（只用于读取 platform.iscsi.configfs_root）")
-	fix := fs.Bool("fix", true, "自动修复可修复的缺项（挂载 configfs、加载/重载内核模块、写 modules-load.d）")
+	fix := fs.Bool("fix", true, "自动修复可修复的缺项（挂载 configfs、加载缺失的内核模块、写 modules-load.d）")
 	install := fs.Bool("install", true, "允许自动安装缺失命令行工具对应的软件包（apt-get/dnf/yum/zypper/apk/pacman）")
 	asJSON := fs.Bool("json", false, "以 JSON 输出报告（便于脚本/CMDB 消费）")
 	fs.SetOutput(os.Stderr)

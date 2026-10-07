@@ -101,6 +101,9 @@ func (r *Router) routes() {
 		// 任何登录用户可读——横幅要告诉所有使用者"哪些功能不可用、怎么补"，
 		// 而不是只有超管能看到原因。只读：修复只在启动期与 doctor 里做。
 		g.Get("/v1/system/deps", r.handleSystemDeps)
+		// 按需安装依赖（当前用于 targetcli 等命令行工具）：会真的调用宿主机包管理器，
+		// 因此仅超级管理员，且返回 202 + 任务对象——前端轮询 /v1/jobs/{id} 显示进度。
+		g.With(r.requireSuperAdminMW).Post("/v1/system/deps/install", r.handleInstallSystemDeps)
 		g.Get("/v1/system/settings", r.requireSuperAdmin(r.handleGetSettings))
 		g.Patch("/v1/system/settings", r.requireSuperAdmin(r.handlePatchSettings))
 		// 全量配置表（读）与在线改配置（写回 config.yaml）：仅超级管理员。
@@ -130,6 +133,9 @@ func (r *Router) routes() {
 		// 新建卷组前估算可建池容量：此刻卷组还不存在，前端拿不到 pool_max_bytes，
 		// 而容量口径必须与建池时的校验一致，否则"自动填好的容量"一提交就超限。
 		g.With(r.requireSuperAdminMW).Post("/v1/system/pools/estimate", r.handleEstimatePoolSize)
+		// 删除存储池：可选连带删除卷组并把物理卷清回"可选"。
+		// 破坏性操作，前端必须二次确认；服务端另有默认池/占用/系统盘三道拦截（仅超级管理员）。
+		g.With(r.requireSuperAdminMW).Post("/v1/system/pools/delete", r.handleDeletePool)
 
 		// 用户与证书（管理员）
 		g.With(r.requireSuperAdminMW).Get("/v1/users", r.handleListUsers)

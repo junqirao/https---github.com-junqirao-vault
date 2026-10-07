@@ -524,6 +524,8 @@ func runServe(configPath *string, migrateOnly *bool) int {
 		StorageVol: plat.StorageVol,
 		// 系统依赖实时探测（前端横幅）：Linux 注入，Windows 为 nil。
 		SysDepsProbe: plat.SysDepsProbe,
+		// 系统依赖按需安装（前端"安装"按钮 → 后台任务）：Linux 注入，Windows 为 nil。
+		SysDepsInstall: plat.SysDepsInstall,
 		Tokens:       cert.NewTokenStore(security.EnrollmentTokenTTL.Std()),
 		Sessions:     app.NewSessionStore(security.SessionTTL.Std()),
 		Events:       eventSinkAdapter{hub: events},
@@ -824,6 +826,11 @@ type platformDeps struct {
 	//
 	// 只探测不修复：修复发生在启动期与 `vault-server doctor`。前端据此显示"缺了什么"的横幅。
 	SysDepsProbe func(context.Context) *app.SysDepsReport
+	// SysDepsInstall 按需安装系统依赖（Linux 注入；Windows 为 nil → 接口返回 platform.unsupported）。
+	//
+	// 与探测分开的理由：一定是**改动宿主机**的操作，只经超级管理员的显式点击触发，
+	// 并受 platform.auto_install 开关约束。实现见 platform_linux.go 的 sysDepsInstallerAdapter。
+	SysDepsInstall app.SysDepsInstaller
 }
 
 // checkPlatformKind 校验配置声明的平台种类与当前构建产物是否一致。

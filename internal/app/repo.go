@@ -1293,8 +1293,11 @@ func (s *RepoService) refreshParentFingerprint(ctx context.Context, repo *domain
 	if err != nil {
 		return err
 	}
+	// 注意写的是**物理占用**：SizeBytes 是标称容量，而"库容量"正是从母盘的
+	// SizeBytes 派生的（见 store.repoCapacitySQL）——早先这里写成 SizeBytes，
+	// 一旦母盘物理占用（远小于容量）覆盖上去，库容量就被打塌、进度条直接拉满。
 	if size, err := s.Disk.PhysicalSize(parent.VHDXPath); err == nil {
-		parent.SizeBytes = size
+		parent.PhysicalBytes = size
 	}
 	parent.ContentFingerprint = fp
 	return s.Store.UpdateDisk(ctx, parent)

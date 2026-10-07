@@ -329,11 +329,20 @@ func (m *Manager) Delete(ctx context.Context, ref string) error {
 // 退化口径：thin_ls 缺失或解析失败时，用 lvs 的 lv_size × data_percent/100 估算。
 // 两种口径的差异：退化版对同一池里的多个快照会把共享块**各自计入**（重复计数），
 // 数值偏大，只能用于展示，不能用于配额精算。
+//
+// ⚠️ 返回 0 是**合法实测值**（差异盘刚派生时独占块就是 0，全部与母盘共享），
+// 不代表"没测到"：调用方与配额口径都必须按实测值处理（见 store.accountedUsageSQL）。
 func (m *Manager) PhysicalSize(ref string) (int64, error) {
 	vg, lv, err := parseRef(ref)
 	if err != nil {
 		return 0, err
 	}
+	// 量测必须在激活态下做，否则只剩退化估算（见 activateForMeasure）。
+	restore, err := m.activateForMeasure(vg, lv)
+	if err != nil {
+		return 0, err
+	}
+	defer restore()
 	if n, err := m.thinExclusiveBytes(vg, lv); err == nil {
 		return n, nil
 	} else {
@@ -341,6 +350,58 @@ func (m *Manager) PhysicalSize(ref string) (int64, error) {
 			"ref", ref, "err", err.Error())
 	}
 	return m.estimatePhysicalBytes(vg, lv)
+}
+
+// activateForMeasure 保证量测期间 LV 处于激活态，并返回把状态还原成原样的函数。
+//
+// 为什么量测需要它（真实故障）：`dmsetup table`（取 thin id 的途径）与读 /dev/mapper
+// 节点都只对**已激活**的设备有效，而"量占用"几乎总发生在激活之前或之后——
+//   - 差异盘：`lvcreate -s` 出来的快照默认带 skip-activation 标记，发布给 iSCSI 时才激活；
+//   - 母盘：格式化完就被 `-an` 回池，之后一直未激活。
+//
+// 在这两种情形下量测必然退化成估算口径：日志里的
+// `dmsetup: Device /dev/mapper/... not found`(ERROR) +
+// `thin_ls 不可用或解析失败，退化为 lvs data_percent 估算…`(WARN) 就是这么来的。
+// 更糟的是估算值会被调用方当作"实测物理占用"落库，把刚建好的差异盘记成满盘
+// （真实反馈：新建的库一上来就"已用 100%"）。
+//
+// 这里只"借"一次激活态做量测、量完立即还原，不改调用方既有的激活顺序；
+// 还原失败只会留下一个激活的 LV（无数据风险，下次操作即可收敛），因此按 Debug 记录。
+func (m *Manager) activateForMeasure(vg, lv string) (func(), error) {
+	ctx, cancel := m.probeCtx()
+	defer cancel()
+	active, err := m.lvIsActive(ctx, vg, lv)
+	if err != nil {
+		return nil, err
+	}
+	if active {
+		return func() {}, nil
+	}
+	actx, acancel := context.WithTimeout(context.Background(), metadataSnapTimeout)
+	defer acancel()
+	// -K 不能省：thin LV 默认带 skip-activation 标记，少了它 lvchange 会静默不做激活。
+	if _, err := m.run(actx, "lvchange", "-ay", "-K", vg+"/"+lv); err != nil {
+		return nil, err
+	}
+	return func() {
+		rctx, rcancel := context.WithTimeout(context.Background(), probeTimeout)
+		defer rcancel()
+		if _, err := m.runQuiet(rctx, "lvchange", "-an", vg+"/"+lv); err != nil {
+			m.logger.Debug("量测后还原 LV 停用态未成功（忽略）", "ref", lvRef(vg, lv), "err", err.Error())
+		}
+	}, nil
+}
+
+// lvIsActive 报告 LV 是否处于激活态（lvs 的 lv_active 列：激活时为 "active"，否则为空）。
+func (m *Manager) lvIsActive(ctx context.Context, vg, lv string) (bool, error) {
+	rows, err := m.lvsRows(ctx, "-o", "lv_active", vg+"/"+lv)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) == 0 {
+		return false, fmt.Errorf("lvs 无结果")
+	}
+	return strings.TrimSpace(rowStr(rows[0], "lv_active")) == "active", nil
 }
 
 // thinExclusiveBytes 用 thin_ls 读取该 thin LV 的独占物理占用。
@@ -514,6 +575,13 @@ func (m *Manager) Fingerprint(ref string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// 读 /dev/mapper 节点同样要求设备在场：未激活的 LV 连节点都不存在
+	// （母盘格式化完被 -an 回池后就属于这种情形，指纹会静默算不出来）。
+	restore, err := m.activateForMeasure(vg, lv)
+	if err != nil {
+		return "", err
+	}
+	defer restore()
 	f, err := os.Open(lvRef(vg, lv))
 	if err != nil {
 		return "", apperr.New(CodeAccessDenied, http.StatusInternalServerError).

@@ -124,6 +124,12 @@ type Session struct {
 	ServerInstanceID string `json:"server_instance_id"`
 	// ServerName 服务端名称。
 	ServerName string `json:"server_name"`
+	// Alias 是客户端为**本机**设置的服务端别名（可选）。
+	//
+	// 用途：目录模式的挂载点命名 `<服务端别名>_<存储库名称>`（见 mountEngine.serverAlias）。
+	// 多服务端下每台各自带自己的别名，否则两台服务端的挂载目录会撞进同一个命名空间。
+	// 空串时退回服务端名称。
+	Alias string `json:"alias,omitempty"`
 	// Token 会话令牌（Bearer）。
 	Token string `json:"token"`
 	// CertSHA256 服务端证书 DER 的 SHA-256（小写十六进制）。
@@ -164,12 +170,16 @@ const (
 // "连接失败 2 次之后不再重试，边上加一个按钮让用户手动重试，手动重试会刷新计数"）。
 const maxServerConnectAttempts = 2
 
-// ServerState 描述代理当前连接的服务端。
+// ServerState 描述代理连接的一台服务端。
+//
+// 多服务端下代理同时维护多份：每台一份（键见 stateStore.servers），互不影响。
 type ServerState struct {
 	URL        string `json:"url"`
 	InstanceID string `json:"instance_id"`
 	Name       string `json:"name"`
-	Connected  bool   `json:"connected"`
+	// Alias 是客户端下发的本机侧别名（见 Session.Alias）；目录命名优先用它。
+	Alias     string `json:"alias,omitempty"`
+	Connected bool   `json:"connected"`
 	// Phase 是连接阶段（见 ServerPhase*）：connecting / connected / disconnected。
 	Phase string `json:"phase,omitempty"`
 	// FailCount 是**连续**连接失败次数（任意一次成功即归零）。
@@ -194,10 +204,21 @@ type MountState struct {
 	LeaseID      string `json:"lease_id"`
 	TargetIQN    string `json:"target_iqn"`
 	Portal       string `json:"portal"`
-	MountMode    string `json:"mount_mode"`
-	MountPath    string `json:"mount_path"`
-	DiskNumber   int    `json:"disk_number,omitempty"`
-	State        string `json:"state"`
+	// ServerKey / ServerURL / ServerName 标识这条挂载属于**哪台**服务端。
+	//
+	// 多服务端下这是必须的：心跳、挂载点回写、租约释放都必须发给"当初受理这次挂载的那台"
+	// （见 Agent.serverClientFor）。ServerKey 与身份存储、前端 ServerEntry.key 同算法：
+	// 实例 ID 优先，其次规范化地址（见 serverKeyOf）。
+	//
+	// ⚠️ 为空只可能是"单服务端时代留下的旧记录"：那时会被归给唯一的那台（见 NewStateStore），
+	// 运行期未归类的记录才按主服务端兜底（见 Agent.mountClient）。
+	ServerKey  string `json:"server_key,omitempty"`
+	ServerURL  string `json:"server_url,omitempty"`
+	ServerName string `json:"server_name,omitempty"`
+	MountMode  string `json:"mount_mode"`
+	MountPath  string `json:"mount_path"`
+	DiskNumber int    `json:"disk_number,omitempty"`
+	State      string `json:"state"`
 	// Phase 是 state=mounting 期间的细粒度阶段（见 MountPhase* 常量）；非挂载中为空。
 	// 界面据此显示"服务端正在创建 iSCSI 目标"这类即时反馈。
 	Phase           string `json:"phase,omitempty"`
@@ -275,28 +296,70 @@ func (r *mountRuntime) leaseTTL() time.Duration {
 	return defaultLeaseTTL
 }
 
+// persistedServer 是状态文件里**一台**服务端的持久化形态（不含会话令牌）。
+type persistedServer struct {
+	Key   string      `json:"key"`
+	State ServerState `json:"state"`
+	User  UserState   `json:"user"`
+}
+
 // persistedState 是本地状态文件的形状。
 //
 // 注意：只持久化「服务端展示信息 + 挂载状态」，不含会话令牌与 CHAP 密钥。
 type persistedState struct {
-	ClientID string       `json:"client_id"`
-	Server   ServerState  `json:"server"`
-	User     UserState    `json:"user"`
-	Mounts   []MountState `json:"mounts"`
+	ClientID string `json:"client_id"`
+	// PrimaryKey 是主服务端（更新源等"没有服务端上下文"的操作用它，见 Agent.primaryServerKey）。
+	PrimaryKey string            `json:"primary_key,omitempty"`
+	Servers    []persistedServer `json:"servers,omitempty"`
+	// Server / User 是单服务端时代的字段，**只用于读取旧文件**：读到即迁移进 Servers。
+	Server *ServerState `json:"server,omitempty"`
+	User   *UserState   `json:"user,omitempty"`
+	Mounts []MountState `json:"mounts"`
+}
+
+// serverEntry 是**一台**服务端的本地状态：连接状态 + 登录用户 + 会话（会话仅内存）。
+type serverEntry struct {
+	state   ServerState
+	user    UserState
+	session *Session
+}
+
+// ServerSnapshot 是一台服务端的完整状态快照（对外只读）。
+type ServerSnapshot struct {
+	Key     string
+	State   ServerState
+	User    UserState
+	Session *Session
 }
 
 // stateStore 是代理的内存态 + 本地持久化。
+//
+// 多服务端：servers 里每台一份（键见 serverKeyOf），挂载状态按 MountState.ServerKey 归属到台。
+// 这是"多服务端各自自动登录、各自自动挂载"的存储前提（见 docs/implementation.md §3.4.1）。
 type stateStore struct {
 	path   string
 	logger *slog.Logger
 
 	mu       sync.Mutex
 	clientID string
-	server   ServerState
-	user     UserState
-	mounts   map[string]*MountState
-	runtime  map[string]*mountRuntime
-	session  *Session
+	// servers 各服务端状态；primary 是主服务端键（可能为空：还没有任何服务端）。
+	servers map[string]*serverEntry
+	primary string
+	mounts  map[string]*MountState
+	runtime map[string]*mountRuntime
+}
+
+// sameServerRef 判断两组"服务端引用"（实例 ID + 地址）是否指向同一个服务端实例。
+//
+// 两边都有实例 ID 时以实例 ID 为准；否则退回规范化地址比较（与 sameServer 同口径）。
+func sameServerRef(instanceID, serverURL, otherInstanceID, otherURL string) bool {
+	mine := strings.ToLower(strings.TrimSpace(instanceID))
+	other := strings.ToLower(strings.TrimSpace(otherInstanceID))
+	if mine != "" && other != "" {
+		return mine == other
+	}
+	url := normalizeServerURL(serverURL)
+	return url != "" && normalizeServerURL(otherURL) == url
 }
 
 // NewStateStore 加载本地状态；文件不存在时新建（并生成稳定的 client_id）。
@@ -308,11 +371,9 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 		path = DefaultStatePath()
 	}
 	s := &stateStore{
-		path:   path,
-		logger: logger,
-		// 阶段先按"连接中"起步：首次运行（没有状态文件）或状态文件损坏时也走这条零值路径，
-		// 留空会让界面把它读成"未连接"并挂出手动重试按钮 —— 可进程刚起来一次都没试过。
-		server:  ServerState{Phase: ServerPhaseConnecting},
+		path:    path,
+		logger:  logger,
+		servers: make(map[string]*serverEntry),
 		mounts:  make(map[string]*MountState),
 		runtime: make(map[string]*mountRuntime),
 	}
@@ -325,15 +386,7 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 			logger.Warn("本地状态文件无法解析，已忽略其内容", "path", path, "error", err)
 		} else {
 			s.clientID = loaded.ClientID
-			s.server = loaded.Server
-			s.user = loaded.User
-			// 进程重启后真实会话已不存在：连接状态一律复位。
-			// 阶段复位成"连接中"而不是"未连接"：进程刚起来还没试过，界面该显示转圈的
-			// "连接中"；真试过 2 次都失败才轮到"未连接"（真实诉求）。
-			s.server.Connected = false
-			s.server.Phase = ServerPhaseConnecting
-			s.server.FailCount = 0
-			s.server.LastError = ""
+			legacyKey := s.loadServersLocked(&loaded)
 			for i := range loaded.Mounts {
 				m := loaded.Mounts[i]
 				if m.AllocationID == "" {
@@ -344,6 +397,24 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 				// 循环（约 20s 内）或启动时的自动挂载写入真实值。
 				m.SessionActive = false
 				m.SessionCheckedAt = 0
+				// 旧文件（单服务端时代）的挂载记录没有服务端归属：归给当时唯一的那台。
+				// 不归类的话多服务端下心跳会按"主服务端"兜底发出去 —— 发给了根本没受理过
+				// 这次挂载的服务端（见 Agent.mountClient）。
+				if legacyKey != "" && strings.TrimSpace(m.ServerKey) == "" {
+					m.ServerKey = legacyKey
+				}
+				// 归属三件套（键/地址/名称）补齐：挂载记录自带服务端标识，界面与日志直接可读，
+				// 不必再回查状态表（旧记录里这三样都缺）。
+				if m.ServerKey == legacyKey {
+					if entry := s.servers[legacyKey]; entry != nil {
+						if m.ServerURL == "" {
+							m.ServerURL = entry.state.URL
+						}
+						if m.ServerName == "" {
+							m.ServerName = entry.state.Name
+						}
+					}
+				}
 				s.mounts[m.AllocationID] = &m
 			}
 		}
@@ -361,6 +432,59 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 	return s, nil
 }
 
+// loadServersLocked 把状态文件里的服务端装载进内存（连接状态复位），并确定主服务端。
+//
+// 返回"旧格式挂载记录可归属的唯一服务端键"：文件里恰好一台时才有值，否则为空（那说明文件
+// 本来就带归属信息，或压根没有服务端）。
+func (s *stateStore) loadServersLocked(loaded *persistedState) string {
+	entries := loaded.Servers
+	if len(entries) == 0 && loaded.Server != nil {
+		// 单服务端时代的文件：一份 server/user 迁移成一台。
+		user := UserState{}
+		if loaded.User != nil {
+			user = *loaded.User
+		}
+		entries = []persistedServer{{
+			Key:   serverKeyOf(loaded.Server.InstanceID, loaded.Server.URL),
+			State: *loaded.Server,
+			User:  user,
+		}}
+	}
+	for i := range entries {
+		item := entries[i]
+		key := strings.TrimSpace(item.Key)
+		if key == "" {
+			key = serverKeyOf(item.State.InstanceID, item.State.URL)
+		}
+		if key == "" {
+			continue
+		}
+		state := item.State
+		// 进程重启后真实会话已不存在：连接状态一律复位。
+		// 阶段复位成"连接中"而不是"未连接"：进程刚起来还没试过，界面该显示转圈的
+		// "连接中"；真试过 maxServerConnectAttempts 次都失败才轮到"未连接"（真实诉求）。
+		state.Connected = false
+		state.Phase = ServerPhaseConnecting
+		state.FailCount = 0
+		state.LastError = ""
+		s.servers[key] = &serverEntry{state: state, user: item.User}
+	}
+
+	legacyKey := ""
+	if len(s.servers) == 1 {
+		for k := range s.servers {
+			legacyKey = k
+		}
+	}
+	s.primary = strings.TrimSpace(loaded.PrimaryKey)
+	if s.primary == "" || s.servers[s.primary] == nil {
+		// 主服务端没记（或记的那台已经没了）：单台时就是它自己；多台时先留空，
+		// 由第一台推来会话的服务端顶上（见 SetSession）。
+		s.primary = legacyKey
+	}
+	return legacyKey
+}
+
 // Path 返回状态文件路径。
 func (s *stateStore) Path() string { return s.path }
 
@@ -371,58 +495,392 @@ func (s *stateStore) ClientID() string {
 	return s.clientID
 }
 
-// SetSession 保存服务端会话（仅内存），并记录收到时刻（用于计算会话寿命）。
-func (s *stateStore) SetSession(session *Session) {
+// entryLocked 返回（必要时创建）某台服务端的内存条目；键为空时返回 nil（调用方跳过即可）。
+func (s *stateStore) entryLocked(key string) *serverEntry {
+	if key == "" {
+		return nil
+	}
+	entry := s.servers[key]
+	if entry == nil {
+		// 阶段先按"连接中"起步：这台刚登记、一次都还没试过，留空会被界面读成"未连接"
+		// 并挂出手动重试按钮（与首次运行同一条零值路径）。
+		entry = &serverEntry{state: ServerState{Phase: ServerPhaseConnecting}}
+		s.servers[key] = entry
+	}
+	return entry
+}
+
+// primaryKeyLocked 返回主服务端键；主服务端没登记时退回"唯一的那台"，都没有则为空串。
+func (s *stateStore) primaryKeyLocked() string {
+	if s.primary != "" && s.servers[s.primary] != nil {
+		return s.primary
+	}
+	if len(s.servers) == 1 {
+		for key := range s.servers {
+			return key
+		}
+	}
+	return ""
+}
+
+// orderedKeysLocked 返回服务端键（主服务端排最前，其余按键排序，保证输出稳定）。
+func (s *stateStore) orderedKeysLocked() []string {
+	keys := make([]string, 0, len(s.servers))
+	for key := range s.servers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if primary := s.primaryKeyLocked(); primary != "" {
+		for i, key := range keys {
+			if key != primary {
+				continue
+			}
+			keys = append(keys[:i], keys[i+1:]...)
+			keys = append([]string{primary}, keys...)
+			break
+		}
+	}
+	return keys
+}
+
+// matchKeyLocked 在已知服务端里找与"键、实例 ID 或地址"匹配的条目，返回其键（找不到为空串）。
+func (s *stateStore) matchKeyLocked(reference string) string {
+	ref := strings.TrimSpace(reference)
+	if ref == "" {
+		return ""
+	}
+	if _, ok := s.servers[ref]; ok {
+		return ref
+	}
+	for existing, entry := range s.servers {
+		if strings.EqualFold(strings.TrimSpace(entry.state.InstanceID), ref) ||
+			normalizeServerURL(entry.state.URL) == normalizeServerURL(ref) {
+			return existing
+		}
+	}
+	return ""
+}
+
+// resolveExistingKeyLocked 把键解析成已登记的条目键（空键 -> 主服务端），找不到返回空串。
+func (s *stateStore) resolveExistingKeyLocked(key string) string {
+	if k := strings.TrimSpace(key); k != "" {
+		return s.matchKeyLocked(k)
+	}
+	return s.primaryKeyLocked()
+}
+
+// SetSession 保存**某台**服务端的会话（仅内存），返回该会话实际归属的服务端键。
+//
+// key 为空时按会话字段推导（实例 ID 优先，其次规范化地址，见 serverKeyOf）。同一台若已存在
+// "另一把键"，这里会合并成一把（见 rekeyLocked）。
+func (s *stateStore) SetSession(key string, session *Session) string {
+	if session == nil {
+		s.ClearSession(key)
+		return key
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if session == nil {
-		s.session = nil
-		return
+
+	sessionKey := s.rekeyLocked(s.resolveSessionKeyLocked(key, session), session)
+	entry := s.entryLocked(sessionKey)
+	if entry == nil {
+		return sessionKey
 	}
 	cp := *session
 	cp.receivedAt = time.Now().UnixMilli()
-	s.session = &cp
+	entry.session = &cp
+	// 会话里带的服务端信息同步进状态（名称/别名等）；连接状态不动 —— 那要等真实探活
+	// （Agent.onSessionEstablished）之后才作数。
+	if session.ServerURL != "" {
+		entry.state.URL = session.ServerURL
+	}
+	if session.ServerInstanceID != "" {
+		entry.state.InstanceID = session.ServerInstanceID
+	}
+	if session.ServerName != "" {
+		entry.state.Name = session.ServerName
+	}
+	if session.Alias != "" {
+		entry.state.Alias = session.Alias
+	}
+	if s.primary == "" || s.servers[s.primary] == nil {
+		s.primary = sessionKey
+	}
+	_ = s.persistLocked()
+	return sessionKey
 }
 
-// Session 返回当前会话副本；未推送时 ok=false。
-func (s *stateStore) Session() (*Session, bool) {
+// Session 返回指定服务端的会话副本；未推送时 ok=false。key 为空时取主服务端。
+func (s *stateStore) Session(key string) (*Session, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.session == nil {
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil || entry.session == nil {
 		return nil, false
 	}
-	cp := *s.session
+	cp := *entry.session
 	return &cp, true
 }
 
-// ClearSession 清除会话（退出登录），并把连接状态复位。
+// Sessions 返回全部会话副本（服务端键 -> 会话），供逐台续期/订阅使用。
+func (s *stateStore) Sessions() map[string]*Session {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]*Session, len(s.servers))
+	for key, entry := range s.servers {
+		if entry.session == nil {
+			continue
+		}
+		cp := *entry.session
+		out[key] = &cp
+	}
+	return out
+}
+
+// resolveSessionKeyLocked 算出会话应落到的键：显式键优先（能匹配既有条目就复用），
+// 否则按会话自身的实例 ID/地址推导（见 serverKeyOf）。
+func (s *stateStore) resolveSessionKeyLocked(key string, session *Session) string {
+	if k := strings.TrimSpace(key); k != "" {
+		if matched := s.matchKeyLocked(k); matched != "" {
+			return matched
+		}
+		return k
+	}
+	return serverKeyOf(session.ServerInstanceID, session.ServerURL)
+}
+
+// rekeyLocked 保证"同一台服务端只有一把键"：把指向同一台的其它条目并进 key。
+//
+// 键有两种来源：实例 ID 与规范化地址。客户端先只知道地址、拿到 system/info 之后才知道实例 ID，
+// 于是同一台可能先以地址为键、后以实例 ID 为键出现。不合并的话同一台在 servers 里会有两份，
+// 挂载归属与心跳各认一半。
+func (s *stateStore) rekeyLocked(key string, session *Session) string {
+	if key == "" {
+		return key
+	}
+	for old, entry := range s.servers {
+		if old == key {
+			continue
+		}
+		if !sameServerRef(session.ServerInstanceID, session.ServerURL, entry.state.InstanceID, entry.state.URL) {
+			continue
+		}
+		s.mergeEntryLocked(old, key)
+	}
+	return key
+}
+
+// mergeEntryLocked 把 from 这台服务端的本地状态并进 to（挂载归属一并改键），然后删掉 from。
+//
+// 只在两者确认为同一台服务端时调用（见 rekeyLocked）；已存在的字段优先保留 to 的。
+func (s *stateStore) mergeEntryLocked(from, to string) {
+	src := s.servers[from]
+	if from == to || src == nil {
+		return
+	}
+	dst := s.entryLocked(to)
+	if dst == nil {
+		return
+	}
+	if dst.state.URL == "" {
+		dst.state.URL = src.state.URL
+	}
+	if dst.state.InstanceID == "" {
+		dst.state.InstanceID = src.state.InstanceID
+	}
+	if dst.state.Name == "" {
+		dst.state.Name = src.state.Name
+	}
+	if dst.state.Alias == "" {
+		dst.state.Alias = src.state.Alias
+	}
+	if dst.state.LastError == "" {
+		dst.state.LastError = src.state.LastError
+	}
+	if dst.user.ID == "" {
+		dst.user = src.user
+	}
+	if dst.session == nil {
+		dst.session = src.session
+	}
+	delete(s.servers, from)
+	for _, ms := range s.mounts {
+		if ms.ServerKey == from {
+			ms.ServerKey = to
+		}
+	}
+	if s.primary == from {
+		s.primary = to
+	}
+}
+
+// ClearSession 清除**某台**服务端的会话（退出登录/移除该台），并把该台连接状态复位。
 //
 // 刻意把失败计数顶到上限：退出登录后本地证书身份**仍在**，若让自动重连循环继续跑，它会
 // 立刻用证书把人"登回来"，用户看到的是"登出没生效"。顶到上限后阶段即为 disconnected，
 // 自动重连停手，只有界面手动重试（POST /agent/server/reconnect）才会重新连接。
-func (s *stateStore) ClearSession() {
+func (s *stateStore) ClearSession(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.session = nil
-	s.server.Connected = false
-	s.server.LastError = ""
-	s.server.FailCount = maxServerConnectAttempts
-	s.server.Phase = ServerPhaseDisconnected
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil {
+		return
+	}
+	entry.session = nil
+	entry.state.Connected = false
+	entry.state.LastError = ""
+	entry.state.FailCount = maxServerConnectAttempts
+	entry.state.Phase = ServerPhaseDisconnected
 	_ = s.persistLocked()
 }
 
-// Server 返回服务端状态。
-func (s *stateStore) Server() ServerState {
+// ClearAllSessions 清除全部服务端会话（客户端"退出登录"）。
+//
+// 服务端条目本身保留：身份（客户端证书）是本机的，删条目会让下次启动丢掉"这台是谁"，
+// 而退出登录只是不再持有令牌（见 ClearSession 注释）。
+func (s *stateStore) ClearAllSessions() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.server
+	for _, entry := range s.servers {
+		entry.session = nil
+		entry.state.Connected = false
+		entry.state.LastError = ""
+		entry.state.FailCount = maxServerConnectAttempts
+		entry.state.Phase = ServerPhaseDisconnected
+	}
+	_ = s.persistLocked()
 }
 
-// SetServer 覆盖服务端状态并持久化。
-func (s *stateStore) SetServer(state ServerState) {
+// RemoveServer 移除一台服务端的本地状态（客户端删掉该服务端条目时调用）。
+//
+// 挂载记录**保留**：盘还挂在本机，仍要能卸载、能回写挂载点；只是没人给它发心跳了
+// （它归属的那台已经没有会话），租约到期由服务端自行回收。
+func (s *stateStore) RemoveServer(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.server = state
+	resolved := s.resolveExistingKeyLocked(key)
+	if resolved == "" {
+		return
+	}
+	delete(s.servers, resolved)
+	if s.primary == resolved {
+		s.primary = ""
+		for existing := range s.servers {
+			s.primary = existing
+			break
+		}
+	}
+	_ = s.persistLocked()
+}
+
+// ServerKeys 返回已知服务端的键（主服务端在前）。
+func (s *stateStore) ServerKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.orderedKeysLocked()
+}
+
+// PrimaryKey 返回主服务端键（没有则为空串）。
+func (s *stateStore) PrimaryKey() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.primaryKeyLocked()
+}
+
+// SetPrimary 指定主服务端（键没登记时忽略）。
+func (s *stateStore) SetPrimary(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	resolved := s.matchKeyLocked(key)
+	if resolved == "" || resolved == s.primary {
+		return
+	}
+	s.primary = resolved
+	_ = s.persistLocked()
+}
+
+// ResolveKey 把外部给的"服务端引用"（键或地址）映射成代理内部的服务端键。
+//
+// 两者都为空时返回主服务端键（老客户端不带服务端标识时的兜底）；给了却没匹配上则返回空串，
+// 由调用方决定是报错还是兜底。
+func (s *stateStore) ResolveKey(key, serverURL string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if matched := s.matchKeyLocked(key); matched != "" {
+		return matched
+	}
+	if matched := s.matchKeyLocked(serverURL); matched != "" {
+		return matched
+	}
+	if strings.TrimSpace(key) != "" || strings.TrimSpace(serverURL) != "" {
+		return ""
+	}
+	return s.primaryKeyLocked()
+}
+
+// Servers 返回全部服务端状态快照（主服务端在前）。
+func (s *stateStore) Servers() []ServerSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ServerSnapshot, 0, len(s.servers))
+	for _, key := range s.orderedKeysLocked() {
+		out = append(out, s.snapshotLocked(key))
+	}
+	return out
+}
+
+// snapshotLocked 组装一台服务端的状态快照（调用方持锁）。
+func (s *stateStore) snapshotLocked(key string) ServerSnapshot {
+	entry := s.servers[key]
+	if entry == nil {
+		return ServerSnapshot{Key: key}
+	}
+	snap := ServerSnapshot{Key: key, State: entry.state, User: entry.user}
+	if entry.session != nil {
+		cp := *entry.session
+		snap.Session = &cp
+	}
+	return snap
+}
+
+// Server 返回指定服务端的状态；不存在时 ok=false。key 为空时取主服务端。
+func (s *stateStore) Server(key string) (ServerState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil {
+		return ServerState{}, false
+	}
+	return entry.state, true
+}
+
+// SetServer 覆盖某台服务端状态并持久化（键为空时按主服务端处理；键不存在则新建）。
+func (s *stateStore) SetServer(key string, state ServerState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if resolved := s.resolveExistingKeyLocked(key); resolved != "" {
+		key = resolved
+	}
+	entry := s.entryLocked(key)
+	if entry == nil {
+		return
+	}
+	entry.state = state
+	_ = s.persistLocked()
+}
+
+// UpdateServer 在锁内变更某台服务端状态并持久化；键不存在时忽略。
+func (s *stateStore) UpdateServer(key string, mutate func(*ServerState)) {
+	if mutate == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil {
+		return
+	}
+	mutate(&entry.state)
 	_ = s.persistLocked()
 }
 
@@ -430,77 +888,127 @@ func (s *stateStore) SetServer(state ServerState) {
 //
 // 连接成功时顺带把阶段置为 connected 并清空失败计数：FailCount 统计的是"连续失败"，
 // 任何一次成功都该让它归零（手动重试、心跳成功、重新推会话都走这里）。
-func (s *stateStore) SetServerConnected(connected bool, lastError string) {
+func (s *stateStore) SetServerConnected(key string, connected bool, lastError string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	phase := s.server.Phase
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil {
+		return
+	}
+	phase := entry.state.Phase
 	if connected {
 		phase = ServerPhaseConnected
 	}
-	if s.server.Connected == connected && s.server.LastError == lastError &&
-		s.server.Phase == phase && (!connected || s.server.FailCount == 0) {
+	if entry.state.Connected == connected && entry.state.LastError == lastError &&
+		entry.state.Phase == phase && (!connected || entry.state.FailCount == 0) {
 		return
 	}
-	s.server.Connected = connected
-	s.server.LastError = lastError
-	s.server.Phase = phase
+	entry.state.Connected = connected
+	entry.state.LastError = lastError
+	entry.state.Phase = phase
 	if connected {
-		s.server.FailCount = 0
+		entry.state.FailCount = 0
 	}
 	_ = s.persistLocked()
 }
 
-// SetServerPhase 更新连接阶段（无变化时不写盘）。
-func (s *stateStore) SetServerPhase(phase string) {
+// SetServerPhase 更新某台的连接阶段（无变化时不写盘）。
+func (s *stateStore) SetServerPhase(key, phase string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.server.Phase == phase {
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil || entry.state.Phase == phase {
 		return
 	}
-	s.server.Phase = phase
+	entry.state.Phase = phase
 	_ = s.persistLocked()
 }
 
-// RecordServerConnectFailure 记一次自动重连失败，返回是否已达上限（上限后不再自动重连）。
-func (s *stateStore) RecordServerConnectFailure(lastError string) bool {
+// RecordServerConnectFailure 记某台一次自动重连失败，返回是否已达上限（上限后不再自动重连）。
+func (s *stateStore) RecordServerConnectFailure(key, lastError string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.server.FailCount++
-	s.server.Connected = false
-	s.server.LastError = lastError
-	exhausted := s.server.FailCount >= maxServerConnectAttempts
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil {
+		return true
+	}
+	entry.state.FailCount++
+	entry.state.Connected = false
+	entry.state.LastError = lastError
+	exhausted := entry.state.FailCount >= maxServerConnectAttempts
 	if exhausted {
-		s.server.Phase = ServerPhaseDisconnected
+		entry.state.Phase = ServerPhaseDisconnected
 	} else {
-		s.server.Phase = ServerPhaseConnecting
+		entry.state.Phase = ServerPhaseConnecting
 	}
 	_ = s.persistLocked()
 	return exhausted
 }
 
-// ResetServerConnectFailures 清零失败计数并回到"连接中"（界面手动重试时调用）。
-func (s *stateStore) ResetServerConnectFailures() {
+// ResetServerConnectFailures 清零某台的失败计数并回到"连接中"（界面手动重试时调用）。
+func (s *stateStore) ResetServerConnectFailures(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.server.FailCount = 0
-	s.server.LastError = ""
-	s.server.Phase = ServerPhaseConnecting
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil {
+		return
+	}
+	entry.state.FailCount = 0
+	entry.state.LastError = ""
+	entry.state.Phase = ServerPhaseConnecting
 	_ = s.persistLocked()
 }
 
-// User 返回当前用户。
-func (s *stateStore) User() UserState {
+// User 返回某台服务端的登录用户（key 为空时取主服务端）。
+func (s *stateStore) User(key string) UserState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.user
+	entry := s.servers[s.resolveExistingKeyLocked(key)]
+	if entry == nil {
+		return UserState{}
+	}
+	return entry.user
 }
 
-// SetUser 覆盖当前用户并持久化。
-func (s *stateStore) SetUser(user UserState) {
+// SetUser 覆盖某台服务端的登录用户并持久化。
+func (s *stateStore) SetUser(key string, user UserState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.user = user
+	if resolved := s.resolveExistingKeyLocked(key); resolved != "" {
+		key = resolved
+	}
+	entry := s.entryLocked(key)
+	if entry == nil {
+		return
+	}
+	entry.user = user
 	_ = s.persistLocked()
+}
+
+// MountsForServer 返回归属于某台服务端的挂载状态（按键为空时返回未归类 + 主服务端的）。
+func (s *stateStore) MountsForServer(key string) []MountState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	primary := s.primaryKeyLocked()
+	out := make([]MountState, 0, len(s.mounts))
+	for _, ms := range s.mounts {
+		if mountBelongsTo(ms, key, primary) {
+			out = append(out, *ms)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AllocationID < out[j].AllocationID })
+	return out
+}
+
+// mountBelongsTo 判断挂载是否归属某台服务端：有显式归属按显式归属，未归类的（旧记录）算主服务端的。
+func mountBelongsTo(ms *MountState, key, primary string) bool {
+	if ms == nil {
+		return false
+	}
+	if strings.TrimSpace(ms.ServerKey) == "" {
+		return key == primary
+	}
+	return ms.ServerKey == key
 }
 
 // PutMount 写入/覆盖挂载状态与运行时信息并持久化。
@@ -615,10 +1123,17 @@ func (s *stateStore) Persist() error {
 // persistLocked 写盘。调用方需持有锁。
 func (s *stateStore) persistLocked() error {
 	state := persistedState{
-		ClientID: s.clientID,
-		Server:   s.server,
-		User:     s.user,
-		Mounts:   make([]MountState, 0, len(s.mounts)),
+		ClientID:   s.clientID,
+		PrimaryKey: s.primaryKeyLocked(),
+		Servers:    make([]persistedServer, 0, len(s.servers)),
+		Mounts:     make([]MountState, 0, len(s.mounts)),
+	}
+	for _, key := range s.orderedKeysLocked() {
+		entry := s.servers[key]
+		if entry == nil {
+			continue
+		}
+		state.Servers = append(state.Servers, persistedServer{Key: key, State: entry.state, User: entry.user})
 	}
 	for _, ms := range s.mounts {
 		state.Mounts = append(state.Mounts, *ms)

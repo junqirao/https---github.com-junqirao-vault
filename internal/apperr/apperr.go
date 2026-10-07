@@ -9,7 +9,9 @@ package apperr
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"sort"
 )
 
 // Error 是业务错误。实现 error 接口，并支持 errors.Is / errors.As。
@@ -45,6 +47,47 @@ func (e *Error) Unwrap() error {
 		return nil
 	}
 	return e.Cause
+}
+
+// LogValue 实现 slog.LogValuer：让 `"error", err` 这种**最常见的**日志写法自动带上
+// Args 与 Cause。
+//
+// 为什么必须补这一步：Error() 按约定只返回稳定的 Code（Args 是留给前端 i18n 插值的），
+// 于是 component / hint / root 这些**排障时唯一有用**的信息在日志里全部消失，现场只看到
+// 一句光秃秃的 system.unavailable。真实后果：明明是"iscsi_target_mod 没加载、fabric 目录
+// 不在"，却因为看不出组件而在代码逻辑里反复找原因（曾据此误判为"iSCSI 还在自己实现"）。
+//
+// 为什么实现 LogValuer 而不改 Error()：Error() 的字符串可能被写进任务结果/接口响应下发到
+// 客户端，而 Args 里含服务端路径；**日志要全、对外要收敛**，两者不能共用一条渲染路径。
+//
+// 无需改动任何调用点：slog 的 Value.Kind() 会优先识别 LogValuer（见 log/slog value.go
+// 的 `case LogValuer: return KindLogValuer`），故既有 `slog.X(..., "error", err)` 即刻生效。
+// nil 接收者安全（与 Error/Unwrap 一致）。JSON 输出形如
+// "error":{"code":"system.unavailable","component":"iscsi_fabric","hint":"..."}。
+func (e *Error) LogValue() slog.Value {
+	if e == nil {
+		return slog.StringValue("")
+	}
+	attrs := make([]slog.Attr, 0, len(e.Args)+2)
+	attrs = append(attrs, slog.String("code", e.Code))
+	// 参数名排序：同一错误的日志字段顺序稳定，便于 diff 与按字段检索。
+	for _, k := range e.argKeys() {
+		attrs = append(attrs, slog.Any(k, e.Args[k]))
+	}
+	if e.Cause != nil {
+		attrs = append(attrs, slog.String("cause", e.Cause.Error()))
+	}
+	return slog.GroupValue(attrs...)
+}
+
+// argKeys 返回排序后的插值参数名。
+func (e *Error) argKeys() []string {
+	keys := make([]string, 0, len(e.Args))
+	for k := range e.Args {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // WithArg 追加插值参数，返回自身便于链式调用。
@@ -202,6 +245,74 @@ func PoolSizeExceeded(freeBytes, requestedBytes int64) *Error {
 // 因此在校验阶段就拒绝。前端已把两者做成互斥勾选，这里兜住直连 API 的情况。
 func CacheDeviceOverlap(device string) *Error {
 	return New("platform.cache_device_overlap", http.StatusBadRequest).WithArg("device", device)
+}
+
+// ---- platform：存储池运维（删除池/卷组，见 platform/linuxlvm/pooldelete.go）----
+
+// PoolInUse 池或卷组里还有内容，禁止删除。
+//
+// reason 取值（前端据此选用哪条文案）：
+//   - "thin_volumes"：池里还有 thin 卷——存储的底层卷、母盘、差异盘都住在这个池里；
+//   - "volume_group"：要连卷组一起删，但卷组里还有别的逻辑卷；
+//   - "storages"    ：应用层查库发现该池上还挂着存储记录（先删存储，再删池）。
+//
+// 与 StorageInUse 同一思路：把"还剩几个、是谁"作为参数带给前端。只回一句"池被占用"，
+// 用户只能自己去敲 LVM 命令行找原因，这正是本次要消灭的体验。
+func PoolInUse(reason string) *Error {
+	return New("platform.pool_in_use", http.StatusConflict).WithArg("reason", reason)
+}
+
+// PoolProtected 不允许删除的池：服务端配置的默认池，或物理卷上带着系统挂载点的卷组。
+//
+// 默认池（platform.lvm.vg/thin_pool）是服务端所有建库/建存储的落脚点，删掉它服务随即不可用，
+// 因此不论前端怎么点都拒绝——真要删得先改配置、重启后再来。
+// reason 取值："default_pool" | "system_vg"。
+func PoolProtected(reason string) *Error {
+	return New("platform.pool_protected", http.StatusConflict).WithArg("reason", reason)
+}
+
+// PoolNotFound 池或卷组不存在（可能已被删除，或已被别人先一步处理掉）。
+func PoolNotFound(vg, thinPool string) *Error {
+	return New("platform.pool_not_found", http.StatusNotFound).
+		WithArg("vg", vg).
+		WithArg("thin_pool", thinPool)
+}
+
+// ---- platform：系统依赖按需安装（管理端"安装"按钮，见 platform/sysdeps/install.go）----
+
+// SysDepsNotInstallable 该依赖项不支持按需安装。
+//
+// 内核模块、configfs 挂载这类缺项不是"装个包"能解决的，必须按 Hint 里的命令人工处理；
+// 用 501 而不是 400：请求本身合法，是服务端没有这项能力。
+func SysDepsNotInstallable(key string) *Error {
+	return New("platform.sysdeps_not_installable", http.StatusNotImplemented).WithArg("key", key)
+}
+
+// SysDepsInstallDisabled 服务端配置明确关闭了装包（platform.auto_install=false）。
+//
+// 刻意**不**因为"这是用户点按钮"就绕过开关：该开关的语义正是"别让服务端动这台机器的包管理"，
+// 通常意味着依赖由 Ansible/镜像构建等外部工具接管，或机器根本不通外网——
+// 此时调包管理器只会等满超时再失败，徒增困惑。
+func SysDepsInstallDisabled() *Error {
+	return New("platform.sysdeps_install_disabled", http.StatusConflict)
+}
+
+// SysDepsInstallNotRoot 服务端不是以 root 运行，无法调用发行版包管理器。
+func SysDepsInstallNotRoot() *Error {
+	return New("platform.sysdeps_install_not_root", http.StatusConflict)
+}
+
+// SysDepsNoPackageManager 宿主机没有受支持的包管理器，无法自动安装。
+func SysDepsNoPackageManager() *Error {
+	return New("platform.sysdeps_no_pkg_manager", http.StatusConflict)
+}
+
+// SysDepsInstallFailed 安装命令执行失败（软件源不可达、包名与发行版不匹配等）。
+//
+// 与上面几个的区别：那些是**提交前**就能确定的拒绝理由，这个是命令真的跑过并失败了。
+// 底层输出只进日志，客户端只拿到这个码（见 6.5）。
+func SysDepsInstallFailed() *Error {
+	return New("platform.sysdeps_install_failed", http.StatusInternalServerError)
 }
 
 // ---- repo ----

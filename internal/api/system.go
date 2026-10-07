@@ -47,6 +47,40 @@ func (r *Router) handleSystemDeps(w http.ResponseWriter, req *http.Request) {
 	r.writeJSON(w, http.StatusOK, r.deps.App.SysDeps(req.Context()))
 }
 
+// sysDepsInstallRequest 是按需安装系统依赖的请求体。
+type sysDepsInstallRequest struct {
+	// Key 依赖项标识，与 GET /v1/system/deps 的 items[].key 一致（如 lio_tools）。
+	Key string `json:"key"`
+}
+
+// handleInstallSystemDeps 提交"按需安装系统依赖"任务（仅超级管理员）。
+//
+// 为什么是异步任务而不是"装完再返回"：装包要拉软件源、解包，动辄几十秒到几分钟，
+// 同步等待只会让前端"点一下卡住"，还要顶着 HTTP 超时。这里立刻返回 202 + 任务对象，
+// 前端轮询 GET /v1/jobs/{id} 直到终态（与其它长任务一致），随后刷新 /v1/system/deps。
+//
+// 与 GET 的权限差异是刻意的：读是只读探测、任何登录用户都该知道"缺了什么、怎么补"；
+// 而装包会**改动宿主机且影响整台机器**，因此只放给超级管理员，并受 platform.auto_install
+// 开关约束（关闭时提交即被拒，见 app.InstallSysDeps）。
+func (r *Router) handleInstallSystemDeps(w http.ResponseWriter, req *http.Request) {
+	var in sysDepsInstallRequest
+	if err := r.decodeJSON(req, &in); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	j, err := r.deps.App.InstallSysDeps(req.Context(), in.Key)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	// 装包是"谁让它装的"必须可追溯的操作，审计里留下依赖项 Key 与任务 ID。
+	if p, err := r.principal(req); err == nil {
+		r.deps.App.Audit(req.Context(), p.UserID, "system.deps.install", "key:"+in.Key,
+			"job_id="+j.ID, domain.AuditResultOK)
+	}
+	r.writeJSON(w, http.StatusAccepted, toJobDTO(j))
+}
+
 // handleSystemHealth 健康检查。
 //
 // 全部检查通过返回 200，否则返回 503（响应体始终含 ok 字段与各项结果）。

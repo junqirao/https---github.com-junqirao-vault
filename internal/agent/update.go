@@ -265,14 +265,13 @@ func (a *Agent) resolveUpdate(ctx context.Context) (*updateCandidate, *UpdateChe
 //     这不是错误，前端展示为"无可用更新"，避免把"暂时查不到"变成刺眼的报错；
 //   - (nil, nil, err)：**硬失败**（验签失败 / 清单非法），必须原样上报，绝不降级。
 func (a *Agent) resolveUpdateKind(ctx context.Context, kind updatepkg.ArtifactKind) (*updateCandidate, *UpdateCheckResult, error) {
-	// ① 更新源：当前会话对应的服务端。
+	// ① 更新源：**主服务端**（多服务端下更新源只能有一个，见 §7.4.1）。
 	//
 	// TODO(多服务端回退)：设计目标是 primary → 其他 COMPATIBLE 服务端按配置顺序回退（§7.4.1）。
-	// 代理当前只持有**单个会话**（前端每次只推送一个服务端），拿不到候选列表，
-	// 因此这里实现为"用当前服务端；不可达则明确返回 server_unreachable"。
-	// 落地方式：前端推送会话时附带候选服务端列表（或新增 GET /agent/servers），
-	// 这里改为按序尝试并在结果中返回真正生效的更新源。
-	session, ok := a.store.Session()
+	// 代理现在已持有全部服务端的会话，但"回退"还涉及更新产物与客户端兼容性的一致性，
+	// 暂未实现；不可达时明确返回 server_unreachable。
+	key := a.primaryServerKey()
+	session, ok := a.store.Session(key)
 	if !ok || strings.TrimSpace(session.ServerURL) == "" {
 		// 无会话是"尚未登录 / 会话已过期"的**预期状态**，不是更新源故障：不要把它写成
 		// 服务端的"最后错误"（否则界面上会挂一条 `update_source:agent.no_session`，
@@ -280,7 +279,7 @@ func (a *Agent) resolveUpdateKind(ctx context.Context, kind updatepkg.ArtifactKi
 		// 设置页可据此显示"未登录"。
 		return nil, a.unavailable("no_session"), nil
 	}
-	client, err := newServerClient(session.ServerURL, session.Token, session.CertSHA256, a.logger)
+	client, err := a.serverClientFor(key)
 	if err != nil {
 		a.noteUpdateError("update_source", err)
 		return nil, a.unavailable("server_unreachable"), nil
@@ -383,28 +382,50 @@ func (a *Agent) resolveUpdateKind(ctx context.Context, kind updatepkg.ArtifactKi
 		return nil, res, nil
 	}
 
-	// ⑥ 客户端兼容性预检（§7.4.3）：升级后若超出该服务端的 client_compat.max，
-	//    不阻断，但把冲突信息交给前端提示用户确认。
-	breaks := a.precheckServerCompat(ctx, client, manifest.Version)
+	// ⑥ 客户端兼容性预检（§7.4.3）：升级后若超出某台服务端的 client_compat.max，
+	//    不阻断，但把冲突信息交给前端提示用户确认。逐台预检（见 precheckServerCompat）。
+	breaks := a.precheckServerCompat(ctx, client, key, manifest.Version)
 
 	return &updateCandidate{
 		manifest:   manifest,
 		artifact:   artifact,
 		client:     client,
-		serverName: a.serverDisplayName(),
+		serverName: a.serverDisplayName(key),
 		breaks:     breaks,
 	}, nil, nil
 }
 
-// precheckServerCompat 预检"升级后是否会导致当前服务端不兼容"。
+// precheckServerCompat 预检"升级后是否会导致**任一**服务端不兼容"（§7.4.3）。
 //
-// TODO(多服务端)：理想实现是对全部已配置服务端逐个预检（§7.4.3）。
-// 代理当前只有单会话，因此只能预检当前服务端。预检失败按"无冲突"处理（不阻断升级）：
-// 拉不到契约时宁可让升级继续，也不要因为一个探测失败而永远无法升级。
-func (a *Agent) precheckServerCompat(ctx context.Context, client *serverClient, targetVersion string) []BreakServer {
+// 客户端要同时跟本机登录的每一台服务端打交道，因此不能只预检更新源那一台 —— 升级到与 B 台
+// 不兼容的版本，照样会把 B 台那侧的功能弄坏。source/sourceKey 是本次更新源（已请求过一次，
+// 不重复请求），其余各台逐台取契约；取不到就跳过（不阻断升级）。
+func (a *Agent) precheckServerCompat(ctx context.Context, source *serverClient, sourceKey, targetVersion string) []BreakServer {
+	breaks := a.serverCompatBreaks(ctx, source, a.serverDisplayName(sourceKey), targetVersion)
+	for _, key := range a.store.ServerKeys() {
+		if key == sourceKey {
+			continue
+		}
+		client, err := a.serverClientFor(key)
+		if err != nil {
+			// 该台没有可用会话（未登录/已登出）：它不参与本次兼容性判断。
+			continue
+		}
+		breaks = append(breaks, a.serverCompatBreaks(ctx, client, a.serverDisplayName(key), targetVersion)...)
+	}
+	return breaks
+}
+
+// serverCompatBreaks 单台服务端的兼容性预检：超出该台 client_compat.max 时返回一条
+// BreakServer，兼容（或取不到契约/契约非法）时返回 nil。
+//
+// 预检失败按"无冲突"处理（不阻断升级）：拉不到契约时宁可让升级继续，也不要因为一个探测失败
+// 而永远无法升级。
+func (a *Agent) serverCompatBreaks(ctx context.Context, client *serverClient, serverName, targetVersion string) []BreakServer {
 	info, err := client.SystemInfo(ctx)
 	if err != nil {
-		a.logger.Warn("升级兼容性预检失败（无法获取服务端 client_compat），已跳过", "error", err)
+		a.logger.Warn("升级兼容性预检失败（无法获取服务端 client_compat），已跳过",
+			"server", serverName, "error", err)
 		return nil
 	}
 	if !info.ClientCompat.Enabled || strings.TrimSpace(info.ClientCompat.Max) == "" {
@@ -421,20 +442,26 @@ func (a *Agent) precheckServerCompat(ctx context.Context, client *serverClient, 
 	if newV.LTE(maxV) {
 		return nil
 	}
-	return []BreakServer{{ServerName: a.serverDisplayName(), Max: info.ClientCompat.Max}}
+	return []BreakServer{{ServerName: serverName, Max: info.ClientCompat.Max}}
 }
 
 // noteUpdateError 把更新源故障记入"服务端最近错误"，便于界面与排障看到原因。
 //
 // 只补 last_error，**不动 connected 标志**：更新源取不到清单并不代表服务端 API 不可用
 // （服务端未配置 artifacts_dir 时也会返回 404），不能因此把"已连接"改成"未连接"。
+//
+// 记在**主服务端**上：多服务端下更新源就是主服务端（见 resolveUpdateKind）。
 func (a *Agent) noteUpdateError(stage string, err error) {
 	if err == nil {
 		return
 	}
-	server := a.store.Server()
-	server.LastError = describeError(stage, err)
-	a.store.SetServer(server)
+	key := a.primaryServerKey()
+	if key == "" {
+		return
+	}
+	a.store.UpdateServer(key, func(state *ServerState) {
+		state.LastError = describeError(stage, err)
+	})
 }
 
 // unavailable 构造"无可用更新"的软失败结果，并记录原因供 GET /agent/state 展示。
@@ -450,7 +477,7 @@ func (a *Agent) unavailable(reason string) *UpdateCheckResult {
 		Available:            false,
 		Version:              info.CurrentVersion,
 		SizeBytes:            0,
-		Source:               a.serverDisplayName(),
+		Source:               a.serverDisplayName(a.primaryServerKey()),
 		Reason:               reason,
 		Channel:              info.Channel,
 		PublicKeyFingerprint: UpdatePublicKeyFingerprint(),

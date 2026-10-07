@@ -219,7 +219,8 @@ func (a *Agent) handleIdentityLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 与 POST /agent/session 一致地写回本地状态，供心跳/事件订阅等后续能力复用。
-	a.setSession(session)
+	// key 留空：按会话自带的实例 ID/地址推导归属于哪一台。
+	a.setSession("", session, false)
 	a.logger.Info("已用本地客户端证书免密登录", "server_url", session.ServerURL, "username", session.Username)
 	// 原样透出服务端响应。
 	a.writeJSON(w, http.StatusOK, out)
@@ -308,15 +309,17 @@ func (a *Agent) resolveIdentity(instanceID, serverURL string) (Identity, bool) {
 //
 // 多服务端下这里必须核对"是不是同一个服务端"：否则会把 A 服务端的指纹拿去固定
 // B 服务端的证书，握手阶段就被拒（表现为 TLS handshake error 反复刷屏）。
+// 因此逐台会话比对，取属于该服务端的那一份。
 func (a *Agent) pinForIdentity(id Identity) string {
 	if p := strings.ToLower(strings.TrimSpace(id.ServerCertSHA256)); p != "" {
 		return p
 	}
-	sess, ok := a.store.Session()
-	if !ok || !sameServer(id, sess.ServerInstanceID, sess.ServerURL) {
-		return ""
+	for _, sess := range a.store.Sessions() {
+		if sameServer(id, sess.ServerInstanceID, sess.ServerURL) {
+			return strings.ToLower(strings.TrimSpace(sess.CertSHA256))
+		}
 	}
-	return strings.ToLower(strings.TrimSpace(sess.CertSHA256))
+	return ""
 }
 
 // sameServer 判断身份与给定服务端（实例 ID + 地址）是否指向同一个服务端实例。

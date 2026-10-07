@@ -106,6 +106,30 @@ export function errorMessageOf(code: string, args: Record<string, unknown> = {})
     if (hasKey(reasonKey)) return { key: reasonKey, params: args }
   }
 
+  // 删池失败的 reason 是**该错误码专有**的（thin_volumes / volume_group / storages），
+  // 与 auth.forbidden 那套跨接口复用的 err.reason.* 不同，因此键就挂在错误码下面：
+  // 既保留了"按 reason 细分文案"的结构，也不会让 err.reason.* 混进别人的语义。
+  if (code === 'platform.pool_in_use' && typeof args.reason === 'string') {
+    const reasonKey = `err.platform.pool_in_use.${args.reason}`
+    if (hasKey(reasonKey)) return { key: reasonKey, params: args }
+  }
+
+  if (code === 'platform.pool_protected' && typeof args.reason === 'string') {
+    // 系统卷组若挂着系统挂载点，把挂载点一并摆出来；`mounts` 可能为空串，
+    // 空的时候用不带插值的键，免得界面上出现"（挂载点：）"这种半句话。
+    const mounts = typeof args.mounts === 'string' ? args.mounts.trim() : ''
+    const suffix = args.reason === 'system_vg' && mounts !== '' ? '_mounts' : ''
+    const reasonKey = `err.platform.pool_protected.${args.reason}${suffix}`
+    if (hasKey(reasonKey)) return { key: reasonKey, params: args }
+  }
+
+  // 只删空卷组时 thin_pool 传空串，后端对"卷组不存在"复用同一个码；
+  // 空串时套用卷组文案，免得界面出现"存储池 vg1/ 不存在"。
+  if (code === 'platform.pool_not_found' && typeof args.thin_pool === 'string' && args.thin_pool.trim() === '') {
+    const key = 'err.platform.volume_group_not_found'
+    if (hasKey(key)) return { key, params: args }
+  }
+
   return { key: `err.${code}`, params: numericArgs(args) }
 }
 

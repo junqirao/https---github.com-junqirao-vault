@@ -132,3 +132,10 @@ func VolumeKey(volumeID string) string { return "volume:" + volumeID }
 
 // TargetKey iSCSI 目标级互斥键。
 func TargetKey(targetName string) string { return "iscsi:" + targetName }
+
+// HostKey 宿主机级互斥键（key 区分不同的全局操作，如 "sysdeps"）。
+//
+// 用于**影响整台机器**而不属于任何业务实体的操作：包管理器（apt/dpkg/rpm）自身在宿主机
+// 范围内只有一把锁，两个装包任务并行只会互相撞锁、留下装到一半的状态；
+// 而这类操作既不属于某块磁盘也不属于某个库，用 DiskKey/RepoKey 表达是错的。
+func HostKey(name string) string { return "host:" + name }

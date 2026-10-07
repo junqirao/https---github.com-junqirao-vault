@@ -120,14 +120,20 @@ func dispatchServerEvent(eventType, payload string, handle func(string, json.Raw
 	handle(eventType, envelope.Data)
 }
 
-// runServerEvents 持续消费服务端事件流，直到服务端不再支持或上下文结束。
-func (a *Agent) runServerEvents(ctx context.Context) {
+// runServerEvents 持续消费**某台**服务端的事件流，直到该台不再支持或上下文结束。
+//
+// 多服务端下每台各有一条订阅协程（见 ensureEventSubscriber）：一台断了重连不影响其它台。
+func (a *Agent) runServerEvents(ctx context.Context, key string) {
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		client, err := a.serverClient()
+		// 该台会话已被清掉（退出登录/移除服务端）：结束订阅，不必空转重连。
+		if _, ok := a.store.Session(key); !ok {
+			return
+		}
+		client, err := a.serverClientFor(key)
 		if err != nil {
 			// 无会话：等待前端推送会话（onSessionEstablished 会重新拉起订阅）。
 			return
@@ -136,27 +142,30 @@ func (a *Agent) runServerEvents(ctx context.Context) {
 		// 事件流就绪即确认连接：SystemInfo 可能失败（10s 超时），而心跳只在**有挂载**时才发
 		// （见 lease.go 的 sweepHeartbeats），两条路都不通时界面会一直卡在"未连接"，
 		// 即使服务端其实完全可达。
-		err = client.streamEvents(ctx, a.handleServerEvent, func() {
-			a.setServerConnected(true, "")
+		err = client.streamEvents(ctx, func(eventType string, data json.RawMessage) {
+			a.handleServerEvent(key, eventType, data)
+		}, func() {
+			a.setServerConnected(key, true, "")
 		})
 		switch {
 		case ctx.Err() != nil:
 			return
 		case errors.Is(err, errServerEventsUnsupported):
-			a.eventsUnsupported.Store(true)
-			a.logger.Warn("服务端未提供事件通道，降级为仅心跳模式（靠心跳错误 lease.revoked 触发卸载）")
+			a.setEventsSupported(key, false)
+			a.logger.Warn("服务端未提供事件通道，降级为仅心跳模式（靠心跳错误 lease.revoked 触发卸载）",
+				"server", key)
 			return
 		case err == nil:
-			a.setServerConnected(false, "events_closed")
+			a.setServerConnected(key, false, "events_closed")
 		default:
-			a.setServerConnected(false, describeError("events", err))
-			a.logger.Warn("服务端事件流中断，稍后重试", "error", err)
+			a.setServerConnected(key, false, describeError("events", err))
+			a.logger.Warn("服务端事件流中断，稍后重试", "server", key, "error", err)
 			// 服务端重启后会话表被清空，事件流会一直 401；这里主动用本地证书重登录，
-			// 下次循环拿到新客户端即可恢复订阅（refreshSessionToken 自带节流与单飞）。
+			// 下次循环拿到新客户端即可恢复订阅（refreshSessionTokenFor 自带节流与单飞）。
 			if isSessionExpiredError(err) {
 				retryCtx, retryCancel := context.WithTimeout(ctx, serverRequestTimeout)
-				if _, rErr := a.refreshSessionToken(retryCtx); rErr != nil {
-					a.logger.Warn("事件流因会话失效中断，用本地证书重新登录失败", "error", rErr)
+				if _, rErr := a.refreshSessionTokenFor(retryCtx, key); rErr != nil {
+					a.logger.Warn("事件流因会话失效中断，用本地证书重新登录失败", "server", key, "error", rErr)
 				}
 				retryCancel()
 			}
@@ -180,8 +189,11 @@ func (a *Agent) runServerEvents(ctx context.Context) {
 // 并由 mount_phase_test.go 的合约测试钉住。
 const serverMountEventType = "mount"
 
-// handleServerEvent 处理单条服务端事件。
-func (a *Agent) handleServerEvent(eventType string, data json.RawMessage) {
+// handleServerEvent 处理某台服务端发来的单条事件。
+//
+// key 是事件来源服务端：分配 ID 全局唯一（UUID），因此这里不需要按来源过滤，只用它做日志与事件
+// 归属标注（界面据此把事件落到对应那台）。
+func (a *Agent) handleServerEvent(key, eventType string, data json.RawMessage) {
 	switch eventType {
 	case "revoke", "lease.revoked", "lease_revoked":
 		var payload struct {
@@ -198,7 +210,7 @@ func (a *Agent) handleServerEvent(eventType string, data json.RawMessage) {
 			}
 		}
 		if allocationID == "" {
-			a.logger.Warn("收到踢下线事件但无法定位分配", "lease_id", payload.LeaseID)
+			a.logger.Warn("收到踢下线事件但无法定位分配", "server", key, "lease_id", payload.LeaseID)
 			return
 		}
 		reason := strings.TrimSpace(payload.Reason)

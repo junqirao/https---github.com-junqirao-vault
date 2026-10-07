@@ -80,9 +80,28 @@ func heartbeatEligible(state string, rt mountRuntime) bool {
 	return false
 }
 
+// mountClient 返回该挂载所属服务端的客户端。
+//
+// 多服务端的关键：心跳必须发给**当初受理这次挂载的那台**。挂载记录的 ServerKey 为空只可能是
+// 单服务端时代的旧记录（装载时已尽量归类，见 NewStateStore），此时退回主服务端。
+func (a *Agent) mountClient(ms MountState) (*serverClient, error) {
+	if key := strings.TrimSpace(ms.ServerKey); key != "" {
+		return a.serverClientFor(key)
+	}
+	return a.primaryServerClient()
+}
+
+// mountServerKey 返回挂载归属的服务端键（未归类时退回主服务端键；都没有则为空串）。
+func (a *Agent) mountServerKey(ms MountState) string {
+	if key := strings.TrimSpace(ms.ServerKey); key != "" {
+		return key
+	}
+	return a.primaryServerKey()
+}
+
 // heartbeatOne 对单个租约发送一次心跳，并按结果更新状态。
 func (a *Agent) heartbeatOne(ctx context.Context, ms MountState, now time.Time) {
-	client, err := a.serverClient()
+	client, err := a.mountClient(ms)
 	if err != nil {
 		// 无会话：不视为心跳失败，等待前端推送会话（不写 last_error）。
 		return
@@ -101,7 +120,7 @@ func (a *Agent) heartbeatOne(ctx context.Context, ms MountState, now time.Time) 
 			a.handleRevoke(ctx, ms.AllocationID, leaseRevokedCode)
 			return
 		}
-		a.recordHeartbeatFailure(ms.AllocationID, now, hbErr)
+		a.recordHeartbeatFailure(ms, now, hbErr)
 		return
 	}
 
@@ -133,10 +152,12 @@ func (a *Agent) heartbeatOne(ctx context.Context, ms MountState, now time.Time) 
 		a.logger.Info("心跳已恢复，挂载状态复位为已挂载", "allocation_id", ms.AllocationID)
 		a.publishMount(recovered)
 	}
-	a.setServerConnected(true, "")
+	serverKey := a.mountServerKey(ms)
+	a.setServerConnected(serverKey, true, "")
 	a.hub.Publish(Event{Type: "heartbeat", Data: map[string]any{
 		"at":            now.UnixMilli(),
 		"allocation_id": ms.AllocationID,
+		"server_key":    serverKey,
 	}})
 }
 
@@ -146,7 +167,8 @@ func (a *Agent) heartbeatOne(ctx context.Context, ms MountState, now time.Time) 
 // 挂载依然好好地挂在机器上，只是"和说话的人断了线"，往挂载上贴一个红色感叹号纯属误导
 // ——服务端连通性由代理的 server.last_error 与界面横幅统一反映。只有真正降级
 // （连续失败超过 TTL，本地判定 error）时才写 last_error，那次会同时把状态推给界面。
-func (a *Agent) recordHeartbeatFailure(allocationID string, now time.Time, cause error) {
+func (a *Agent) recordHeartbeatFailure(ms MountState, now time.Time, cause error) {
+	allocationID := ms.AllocationID
 	var errorState *MountState
 
 	a.store.UpdateMount(allocationID, func(m *MountState, r *mountRuntime) {
@@ -173,8 +195,8 @@ func (a *Agent) recordHeartbeatFailure(allocationID string, now time.Time, cause
 		}
 	})
 
-	a.setServerConnected(false, describeError("heartbeat", cause))
-	a.logger.Warn("租约心跳失败", "allocation_id", allocationID, "error", cause)
+	a.setServerConnected(a.mountServerKey(ms), false, describeError("heartbeat", cause))
+	a.logger.Warn("租约心跳失败", "allocation_id", allocationID, "server", a.mountServerKey(ms), "error", cause)
 
 	if errorState != nil {
 		a.publishMount(errorState)
@@ -202,8 +224,13 @@ func (a *Agent) handleRevoke(ctx context.Context, allocationID, reason string) {
 		a.logger.Error("响应踢下线时卸载失败", "allocation_id", allocationID, "error", err)
 	}
 
+	serverKey := ""
+	if ms, _, ok := a.store.GetMount(allocationID); ok {
+		serverKey = a.mountServerKey(ms)
+	}
 	a.hub.Publish(Event{Type: "revoked", Data: map[string]any{
 		"allocation_id": allocationID,
 		"reason":        reason,
+		"server_key":    serverKey,
 	}})
 }

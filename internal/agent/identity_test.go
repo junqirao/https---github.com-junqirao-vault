@@ -294,7 +294,7 @@ func TestPinForIdentityRequiresSameServer(t *testing.T) {
 	agent := &Agent{logger: testLogger(), store: store, hub: NewEventHub()}
 
 	pin := strings.Repeat("cd", 32)
-	store.SetSession(&Session{
+	store.SetSession("", &Session{
 		ServerURL:        "https://10.0.0.2:8443",
 		ServerInstanceID: "srv-b",
 		CertSHA256:       pin,

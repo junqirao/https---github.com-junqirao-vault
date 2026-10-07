@@ -105,6 +105,12 @@ type uploadStartRequest struct {
 	QuotaBytes int64 `json:"quota_bytes"`
 	// SourceMode copy | move；留空默认 copy。move 仅在服务端建库成功后删除本地源目录。
 	SourceMode string `json:"source_mode"`
+	// ServerKey / ServerURL 指明把库建到**哪台**服务端（多服务端下应带上）。
+	//
+	// 都为空时按主服务端兜底（老客户端不带服务端标识）；给了却匹配不上任何已登记服务端
+	// 则明确报 agent.server_unknown —— 存储 ID 只对"它所属的那台服务端"有意义。
+	ServerKey string `json:"server_key"`
+	ServerURL string `json:"server_url"`
 }
 
 // uploadSessionPlan 是一次上传要使用的服务端会话计划。
@@ -403,8 +409,15 @@ func (a *Agent) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 	req.SourceMode = sourceMode
 	req.StorageID = strings.TrimSpace(req.StorageID)
 
+	// 目标服务端：请求指定的服务端 > 主服务端（老客户端不带标识）。给了标识却匹配不上必须报错，
+	// 绝不改往别的台建库 —— 存储 ID 只对"它所属的那台服务端"有意义。
+	serverKey := a.store.ResolveKey(req.ServerKey, req.ServerURL)
+	if serverKey == "" {
+		a.writeError(w, errServerUnknown())
+		return
+	}
 	// 无会话或会话不可用时明确报错，绝不静默失败。
-	client, err := a.serverClient()
+	client, err := a.serverClientFor(serverKey)
 	if err != nil {
 		a.writeError(w, err)
 		return

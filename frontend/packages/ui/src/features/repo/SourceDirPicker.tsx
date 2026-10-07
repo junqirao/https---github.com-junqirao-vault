@@ -190,15 +190,27 @@ export function SourceDirPicker({ value, onChange, onValidityChange }: SourceDir
   )
 }
 
-interface ServerDirBrowserProps {
+export interface ServerDirBrowserProps {
   open: boolean
   initialPath?: string
+  /** 弹窗标题；默认"服务端目录"，其他场景（如存储挂载点）可自定义。 */
+  title?: string
   onCancel: () => void
   onConfirm: (path: string) => void
 }
 
-/** 服务端目录浏览弹窗：根列表 + 面包屑 + 子目录列表 + 目录统计。 */
-function ServerDirBrowser({ open, initialPath, onCancel, onConfirm }: ServerDirBrowserProps): JSX.Element {
+/**
+ * 服务端目录浏览弹窗：根列表 + 面包屑 + 子目录列表 + 目录统计。
+ *
+ * 除「源目录选择」外，Windows 上创建存储选择挂载点也复用它（同一个 /v1/fs/* 白名单）。
+ */
+export function ServerDirBrowser({
+  open,
+  initialPath,
+  title,
+  onCancel,
+  onConfirm
+}: ServerDirBrowserProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const [current, setCurrent] = useState<string>('')
@@ -241,7 +253,7 @@ function ServerDirBrowser({ open, initialPath, onCancel, onConfirm }: ServerDirB
   return (
     <Modal
       open={open}
-      title={t('sourceDir.server')}
+      title={title ?? t('sourceDir.server')}
       width={640}
       centered
       okText={t('sourceDir.selectThis')}

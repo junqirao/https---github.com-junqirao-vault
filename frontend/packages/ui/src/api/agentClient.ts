@@ -555,6 +555,10 @@ export const agentApi = {
     mount_path?: string
     repo_id?: string
     repo_name?: string
+    /** 归属服务端（二选一即可）：省略时按"本机既有记录 → 主服务端"兜底。 */
+    server_key?: string
+    server_url?: string
+    server_name?: string
   }): Promise<{ mount: AgentMountState }> {
     return request({ method: 'POST', path: '/agent/mount', body: input, timeoutMs: MOUNT_TIMEOUT_MS })
   },
@@ -572,6 +576,8 @@ export const agentApi = {
     disk_id: string
     target_dir?: string
     file_name?: string
+    /** 从**哪台**服务端下载（二选一即可）；都省略时按主服务端兜底（老客户端）。 */
+    server_key?: string
     server_url?: string
   }): Promise<{ download: DownloadState }> {
     return request({ method: 'POST', path: '/agent/disks/download', body: input })
@@ -607,12 +613,24 @@ export const agentApi = {
     return request({ method: 'DELETE', path: `/agent/uploads/${encodeURIComponent(uploadId)}` })
   },
 
-  pushSession(input: ServerSession): Promise<{ ok: true }> {
+  /**
+   * 推送一台服务端的会话（多服务端下对 servers[] 逐台各推一次即完成"全部自动登录"）。
+   *
+   * 响应回传该会话**实际归属**的 server_key：同一台的两种键（地址 / 实例 ID）在代理内会被
+   * 合并，调用方据此对齐自己记的键。
+   */
+  pushSession(input: ServerSession): Promise<{ ok: true; server_key: string }> {
     return request({ method: 'POST', path: '/agent/session', body: input })
   },
 
-  clearSession(): Promise<{ ok: true }> {
-    return request({ method: 'DELETE', path: '/agent/session' })
+  /**
+   * 退出登录（停止该台心跳并解除订阅，不卸载已有挂载）。
+   *
+   * 传 serverKey 时只登出**那一台**；省略时清**全部**会话（单服务端时代的等价语义）。
+   */
+  clearSession(serverKey?: string): Promise<{ ok: true; cleared?: string[]; server_key?: string }> {
+    const query = serverKey ? `?server_key=${encodeURIComponent(serverKey)}` : ''
+    return request({ method: 'DELETE', path: `/agent/session${query}` })
   },
 
   testServer(url: string): Promise<ServerProbe> {
@@ -624,9 +642,15 @@ export const agentApi = {
    *
    * 代理会清零自动重连的失败计数并立即重试一次 —— 即"手动重试会刷新计数"：
    * 之后自动重连循环重新获得 maxServerConnectAttempts 次机会。
+   *
+   * 传 serverKey 时重试**那一台**；省略时针对主服务端（老客户端语义不变）。
    */
-  reconnectServer(): Promise<AgentServerState> {
-    return request({ method: 'POST', path: '/agent/server/reconnect' })
+  reconnectServer(serverKey?: string): Promise<AgentServerState> {
+    return request({
+      method: 'POST',
+      path: '/agent/server/reconnect',
+      body: serverKey ? { server_key: serverKey } : undefined
+    })
   },
 
   getConfig(): Promise<AgentConfig> {
@@ -773,11 +797,16 @@ export function parseAgentEvent(type: string, data: string): AgentEvent | null {
       return {
         type: 'revoked',
         allocation_id: String(value.allocation_id ?? ''),
-        reason: typeof value.reason === 'string' ? value.reason : undefined
+        reason: typeof value.reason === 'string' ? value.reason : undefined,
+        server_key: typeof value.server_key === 'string' ? value.server_key : undefined
       }
     case 'server':
       return {
         type: 'server',
+        // server_key 是归属键：一条事件只更新它那一台（旧版代理不带，按主服务端处理）。
+        server_key: typeof value.server_key === 'string' ? value.server_key : undefined,
+        url: typeof value.url === 'string' ? value.url : undefined,
+        name: typeof value.name === 'string' ? value.name : undefined,
         connected: value.connected === true,
         // phase / fail_count 决定顶栏标签显示"连接中"还是"未连接 + 重试"（见 agentTypes.ts）。
         phase:
@@ -807,7 +836,12 @@ export function parseAgentEvent(type: string, data: string): AgentEvent | null {
     case 'upload':
       return { type: 'upload', upload: raw as UploadState }
     case 'heartbeat':
-      return { type: 'heartbeat', at: typeof value.at === 'number' ? value.at : Date.now() }
+      return {
+        type: 'heartbeat',
+        at: typeof value.at === 'number' ? value.at : Date.now(),
+        allocation_id: typeof value.allocation_id === 'string' ? value.allocation_id : undefined,
+        server_key: typeof value.server_key === 'string' ? value.server_key : undefined
+      }
     default:
       return null
   }

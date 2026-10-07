@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, App, Button, Collapse, Form, Input, InputNumber, Select, Space, Switch, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -11,6 +11,7 @@ import type { CreateStorageRequest, InitializePoolRequest, LvmPoolStatusDTO } fr
 import { useI18n } from '../../i18n'
 import { spacing } from '../../tokens/palette'
 import { formatBytes } from '../../utils/format'
+import { ServerDirBrowser } from '../repo/SourceDirPicker'
 import { BlockDevicePicker, DeviceRefreshButton } from '../system/BlockDevicePicker'
 
 const BYTES_PER_GB = 1024 ** 3
@@ -83,6 +84,54 @@ function buildPoolRequest(values: StorageFormValues, creatingVG: boolean): Initi
     body.cache_mode = values.newPoolCacheMode || 'writethrough'
   }
   return body
+}
+
+/**
+ * Windows 上的挂载点输入：可手动填绝对路径，也可点「浏览」在服务端目录树里挑一个。
+ *
+ * 为什么要有浏览：Windows 上存储就是宿主机上的一个目录，路径要求绝对、且必须在服务端
+ * 能看到的盘上；让用户凭记忆手敲 `D:\...` 既容易打错，也不知道服务端到底有哪些盘。
+ * 浏览走的是既有的 /v1/fs/* 接口（与「源目录选择」同一个白名单）。
+ *
+ * 仍保留可编辑：挂载点目录可以先不存在（服务端会 MkdirAll 建出来），而目录浏览只能
+ * 挑到已存在的目录，手输是新建目录的唯一途径。
+ */
+function MountPointInput({
+  value,
+  onChange,
+  placeholder
+}: {
+  value?: string
+  onChange?: (value: string) => void
+  placeholder?: string
+}): JSX.Element {
+  const { t } = useI18n()
+  const [browserOpen, setBrowserOpen] = useState(false)
+
+  return (
+    <>
+      <Space.Compact style={{ width: '100%' }}>
+        <Input
+          spellCheck={false}
+          // Form.Item 初始值是 undefined，直接透给受控 Input 会让 React 报"非受控变受控"。
+          value={value ?? ''}
+          placeholder={placeholder}
+          onChange={(event) => onChange?.(event.target.value)}
+        />
+        <Button onClick={() => setBrowserOpen(true)}>{t('storage.mountPointBrowse')}</Button>
+      </Space.Compact>
+      <ServerDirBrowser
+        open={browserOpen}
+        initialPath={value}
+        title={t('storage.mountPointBrowseTitle')}
+        onCancel={() => setBrowserOpen(false)}
+        onConfirm={(path) => {
+          onChange?.(path)
+          setBrowserOpen(false)
+        }}
+      />
+    </>
+  )
 }
 
 /**
@@ -473,13 +522,13 @@ export function StorageCreateForm({ onCreated, onCancel }: StorageCreateFormProp
           </Form.Item>
 
           {platformKnown && !supportsVolumes ? (
-            // Windows：没有底层卷，存储就是本地目录，必须显式给出。
+            // Windows：没有底层卷，存储就是本地目录，必须显式给出（可手填，也可浏览服务端目录）。
             <Form.Item
               name="mountPoint"
               label={t('field.mountPoint')}
               rules={[{ required: true, message: t('storage.mountPointRequired') }]}
             >
-              <Input spellCheck={false} />
+              <MountPointInput placeholder={t('field.path')} />
             </Form.Item>
           ) : null}
 
