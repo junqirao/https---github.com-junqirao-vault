@@ -25,7 +25,7 @@ import (
 //     用"短名（IQN 冒号后部分）包含匹配"找会话，两者短名互为子串就会串台。
 //   - L1/L2 预算是**客户端总量**（用户在客户端设置里配），按已启用缓存的库**均分**；
 //     配额在创建目标时定下，运行中不重算（重算会让已缓存的数据被突然判定为超额）。
-//   - 代理不可用（端口占用、后端不可达、CHAP 不支持、配额不足）时挂载流程回退直连
+//   - 代理不可用（端口占用、后端不可达、后端 CHAP 认证失败、配额不足）时挂载流程回退直连
 //     服务端目标 —— 缓存是加速手段，绝不能变成挂载的前置条件。
 const (
 	// cachePortalAddr 门户监听地址。固定端口：本机发起端只配一次门户地址，
@@ -61,8 +61,11 @@ type cacheTargetRequest struct {
 	BackendAddress string
 	BackendPort    int
 	BackendIQN     string
-	// AuthMode 是服务端下发的认证方式；chap 暂不支持（后端发起端目前只做 None）。
+	// AuthMode 是服务端下发的认证方式：none（默认）或 chap（单向 CHAP）。
 	AuthMode string
+	// ChapUser/ChapSecret 是 CHAP 凭证（仅 AuthMode=chap 时使用）；明文只在本次挂载下发。
+	ChapUser   string
+	ChapSecret string
 }
 
 // cacheManager 持有客户端唯一的缓存门户，管理其中的多个目标。
@@ -161,15 +164,12 @@ func (m *cacheManager) runningPortal() *iscsicache.Portal {
 
 // EnsureTarget 为该库注册/复用缓存目标。幂等：key 已在门户中时直接返回。
 //
-// 返回错误表示这个库这次用不上缓存（端口占用、后端不可达、CHAP、配额不足等）——
+// 返回错误表示这个库这次用不上缓存（端口占用、后端不可达、后端认证失败、配额不足等）——
 // 调用方据此**回退直连**，而不是让挂载失败。
 func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest) error {
 	allocationID := strings.TrimSpace(req.AllocationID)
 	if allocationID == "" {
 		return errors.New("cache: allocation_id is required")
-	}
-	if strings.EqualFold(strings.TrimSpace(req.AuthMode), "chap") {
-		return errors.New("cache: 启用 CHAP 的目标暂不支持本地缓存代理")
 	}
 	p, err := m.portalForUse()
 	if err != nil {
@@ -193,6 +193,10 @@ func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest)
 		Backend: iscsicache.BackendConfig{
 			Address:   net.JoinHostPort(strings.TrimSpace(req.BackendAddress), strconv.Itoa(cacheBackendPort(req.BackendPort))),
 			TargetIQN: strings.TrimSpace(req.BackendIQN),
+			// 认证透传给自研后端发起端：none 直连，chap 走单向 CHAP 登录握手。
+			Auth:     strings.TrimSpace(req.AuthMode),
+			Username: req.ChapUser,
+			Secret:   req.ChapSecret,
 		},
 		Vendor:  cacheVendor,
 		Product: cacheProduct,

@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"vault/internal/platform/iscsiinitiator"
 )
 
 // newCacheTestStore 造一个独立的本地配置存储（配了缓存预算）。
@@ -194,6 +195,30 @@ func TestCacheStatusWithoutPortal(t *testing.T) {
 	// ReleaseTarget 在门户未打开时必须是安全空操作（卸载路径会无条件调它）。
 	if err := m.ReleaseTarget("alloc-1"); err != nil {
 		t.Fatalf("未打开门户时 ReleaseTarget 应为空操作，实际 %v", err)
+	}
+}
+
+// TestLocalConnectAuthDropsCHAPWhenCacheActive 锁定：缓存生效时本机连接必须用 None。
+//
+// 生效门户是本机缓存代理，它面向回环只提供 AuthMethod=None。把服务端下发的 chap 继续传给
+// 本机连接，会让本机对本地门户做 CHAP 并直接以 "Authentication Failure" 收场（真实故障）。
+// 而直连服务端目标时 chap 必须保留，否则会以"未鉴权"被目标拒绝。
+func TestLocalConnectAuthDropsCHAPWhenCacheActive(t *testing.T) {
+	chap := &MountSpec{AuthMode: "chap", ChapUser: "vault-abc", ChapSecret: "secret"}
+
+	if mode, user, secret := localConnectAuth(chap, false); mode != iscsiinitiator.AuthModeCHAP ||
+		user != "vault-abc" || secret != "secret" {
+		t.Fatalf("直连应保留 CHAP：mode=%q user=%q secret=%q", mode, user, secret)
+	}
+
+	if mode, user, secret := localConnectAuth(chap, true); mode != iscsiinitiator.AuthModeNone ||
+		user != "" || secret != "" {
+		t.Fatalf("缓存生效时必须用 None 且不带凭证：mode=%q user=%q secret=%q", mode, user, secret)
+	}
+
+	// ip 模式（服务端按白名单过滤）在客户端侧同样是"无认证连接"。
+	if mode, _, _ := localConnectAuth(&MountSpec{AuthMode: "ip"}, false); mode != iscsiinitiator.AuthModeNone {
+		t.Fatalf("ip 模式应为无认证连接，实际 %q", mode)
 	}
 }
 

@@ -266,7 +266,9 @@ target_iqn: "iqn.2024-01.local.iscsi-cache:disk0"
 backend:
   address: "192.168.1.100:3260"
   target_iqn: "iqn.2024-01.nas:disk0"
-  auth: "none"                # none | chap
+  auth: "none"                # none | chap（单向 CHAP）
+  username: ""                # auth=chap 时必填（CHAP_N）
+  secret: ""                  # auth=chap 时必填（共享密钥）
 
 cache:
   mode: "writearound"         # MVP 仅此一种
@@ -390,6 +392,13 @@ Windows 专项补充用例见完整设计第三十七章。
   服务端目标，原因写入挂载状态的 `cache_error` —— 绝不因缓存导致挂载失败。
 - **卸载即回收**：卸载流程在**断开会话之后、回写 release 之前**注销该库在门户上的目标并回收
   其 L2 文件；顺序不能反，否则仍在飞的命令会失败。
+- **后端认证**：服务端下发 `auth_mode=chap` 时，代理用**单向 CHAP**（RFC 7143 §11.2.2）与后端
+  目标完成登录握手——`chap_user` / `chap_secret` 随挂载参数下发（明文仅本次使用，不落盘客户端），
+  后端发起端在该阶段用 `CHAP_A=5`（MD5）应答挑战。认证失败与端口占用、后端不可达一样**回退直连**，
+  原因写入 `cache_error`。反向 CHAP 不在支持范围（服务端自动下发路径不产生反向密钥）。
+  本机门户（面向 `127.0.0.1`）仍只提供 `AuthMethod=None`：回环链路无需认证，因此**缓存生效时
+  本机发起端一律以 None 连本地门户**，绝不能把服务端下发的 chap 继续传给这一环（否则本机会对
+  本地门户做 CHAP 并以 `Authentication Failure` 收场）。
 
 ### 15.4 状态与界面
 

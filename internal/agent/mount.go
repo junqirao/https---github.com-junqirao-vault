@@ -178,8 +178,8 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	// 生效门户与生效 IQN：库启用了本地读缓存时走**本机代理**（下发 → 代理 → 本地建联代理），
 	// 否则直连服务端下发的目标。
 	//
-	// 缓存不可用（端口占用、后端不可达、CHAP、配额不足…）一律**回退直连**，绝不因为缓存
-	// 把挂载搞失败：缓存只是加速手段，不是挂载的前置条件（见 cacheproxy.go 文件头）。
+	// 缓存不可用（端口占用、后端不可达、后端 CHAP 认证失败、配额不足…）一律**回退直连**，
+	// 绝不因为缓存把挂载搞失败：缓存只是加速手段，不是挂载的前置条件（见 cacheproxy.go 文件头）。
 	effectivePortalAddr, effectivePortalPort := spec.PortalAddress, portalPort(spec)
 	effectiveIQN := spec.TargetIQN
 	cacheEnabled, cacheActive := false, false
@@ -193,7 +193,11 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 			BackendAddress: spec.PortalAddress,
 			BackendPort:    portalPort(spec),
 			BackendIQN:     spec.TargetIQN,
-			AuthMode:       spec.AuthMode,
+			// 与直连路径同一套映射：只有 chap 需要握手，ip/none 都是无认证连接
+			// （服务端按白名单过滤时，客户端侧无需 CHAP）。
+			AuthMode:   clientAuthMode(spec.AuthMode),
+			ChapUser:   spec.ChapUser,
+			ChapSecret: spec.ChapSecret,
 		}); err != nil {
 			cacheErr = err.Error()
 			e.a.logger.Warn("本地读缓存代理不可用，回退直连服务端目标",
@@ -204,6 +208,9 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 			effectiveIQN = cacheTargetIQN(allocationID)
 		}
 	}
+
+	// 本机发起端连**生效门户**时用的认证方式与凭证（缓存生效时为 None，见 localConnectAuth）。
+	localAuthMode, localChapUser, localChapSecret := localConnectAuth(spec, cacheActive)
 
 	ms := &MountState{
 		RepoID: strings.TrimSpace(req.RepoID),
@@ -226,11 +233,12 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		Phase: MountPhaseConnecting,
 	}
 	rt := &mountRuntime{
-		PortalAddress:    effectivePortalAddr,
-		PortalPort:       effectivePortalPort,
-		AuthMode:         spec.AuthMode,
-		ChapUser:         spec.ChapUser,
-		ChapSecret:       spec.ChapSecret,
+		PortalAddress: effectivePortalAddr,
+		PortalPort:    effectivePortalPort,
+		// 记的是**本机发起端实际用的**认证（缓存生效时为 None），不是服务端下发的值。
+		AuthMode:         localAuthMode,
+		ChapUser:         localChapUser,
+		ChapSecret:       localChapSecret,
 		PostScript:       spec.PostScript,
 		HeartbeatSeconds: spec.HeartbeatSeconds,
 		LeaseTTLSeconds:  spec.LeaseTTLSeconds,
@@ -308,7 +316,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	failConnect := func(stage string, cause error) (*MountState, error) {
 		portal := net.JoinHostPort(effectivePortalAddr, strconv.Itoa(effectivePortalPort))
 		detail, tcp := connectDiagnosticsFor(ctx, effectivePortalAddr, effectivePortalPort,
-			effectiveIQN, spec.AuthMode, spec.ChapUser)
+			effectiveIQN, localAuthMode, localChapUser)
 		// 缓存模式下生效门户是本机回环地址，它几乎不可能"网络不通"——真正断的大多是
 		// **代理到服务端**那一段。不把后端门户的可达性打出来，用户在 127.0.0.1 上排查毫无头绪。
 		if cacheActive {
@@ -319,7 +327,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		return failWithDetail(stage, cause, detail, map[string]any{
 			"portal":     portal,
 			"target_iqn": effectiveIQN,
-			"auth_mode":  clientAuthMode(spec.AuthMode),
+			"auth_mode":  localAuthMode,
 			"tcp":        tcp,
 		})
 	}
@@ -344,9 +352,10 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		TargetIQN:     effectiveIQN,
 		PortalAddress: effectivePortalAddr,
 		PortalPort:    effectivePortalPort,
-		AuthMode:      clientAuthMode(spec.AuthMode),
-		ChapUser:      spec.ChapUser,
-		ChapSecret:    spec.ChapSecret,
+		// 连的是**生效门户**：缓存生效时是本机代理，只支持 None（见 localAuthMode 的说明）。
+		AuthMode:   localAuthMode,
+		ChapUser:   localChapUser,
+		ChapSecret: localChapSecret,
 		// 不用 Windows 持久化目标（-IsPersistent）：它与 OneWayCHAP 明文密钥叠加时会把
 		// 目标连成 "hidden from login"（真实事故：手动 Connect 去掉 -IsPersistent 后
 		// 立即连上）。重启后的重连由本代理的 restoreMounts 自动重挂负责，无需依赖
@@ -1234,6 +1243,20 @@ func clientAuthMode(authMode string) string {
 		return iscsiinitiator.AuthModeCHAP
 	}
 	return iscsiinitiator.AuthModeNone
+}
+
+// localConnectAuth 返回本机发起端连接**生效门户**时应使用的认证方式与凭证。
+//
+// 直连服务端目标时照搬服务端下发的认证（可能是 chap）。但走缓存代理时必须用 None：
+// 生效门户是本机代理（127.0.0.1:3261），它面向回环只提供 AuthMethod=None，**不支持 CHAP**。
+// CHAP 属于"代理 → 服务端目标"那一段（凭证已在 EnsureTarget 里交给代理），本机发起端到本地
+// 门户这一环带上它，只会让本机连接直接以 "Authentication Failure" 收场
+// （真实故障：缓存开了、后端也是 chap，却拿 chap 去连本地门户）。
+func localConnectAuth(spec *MountSpec, cacheActive bool) (mode, user, secret string) {
+	if cacheActive {
+		return iscsiinitiator.AuthModeNone, "", ""
+	}
+	return clientAuthMode(spec.AuthMode), spec.ChapUser, spec.ChapSecret
 }
 
 // portalPort 返回有效门户端口。

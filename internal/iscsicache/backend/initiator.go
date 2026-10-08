@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"crypto/md5"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -35,9 +36,10 @@ type Config struct {
 	TargetIQN string
 	// InitiatorIQN is our own name; generated from the host name when empty.
 	InitiatorIQN string
-	// Auth is "none" (MVP) or "chap" (not implemented).
+	// Auth is "none" (default) or "chap" (one-way CHAP, RFC 7143 §11.2.2).
 	Auth string
-	// Username/Secret are reserved for CHAP support.
+	// Username/Secret are the CHAP N (name) and shared secret. They are required
+	// when Auth is "chap" and ignored otherwise.
 	Username string
 	Secret   string
 
@@ -122,8 +124,17 @@ func Dial(ctx context.Context, cfg Config) (*Initiator, error) {
 	if cfg.TargetIQN == "" {
 		return nil, errors.New("backend: target_iqn is required")
 	}
-	if !strings.EqualFold(cfg.Auth, "none") && cfg.Auth != "" {
-		return nil, fmt.Errorf("backend: auth %q is not supported by the MVP", cfg.Auth)
+	switch {
+	case cfg.Auth == "", strings.EqualFold(cfg.Auth, "none"):
+		// No authentication.
+	case strings.EqualFold(cfg.Auth, "chap"):
+		// One-way CHAP needs both halves of the credential; a missing half would
+		// otherwise fail deep inside the login exchange with a bare auth error.
+		if cfg.Username == "" || cfg.Secret == "" {
+			return nil, errors.New("backend: auth \"chap\" requires username and secret")
+		}
+	default:
+		return nil, fmt.Errorf("backend: auth %q is not supported (only none or chap)", cfg.Auth)
 	}
 
 	log := cfg.Logger
@@ -250,21 +261,114 @@ func (it *Initiator) operationalKeys() [][2]string {
 	}
 }
 
+// chapAlgorithmMD5 is the CHAP_A identifier for MD5. RFC 7143 §11.2.2 only
+// defines MD5 for iSCSI, so it is the only algorithm we offer or accept.
+const chapAlgorithmMD5 = "5"
+
+// chapEnabled reports whether one-way CHAP authentication is configured.
+func (it *Initiator) chapEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(it.cfg.Auth), "chap")
+}
+
+// securityKeys builds the security-stage login keys: the session identity plus
+// the AuthMethod offer. With CHAP configured we offer "CHAP,None" (let the
+// target choose) and advertise MD5; otherwise we offer only None, which is what
+// the MVP target historically received.
+func (it *Initiator) securityKeys() [][2]string {
+	keys := [][2]string{
+		{"InitiatorName", it.cfg.InitiatorIQN},
+		{"TargetName", it.cfg.TargetIQN},
+		{"SessionType", "Normal"},
+	}
+	if it.chapEnabled() {
+		keys = append(keys,
+			[2]string{"AuthMethod", "CHAP,None"},
+			[2]string{"CHAP_A", chapAlgorithmMD5})
+	} else {
+		keys = append(keys, [2]string{"AuthMethod", "None"})
+	}
+	return append(keys,
+		[2]string{"HeaderDigest", "None"},
+		[2]string{"DataDigest", "None"},
+		[2]string{"MaxRecvDataSegmentLength", strconv.Itoa(it.cfg.MaxRecvDataSegmentLength)})
+}
+
+// chapChallenge is the challenge a target sends in the security stage.
+type chapChallenge struct {
+	algorithm string
+	id        uint8
+	challenge []byte
+}
+
+// parseCHAPChallenge extracts a CHAP challenge from a login response's text
+// keys. The second return value is false when the response carries no challenge
+// (a target that accepted None, for instance), which is not an error.
+func parseCHAPChallenge(text map[string]string) (chapChallenge, bool, error) {
+	rawC, hasC := text["chap_c"]
+	rawI, hasI := text["chap_i"]
+	if !hasC && !hasI {
+		return chapChallenge{}, false, nil
+	}
+	c := chapChallenge{algorithm: strings.TrimSpace(text["chap_a"])}
+	if c.algorithm == "" {
+		c.algorithm = chapAlgorithmMD5
+	}
+	id, err := strconv.Atoi(strings.TrimSpace(rawI))
+	if err != nil || id < 0 || id > 0xff {
+		return chapChallenge{}, false, fmt.Errorf("backend: invalid CHAP_I %q", rawI)
+	}
+	c.id = uint8(id)
+	challenge, err := decodeHexValue(rawC)
+	if err != nil {
+		return chapChallenge{}, false, fmt.Errorf("backend: invalid CHAP_C %q: %w", rawC, err)
+	}
+	c.challenge = challenge
+	return c, true, nil
+}
+
+// chapResponseKeys computes CHAP_N (the user name) and CHAP_R (the answer) for
+// the given challenge.
+//
+// The digest is MD5 over the concatenation of the one-byte CHAP_I value, the
+// shared secret and the challenge, per RFC 7143 §11.2.2 (which references the
+// CHAP procedure of RFC 1994 §4.1). The answer is sent as "0x" prefixed hex.
+func (it *Initiator) chapResponseKeys(c chapChallenge) ([][2]string, error) {
+	if !strings.EqualFold(c.algorithm, chapAlgorithmMD5) {
+		return nil, fmt.Errorf("backend: target selected unsupported CHAP algorithm %q", c.algorithm)
+	}
+	h := md5.New()
+	h.Write([]byte{c.id})
+	h.Write([]byte(it.cfg.Secret))
+	h.Write(c.challenge)
+	return [][2]string{
+		{"CHAP_N", it.cfg.Username},
+		{"CHAP_R", "0x" + hex.EncodeToString(h.Sum(nil))},
+	}, nil
+}
+
+// decodeHexValue decodes an iSCSI CHAP hex string, tolerating the optional "0x"
+// prefix, and treats an empty value as an empty challenge.
+func decodeHexValue(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && (s[:2] == "0x" || s[:2] == "0X") {
+		s = s[2:]
+	}
+	if s == "" {
+		return nil, nil
+	}
+	return hex.DecodeString(s)
+}
+
 func (it *Initiator) login(ctx context.Context) error {
 	itt := it.nextITT()
 	stage := uint8(iscsi.StageSecurity)
 	nsg := uint8(iscsi.StageOperational)
 	transit := true
-	keys := [][2]string{
-		{"InitiatorName", it.cfg.InitiatorIQN},
-		{"TargetName", it.cfg.TargetIQN},
-		{"SessionType", "Normal"},
-		{"AuthMethod", "None"},
-		{"HeaderDigest", "None"},
-		{"DataDigest", "None"},
-		{"MaxRecvDataSegmentLength", strconv.Itoa(it.cfg.MaxRecvDataSegmentLength)},
-	}
+	keys := it.securityKeys()
 	var tsih uint16
+	// chapSent flips once the CHAP_R answer has gone out, so a target that echoes
+	// the challenge in a later iteration cannot make us answer twice.
+	chapSent := false
 
 	for iter := 0; iter < 16; iter++ {
 		req := iscsi.NewPDU(iscsi.OpLoginReq, iscsi.EncodeText(keys...))
@@ -319,6 +423,30 @@ func (it *Initiator) login(ctx context.Context) error {
 			"iter", iter, "csg", resp.Header.LoginCSG(), "nsg", resp.Header.LoginNSG(),
 			"transit", resp.Header.LoginTransit(), "continue", resp.Header.LoginContinue(),
 			"status_class", resp.Header.LoginStatusClass(), "keys", len(text))
+
+		// CHAP (RFC 7143 §11.2.2, one-way): the target answers our
+		// AuthMethod=CHAP,None / CHAP_A offer with its challenge — CHAP_I (a
+		// one-byte identifier) and CHAP_C (the challenge, hex) — during the
+		// security stage. Answer in the same stage with CHAP_N + CHAP_R and offer
+		// to move on; the target then decides whether the digest was accepted.
+		if stage == iscsi.StageSecurity && !chapSent && it.chapEnabled() {
+			challenge, ok, err := parseCHAPChallenge(text)
+			if err != nil {
+				return err
+			}
+			if ok {
+				respKeys, err := it.chapResponseKeys(challenge)
+				if err != nil {
+					return err
+				}
+				chapSent = true
+				it.log.Debug("login CHAP challenge answered",
+					"iter", iter, "algorithm", challenge.algorithm,
+					"id", challenge.id, "challenge_len", len(challenge.challenge))
+				stage, nsg, transit, keys = iscsi.StageSecurity, iscsi.StageOperational, true, respKeys
+				continue
+			}
+		}
 
 		rcsg := resp.Header.LoginCSG()
 		rnsg := resp.Header.LoginNSG()

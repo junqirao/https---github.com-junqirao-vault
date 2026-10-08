@@ -17,7 +17,11 @@ backend:
   target_iqn: "iqn.1991-05.com.microsoft:win-0e595h11jss-test-target"
   # Empty generates iqn.2024-01.local.vault-iscsi-cache:<hostname>.
   initiator_iqn: ""
+  # "none" or "chap" (one-way CHAP, RFC 7143 §11.2.2). With "chap" both
+  # username and secret are required.
   auth: "none"
+  username: ""
+  secret: ""
   dial_timeout: "10s"
   io_timeout: "30s"
   max_recv_data_segment_length: 65536
