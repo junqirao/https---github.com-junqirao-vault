@@ -26,6 +26,13 @@ backend:
   io_timeout: "30s"
   max_recv_data_segment_length: 65536
   max_burst_length: 262144
+  # Upper bound on the backing sessions the proxy may run. A single session has a
+  # queue depth of one, so without a few sessions the client's queue depth is
+  # collapsed and every read pays the backing round trip on its own. The proxy
+  # opens 4 sessions at mount and grows on demand up to this cap while the client
+  # pipelines more commands than it has sessions. 0 selects the cap of 64, which
+  # matches the command window the proxy advertises to local initiators.
+  sessions: 0
 
 cache:
   # Only "writearound" is supported by the MVP: writes are forwarded to the

@@ -165,8 +165,19 @@ type Cache struct {
 	l2      L2
 	log     *slog.Logger
 
+	// l2Sem bounds how many L2 populations may be in flight and l2Pending tracks
+	// them, so an invalidation can wait for the writes it must not be overtaken
+	// by. Both are nil/unused when the cache has no L2.
+	l2Sem     chan struct{}
+	l2Pending sync.WaitGroup
+
 	stats Stats
 }
+
+// l2WriteConcurrency bounds the background L2 populations. L2 is a secondary
+// cache: when this many writes are already outstanding a miss simply skips
+// populating L2 instead of delaying the read.
+const l2WriteConcurrency = 8
 
 // New creates a Cache.
 func New(cfg Config) (*Cache, error) {
@@ -195,6 +206,9 @@ func New(cfg Config) (*Cache, error) {
 	c.shards = make([]*shard, cfg.Shards)
 	for i := range c.shards {
 		c.shards[i] = newShard(c, per, cfg.NewQuotaPct, cfg.HighWatermark, cfg.LowWatermark)
+	}
+	if c.l2 != nil {
+		c.l2Sem = make(chan struct{}, l2WriteConcurrency)
 	}
 	return c, nil
 }
@@ -228,8 +242,17 @@ func (c *Cache) Usage() (used, limit int64) {
 // Drop discards every cached block, keeping the L2 file contents untouched
 // (the L2 index is memory only, so dropping it makes the L2 logically empty).
 func (c *Cache) Drop() {
+	c.drainL2()
 	for _, s := range c.shards {
 		s.drop()
+	}
+}
+
+// drainL2 waits for the background L2 populations to finish. It is called by the
+// operations that must not be overtaken by a write already in flight.
+func (c *Cache) drainL2() {
+	if c.l2 != nil {
+		c.l2Pending.Wait()
 	}
 }
 
@@ -246,18 +269,59 @@ func (c *Cache) Read(ctx context.Context, off int64, dst []byte, src Source) err
 	admitted := !c.scan.observe(off, int64(len(dst)))
 	if !admitted {
 		c.stats.ScanBypass.Add(1)
+		// A bypassed stream never populates the cache, so the whole request is
+		// served with one aligned backend read instead of one read per cache
+		// block. A sequential stream lands here after the admission threshold, so
+		// reading block by block would charge the backing target one round trip
+		// per 64 KiB of a streamed read and cap throughput at the round trip time.
+		return c.readAligned(ctx, off, dst, src)
 	}
 
 	end := off + int64(len(dst))
 	backendBefore := c.stats.BackendReads.Load()
+	bs := int64(c.blockSize)
 	for cur := off; cur < end; {
-		blk := uint64(cur / int64(c.blockSize))
-		blkStart := int64(blk) * int64(c.blockSize)
-		segEnd := blkStart + int64(c.blockSize)
+		blk := uint64(cur / bs)
+		blkStart := int64(blk) * bs
+		segEnd := blkStart + bs
 		if segEnd > end {
 			segEnd = end
 		}
-		if err := c.readSegment(ctx, blk, blkStart, cur, dst[cur-off:segEnd-off], src, admitted); err != nil {
+		sh := c.shard(blk)
+		if e := sh.lookup(blk); e != nil {
+			if e.copyIfValid(blkStart, cur, dst[cur-off:segEnd-off], c.sectorSize) {
+				sh.touch(e)
+				c.stats.L1Hits.Add(1)
+				cur = segEnd
+				continue
+			}
+			// A partly valid entry falls through to readSegment, which accounts
+			// for the partial hit and fills only the missing sectors.
+		} else {
+			// The block is absent, so the request can be served by loading the
+			// whole run of consecutive absent blocks with one backend read. A
+			// large miss otherwise costs the backing target one command per cache
+			// block, which is what makes a streamed read through the proxy carry a
+			// round trip every blockSize bytes and caps throughput at the round
+			// trip time. Blocks that are present but only partly valid keep the
+			// per-block fill below, which reads just the missing sectors.
+			runEnd := segEnd
+			for runEnd < end {
+				next := uint64(runEnd / bs)
+				if c.shard(next).lookup(next) != nil {
+					break
+				}
+				runEnd = blockEnd(next, bs, end)
+			}
+			if runEnd > segEnd {
+				if err := c.fillRun(ctx, cur, runEnd, dst[cur-off:runEnd-off], src); err != nil {
+					return err
+				}
+				cur = runEnd
+				continue
+			}
+		}
+		if err := c.readSegment(ctx, blk, blkStart, cur, dst[cur-off:segEnd-off], src); err != nil {
 			return err
 		}
 		cur = segEnd
@@ -271,7 +335,7 @@ func (c *Cache) Read(ctx context.Context, off int64, dst []byte, src Source) err
 	return nil
 }
 
-func (c *Cache) readSegment(ctx context.Context, blk uint64, blkStart, off int64, dst []byte, src Source, admitted bool) error {
+func (c *Cache) readSegment(ctx context.Context, blk uint64, blkStart, off int64, dst []byte, src Source) error {
 	sh := c.shard(blk)
 	if e := sh.lookup(blk); e != nil {
 		if e.copyIfValid(blkStart, off, dst, c.sectorSize) {
@@ -280,9 +344,6 @@ func (c *Cache) readSegment(ctx context.Context, blk uint64, blkStart, off int64
 			return nil
 		}
 		c.stats.PartialHits.Add(1)
-	}
-	if !admitted {
-		return c.readAligned(ctx, off, dst, src)
 	}
 
 	s0, s1 := c.sectorRange(blkStart, off, int64(len(dst)))
@@ -305,6 +366,58 @@ func (c *Cache) readSegment(ctx context.Context, blk uint64, blkStart, off int64
 	return c.readAligned(ctx, off, dst, src)
 }
 
+// blockEnd returns the exclusive end of blk's byte range, clipped to end.
+func blockEnd(blk uint64, blockSize, end int64) int64 {
+	e := int64(blk)*blockSize + blockSize
+	if e > end {
+		e = end
+	}
+	return e
+}
+
+// fillRun loads the sector aligned span of [start,end) with a single backend
+// read, installs it into the L1 entries of the blocks it covers and copies the
+// requested [start,end) bytes into dst. It returns on the first error, leaving
+// the caller's per-block path to report it if it wants a retry.
+//
+// It deliberately does not populate L2: it serves the multi-block (bulk) reads
+// that are the closest to a stream, and spending L2 write bandwidth on them
+// would evict the scattered hot blocks L2 exists to keep.
+func (c *Cache) fillRun(ctx context.Context, start, end int64, dst []byte, src Source) error {
+	sector := int64(c.sectorSize)
+	readStart := start / sector * sector
+	readEnd := (end-1)/sector*sector + sector
+	// A staging buffer is only needed to trim a partial sector at either end.
+	// When the requested span is already sector aligned the backing read fills
+	// dst directly, which takes an allocation and a copy per command off the
+	// streaming path (the read that misses the cache most often).
+	buf, staging := dst, false
+	if readStart != start || readEnd != end {
+		buf, staging = make([]byte, readEnd-readStart), true
+	}
+	if err := src.ReadAt(ctx, readStart, buf); err != nil {
+		return err
+	}
+	c.stats.BackendReads.Add(1)
+
+	bs := int64(c.blockSize)
+	for off := readStart; off < readEnd; {
+		blk := uint64(off / bs)
+		blkStart := int64(blk) * bs
+		segEnd := blkStart + bs
+		if segEnd > readEnd {
+			segEnd = readEnd
+		}
+		c.shard(blk).install(blk, buf[off-readStart:segEnd-readStart], int(off-blkStart))
+		off = segEnd
+	}
+	c.stats.Fills.Add(1)
+	if staging {
+		copy(dst, buf[start-readStart:end-readStart])
+	}
+	return nil
+}
+
 // fillBlock makes the sectors [s0,s1] of blk valid inside its entry, loading
 // whatever is missing from L2 and then from src. It runs under the block's
 // single-flight guard so only one goroutine writes an entry at a time.
@@ -315,11 +428,7 @@ func (c *Cache) fillBlock(ctx context.Context, blk uint64, blkStart int64, s0, s
 		return nil
 	}
 
-	type seg struct {
-		sector int
-		data   []byte
-	}
-	var pending []seg
+	var pending []l2Seg
 	for _, r := range e.missingRuns(s0, s1) {
 		n := r[1] - r[0] + 1
 		buf := make([]byte, n*c.sectorSize)
@@ -340,7 +449,7 @@ func (c *Cache) fillBlock(ctx context.Context, blk uint64, blkStart int64, s0, s
 			}
 			c.stats.BackendReads.Add(1)
 		}
-		pending = append(pending, seg{sector: r[0], data: buf})
+		pending = append(pending, l2Seg{sector: r[0], data: buf})
 	}
 	if len(pending) == 0 {
 		return nil
@@ -360,16 +469,45 @@ func (c *Cache) fillBlock(ctx context.Context, blk uint64, blkStart int64, s0, s
 		}
 	}
 	c.stats.Fills.Add(1)
+	c.enqueueL2Write(blk, pending)
+	return nil
+}
 
-	if c.l2 != nil {
-		for _, p := range pending {
-			n := len(p.data) / c.sectorSize
-			if err := c.l2.WriteSectors(blk, p.sector, n, p.data); err != nil {
+// l2Seg is a just filled sector run, handed to a background L2 population.
+type l2Seg struct {
+	sector int
+	data   []byte
+}
+
+// enqueueL2Write populates L2 with a freshly filled block without putting the
+// file write on the read's critical path: the client is served as soon as the
+// data is in L1, and the L2 write runs in the background. Ordering against
+// invalidation is preserved by Cache.Invalidate draining these writes, which is
+// a complete fence because the caller serialises reads and writes.
+//
+// When the bounded queue is saturated the population is skipped: L2 is a
+// secondary cache, so dropping a write costs a future backend read, never
+// correctness or latency.
+func (c *Cache) enqueueL2Write(blk uint64, segs []l2Seg) {
+	if c.l2 == nil || len(segs) == 0 {
+		return
+	}
+	select {
+	case c.l2Sem <- struct{}{}:
+	default:
+		return
+	}
+	c.l2Pending.Add(1)
+	go func() {
+		defer c.l2Pending.Done()
+		defer func() { <-c.l2Sem }()
+		for _, s := range segs {
+			n := len(s.data) / c.sectorSize
+			if err := c.l2.WriteSectors(blk, s.sector, n, s.data); err != nil {
 				c.log.Warn("cache: l2 write failed", "block", blk, "err", err)
 			}
 		}
-	}
-	return nil
+	}()
 }
 
 // Invalidate drops [off, off+length) from both cache levels. It must complete
@@ -379,6 +517,12 @@ func (c *Cache) Invalidate(off, length int64) {
 		return
 	}
 	c.stats.Invalidations.Add(1)
+	// A background L2 population enqueued by an earlier read of this range must
+	// not land after the sectors below are dropped, or it would resurrect stale
+	// data. The caller serialises this invalidation against reads (it holds the
+	// proxy's exclusive lock), so draining here is a complete fence: no new
+	// population can be enqueued while we run.
+	c.drainL2()
 	end := off + length
 	for cur := off; cur < end; {
 		blk := uint64(cur / int64(c.blockSize))
@@ -413,12 +557,19 @@ func (c *Cache) sectorRange(blkStart, off, length int64) (int, int) {
 }
 
 // readAligned reads the sector aligned superset of [off, off+len(dst)) straight
-// from src and copies the requested slice out of it.
+// from src, copying the requested slice out of it unless the request is already
+// sector aligned.
 func (c *Cache) readAligned(ctx context.Context, off int64, dst []byte, src Source) error {
-	s0 := off / int64(c.sectorSize)
-	s1 := (off + int64(len(dst)) - 1) / int64(c.sectorSize)
-	start := s0 * int64(c.sectorSize)
-	buf := make([]byte, (s1-s0+1)*int64(c.sectorSize))
+	sector := int64(c.sectorSize)
+	s0 := off / sector
+	s1 := (off + int64(len(dst)) - 1) / sector
+	start := s0 * sector
+	// An already aligned request needs no staging buffer: read straight into dst
+	// instead of allocating a superset and copying the request out of it.
+	if start == off && (s1-s0+1)*sector == int64(len(dst)) {
+		return src.ReadAt(ctx, off, dst)
+	}
+	buf := make([]byte, (s1-s0+1)*sector)
 	if err := src.ReadAt(ctx, start, buf); err != nil {
 		return err
 	}
@@ -575,6 +726,34 @@ func (s *shard) insert(blk uint64) *entry {
 	s.newQ = append(s.newQ, e)
 	s.maintainLocked()
 	return e
+}
+
+// install stores buf, the bytes of blk starting at blockOff, into the block's
+// entry and marks the sectors it covers valid, creating the entry when needed.
+//
+// Sectors that are already valid are skipped: their content came from the same
+// backing range, and leaving them untouched keeps a bulk fill that overlaps
+// another one from rewriting bytes a concurrent reader may be copying.
+func (s *shard) install(blk uint64, buf []byte, blockOff int) {
+	ss := s.c.sectorSize
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.blocks[blk]
+	if e == nil {
+		e = &entry{blk: blk, data: make([]byte, s.c.blockSize)}
+		s.blocks[blk] = e
+		e.q = queueNew
+		s.newQ = append(s.newQ, e)
+		s.maintainLocked()
+	}
+	for i := blockOff / ss; i < (blockOff+len(buf))/ss; i++ {
+		if e.valid.Load()&(1<<uint(i)) != 0 {
+			continue
+		}
+		start := i * ss
+		copy(e.data[start:start+ss], buf[start-blockOff:start-blockOff+ss])
+		e.setValid(i)
+	}
 }
 
 func (s *shard) drop() {

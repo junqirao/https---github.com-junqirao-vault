@@ -58,6 +58,13 @@ type Result struct {
 	Residual  uint32
 	Overflow  bool
 	Underflow bool
+
+	// Release, when non-nil, is called by the target once Data has been written
+	// out (or the command failed) and the handler may reuse the buffer. It lets
+	// a handler serve Data out of a pool instead of allocating a fresh buffer
+	// per command, which for a read is the largest allocation on the path.
+	// Handlers that return a buffer they do not own leave it nil.
+	Release func()
 }
 
 // Handler executes SCSI commands for the target. Implementations must be safe

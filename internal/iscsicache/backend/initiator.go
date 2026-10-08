@@ -22,7 +22,13 @@ import (
 
 // Defaults for the MVP initiator.
 const (
-	DefaultMaxRecvDataSegmentLength = 65536
+	// DefaultMaxRecvDataSegmentLength is the largest Data-In segment this
+	// initiator advertises it can receive. It is the size of the PDUs the
+	// backing target sends back, so a small value turns one streamed read into
+	// one socket read (and one segment allocation) per chunk: at 64 KiB a MiB
+	// cost sixteen of each. The key is negotiable, so a target that caps it below
+	// this value is handled transparently.
+	DefaultMaxRecvDataSegmentLength = 1 << 20
 	DefaultMaxBurstLength           = 262144
 	DefaultDialTimeout              = 10 * time.Second
 	DefaultIOTimeout                = 30 * time.Second
@@ -50,6 +56,12 @@ type Config struct {
 	MaxRecvDataSegmentLength int
 	// MaxBurstLength is the largest burst we accept.
 	MaxBurstLength int
+
+	// Sessions is the maximum number of independent sessions a Pool may run; it
+	// is ignored by Dial, which always opens exactly one. Zero (or a value above
+	// MaxSessions) selects MaxSessions. The pool opens DefaultSessions eagerly
+	// and grows towards this cap only while every session is busy.
+	Sessions int
 
 	Logger *slog.Logger
 }
@@ -147,6 +159,18 @@ func Dial(ctx context.Context, cfg Config) (*Initiator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("backend: dial %s: %w", cfg.Address, err)
 	}
+	if tc, ok := conn.(*net.TCPConn); ok {
+		// iSCSI is a request/response protocol with small PDUs: a delayed ACK
+		// combined with Nagle would hold a command or an R2T Data-Out burst for
+		// tens of milliseconds on every command. The frontend already disables
+		// Nagle on the initiator side; the backing side needs it too.
+		_ = tc.SetNoDelay(true)
+		// Detect a backing target that vanished without logging out, so a dead
+		// session is not held open by commands waiting on a socket nobody will
+		// answer on.
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
 
 	it := &Initiator{
 		cfg:              cfg,
@@ -239,6 +263,36 @@ func (it *Initiator) setWriteDeadline(ctx context.Context) {
 func (it *Initiator) readPDU(ctx context.Context) (*iscsi.PDU, error) {
 	it.setReadDeadline(ctx)
 	return iscsi.ReadPDU(it.conn)
+}
+
+// readResponse reads one response PDU for Exec. A Data-In segment that lies
+// inside transfer is read straight into it, so the caller operates on the buffer
+// it is going to return and pays neither a segment allocation nor a copy per
+// PDU; inPlace reports that case. Any other segment (R2T, NOP-In, a Data-In
+// beyond the transfer, sense data) goes to scratch, which is reused across the
+// PDUs of one command.
+func (it *Initiator) readResponse(transfer []byte, scratch *[]byte) (*iscsi.PDU, bool, error) {
+	h, err := iscsi.ReadBHS(it.conn)
+	if err != nil {
+		return nil, false, err
+	}
+	dsl := h.DataSegmentLength()
+	var seg []byte
+	inPlace := false
+	if dsl > 0 {
+		if off := int(h.BufOffset()); h.Opcode() == iscsi.OpDataIn && off+dsl <= len(transfer) {
+			seg, inPlace = transfer[off:off+dsl], true
+		} else {
+			if cap(*scratch) < dsl {
+				*scratch = make([]byte, dsl)
+			}
+			seg = (*scratch)[:dsl]
+		}
+	}
+	if err := iscsi.ReadSegment(it.conn, &h, seg); err != nil {
+		return nil, false, err
+	}
+	return &iscsi.PDU{Header: h, Data: seg}, inPlace, nil
 }
 
 func (it *Initiator) writePDU(ctx context.Context, p *iscsi.PDU) error {
@@ -569,8 +623,24 @@ func firstDesignator(vpd []byte) string {
 
 // Exec -------------------------------------------------------------------------------
 
-// Exec issues one SCSI command over the session.
+// Exec issues one SCSI command over the session. A command that reads data
+// returns it in a freshly allocated Result.Data.
 func (it *Initiator) Exec(ctx context.Context, cdb []byte, dataOut []byte, inLen int) (*Result, error) {
+	return it.exec(ctx, cdb, dataOut, nil, inLen)
+}
+
+// ExecInto issues one SCSI command whose read payload is written straight into
+// buf, so a caller that already has a destination pays neither an allocation
+// nor a copy for the transfer. Result.Data aliases buf and is not a copy of it,
+// which makes this the read path for a cache or proxy that owns its buffers.
+func (it *Initiator) ExecInto(ctx context.Context, cdb []byte, dataOut []byte, buf []byte) (*Result, error) {
+	if len(buf) == 0 {
+		return nil, errors.New("backend: empty read buffer")
+	}
+	return it.exec(ctx, cdb, dataOut, buf, len(buf))
+}
+
+func (it *Initiator) exec(ctx context.Context, cdb []byte, dataOut []byte, buf []byte, inLen int) (*Result, error) {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 	if it.conn == nil || it.closed {
@@ -597,43 +667,68 @@ func (it *Initiator) Exec(ctx context.Context, cdb []byte, dataOut []byte, inLen
 	}
 	cmd := iscsi.BuildSCSICommand(itt, it.cmdSN, it.expStatSN, 0, cdb, expLen, inLen > 0, len(dataOut) > 0)
 	it.cmdSN++
-	it.log.Debug("backend: pdu send", "opcode", "SCSICommand", "itt", itt, "cmdsn", cmd.Header.CmdSN(),
-		"expstatsn", it.expStatSN, "expdatalen", expLen, "cdb", hex.EncodeToString(cdb[:min(16, len(cdb))]))
+	if it.log.Enabled(ctx, slog.LevelDebug) {
+		it.log.Debug("backend: pdu send", "opcode", "SCSICommand", "itt", itt, "cmdsn", cmd.Header.CmdSN(),
+			"expstatsn", it.expStatSN, "expdatalen", expLen, "cdb", hex.EncodeToString(cdb[:min(16, len(cdb))]))
+	}
 	if err := it.writePDU(ctx, cmd); err != nil {
 		return nil, fmt.Errorf("backend: send command: %w", err)
 	}
 
 	res := &Result{}
 	var dataBuf []byte
-	if inLen > 0 {
+	switch {
+	case buf != nil:
+		// The caller supplied the destination, so the transfer is read into it.
+		dataBuf = buf
+	case inLen > 0:
 		dataBuf = make([]byte, inLen)
 	}
 	var dataOutSN uint32
 	var haveIn int
+	var scratch []byte
+
+	// The command is bounded as a whole by ctx, so the socket read deadline is
+	// the ctx deadline: arming it once here is equivalent to re-arming it before
+	// every PDU, minus the netpoll timer update that a streamed read otherwise
+	// paid on each Data-In.
+	it.setReadDeadline(ctx)
 
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("backend: command timed out after %s: %w", it.cfg.IOTimeout, err)
 		}
-		pdu, err := it.readPDU(ctx)
+		pdu, inPlace, err := it.readResponse(dataBuf, &scratch)
 		if err != nil {
 			return nil, fmt.Errorf("backend: read response: %w", err)
 		}
 		h := &pdu.Header
-		it.log.Debug("backend: pdu recv", "opcode", iscsi.OpcodeName(h.Opcode()), "itt", h.ITT(), "ttt", h.TTT(),
-			"statsn", h.StatSN(), "expcmdsn", h.ExpCmdSN(), "flags", fmt.Sprintf("0x%02x", h.Flags()),
-			"len", len(pdu.Data), "bufoff", h.BufOffset(), "residual", h.ResidualCount())
+		// Formatting the trace costs a Printf and a hex dump per PDU, and the
+		// arguments are evaluated whether or not the level is enabled, so the
+		// level is checked before building them.
+		if it.log.Enabled(ctx, slog.LevelDebug) {
+			it.log.Debug("backend: pdu recv", "opcode", iscsi.OpcodeName(h.Opcode()), "itt", h.ITT(), "ttt", h.TTT(),
+				"statsn", h.StatSN(), "expcmdsn", h.ExpCmdSN(), "flags", fmt.Sprintf("0x%02x", h.Flags()),
+				"len", len(pdu.Data), "bufoff", h.BufOffset(), "residual", h.ResidualCount())
+		}
 		switch h.Opcode() {
 		case iscsi.OpDataIn:
 			off := int(h.BufOffset())
-			if off+len(pdu.Data) > len(dataBuf) {
+			switch {
+			case off+len(pdu.Data) > len(dataBuf):
 				// Target sent more than requested: keep what fits and note the residual.
 				it.log.Warn("backend: data-in beyond expected length", "offset", off, "len", len(pdu.Data), "expected", len(dataBuf))
 				if off < len(dataBuf) {
 					copy(dataBuf[off:], pdu.Data)
 					haveIn = len(dataBuf)
 				}
-			} else {
+			case inPlace:
+				// The segment was read straight into dataBuf, so only the high
+				// water mark has to move.
+				if off+len(pdu.Data) > haveIn {
+					haveIn = off + len(pdu.Data)
+				}
+			default:
 				copy(dataBuf[off:], pdu.Data)
 				if off+len(pdu.Data) > haveIn {
 					haveIn = off + len(pdu.Data)

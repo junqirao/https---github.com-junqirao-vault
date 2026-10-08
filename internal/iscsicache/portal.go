@@ -63,7 +63,7 @@ type TargetConfig struct {
 type targetRuntime struct {
 	iqn string
 
-	be *backend.Initiator
+	be *backend.Pool
 	l2 *l2.File
 	c  *cache.Cache
 	px *proxy.Proxy
@@ -137,7 +137,7 @@ func buildTarget(ctx context.Context, log *slog.Logger, tc TargetConfig) (*targe
 		}
 	}
 
-	be, err := backend.Dial(ctx, backend.Config{
+	be, err := backend.DialPool(ctx, backend.Config{
 		Address:                  tc.Backend.Address,
 		TargetIQN:                tc.Backend.TargetIQN,
 		InitiatorIQN:             tc.Backend.InitiatorIQN,
@@ -148,6 +148,7 @@ func buildTarget(ctx context.Context, log *slog.Logger, tc TargetConfig) (*targe
 		IOTimeout:                ioTimeout,
 		MaxRecvDataSegmentLength: tc.Backend.MaxRecvDataSegmentLength,
 		MaxBurstLength:           tc.Backend.MaxBurstLength,
+		Sessions:                 tc.Backend.Sessions,
 		Logger:                   log.With("component", "backend"),
 	})
 	if err != nil {

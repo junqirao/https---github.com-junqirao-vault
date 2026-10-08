@@ -67,6 +67,13 @@ type BackendConfig struct {
 
 	MaxRecvDataSegmentLength int `yaml:"max_recv_data_segment_length"`
 	MaxBurstLength           int `yaml:"max_burst_length"`
+
+	// Sessions caps how many independent backing sessions the proxy may hold. Zero
+	// selects backend.MaxSessions. The proxy opens backend.DefaultSessions eagerly
+	// at mount time and grows towards this cap only while the client pipelines
+	// more commands than there are sessions, which is what keeps the backing
+	// queue depth from being collapsed to one.
+	Sessions int `yaml:"sessions"`
 }
 
 // CacheConfig describes the read cache.
@@ -184,7 +191,7 @@ type Service struct {
 	cfg Config
 	log *slog.Logger
 
-	be  *backend.Initiator
+	be  *backend.Pool
 	l2  *l2.File
 	c   *cache.Cache
 	px  *proxy.Proxy

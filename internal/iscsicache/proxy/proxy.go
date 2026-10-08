@@ -299,19 +299,56 @@ func (p *Proxy) read(ctx context.Context, cdb []byte, inLen int) (frontend.Resul
 		return res, nil
 	}
 
-	buf := make([]byte, length)
+	// A read is the only command with a large payload, so allocating (and
+	// zeroing) one buffer per command is what puts the proxy's memory traffic on
+	// the collector. The buffer is handed to the frontend as Result.Data and
+	// given back through Result.Release once the reply has been written.
+	buf := getReadBuf(int(length))
 	if p.c == nil {
 		if err := p.source().ReadAt(ctx, int64(params.LBA)*int64(p.dev.BlockSize), buf); err != nil {
+			putReadBuf(buf)
 			return frontend.Result{}, err
 		}
 	} else if err := p.c.Read(ctx, int64(params.LBA)*int64(p.dev.BlockSize), buf, p.source()); err != nil {
+		putReadBuf(buf)
 		return frontend.Result{}, err
 	}
 	p.stats.Reads.Add(1)
 	if inLen > 0 && len(buf) > inLen {
 		buf = buf[:inLen]
 	}
-	return frontend.Result{Status: iscsi.StatusGood, Data: buf}, nil
+	return frontend.Result{Status: iscsi.StatusGood, Data: buf, Release: func() { putReadBuf(buf) }}, nil
+}
+
+// readBufs recycles read payload buffers.
+//
+// A buffer is stored behind a pointer so returning one does not box a slice
+// header and allocate on the way out, which would put the pool's own traffic
+// back on the collector.
+var readBufs = sync.Pool{New: func() any { return new([]byte) }}
+
+// maxPooledRead bounds what the pool keeps: a single unusually large read must
+// not pin a buffer that will never be handed out again.
+const maxPooledRead = 16 << 20
+
+func getReadBuf(n int) []byte {
+	bp := readBufs.Get().(*[]byte)
+	if buf := *bp; cap(buf) >= n {
+		*bp = nil
+		return buf[:n]
+	}
+	*bp = nil
+	readBufs.Put(bp)
+	return make([]byte, n)
+}
+
+func putReadBuf(buf []byte) {
+	if cap(buf) == 0 || cap(buf) > maxPooledRead {
+		return
+	}
+	bp := readBufs.Get().(*[]byte)
+	*bp = buf[:0]
+	readBufs.Put(bp)
 }
 
 // bounds rejects a CDB whose LBA range leaves the LUN.
@@ -435,6 +472,14 @@ func (p *Proxy) source() source { return source{p: p} }
 
 type source struct{ p *Proxy }
 
+// readInto is the optional Backend extension a backing target implements when
+// it can fill a caller-provided buffer. The cache hands its own staging buffer
+// down to the backend, so a miss costs one copy out of the backing read instead
+// of an extra allocation and copy per command.
+type readInto interface {
+	ExecInto(ctx context.Context, cdb []byte, dataOut []byte, buf []byte) (*backend.Result, error)
+}
+
 func (s source) ReadAt(ctx context.Context, off int64, dst []byte) error {
 	p := s.p
 	bs := int64(p.dev.BlockSize)
@@ -448,6 +493,9 @@ func (s source) ReadAt(ctx context.Context, off int64, dst []byte) error {
 	blocks := uint64(len(dst)) / uint64(bs)
 
 	cdb := make([]byte, 16)
+	var res *backend.Result
+	var err error
+	inPlace := false
 	if lba <= 0xffffffff && blocks <= 0xffff {
 		cdb[0] = iscsi.SCSIRead10
 		binary.BigEndian.PutUint32(cdb[2:6], uint32(lba))
@@ -458,8 +506,13 @@ func (s source) ReadAt(ctx context.Context, off int64, dst []byte) error {
 		binary.BigEndian.PutUint64(cdb[2:10], lba)
 		binary.BigEndian.PutUint32(cdb[10:14], uint32(blocks))
 	}
-
-	res, err := p.be.Exec(ctx, cdb, nil, len(dst))
+	if rb, ok := p.be.(readInto); ok {
+		// The backend filled dst itself; Result.Data aliases it.
+		res, err = rb.ExecInto(ctx, cdb, nil, dst)
+		inPlace = true
+	} else {
+		res, err = p.be.Exec(ctx, cdb, nil, len(dst))
+	}
 	if err != nil {
 		return err
 	}
@@ -470,7 +523,9 @@ func (s source) ReadAt(ctx context.Context, off int64, dst []byte) error {
 	if len(res.Data) < len(dst) {
 		return fmt.Errorf("proxy: backend read returned %d of %d bytes: %w", len(res.Data), len(dst), io.ErrUnexpectedEOF)
 	}
-	copy(dst, res.Data[:len(dst)])
+	if !inPlace {
+		copy(dst, res.Data[:len(dst)])
+	}
 	return nil
 }
 

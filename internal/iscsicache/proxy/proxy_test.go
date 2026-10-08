@@ -498,3 +498,40 @@ func TestNewValidatesGeometry(t *testing.T) {
 		t.Fatal("expected a missing backend to be rejected")
 	}
 }
+
+// TestReadBufferIsPooled pins the contract the frontend relies on: a read hands
+// back its buffer through Release, and the pool then serves that same buffer to
+// the next read instead of allocating a fresh one per command.
+func TestReadBufferIsPooled(t *testing.T) {
+	p, _, _ := newTestProxy(t, false)
+	ctx := context.Background()
+
+	var first *byte
+	reused := false
+	for i := 0; i < 4 && !reused; i++ {
+		res, err := p.Execute(ctx, read10(0, 8), nil, 4096)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if res.Release == nil {
+			t.Fatal("a read must hand its buffer back through Release")
+		}
+		if first == nil {
+			first = &res.Data[0]
+		} else if &res.Data[0] == first {
+			reused = true
+		}
+		res.Release()
+	}
+	if !reused {
+		t.Fatal("the pool never handed the read buffer back")
+	}
+
+	// A buffer too large to be reused is not retained.
+	huge := getReadBuf(maxPooledRead + 1)
+	putReadBuf(huge)
+	next := getReadBuf(maxPooledRead + 1)
+	if &next[0] == &huge[0] {
+		t.Fatal("an oversized read buffer must not be retained by the pool")
+	}
+}

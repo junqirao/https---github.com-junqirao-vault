@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 )
 
 // BHSLen is the fixed size of the iSCSI Basic Header Segment.
@@ -306,37 +307,88 @@ func (p *PDU) Bytes() []byte {
 func pad4(n int) int { return (4 - n%4) % 4 }
 
 // WritePDU serialises and writes a PDU.
+//
+// The header, the data segment and the alignment padding are handed to the
+// writer as separate buffers instead of first being concatenated into one: a
+// network connection sends the three with a single scatter-gather call (WSASend
+// on Windows), so a streamed read neither allocates nor copies a whole PDU per
+// block. Bytes() still exists for callers that want one contiguous slice (tests,
+// digests); it is the copy this function avoids.
 func WritePDU(w io.Writer, p *PDU) error {
-	buf := p.Bytes()
-	_, err := w.Write(buf)
+	dsl := len(p.Data)
+	p.Header.SetDataSegmentLength(dsl)
+	// The header must outlive the call, so it is a local array whose slice the
+	// buffer list refers to; it is small enough that the escape is irrelevant.
+	var hdr [BHSLen]byte
+	copy(hdr[:], p.Header[:])
+
+	// Empty buffers are left out: a writer that is not a real socket falls back
+	// to one Write per buffer, and a zero-length Write blocks forever on a
+	// synchronous pipe (net.Pipe) even though there is nothing to send.
+	bufs := net.Buffers{hdr[:]}
+	if dsl > 0 {
+		var pad [3]byte
+		bufs = append(bufs, p.Data)
+		if n := pad4(dsl); n > 0 {
+			bufs = append(bufs, pad[:n])
+		}
+	}
+	_, err := bufs.WriteTo(w)
 	return err
 }
 
-// ReadPDU reads a single PDU (BHS + AHS + data segment + padding).
-func ReadPDU(r io.Reader) (*PDU, error) {
+// ReadBHS reads a Basic Header Segment and skips any AHS, returning the header.
+//
+// Splitting the header from the data segment lets a caller that already knows
+// the transfer it is waiting for read the segment straight into its own buffer
+// (see ReadSegment), instead of paying for a fresh segment allocation per PDU.
+func ReadBHS(r io.Reader) (BHS, error) {
 	var h BHS
 	if _, err := io.ReadFull(r, h[:]); err != nil {
-		return nil, err
+		return h, err
 	}
-	ahsLen := h.AHSLength() * 4
-	if ahsLen > 0 {
+	if ahsLen := h.AHSLength() * 4; ahsLen > 0 {
 		if _, err := io.CopyN(io.Discard, r, int64(ahsLen)); err != nil {
-			return nil, fmt.Errorf("iscsi: read AHS: %w", err)
+			return h, fmt.Errorf("iscsi: read AHS: %w", err)
 		}
 	}
+	return h, nil
+}
+
+// ReadSegment reads the data segment of the PDU whose header is h into dst,
+// which must be exactly h.DataSegmentLength() bytes long, and consumes the
+// alignment padding.
+func ReadSegment(r io.Reader, h *BHS, dst []byte) error {
 	dsl := h.DataSegmentLength()
-	var data []byte
+	if dsl != len(dst) {
+		return fmt.Errorf("iscsi: data segment length %d does not match the %d byte buffer", dsl, len(dst))
+	}
 	if dsl > 0 {
-		data = make([]byte, dsl)
-		if _, err := io.ReadFull(r, data); err != nil {
-			return nil, fmt.Errorf("iscsi: read data segment: %w", err)
+		if _, err := io.ReadFull(r, dst); err != nil {
+			return fmt.Errorf("iscsi: read data segment: %w", err)
 		}
 	}
 	if p := pad4(dsl); p > 0 {
 		var pad [3]byte
 		if _, err := io.ReadFull(r, pad[:p]); err != nil {
-			return nil, fmt.Errorf("iscsi: read padding: %w", err)
+			return fmt.Errorf("iscsi: read padding: %w", err)
 		}
+	}
+	return nil
+}
+
+// ReadPDU reads a single PDU (BHS + AHS + data segment + padding).
+func ReadPDU(r io.Reader) (*PDU, error) {
+	h, err := ReadBHS(r)
+	if err != nil {
+		return nil, err
+	}
+	var data []byte
+	if dsl := h.DataSegmentLength(); dsl > 0 {
+		data = make([]byte, dsl)
+	}
+	if err := ReadSegment(r, &h, data); err != nil {
+		return nil, err
 	}
 	return &PDU{Header: h, Data: data}, nil
 }
@@ -456,6 +508,44 @@ const (
 	DataInOffResidual  = 44
 )
 
+// FillDataInHeader writes the BHS of a SCSI Data-In PDU into h. dataLen is this
+// PDU's data segment length, which the header has to report.
+//
+// BuildDataIn is the convenience wrapper that pairs a header with a freshly
+// allocated PDU; the frontend uses this directly so a burst of Data-In PDUs can
+// be serialised without allocating a PDU object per segment.
+func FillDataInHeader(h *BHS, itt, ttt, statSN, expCmdSN, maxCmdSN, dataSN, bufOffset uint32, dataLen int, last, withStatus bool, status uint8, residual uint32, overflow, underflow bool) {
+	h[0] = OpDataIn
+	h[1] = 0
+	h[2] = 0
+	h[3] = 0
+	h.SetDataSegmentLength(dataLen)
+	var flags uint8
+	if last {
+		flags |= DataInFlagFinal
+	}
+	if last && withStatus {
+		flags |= DataInFlagStatus
+		h[3] = status
+		h.setU32(DataInOffResidual, residual)
+		if overflow {
+			flags |= DataInFlagOverflow
+		}
+		if underflow {
+			flags |= DataInFlagUnderflow
+		}
+	}
+	h.SetFlags(flags)
+	h.SetLUN(0)
+	h.SetITT(itt)
+	h.SetTTT(ttt)
+	h.setU32(DataInOffStatSN, statSN)
+	h.setU32(DataInOffExpCmdSN, expCmdSN)
+	h.setU32(DataInOffMaxCmdSN, maxCmdSN)
+	h.setU32(DataInOffDataSN, dataSN)
+	h.setU32(DataInOffBufOffset, bufOffset)
+}
+
 // BuildDataIn builds a SCSI Data-In PDU. When last is true the F bit is set and
 // the PDU ends the data sequence.
 //
@@ -465,31 +555,9 @@ const (
 // that returns data; closing such a command with a separate SCSI Response
 // instead makes the Windows initiator reset the connection.
 func BuildDataIn(itt, ttt, statSN, expCmdSN, maxCmdSN, dataSN, bufOffset uint32, data []byte, last, withStatus bool, status uint8, residual uint32, overflow, underflow bool) *PDU {
-	p := NewPDU(OpDataIn, data)
-	var flags uint8
-	if last {
-		flags |= DataInFlagFinal
-	}
-	if last && withStatus {
-		flags |= DataInFlagStatus
-		p.Header[3] = status
-		p.Header.setU32(DataInOffResidual, residual)
-		if overflow {
-			flags |= DataInFlagOverflow
-		}
-		if underflow {
-			flags |= DataInFlagUnderflow
-		}
-	}
-	p.Header.SetFlags(flags)
-	p.Header.SetLUN(0)
-	p.Header.SetITT(itt)
-	p.Header.SetTTT(ttt)
-	p.Header.setU32(DataInOffStatSN, statSN)
-	p.Header.setU32(DataInOffExpCmdSN, expCmdSN)
-	p.Header.setU32(DataInOffMaxCmdSN, maxCmdSN)
-	p.Header.setU32(DataInOffDataSN, dataSN)
-	p.Header.setU32(DataInOffBufOffset, bufOffset)
+	p := &PDU{Data: data}
+	FillDataInHeader(&p.Header, itt, ttt, statSN, expCmdSN, maxCmdSN, dataSN, bufOffset,
+		len(data), last, withStatus, status, residual, overflow, underflow)
 	return p
 }
 

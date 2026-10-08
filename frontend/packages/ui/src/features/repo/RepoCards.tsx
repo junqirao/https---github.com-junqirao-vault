@@ -132,6 +132,10 @@ function RepoUsage({ repo, style }: { repo: RepoDTO; style?: CSSProperties }): J
  *   - cache_active=true → 从 GET /agent/cache 取该库的 L1/L2 用量与命中率。
  *
  * 取不到该库的统计（首次轮询未回来）时只说「缓存已生效」，不显示假数字。
+ *
+ * 外层套一个 block 容器：里面是 antd `Space`（inline-flex），而紧随其后的次要信息行
+ * 也是一个 `Space`（inline-flex）。两个行内级元素会排在同一行、中间没有任何空隙，
+ * 「命中率」和「共享数量」就黏在了一起。这里让它独占一行，空隙交给下面的 marginTop。
  */
 function RepoCacheUsage({
   controller,
@@ -147,43 +151,45 @@ function RepoCacheUsage({
 
   if (!mount.cache_active) {
     return (
-      <Typography.Text
-        type="warning"
-        ellipsis={{ tooltip: mount.cache_error }}
-        style={{ fontSize: fontSize.xs, ...style }}
-      >
-        {t('repo.cache.inactive')}
-        {mount.cache_error ? `（${mount.cache_error}）` : ''}
-      </Typography.Text>
+      <div style={style}>
+        <Typography.Text type="warning" ellipsis={{ tooltip: mount.cache_error }} style={{ fontSize: fontSize.xs }}>
+          {t('repo.cache.inactive')}
+          {mount.cache_error ? `（${mount.cache_error}）` : ''}
+        </Typography.Text>
+      </div>
     )
   }
 
   const stat = agent.cache?.targets.find((item) => item.allocation_id === mount.allocation_id)
   if (!stat) {
     return (
-      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, ...style }}>
-        {t('repo.cache.active')}
-      </Typography.Text>
+      <div style={style}>
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+          {t('repo.cache.active')}
+        </Typography.Text>
+      </div>
     )
   }
 
   const hitPercent = Math.round(stat.hit_rate * 100)
   return (
     // 整卡可点进详情，这里只读展示，事件不冒泡。
-    <Space size={spacing.md} wrap style={style} onClick={(event) => event.stopPropagation()}>
-      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-        {t('repo.cache.l1')} {formatBytes(stat.l1_used_bytes)} / {formatBytes(stat.l1_limit_bytes)}
-      </Typography.Text>
-      {/* L2 未启用（限额 0）时不显示这一段，免得写一个恒为 0 的分母。 */}
-      {stat.l2_limit_bytes > 0 ? (
+    <div style={style} onClick={(event) => event.stopPropagation()}>
+      <Space size={spacing.md} wrap>
         <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-          {t('repo.cache.l2')} {formatBytes(stat.l2_used_bytes)} / {formatBytes(stat.l2_limit_bytes)}
+          {t('repo.cache.l1')} {formatBytes(stat.l1_used_bytes)} / {formatBytes(stat.l1_limit_bytes)}
         </Typography.Text>
-      ) : null}
-      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-        {t('repo.cache.hitRate')} {hitPercent}%
-      </Typography.Text>
-    </Space>
+        {/* L2 未启用（限额 0）时不显示这一段，免得写一个恒为 0 的分母。 */}
+        {stat.l2_limit_bytes > 0 ? (
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+            {t('repo.cache.l2')} {formatBytes(stat.l2_used_bytes)} / {formatBytes(stat.l2_limit_bytes)}
+          </Typography.Text>
+        ) : null}
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+          {t('repo.cache.hitRate')} {hitPercent}%
+        </Typography.Text>
+      </Space>
+    </div>
   )
 }
 

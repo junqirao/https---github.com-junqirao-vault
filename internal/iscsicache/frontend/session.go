@@ -463,6 +463,12 @@ func (s *session) runCommand(ctx context.Context, pdu *iscsi.PDU) error {
 	}
 
 	res, err := s.h.Execute(ctx, cdb, dataOut, inLen)
+	// The handler may have served Data from a pooled buffer; it stays borrowed
+	// until the reply has been written (or the command has failed), so the
+	// release runs on the way out of this function, after the send below.
+	if res.Release != nil {
+		defer res.Release()
+	}
 	if err != nil {
 		s.log.Warn("frontend: command failed", "cdb", hex.EncodeToString(cdb[:min(16, len(cdb))]), "err", err)
 		res = Result{Status: iscsi.StatusCheckCondition, Sense: iscsi.NotReadySense()}
@@ -589,28 +595,45 @@ func (s *session) sendDataIn(itt uint32, data []byte, status uint8, residual uin
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	// The whole burst shares one StatSN and must not interleave with another
-	// command's response, so the loop runs under the same lock.
+	// command's response, so it is both built and sent under the same lock.
 	statSN := s.statSN
 	expCmdSN := s.expCmdSN.Load()
 	maxCmdSN := expCmdSN + cmdWindow
+
+	// The burst goes out as one scatter-gather write: every PDU contributes its
+	// header plus a slice of the payload, so the payload is never copied and the
+	// response costs one syscall instead of one per PDU. A streamed read is a
+	// single command carrying a large payload, which is exactly where a per-PDU
+	// copy and syscall would dominate.
+	n := (len(data) + max - 1) / max
+	hdrs := make([]iscsi.BHS, n)
+	bufs := make(net.Buffers, 0, 2*n+1)
+	var pad [3]byte
 	var dataSN uint32
-	for off := 0; off < len(data); off += max {
+	for i := 0; i < n; i++ {
+		off := i * max
 		end := off + max
 		if end > len(data) {
 			end = len(data)
 		}
+		seg := data[off:end]
 		last := end == len(data)
 		var res uint32
 		var ov, un bool
 		if last {
 			res, ov, un = residual, overflow, underflow
 		}
-		p := iscsi.BuildDataIn(itt, iscsi.ReservedTag, statSN, expCmdSN, maxCmdSN,
-			dataSN, uint32(off), data[off:end], last, last, status, res, ov, un)
-		if err := s.writePDU(p); err != nil {
-			return err
+		iscsi.FillDataInHeader(&hdrs[i], itt, iscsi.ReservedTag, statSN, expCmdSN, maxCmdSN,
+			dataSN, uint32(off), len(seg), last, last, status, res, ov, un)
+		bufs = append(bufs, hdrs[i][:], seg)
+		if p := (4 - len(seg)%4) % 4; p > 0 {
+			bufs = append(bufs, pad[:p])
 		}
 		dataSN++
+	}
+	_ = s.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	if _, err := bufs.WriteTo(s.conn); err != nil {
+		return err
 	}
 	s.statSN++
 	return nil

@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeSource serves a synthetic pattern in which every byte equals the index of
@@ -160,10 +161,46 @@ func TestReadAcrossBlocks(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	expectPattern(t, ss, off, buf)
-	// Rounding to sectors means the backend is read twice: the tail of block 0
-	// and the head of block 1.
-	if src.count() != 2 {
-		t.Fatalf("backend reads = %d, want 2", src.count())
+	// Both blocks are absent, so the request is one run and the backend is read
+	// once; rounding to sectors only widens the run to the sector boundaries.
+	if src.count() != 1 {
+		t.Fatalf("backend reads = %d, want 1 (the run of absent blocks is one read)", src.count())
+	}
+}
+
+// TestAbsentRunIsOneBackendRead pins the point of merging: a read spanning many
+// absent blocks must cost one backend command, not one per block. A per block
+// command carries the backing target's round trip per cache block, which is what
+// caps a streamed read through the proxy.
+func TestAbsentRunIsOneBackendRead(t *testing.T) {
+	const bs, ss = 16 << 10, 4 << 10
+	src := newFakeSource(ss, 16<<20)
+	c := newTestCache(t, testOpts{})
+	ctx := context.Background()
+
+	const blocks = 16
+	buf := make([]byte, blocks*bs)
+	if err := c.Read(ctx, 0, buf, src); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	expectPattern(t, ss, 0, buf)
+	if src.count() != 1 {
+		t.Fatalf("backend reads = %d, want 1 for a %d block run", src.count(), blocks)
+	}
+	if st := c.Stats(); st.Fills != 1 || st.BackendReads != 1 {
+		t.Fatalf("stats = %+v", st)
+	}
+
+	// The merged read populated every block, so the second read is all hits.
+	if err := c.Read(ctx, 0, buf, src); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	expectPattern(t, ss, 0, buf)
+	if src.count() != 1 {
+		t.Fatalf("backend reads = %d, want 1 (the run is cached)", src.count())
+	}
+	if st := c.Stats(); st.L1Hits != blocks || st.RequestHits != 1 {
+		t.Fatalf("stats = %+v", st)
 	}
 }
 
@@ -231,10 +268,11 @@ func TestInvalidateSpanningBlocks(t *testing.T) {
 	if err := c.Read(ctx, 0, buf, src); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	// Only the invalidated sectors of both blocks need refilling; the rest is
-	// still cached, so two backend reads (one per block).
-	if src.count() != 4 {
-		t.Fatalf("backend reads = %d, want 4", src.count())
+	// The first fill reads both absent blocks as one run. Only the invalidated
+	// sectors then need refilling; each block still holds its other sectors, so
+	// the second read costs one command per block.
+	if src.count() != 3 {
+		t.Fatalf("backend reads = %d, want 3", src.count())
 	}
 }
 
@@ -378,5 +416,127 @@ func TestReadEmptyBuffer(t *testing.T) {
 	}
 	if src.count() != 0 {
 		t.Fatal("an empty read must not touch the backend")
+	}
+}
+
+// fakeL2 is an in-memory L2 whose writes can be held open, so a test can observe
+// that an invalidation waits for a population already in flight.
+type fakeL2 struct {
+	mu      sync.Mutex
+	secSize int
+	sects   map[uint64]map[int][]byte
+	// gate, when set, blocks every WriteSectors until it is closed.
+	gate chan struct{}
+}
+
+func newFakeL2(secSize int) *fakeL2 {
+	return &fakeL2{secSize: secSize, sects: map[uint64]map[int][]byte{}}
+}
+
+func (f *fakeL2) ReadSectors(blk uint64, sec, n int, dst []byte) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := f.sects[blk]
+	for i := 0; i < n; i++ {
+		if m == nil || m[sec+i] == nil {
+			return false, nil
+		}
+	}
+	for i := 0; i < n; i++ {
+		copy(dst[i*f.secSize:], m[sec+i])
+	}
+	return true, nil
+}
+
+func (f *fakeL2) WriteSectors(blk uint64, sec, n int, src []byte) error {
+	if f.gate != nil {
+		<-f.gate
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := f.sects[blk]
+	if m == nil {
+		m = map[int][]byte{}
+		f.sects[blk] = m
+	}
+	for i := 0; i < n; i++ {
+		m[sec+i] = append([]byte(nil), src[i*f.secSize:(i+1)*f.secSize]...)
+	}
+	return nil
+}
+
+func (f *fakeL2) InvalidateSectors(blk uint64, sec, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := 0; i < n; i++ {
+		delete(f.sects[blk], sec+i)
+	}
+}
+
+func (f *fakeL2) has(blk uint64, sec, n int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	m := f.sects[blk]
+	for i := 0; i < n; i++ {
+		if m == nil || m[sec+i] == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// TestReadPopulatesL2InBackground pins that a miss still reaches L2: the write
+// is asynchronous, so it is only guaranteed to have landed once an operation
+// that fences on it (Drop) has returned.
+func TestReadPopulatesL2InBackground(t *testing.T) {
+	const ss = 4 << 10
+	src := newFakeSource(ss, 4<<20)
+	l2 := newFakeL2(ss)
+	c := newTestCache(t, testOpts{l2: l2})
+
+	buf := make([]byte, ss)
+	if err := c.Read(context.Background(), 0, buf, src); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	c.Drop()
+	if !l2.has(0, 0, 1) {
+		t.Fatal("the read did not populate the L2")
+	}
+}
+
+// TestInvalidateWaitsForBackgroundL2Write pins the ordering the asynchronous
+// population depends on: an invalidation must not overtake a write already in
+// flight, or the write would resurrect a sector that a write to the device has
+// just made stale.
+func TestInvalidateWaitsForBackgroundL2Write(t *testing.T) {
+	const ss = 4 << 10
+	src := newFakeSource(ss, 4<<20)
+	gated := make(chan struct{})
+	l2 := newFakeL2(ss)
+	l2.gate = gated
+	c := newTestCache(t, testOpts{l2: l2})
+
+	buf := make([]byte, ss)
+	if err := c.Read(context.Background(), 0, buf, src); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	// The population is blocked in WriteSectors, so the invalidation must still
+	// be waiting on it.
+	done := make(chan struct{})
+	go func() {
+		c.Invalidate(0, ss)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("Invalidate returned while an L2 write for the same range was still in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(gated)
+	<-done
+
+	if l2.has(0, 0, 1) {
+		t.Fatal("the invalidated sector is still present in the L2")
 	}
 }
