@@ -791,6 +791,7 @@
   "err.allocation.not_found": "割り当てが存在しません",
   "err.storage.low_free_space": "ボリュームの空き容量が不足しています（残り {free}、下限 {min_permille}‰）",
   "err.storage.insufficient_space": "ストレージ容量が不足しています（{need} 必要）",
+  "err.storage.parent_pool_unavailable": "親ディスクのプール {pool} に使用可能なストレージがないため、差分ディスクを作成できません。そのプールのストレージを有効にするか、親ディスクを現在のプールへ移してから再試行してください",
   "err.storage.not_found": "ストレージが存在しません",
   "err.storage.disabled": "このストレージは無効です",
   "err.storage.in_use": "このストレージにはまだ {disk_count} 個のディスクがあり、削除できません",

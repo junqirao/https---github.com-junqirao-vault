@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"vault/internal/apperr"
 )
@@ -29,7 +30,7 @@ const (
 	defaultTargetCLI = "targetcli"
 	// defaultBackstoreAlias targetcli 中 iblock 插件的路径末段默认值。
 	defaultBackstoreAlias = "block"
-	// maxOutputInError 回显 targetcli 输出时的截断长度。
+	// maxOutputInError 回显 targetcli 输出时的压缩上限（头尾各留一半，见 truncateOutput）。
 	maxOutputInError = 400
 	// tpgAlias TPG 1 在 targetcli 里的名字（configfs 中对应目录 tpgt_1）。
 	tpgAlias = "tpg1"
@@ -221,8 +222,9 @@ func (d *cliDriver) applyAliases(
 	}
 
 	var (
-		lastErr error
-		lastOut string
+		lastErr   error
+		lastOut   string
+		lastAlias string
 	)
 	for _, alias := range aliases {
 		cmds := nonEmpty(build(alias))
@@ -230,7 +232,7 @@ func (d *cliDriver) applyAliases(
 			return nil
 		}
 		out, err := d.runner.Run(ctx, cmds)
-		lastErr, lastOut = err, out
+		lastErr, lastOut, lastAlias = err, out, alias
 
 		if verify == nil || verify() {
 			if err != nil {
@@ -248,7 +250,7 @@ func (d *cliDriver) applyAliases(
 			"stage", stage, "alias", alias, "error", err,
 			"output", truncateOutput(out, maxOutputInError))
 	}
-	return stageFailure(stage, lastErr, lastOut)
+	return stageFailure(stage, lastAlias, lastErr, lastOut)
 }
 
 // aliasCandidates 返回本次可尝试的插件路径末段列表。
@@ -280,7 +282,11 @@ func (d *cliDriver) rememberAlias(alias string) {
 }
 
 // stageFailure 把"命令已下发但配置未生效"整理成带阶段的业务错误。
-func stageFailure(stage string, err error, out string) error {
+//
+// alias 是最后一次实际下发的插件路径末段（如 block / iblock）。它必须记下来：这一阶段的失败
+// 只可能是"别名探测没走对"或"rtslib 真的拒绝了"，而两者的处置完全不同，仅看 targetcli 输出
+// 却分不出来（回显被截断时更是如此，真实反馈：create_backstore 失败只看到一段 rtslib 横幅）。
+func stageFailure(stage string, alias string, err error, out string) error {
 	cause := err
 	if cause == nil {
 		cause = errors.New("命令已下发但后置条件未满足")
@@ -289,9 +295,12 @@ func stageFailure(stage string, err error, out string) error {
 	if s := truncateOutput(strings.TrimSpace(out), maxOutputInError); s != "" {
 		msg += "；targetcli 输出: " + s
 	}
-	return apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
-		WithArg("stage", stage).
-		WithCause(errors.New(msg))
+	e := apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+		WithArg("stage", stage)
+	if alias != "" {
+		e = e.WithArg("backstore_alias", alias)
+	}
+	return e.WithCause(errors.New(msg))
 }
 
 // nonEmpty 去掉空白项后返回新切片。
@@ -305,13 +314,114 @@ func nonEmpty(in []string) []string {
 	return out
 }
 
-// truncateOutput 截断过长的命令输出，避免把整段 python 回溯塞进日志与 HTTP 响应体。
+// truncateOutput 压缩过长的命令输出，避免把整段 python 回溯塞进日志与 HTTP 响应体。
+//
+// 保留的是**头 + 尾**两段，而不是只留头部：targetcli 每次启动都先打一段固定横幅（rtslib 的
+// dbroot UserWarning、版本号、版权、help 提示，合计 300 字符上下），400 字节的预算会被它吃光，
+// 而真正的报错行恰好排在横幅之后——现场拿到的就成了"命令已下发但后置条件未满足；targetcli 输出:
+// <一整段横幅>"，看不出任何线索（真实反馈：create_backstore 连试 3 次失败，日志里只有横幅）。
+// 所以先剔掉已知无害的行，再头尾各留一半：命令回显（谁被下发）与 rtslib 报错原文都还在。
 func truncateOutput(s string, max int) string {
-	s = strings.TrimSpace(s)
+	raw := strings.TrimSpace(s)
+	s = strings.TrimSpace(filterOutput(raw))
+	if s == "" {
+		// 输出里只有横幅：返回空串看起来像"完全没有输出"，会把现场带偏，所以退回原文。
+		s = raw
+	}
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "...（截断）"
+	if max < 64 {
+		return clipHead(s, max) + "...（截断）"
+	}
+	head := max / 2
+	return clipHead(s, head) + "……（省略）……" + clipTail(s, max-head)
+}
+
+// filterOutput 去掉输出里已知无害的行，并把可能回显出来的 CHAP 密钥掩掉。
+//
+// 密钥只经 stdin 下发是为了不进 argv（见 execRunner.Run），但 targetcli 的批处理回显会把收到的
+// 命令原样打出来，而这段回显会进日志与错误信息——所以出口处必须再兜一道脱敏。
+// 提示符、横幅与空行一并丢掉：它们没有信息量，却会挤占截断预算。
+func filterOutput(s string) string {
+	lines := strings.Split(s, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if t == "" || isPromptOnly(t) || isNoiseLine(t) || isBannerLine(t) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return maskChapSecrets(strings.Join(kept, "\n"))
+}
+
+// isPromptOnly 判断一行是否只是 targetcli 的提示符（"/>"、"/backstores/block>"）而没有回显命令。
+//
+// 回显命令的那行形如 "/> /backstores/block create name=.."，**必须保留**：它记录了下发的
+// 到底是哪条命令、用的哪个插件路径，是这一阶段最重要的一条线索。
+func isPromptOnly(t string) bool {
+	return strings.HasPrefix(t, "/") && strings.HasSuffix(t, ">") && !strings.ContainsAny(t, " \t")
+}
+
+// isBannerLine 判断 targetcli 每次启动固定打印的横幅行（版本/版权/help 提示）。
+//
+// 版本号在探针里已单独记进日志，这里丢掉它腾出来的预算正是报错行所需要的。
+func isBannerLine(t string) bool {
+	return strings.HasPrefix(t, "targetcli shell version") ||
+		strings.HasPrefix(t, "Copyright 2011") ||
+		strings.HasPrefix(t, "For help on commands")
+}
+
+// maskChapSecrets 掩掉回显里的 CHAP 密钥。
+//
+// 掩到**行尾**而不是第一个空白：密钥允许含空格（validateChapSecret 只排除控制字符），按空白
+// 切分只能掩掉前半段，等于没掩；而密钥总在命令行末尾（见 cmdSetACLAuth），掩到行尾是正确口径。
+func maskChapSecrets(s string) string {
+	const key = "password="
+	if !strings.Contains(s, key) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for {
+		i := strings.Index(s, key)
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		b.WriteString(s[:i+len(key)])
+		b.WriteString("***")
+		s = s[i+len(key):]
+		j := strings.IndexByte(s, '\n')
+		if j < 0 {
+			return b.String()
+		}
+		s = s[j:]
+	}
+}
+
+// clipHead 取前 n 个字节，且不切在 UTF-8 字符中间。
+func clipHead(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// clipTail 取末尾 n 个字节，且不切在 UTF-8 字符中间。
+func clipTail(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	i := len(s) - n
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
 }
 
 // firstLine 取文本里第一行**有信息量**的内容（用于把 targetcli version 的整段输出压成一行日志）。
@@ -331,11 +441,26 @@ func firstLine(s string) string {
 	return ""
 }
 
-// isNoiseLine 判断一行输出是否只是无害告警（rtslib 的 prefs、Django 风格弃用提示等）。
+// isNoiseLine 判断一行输出是否只是无害告警（rtslib 的 prefs/dbroot 告警、Django 风格弃用提示等）。
+//
+// 判据放宽到"含有 UserWarning: 就算"，是因为 rtslib 的 dbroot 告警**前面带着来源文件路径**：
+//
+//	/usr/lib/python3/dist-packages/rtslib_fb/root.py:174: UserWarning: Cannot set dbroot to ...
+//	  warn(...)
+//
+// 它每次 targetcli 启动都出现、还排在版本号之前：既污染 version 字段，又吃掉大半截断预算
+// （真实反馈里 400 字节的输出预算正是被它和横幅占满，create_backstore 的真实报错被截掉）。
 func isNoiseLine(line string) bool {
 	l := strings.ToLower(line)
-	return strings.HasPrefix(l, "warning:") || strings.HasPrefix(l, "warn:") ||
-		strings.HasPrefix(l, "deprecationwarning:")
+	if strings.HasPrefix(l, "warning:") || strings.HasPrefix(l, "warn:") ||
+		strings.HasPrefix(l, "deprecationwarning:") {
+		return true
+	}
+	// python 告警的续行（"  warn(...)"）。
+	if strings.HasPrefix(l, "warn(") {
+		return true
+	}
+	return strings.Contains(l, "userwarning:")
 }
 
 // ============================================================================

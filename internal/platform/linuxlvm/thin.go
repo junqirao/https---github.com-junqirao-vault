@@ -120,6 +120,25 @@ func vgOfStorageRoot(storageRoot string) string {
 	return vg
 }
 
+// PoolOf 实现 platform.PooledDiskBackend：返回引用所属的卷组（存储池的比较键）。
+//
+// 入参形态按前缀区分：`/dev/...` 是磁盘引用（也是存储卷引用），其余视作存储根。两者都归一到
+// "卷组名"这同一个比较键上 —— 差异盘是 thin 快照，只能与原点同卷组，判定"是否同池"用卷组就够。
+func (m *Manager) PoolOf(ref string) string {
+	r := strings.TrimSpace(ref)
+	if r == "" {
+		return ""
+	}
+	if strings.HasPrefix(r, "/dev/") {
+		vg, _, err := parseRef(r)
+		if err != nil {
+			return ""
+		}
+		return vg
+	}
+	return vgOfStorageRoot(r)
+}
+
 // mapLVName 把平台中性的相对布局标识映射为 LV 名。
 //
 // 规则：去掉 .vhdx 后缀；把 '/'、'\' 与 '-' 统一折叠为 '_'；其余字符原样。
@@ -223,8 +242,12 @@ func (m *Manager) CreateDiff(ctx context.Context, childRef, parentRef string) er
 		return err
 	}
 	if cvg != pvg {
-		// thin snapshot 只能与原点同 VG。
-		return apperr.InvalidParam("parent_ref")
+		// thin snapshot 只能与原点同 VG。走到这里说明**上游选根跨了池**：app 层
+		// pickGuardForPath/pickGuardInPool 会保证差异盘与母盘同池，只有绕过它（或母盘被
+		// 手工迁到别的池、存储配置被改）才会命中。带上两个 VG，免得只报一句 parent_ref
+		// 无效让人看不出"其实是跨池了"（真实反馈："linux下创建失败了"，日志里只有
+		// system.invalid_param / parent_ref）。
+		return apperr.InvalidParam("parent_ref").WithArg("child_vg", cvg).WithArg("parent_vg", pvg)
 	}
 	if err := m.checkWatermark(ctx, cvg); err != nil {
 		return err

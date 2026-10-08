@@ -605,6 +605,18 @@ type PooledDiskBackend interface {
 	// DiskRefInPool 在指定存储池中生成虚拟磁盘引用。
 	// poolRef 为空时等价于 DiskRef("", rel)（使用后端默认池）。
 	DiskRefInPool(poolRef, rel string) (string, error)
+
+	// PoolOf 返回某个引用所属**存储池的比较键**：入参既可以是存储根（storages.path），
+	// 也可以是虚拟磁盘引用；判定不出来返回空串（调用方退回路径语义）。
+	//
+	// 为什么需要它：Linux 的差异盘是 thin 快照，**只能与原点同池**。而磁盘引用形如
+	// `/dev/mapper/<vg>-<lv>`，根本不在任何存储根之下 —— 靠路径前缀（PathGuardSet.GuardForPath）
+	// 永远判不出"母盘在哪个池"，于是选根退化成"可用空间最大的根"，差异盘被建到别的卷组，
+	// lvcreate -s 直接报 parent_ref 无效（真实反馈："linux下创建失败了"）。
+	//
+	// 返回卷组名即可：同池的必要条件就是同卷组；查出 thin pool 名要多一次 lvs，不值当。
+	// 入参形态按前缀区分（`/dev/` 视作磁盘引用，否则视作存储根），不做猜测。
+	PoolOf(ref string) string
 }
 
 // PoolKey 把「卷组 + thin pool」编码成存储池的不透明键（形如 "vg0/vault"）。

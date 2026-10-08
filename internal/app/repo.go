@@ -1367,8 +1367,24 @@ func (s *RepoService) pickGuardForPath(ctx context.Context, preferPath string, n
 	if err != nil {
 		return domain.PathGuard{}, err
 	}
-	if strings.TrimSpace(preferPath) != "" {
-		if g, ok := guards.GuardForPath(preferPath); ok {
+	prefer := strings.TrimSpace(preferPath)
+	if prefer != "" {
+		// ① 池约束优先（Linux）：差异盘是母盘的 thin 快照，**只能与原点同卷组**。
+		//    母盘引用形如 /dev/mapper/<vg>-<lv>，不在任何存储根之下 —— 路径前缀匹配
+		//    （GuardForPath）对它必然落空，于是"优先同根"在 Linux 上从未生效：差异盘直接
+		//    被 Pick 到"可用空间最大的根"（很可能是另一个卷组），lvcreate -s 报 parent_ref
+		//    无效（真实反馈："linux下创建失败了"）。
+		if pb, ok := s.Disk.(platform.PooledDiskBackend); ok {
+			if pool := pb.PoolOf(prefer); pool != "" {
+				g, applicable, perr := pickGuardInPool(ctx, guards, pb, pool, s.volumeProvider(), need)
+				if applicable {
+					return g, perr
+				}
+				// not applicable：连"根落在哪个池"都判不出来，退回下面的路径/空间语义。
+			}
+		}
+		// ② 路径语义（Windows 的 VHDX 路径，或池判定不出来时按原行为兜底）。
+		if g, ok := guards.GuardForPath(prefer); ok {
 			if err := s.ensureVolumeFreeAt(ctx, g.Root, need); err == nil {
 				return g, nil
 			} else {
@@ -1378,6 +1394,54 @@ func (s *RepoService) pickGuardForPath(ctx context.Context, preferPath string, n
 		}
 	}
 	return guards.Pick(ctx, s.volumeProvider(), need)
+}
+
+// pickGuardInPool 在"与母盘同池"的根里挑一个放差异盘。
+//
+// 池语义适用时绝不降级到别的池：跨池派生是**硬失败**（thin 快照只能与原点同卷组）。
+// 与其让 lvcreate 抛一个看不懂的 parent_ref 无效、任务重试三次后失败，不如当场说清
+// "母盘所在池里没有可用的存储"（storage.parent_pool_unavailable，用户可据此启用该池的
+// 存储或迁移母盘）；同池内有根但空间不足时报的是同池的 storage.insufficient_space ——
+// 提示用户扩池，而不是偷偷换一个池。
+//
+// applicable=false 表示**池语义在这台机器上不适用**（没有任何根能判定归属，也问不出
+// 后端默认池），此时必须让调用方退回"路径前缀 + 可用空间"的旧行为：早期版本在 Linux
+// 上就是这么工作的，判不出来还硬报跨池等于把能用的部署改坏。
+func pickGuardInPool(
+	ctx context.Context, guards domain.PathGuardSet, pb platform.PooledDiskBackend,
+	pool string, provider domain.VolumeSpaceProvider, need int64,
+) (guard domain.PathGuard, applicable bool, err error) {
+	// 问出"判不出归属的根最终会落到哪个池"：存储根落在宿主文件系统上时（目录模式，
+	// 或挂载点不是 LV），DiskRef 会回退到后端默认卷组，磁盘其实仍建在那个池里，
+	// 不能因为 PoolOf 判不出来就把它当成"别的池"。
+	defaultPool := ""
+	if ref, derr := pb.DiskRefInPool("", "probe"); derr == nil {
+		defaultPool = pb.PoolOf(ref)
+	}
+
+	roots := make([]string, 0, guards.Len())
+	resolvable := false
+	for _, root := range guards.Roots() {
+		p := pb.PoolOf(root)
+		if p == "" {
+			p = defaultPool
+		} else {
+			resolvable = true
+		}
+		if p == pool {
+			roots = append(roots, root)
+		}
+	}
+
+	if len(roots) > 0 {
+		// 同池内仍按可用空间挑（池内通常只有一个根；多个时也不越过池边界）。
+		g, perr := domain.NewPathGuardSet(roots).Pick(ctx, provider, need)
+		return g, true, perr
+	}
+	if !resolvable && defaultPool == "" {
+		return domain.PathGuard{}, false, nil
+	}
+	return domain.PathGuard{}, true, apperr.New("storage.parent_pool_unavailable", 409).WithArg("pool", pool)
 }
 
 // pickCreateStorage 为新建存储库选择存储与根。

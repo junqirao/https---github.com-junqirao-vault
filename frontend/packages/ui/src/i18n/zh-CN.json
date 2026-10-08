@@ -791,6 +791,7 @@
   "err.allocation.not_found": "分配不存在",
   "err.storage.low_free_space": "卷可用空间不足（剩余 {free}，低于下限 {min_permille}‰）",
   "err.storage.insufficient_space": "存储空间不足（需要 {need}）",
+  "err.storage.parent_pool_unavailable": "母盘所在存储池 {pool} 里没有可用的存储，无法派生差异盘：请启用该池下的存储，或先把母盘迁到当前池，再重试",
   "err.storage.not_found": "存储不存在",
   "err.storage.disabled": "该存储已停用",
   "err.storage.in_use": "该存储下仍有 {disk_count} 个磁盘，无法移除",

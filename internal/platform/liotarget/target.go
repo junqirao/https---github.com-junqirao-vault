@@ -572,6 +572,9 @@ func (m *Manager) applyBackstoreAttribs(ctx context.Context, name string) error 
 // udev_path，此时唯一办法是删掉重建；而读回的字符串有可能是内核规范化后的设备路径
 // （如 /dev/dm-3）而非我们写入的 /dev/mapper/<vg>-<lv>，硬失败会让正常环境也收敛不了。
 // 但如果确实挂错了盘，这条 Warn 是唯一线索，因此必须打出来（旧实现只在写失败时记日志）。
+//
+// 失败路径额外补一份**本包自己查得到的现场**（见 backstoreCreateFailure）：这一阶段的失败报告
+// 不能只有 rtslib 的说法，否则现场只能靠猜。
 func (m *Manager) ensureBackstore(ctx context.Context, name, ref string) error {
 	dir := m.backstorePath(name)
 	if fi, err := os.Stat(dir); err == nil {
@@ -585,9 +588,72 @@ func (m *Manager) ensureBackstore(ctx context.Context, name, ref string) error {
 		}
 		return nil
 	}
-	return m.applyStorage(ctx, "create_backstore",
+	err := m.applyStorage(ctx, "create_backstore",
 		func() bool { return m.isBackstore(name) },
 		func(alias string) []string { return []string{cmdCreateBackstore(alias, name, ref)} })
+	if err != nil {
+		return m.backstoreCreateFailure(name, ref, err)
+	}
+	return nil
+}
+
+// backstoreCreateFailure 给"backstore 没建出来"补上本包能自己查到的现场事实。
+//
+// 为什么非补不可：这一阶段的失败只有两种表达——rtslib 的报错原文（还有可能被截断）与我们的
+// "后置条件未满足"。可现场真正要区分的是几种**处置完全不同**的情形：设备节点不在（LV 没激活或
+// 已被删）、同名对象落在别的插件组目录下（本包按 iblock_0 复验，永远查不到，于是重试到上限）、
+// 以及 configfs 里确实什么都没有。把这几项查出来放进错误参数，日志里就直接看得出该往哪查
+// （真实反馈：create_backstore 连试 3 次失败，日志里只有 targetcli 横幅，什么都没说）。
+func (m *Manager) backstoreCreateFailure(name, ref string, cause error) error {
+	e := apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+		WithArg("stage", "create_backstore").
+		WithArg("backstore", name).
+		WithArg("path", m.backstorePath(name)).
+		WithArg("dev", ref).
+		WithArg("dev_state", deviceState(ref)).
+		WithCause(cause)
+	if other := m.backstorePluginOf(name); other != "" {
+		if other == iblockPlugin {
+			// 复验之后才出现：下发其实生效了，是复验抢在了它前面（或名字大小写不一致）。
+			e = e.WithArg("backstore_dir", "appeared_after_verify")
+		} else {
+			e = e.WithArg("exists_in_plugin", other).
+				WithArg("hint", "同名 backstore 在 "+other+" 组下，本包只按 "+iblockPlugin+" 复验，两者不一致时收敛永远不通过")
+		}
+	}
+	return e
+}
+
+// backstorePluginOf 返回持有该名字 backstore 的插件组目录名；没有则返回空串。
+//
+// 插件组名（iblock_0/fileio_0/…）由内核注册顺序与版本决定，本包只认 iblock_0；名字若出现在别的
+// 组下，创建会被 rtslib 判为"已存在"而复验永远查不到——不显式点出来的话，现场只会看到
+// "重试到上限"加一段横幅。
+func (m *Manager) backstorePluginOf(name string) string {
+	core := path.Dir(m.coreRoot())
+	for _, plugin := range m.listDirs(core) {
+		if m.isDir(path.Join(core, plugin, name)) {
+			return plugin
+		}
+	}
+	return ""
+}
+
+// deviceState 给出引用在文件系统上的状态（供失败诊断用）。"unknown" 表示引用不是绝对路径，
+// 不能据此下结论。
+func deviceState(ref string) string {
+	if !strings.HasPrefix(ref, "/") {
+		return "unknown"
+	}
+	fi, err := os.Stat(ref)
+	switch {
+	case err != nil:
+		return "missing"
+	case fi.Mode()&os.ModeDevice == 0 || fi.Mode()&os.ModeCharDevice != 0:
+		return "not_a_block_device"
+	default:
+		return "ok"
+	}
 }
 
 // removeBackstore 删除一个 backstore（**不删除底层块设备数据**）。幂等。

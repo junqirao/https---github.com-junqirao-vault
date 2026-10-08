@@ -791,6 +791,7 @@
   "err.allocation.not_found": "Allocation not found",
   "err.storage.low_free_space": "Not enough free space on the volume ({free} left, below the {min_permille}‰ floor)",
   "err.storage.insufficient_space": "Not enough storage space (needed {need})",
+  "err.storage.parent_pool_unavailable": "No usable storage in the parent disk's pool {pool}, so the diff disk cannot be created: enable a storage in that pool, or move the parent disk to the current pool, then retry",
   "err.storage.not_found": "Storage not found",
   "err.storage.disabled": "This storage is disabled",
   "err.storage.in_use": "This storage still has {disk_count} disks and cannot be removed",

@@ -791,6 +791,7 @@
   "err.allocation.not_found": "할당이 존재하지 않습니다",
   "err.storage.low_free_space": "볼륨 여유 공간이 부족합니다(남은 공간 {free}, 하한 {min_permille}‰)",
   "err.storage.insufficient_space": "저장 공간이 부족합니다({need} 필요)",
+  "err.storage.parent_pool_unavailable": "상위 디스크의 풀 {pool}에 사용 가능한 스토리지가 없어 차분 디스크를 만들 수 없습니다. 해당 풀의 스토리지를 활성화하거나 상위 디스크를 현재 풀로 옮긴 뒤 다시 시도하세요",
   "err.storage.not_found": "스토리지가 존재하지 않습니다",
   "err.storage.disabled": "이 스토리지는 비활성화되어 있습니다",
   "err.storage.in_use": "이 스토리지에 아직 {disk_count}개의 디스크가 있어 제거할 수 없습니다",

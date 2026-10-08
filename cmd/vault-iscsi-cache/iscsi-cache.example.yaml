@@ -1,0 +1,58 @@
+# Example configuration for vault-iscsi-cache.
+#
+# The proxy presents target_iqn on listen_addr to initiators on this machine and
+# fills its read cache from backend, a remote iSCSI target.
+
+target_iqn: "iqn.2024-01.local.vault:cached-disk0"
+listen_addr: "127.0.0.1:3260"
+
+# INQUIRY strings reported to local initiators. Empty fields fall back to the
+# backing LUN.
+vendor: ""
+product: ""
+revision: ""
+
+backend:
+  address: "172.18.28.200:3260"
+  target_iqn: "iqn.1991-05.com.microsoft:win-0e595h11jss-test-target"
+  # Empty generates iqn.2024-01.local.vault-iscsi-cache:<hostname>.
+  initiator_iqn: ""
+  auth: "none"
+  dial_timeout: "10s"
+  io_timeout: "30s"
+  max_recv_data_segment_length: 65536
+  max_burst_length: 262144
+
+cache:
+  # Only "writearound" is supported by the MVP: writes are forwarded to the
+  # backend and the affected ranges are dropped from both cache levels.
+  mode: "writearound"
+  # Cache geometry: 64 KiB blocks sliced into 4 KiB sectors.
+  block_size: 65536
+  sector_size: 4096
+  # Binding the cache to the backing LUN identity is mandatory: a replaced disk
+  # must not be served stale blocks.
+  identity_binding: true
+
+  l1:
+    size_bytes: 268435456 # 256 MiB in memory
+
+  l2:
+    enabled: true
+    path: "C:/vault-iscsi-cache/l2.bin"
+    size_bytes: 8589934592 # 8 GiB file, sized in whole blocks
+
+  eviction:
+    policy: "s3-fifo"
+    new_quota_pct: 10
+    high_watermark: 0.9
+    low_watermark: 0.7
+
+  scan_detection:
+    # Sequential streams are served without populating the cache.
+    enabled: true
+    threshold: 32
+
+  prefetch:
+    # Not supported by the MVP; must stay false.
+    enabled: false
