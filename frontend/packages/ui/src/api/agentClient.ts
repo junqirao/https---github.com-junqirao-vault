@@ -9,6 +9,7 @@
  */
 import { ApiError, businessErrorFrom } from './errors'
 import type {
+  AgentCacheStatus,
   AgentConfig,
   AgentEvent,
   AgentHealth,
@@ -655,6 +656,15 @@ export const agentApi = {
 
   getConfig(): Promise<AgentConfig> {
     return request<AgentConfig>({ method: 'GET', path: '/agent/config' })
+  },
+
+  /**
+   * 读取本地读缓存代理状态：门户是否在运行 + 每个已启用缓存的库的用量与命中情况。
+   *
+   * 门户是懒启动的，没有库启用缓存时返回 `running:false`、`targets: []`。
+   */
+  getCache(): Promise<AgentCacheStatus> {
+    return request<AgentCacheStatus>({ method: 'GET', path: '/agent/cache' })
   },
 
   patchConfig(patch: Partial<AgentConfig>): Promise<{ config: AgentConfig }> {

@@ -26,12 +26,10 @@ import (
 	"log/slog"
 	"net"
 	"sync"
-	"time"
 
 	"vault/internal/iscsicache/backend"
 	"vault/internal/iscsicache/cache"
 	"vault/internal/iscsicache/frontend"
-	"vault/internal/iscsicache/identity"
 	"vault/internal/iscsicache/l2"
 	"vault/internal/iscsicache/proxy"
 )
@@ -134,17 +132,9 @@ func (c *CacheConfig) applyDefaults() {
 	}
 }
 
-func (c *Config) validate() error {
-	if c.TargetIQN == "" {
-		return errors.New("iscsicache: target_iqn is required")
-	}
-	if c.Backend.Address == "" {
-		return errors.New("iscsicache: backend.address is required")
-	}
-	if c.Backend.TargetIQN == "" {
-		return errors.New("iscsicache: backend.target_iqn is required")
-	}
-	cc := &c.Cache
+// validateCacheConfig applies the defaults and rejects the configurations the
+// MVP does not implement. Shared by Config.validate and the portal.
+func validateCacheConfig(cc *CacheConfig) error {
 	cc.applyDefaults()
 	if cc.Mode != "writearound" {
 		return fmt.Errorf("iscsicache: cache mode %q is not supported (only writearound)", cc.Mode)
@@ -164,6 +154,19 @@ func (c *Config) validate() error {
 	return nil
 }
 
+func (c *Config) validate() error {
+	if c.TargetIQN == "" {
+		return errors.New("iscsicache: target_iqn is required")
+	}
+	if c.Backend.Address == "" {
+		return errors.New("iscsicache: backend.address is required")
+	}
+	if c.Backend.TargetIQN == "" {
+		return errors.New("iscsicache: backend.target_iqn is required")
+	}
+	return validateCacheConfig(&c.Cache)
+}
+
 // Stats aggregates the counters of the layers.
 type Stats struct {
 	Cache    cache.Snapshot
@@ -171,6 +174,9 @@ type Stats struct {
 	L2Slots  int
 	L2Used   int
 	Sessions int64
+	// BlockSize is the cache block size, which is also the L2 slot size; callers
+	// use it to turn L2Slots/L2Used into bytes.
+	BlockSize int
 }
 
 // Service is a running proxy instance.
@@ -199,129 +205,33 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	var dialTimeout, ioTimeout time.Duration
-	var err error
-	if cfg.Backend.DialTimeout != "" {
-		if dialTimeout, err = time.ParseDuration(cfg.Backend.DialTimeout); err != nil {
-			return nil, fmt.Errorf("iscsicache: backend.dial_timeout: %w", err)
-		}
-	}
-	if cfg.Backend.IOTimeout != "" {
-		if ioTimeout, err = time.ParseDuration(cfg.Backend.IOTimeout); err != nil {
-			return nil, fmt.Errorf("iscsicache: backend.io_timeout: %w", err)
-		}
-	}
-
-	be, err := backend.Dial(ctx, backend.Config{
-		Address:                  cfg.Backend.Address,
-		TargetIQN:                cfg.Backend.TargetIQN,
-		InitiatorIQN:             cfg.Backend.InitiatorIQN,
-		Auth:                     cfg.Backend.Auth,
-		Username:                 cfg.Backend.Username,
-		Secret:                   cfg.Backend.Secret,
-		DialTimeout:              dialTimeout,
-		IOTimeout:                ioTimeout,
-		MaxRecvDataSegmentLength: cfg.Backend.MaxRecvDataSegmentLength,
-		MaxBurstLength:           cfg.Backend.MaxBurstLength,
-		Logger:                   log.With("component", "backend"),
+	rt, err := buildTarget(ctx, log, TargetConfig{
+		TargetIQN: cfg.TargetIQN,
+		Backend:   cfg.Backend,
+		Cache:     cfg.Cache,
+		Vendor:    cfg.Vendor,
+		Product:   cfg.Product,
+		Revision:  cfg.Revision,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	s := &Service{cfg: cfg, log: log, be: be}
-	if err := s.build(ctx); err != nil {
-		be.Close()
-		return nil, err
-	}
-	return s, nil
-}
-
-func (s *Service) build(ctx context.Context) error {
-	info := s.be.Info()
-	cc := s.cfg.Cache
-
-	desc := identity.Descriptor{
-		TargetIQN:  info.TargetIQN,
-		Serial:     info.Serial,
-		WWID:       info.WWID,
-		BlockCount: info.BlockCount,
-		BlockSize:  info.BlockSize,
-	}
-	ns := desc.Namespace()
-	if !desc.Full() {
-		s.log.Warn("iscsicache: backing LUN reports no serial or WWID; " +
-			"the cache namespace cannot detect a replaced disk")
-	}
-	s.log.Info("iscsicache: cache namespace bound",
-		"namespace", ns[:16], "serial", info.Serial, "wwid", info.WWID)
-
-	var l2Store cache.L2
-	if cc.L2.Enabled {
-		f, err := l2.Open(l2.Config{
-			Path:       cc.L2.Path,
-			SizeBytes:  cc.L2.SizeBytes,
-			BlockSize:  cc.BlockSize,
-			SectorSize: cc.SectorSize,
-			Namespace:  ns,
-			Logger:     s.log.With("component", "l2"),
-		})
-		switch {
-		case err == nil:
-			s.l2 = f
-			l2Store = f
-		case errors.Is(err, l2.ErrUnsupported):
-			// Linux placeholder: keep serving from L1 only.
-			s.log.Warn("iscsicache: L2 file store is not implemented on this platform, continuing with L1 only")
-		default:
-			return err
-		}
-	}
-
-	c, err := cache.New(cache.Config{
-		BlockSize:     cc.BlockSize,
-		SectorSize:    cc.SectorSize,
-		L1Bytes:       cc.L1.SizeBytes,
-		NewQuotaPct:   cc.Eviction.NewQuotaPct,
-		HighWatermark: cc.Eviction.HighWatermark,
-		LowWatermark:  cc.Eviction.LowWatermark,
-		ScanEnabled:   *cc.ScanDetection.Enabled,
-		ScanThreshold: cc.ScanDetection.Threshold,
-		L2:            l2Store,
-		Logger:        s.log.With("component", "cache"),
-	})
-	if err != nil {
-		return err
-	}
-	s.c = c
-
-	px, err := proxy.New(proxy.Config{
-		Backend:   s.be,
-		Cache:     c,
-		Vendor:    s.cfg.Vendor,
-		Product:   s.cfg.Product,
-		Revision:  s.cfg.Revision,
-		TargetIQN: s.cfg.TargetIQN,
-		Logger:    s.log.With("component", "proxy"),
-	})
-	if err != nil {
-		return err
-	}
-	s.px = px
-
+	s := &Service{cfg: cfg, log: log, be: rt.be, l2: rt.l2, c: rt.c, px: rt.px}
 	tgt, err := frontend.New(frontend.Config{
-		ListenAddr: s.cfg.ListenAddr,
-		TargetIQN:  s.cfg.TargetIQN,
-		Vendor:     px.Device().Vendor,
-		Product:    px.Device().Product,
-		Revision:   px.Device().Revision,
-		Logger:     s.log.With("component", "frontend"),
-	}, px)
+		ListenAddr: cfg.ListenAddr,
+		TargetIQN:  cfg.TargetIQN,
+		Vendor:     rt.px.Device().Vendor,
+		Product:    rt.px.Device().Product,
+		Revision:   rt.px.Device().Revision,
+		Logger:     log.With("component", "frontend"),
+	}, rt.px)
 	if err != nil {
-		return err
+		_ = rt.close()
+		return nil, err
 	}
 	s.tgt = tgt
-	return nil
+	return s, nil
 }
 
 // Addr returns the address the frontend listens on.
@@ -350,6 +260,7 @@ func (s *Service) Stats() Stats {
 	st := Stats{}
 	if s.c != nil {
 		st.Cache = s.c.Stats()
+		st.BlockSize = s.c.BlockSize()
 	}
 	if s.px != nil {
 		st.Proxy = s.px.Stats()

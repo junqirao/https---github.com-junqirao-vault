@@ -21,6 +21,9 @@ func newPhaseTestAgent(t *testing.T) *Agent {
 	}
 	a := &Agent{logger: testLogger(), store: store, hub: NewEventHub(), locks: lock.NewKeyed()}
 	a.engine = &mountEngine{a: a}
+	// 卸载路径会调 cache.ReleaseTarget（注销本地缓存目标）。这里给一个"未打开门户"的
+	// 管理器即可 —— 未启用缓存的库调用它是空操作。
+	a.cache = newCacheManager(nil, testLogger())
 	return a
 }
 

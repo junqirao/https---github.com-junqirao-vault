@@ -91,6 +91,9 @@ type Agent struct {
 	vol      *volume.Manager
 	locks    *lock.Keyed
 	engine   *mountEngine
+	// cache 是本机 iSCSI 读缓存代理：**一个客户端一个代理，一个代理下挂多个目标**
+	// （见 cacheproxy.go）。没有库启用缓存时不监听任何端口（懒启动）。
+	cache *cacheManager
 	// downloads 管理母盘内容下载任务（内存态）。
 	downloads *downloadManager
 	// uploads 管理"本地目录 → 存储库"上传任务（内存态 + <DataDir>/uploads.json 续传记录）。
@@ -199,6 +202,7 @@ func New(opt Options) (*Agent, error) {
 	}
 	a.web = newWebUpdateManager(a)
 	a.engine = &mountEngine{a: a}
+	a.cache = newCacheManager(cfg, logger)
 	a.logUpdateKeyStatus()
 	return a, nil
 }
@@ -264,6 +268,10 @@ func (a *Agent) Start(ctx context.Context) (string, error) {
 	}
 	a.started = true
 	a.mu.Unlock()
+
+	// 缓存代理拿到 Agent 的长生命周期 context：门户是懒启动的（没有库启用缓存就不监听端口），
+	// 但一旦打开，它必须活到进程退出 —— 用挂载请求的 ctx 会让门户在挂载返回后立刻死掉。
+	a.cache.Start(a.baseCtx)
 
 	safeGo(a.logger, "local_http_serve", func() {
 		if err := a.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -357,6 +365,12 @@ func (a *Agent) Stop(ctx context.Context) error {
 		}
 	}
 	a.wg.Wait()
+
+	// 停止本地读缓存代理：进程退出（信号 / 自更新）不走 UnmountAll，这里是 L2 落盘与
+	// 代理到服务端会话 logout 的唯一时机（见 cacheproxy.go 的 Close）。
+	if err := a.cache.Close(); err != nil {
+		a.logger.Warn("停止本地 iSCSI 缓存代理失败", "error", err)
+	}
 
 	if err := a.store.Persist(); err != nil {
 		a.logger.Warn("写入本地状态失败", "error", err)

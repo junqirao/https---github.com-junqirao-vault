@@ -83,6 +83,21 @@ export interface AgentMountState {
    * 当成"断线"，要按 state 展示（判定请统一走 mountSessionLive）。
    */
   session_checked_at?: number
+  /**
+   * 该库是否启用了本地读缓存（来自本机每库配置 repo_mounts[id].cache_enabled）。
+   *
+   * 这是"用户的意图"，不代表链路真的走了代理 —— 是否生效看 cache_active。
+   */
+  cache_enabled?: boolean
+  /**
+   * 缓存是否**真的生效**：true 表示这次挂载走的是 本机 → 本地缓存代理 → 服务端目标。
+   *
+   * false 且 cache_enabled=true 说明代理不可用（端口占用/后端不可达/CHAP/配额不足），
+   * 挂载已**自动回退直连**服务端目标 —— 挂载照样成功，只是没有缓存加速。
+   */
+  cache_active?: boolean
+  /** 缓存未生效（回退直连）的原因；仅 cache_enabled=true 且 cache_active=false 时非空。 */
+  cache_error?: string
 }
 
 export type DownloadStatus = 'running' | 'done' | 'failed' | 'canceled'
@@ -286,6 +301,15 @@ export interface AgentRepoMountPref {
    * 这里是每库显式表态 —— 为 true 时本机没有记录也会挂上；为 false 时连记录都不恢复。
    */
   auto_mount: boolean
+  /**
+   * 是否为该库启用**本地 iSCSI 读缓存代理**（每个库独立，**默认关闭**）。
+   *
+   * 开启后本机到服务端的链路变成 本机发起端 → 本地缓存代理（127.0.0.1:3261）→ 服务端目标：
+   * 多占用一份本机内存（L1）与磁盘（L2，总量在「客户端设置」里配，按已启用的库均分）。
+   * 代理不可用时会**自动回退直连**服务端目标（挂载照常成功，卡片提示「缓存未生效」）。
+   * 改动需要**重新挂载**这个库才生效。
+   */
+  cache_enabled?: boolean
 }
 
 /** GET /agent/config 与 PATCH /agent/config。 */
@@ -306,8 +330,79 @@ export interface AgentConfig {
   server_alias: string
   /** 是否用本地客户端证书免密登录（identity.json 存在时生效）。 */
   auto_login: boolean
+  /**
+   * 本地读缓存代理的 **L1（内存）总预算**（字节）：客户端总量，在已启用缓存的库之间均分。
+   *
+   * 用户只在这一层设置（一个客户端一个代理）；某个库分到多少由代理按"已启用缓存的库数"算。
+   */
+  cache_l1_bytes: number
+  /**
+   * 本地读缓存代理的 **L2（本地磁盘文件）总预算**（字节）：同样是客户端总量、按库均分。
+   * **0 表示关闭 L2**（只做内存缓存），是合法取值。
+   */
+  cache_l2_bytes: number
+  /**
+   * L2 缓存文件的存放目录（客户端设置里可改）。
+   *
+   * 空串表示默认位置（程序数据目录下的 `iscsi-cache`）。非空必须是**绝对路径**，
+   * 否则 PATCH 返回 system.invalid_param（args.field=cache_l2_dir）。
+   * 改动在**下一次挂载**时生效（L2 文件路径在创建缓存目标时定下）。
+   */
+  cache_l2_dir: string
   /** 按存储库 ID 保存的挂载偏好；没有条目的库跟随上面的全局默认值（PATCH 不接受该字段）。 */
   repo_mounts?: Record<string, AgentRepoMountPref>
+}
+
+/**
+ * 单个库（分配）的缓存用量与命中情况（GET /agent/cache 的 targets[]）。
+ *
+ * 只有**当前在本地门户注册了目标**的库才会出现在这里 —— 也就是"已启用缓存且本次挂载
+ * 真的走了代理"的库；未启用或已回退直连的库不会出现。
+ */
+export interface AgentCacheTargetStatus {
+  /** 与挂载记录、存储库卡片一一对应。 */
+  allocation_id: string
+  /** 本地门户为该库公示的 IQN（挂载链路上实际连接的那个）。 */
+  target_iqn: string
+  l1_used_bytes: number
+  l1_limit_bytes: number
+  /** L2 未启用时为 0。 */
+  l2_used_bytes: number
+  l2_limit_bytes: number
+  /** 读命令数。 */
+  reads: number
+  /** **整条命令**完全由缓存满足的次数（命中率的分母/分子口径见 hit_rate）。 */
+  request_hits: number
+  /** 分段细粒度计数。 */
+  l1_hits: number
+  partial_hits: number
+  l2_hits: number
+  backend_reads: number
+  writes: number
+  /** request_hits / reads（0..1）；reads 为 0 时为 0。 */
+  hit_rate: number
+}
+
+/**
+ * 本地 iSCSI 读缓存代理的对外状态（GET /agent/cache）。
+ *
+ * 门户是**懒启动**的：没有任何库启用缓存时不监听任何端口（running=false，targets 为空）。
+ */
+export interface AgentCacheStatus {
+  running: boolean
+  /** 门户监听地址（未运行时为空）。 */
+  addr?: string
+  /** 客户端总量预算。 */
+  l1_limit_bytes: number
+  l2_limit_bytes: number
+  /** 当前均分给每个启用缓存的库的配额。 */
+  l1_quota_bytes: number
+  l2_quota_bytes: number
+  /** 已启用缓存的库数（配额分母）。 */
+  enabled_repos: number
+  targets: AgentCacheTargetStatus[]
+  /** 最近一次打开门户失败的原因（如端口被占用）；正常时为空。 */
+  error?: string
 }
 
 /** GET /agent/identity 与 POST /agent/identity/install 的响应（永不含私钥与证书原文）。 */

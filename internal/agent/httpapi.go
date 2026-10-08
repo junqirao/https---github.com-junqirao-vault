@@ -37,6 +37,8 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("POST /agent/unmount", a.handleUnmount)
 	mux.HandleFunc("POST /agent/remount", a.handleRemount)
 	mux.HandleFunc("GET /agent/mounts", a.handleListMounts)
+	// 本机 iSCSI 读缓存代理的用量与命中情况（客户端存储库页面展示，见 cacheproxy.go）。
+	mux.HandleFunc("GET /agent/cache", a.handleCacheStatus)
 
 	mux.HandleFunc("GET /agent/config", a.handleGetConfig)
 	mux.HandleFunc("PATCH /agent/config", a.handlePatchConfig)
@@ -431,6 +433,15 @@ func (a *Agent) handleListMounts(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{"items": a.store.ListMounts()})
 }
 
+// handleCacheStatus 返回本机 iSCSI 读缓存代理的状态（见 cacheproxy.go）。
+//
+// 内容：门户是否在跑、客户端 L1/L2 总量预算与"每个启用缓存的库"分到的配额，以及按库汇总的
+// 用量（L1/L2 占用）与命中情况（读命令数、整命令命中数、命中率）。存储库页面据此展示
+// "缓存用量/命中情况"；门户没开（没有任何库启用缓存）时 running=false、targets 为空。
+func (a *Agent) handleCacheStatus(w http.ResponseWriter, _ *http.Request) {
+	a.writeJSON(w, http.StatusOK, a.cache.Status())
+}
+
 // ---- 本地配置 ----
 
 // handleGetConfig 返回本地配置。
@@ -463,6 +474,11 @@ type repoMountPrefRequest struct {
 	// 子目录（见 mountDirLeaf），界面在挂载设置里如实告知用户这一点。
 	MountDir  string `json:"mount_dir"`
 	AutoMount bool   `json:"auto_mount"`
+	// CacheEnabled 是否为该库启用本地 iSCSI 读缓存代理（默认关闭，用户手动开启）。
+	//
+	// ⚠️ 这是**整条偏好替换**（见 SetRepoMountPref）：调用方必须把它与 mount_mode/mount_dir/
+	// auto_mount 一起回传，只发其中几项会把没发的项重置为默认值。
+	CacheEnabled bool `json:"cache_enabled"`
 }
 
 // handleSetRepoMountPref 写入单个存储库的挂载偏好（每个库各自独立，互不影响）。
@@ -478,9 +494,10 @@ func (a *Agent) handleSetRepoMountPref(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg, err := a.cfg.SetRepoMountPref(repoID, RepoMountPref{
-		MountMode: in.MountMode,
-		MountDir:  in.MountDir,
-		AutoMount: in.AutoMount,
+		MountMode:    in.MountMode,
+		MountDir:     in.MountDir,
+		AutoMount:    in.AutoMount,
+		CacheEnabled: in.CacheEnabled,
 	})
 	if err != nil {
 		a.writeError(w, err)

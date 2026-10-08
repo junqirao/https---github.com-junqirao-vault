@@ -47,6 +47,9 @@ POST   /agent/server/reconnect     # 界面"重试"按钮：清零自动重连�
 **主服务端（primary）**：多台之中只有一台是"主"，供**没有服务端上下文**的操作使用 ——
 自更新与渲染层资源热更的**更新源**（`update` / `web_update` 只认一台，混用会让版本判定自相矛盾，
 见 implementation.md 7.4.1）。首台注册时自动成为主服务端，之后由 `primary:true` 显式指定。
+桌面客户端把**当前活动服务端**标为 primary（每次推送会话时随 `server_key` 一起声明：
+活动那台 `primary:true`、其余为 false），因此**切换服务端会重新推送会话，更新源随之切到新台** ——
+否则主服务端会一直停在"第一台注册的"，切换服务端后"检查更新"仍打旧服务器（真实反馈）。
 `/agent/state` 的 `primary_key` 与每台的 `primary` 字段可查当前是哪一台。
 
 **兼容**：以上 `server_key` / `primary` / `alias` 都是可选字段。只推一台会话的老客户端
@@ -242,6 +245,17 @@ MountState = {
   #   0/缺省 = **尚未核对**（代理刚启动、记录刚从状态文件加载）。此时界面按 state 展示，
   #   **不得**把 session_active 的缺省值当成"断线"（旧代理没有这两个字段，同样按 state 展示）。
   session_active, session_checked_at,
+  # cache_enabled / cache_active / cache_error：本库的**本地 iSCSI 读缓存**状态。
+  #   cache_enabled：本库是否启用了缓存（来自 repo_mounts，见「本地配置」）—— 用户的**意图**；
+  #   cache_active ：本次挂载实际是否走了本地缓存代理（挂载链路 = 本机 → 本地缓存代理 →
+  #                  服务端目标）—— 实际**生效**结果。此时 target_iqn/portal 记录的是**本地门户**
+  #                  公示的 IQN 与地址（127.0.0.1:3261），不是服务端目标；
+  #   cache_error  ：启用了却没生效时的原因（如门户端口被占用）。代理不可用时挂载会**自动回退**
+  #                  直连服务端目标（cache_active=false 且 cache_error 说明原因）—— 绝不因缓存
+  #                  导致挂载失败。
+  # 界面判据：cache_enabled=true 且 cache_active=false 时显示"缓存未生效"+原因（tooltip）。
+  # 三者在挂载时定下（与配额一致），改 repo_mounts 里的 cache_enabled **需重新挂载**才生效。
+  cache_enabled, cache_active, cache_error,
   # ⚠️ last_error / last_error_detail 只在**真失败**时有值：state="error"（挂载失败，或
   #    心跳连续失败超过租约 TTL）与 state="revoked"（被服务端撤销）。
   #    state="mounted" 的挂载**永远不带错误**：心跳偶发失败只进日志与 server.last_error，
@@ -350,6 +364,53 @@ POST /agent/remount
 GET  /agent/mounts
   ↑ {items:[MountState...]}
 ```
+
+## 本地读缓存（iSCSI 缓存代理）
+
+客户端本地读加速：**一个客户端只起一个代理进程**（内嵌在 Vault-Agent 内），代理在
+`127.0.0.1:3261` 上开一个 iSCSI 门户，**同时服务多个**启用了缓存的库 —— 按 TargetName
+（每个库一个本地 IQN）路由到各自的后端目标。启用缓存的库挂载链路变为
+**本机 → 本地缓存代理 → 服务端目标**；未启用的库仍是本机 → 服务端目标直连。
+
+```
+GET /agent/cache
+  ↑ CacheStatus
+  # 门户没开（没有任何库启用缓存）时 running=false、targets 为空；存储库页面据此展示
+  # "缓存用量/命中情况"。
+
+CacheStatus = {
+  running:bool,                 # 门户是否已打开（**懒启动**：首个库启用缓存时创建）
+  addr,                         # 门户监听地址（running 时有值），如 "127.0.0.1:3261"
+  l1_limit_bytes, l2_limit_bytes,   # 客户端总量预算（L2 为 0 表示关闭 L2）
+  l1_quota_bytes, l2_quota_bytes,   # 当前**均分**给每个启用缓存的库的配额（总量 / 库数）
+  enabled_repos:int,            # 已启用缓存的库数（决定配额分母）
+  targets:[CacheTargetStatus...],   # 按库（分配）汇总的用量与命中情况
+  error                         # 可选：最近一次打开门户失败的原因（如端口被占用）
+}
+
+CacheTargetStatus = {
+  allocation_id,                # 与挂载记录、存储库卡片一一对应
+  target_iqn,                   # 本地门户为该库公示的 IQN（挂载链路上实际连接的）
+  l1_used_bytes, l1_limit_bytes,   # 内存缓存占用与配额
+  l2_used_bytes, l2_limit_bytes,   # L2 文件占用与配额（未启用 L2 时均为 0）
+  reads,                        # 读命令数
+  request_hits,                 # **整条命令**完全由缓存满足的次数
+  l1_hits, partial_hits, l2_hits, backend_reads,   # 分段细粒度计数
+  writes,
+  hit_rate                      # request_hits / reads（0..1）；reads 为 0 时为 0
+}
+```
+
+要点：
+
+- **设面只按客户端**：L1/L2 总量在「客户端设置」里配（`PATCH /agent/config` 的
+  `cache_l1_bytes` / `cache_l2_bytes`，见「本地配置」），**是否启用按库配**
+  （`POST /agent/repo-mounts/{repo_id}` 的 `cache_enabled`）。总量由所有已启用缓存的库均分。
+- **懒启动**：没有任何库启用缓存时不开门户；第一个库启用并挂载时才创建监听。
+- **回退直连**：门户建不起来（如 3261 被占用）时，库照常挂载，只是回退直连服务端目标，
+  原因记在该库挂载状态的 `cache_error` 里。
+- **卸载即回收**：卸载时先断会话再注销该库在门户上的目标并回收其 L2 文件（顺序不能反，
+  否则仍在飞的命令会失败）。
 
 ## 磁盘内容下载（把母盘拷贝到本地）
 
@@ -530,12 +591,13 @@ UploadState = {
 GET   /agent/config
   ↑ {auto_mount:bool, default_mount_mode, default_mount_dir, default_download_dir,
      download_connections, language, start_at_login:bool, update_channel, server_alias,
-     repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool}}}
+     cache_l1_bytes:int, cache_l2_bytes:int, cache_l2_dir:string,
+     repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}}}
 PATCH /agent/config
   ↓ 上述字段的任意子集（不含 repo_mounts / default_mount_mode / default_mount_dir）
   ↑ {config:{...}}
 POST  /agent/repo-mounts/{repo_id}
-  ↓ {mount_mode, mount_dir, auto_mount:bool}
+  ↓ {mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}
   ↑ {config:{...}}
 ```
 
@@ -552,6 +614,10 @@ POST  /agent/repo-mounts/{repo_id}
   （只接受 GET/POST/PATCH/DELETE），PUT 会被挡在代理之外并向上报成 `network.error`。
 - `mount_mode` 为空串表示跟随 `default_mount_mode`；非法值返回
   `system.invalid_param`（args.field=mount_mode），空 `repo_id` 返回 args.field=repo_id。
+- `cache_enabled` 是"是否为该库启用本地 iSCSI 读缓存代理"（默认 **false**，必须由用户在
+  「存储库 → 挂载设置」手动开启），与 `mount_mode` / `mount_dir` / `auto_mount` 同属**整条
+  偏好**：`POST /agent/repo-mounts/{repo_id}` 是整条替换，只发其中几项会把没发的项重置为
+  默认值。改动**需重新挂载才生效**（挂载链路在挂载时确定），界面据此提示用户。
 - `server_alias` 是**全局**别名，只在多服务端改造前/单服务端场景下作为兜底生效。
   多服务端下别名**按台**下发（`POST /agent/session` 的 `alias`，落在 `/agent/state` 里该台的
   `alias` 字段）：全局那一个名字已不足以标识"是哪一台"，继续沿用会让两台服务端的不同库
@@ -588,6 +654,25 @@ POST  /agent/repo-mounts/{repo_id}
 `download_connections` 是「母盘拷贝到本地」的并行分段数，取值 1..8，默认 4。
 取值超出范围时 PATCH 返回 `system.invalid_param`（args.field=download_connections）；
 从配置文件读取到越界值时按「<=0 取默认 4、>8 取 8」归一化。
+
+`cache_l1_bytes` / `cache_l2_bytes` 是本机 iSCSI 读缓存代理的 **L1（内存）/ L2（本地磁盘
+文件）总量预算**（字节），前者默认 512MiB、后者默认 4GiB。语义是**客户端总量**：设面只按
+客户端设置，一个客户端只起一个代理，多个已启用缓存的库**均分**这份总量（见
+`GET /agent/cache` 的 `l1_quota_bytes` / `l2_quota_bytes`）。配额在**挂载建立时定下，运行中
+不重算**，因此：
+
+- **取值范围**：L1 必须落在 `[64MiB, 64GiB]`；L2 允许 **0（= 关闭 L2，只做内存缓存）**，
+  非 0 时必须落在 `[256MiB, 1TiB]`。越界时 PATCH 返回 `system.invalid_param`
+  （args.field=`cache_l1_bytes` / `cache_l2_bytes`），界面在提交前就按同一口径拦下。
+- **0 与"没配"必须区分**：L2 的 0 是合法取值（关闭），配置里显式写过 0 之后不再被归一回
+  默认值（见 `cacheL2Set`）；只有从未配过 L2 时才取默认 4GiB。
+- 改这项**不影响已有挂载**的既有配额（新配额在下一次挂载时生效）。
+
+`cache_l2_dir` 是 L2 缓存文件的**存放目录**（客户端设置里可改，配合上下限一起调节磁盘占用）。
+空串表示默认位置 `<DataDir>\iscsi-cache`；非空必须是**绝对路径**，否则 PATCH 返回
+`system.invalid_param`（args.field=`cache_l2_dir`）。目录不存在时按需创建（`os.MkdirAll`）。
+改动在**下一次挂载**时生效：L2 文件路径在创建缓存目标时定下，已在挂载中的库仍用旧目录
+（换目录不会搬移既有缓存文件，旧目录里的 `.bin` 需用户自行清理）。
 
 > 客户端资源热更（client_web）**没有独立的本地配置项**：它使用与自更新相同的更新通道
 > （`update_channel`）与更新源（**主服务端**，见「认证与会话」的 primary）；激活状态以磁盘上的

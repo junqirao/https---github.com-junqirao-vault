@@ -13,6 +13,7 @@ import {
   type AgentVersionInfo
 } from '../api/agentClient'
 import type {
+  AgentCacheStatus,
   AgentConfig,
   AgentEvent,
   AgentHealth,
@@ -56,6 +57,8 @@ export interface UseAgentResult {
   state: AgentState | null
   health: AgentHealth | null
   config: AgentConfig | null
+  /** 本地读缓存代理状态（来自 GET /agent/cache）；代理不可用时为 null。 */
+  cache: AgentCacheStatus | null
   /** 代理不可用时的错误；其余失败由调用方按需展示。 */
   error: unknown
   /** 母盘下载任务（来自 download 事件与 GET /agent/downloads）。 */
@@ -75,6 +78,8 @@ export interface UseAgentResult {
    */
   reconnectServer: (serverKey?: string) => Promise<AgentServerState>
   refresh: () => Promise<void>
+  /** 拉取一次本地读缓存代理状态（用量会随读写变化，由界面按需轮询）。 */
+  refreshCache: () => Promise<void>
   /** 拉取一次下载任务列表（用于页面挂载时恢复进行中/历史状态）。 */
   refreshDownloads: () => Promise<void>
   /** 拉取一次上传任务列表（用于页面挂载时恢复进行中/历史状态）。 */
@@ -93,6 +98,7 @@ let snapshot: {
   state: AgentState | null
   health: AgentHealth | null
   config: AgentConfig | null
+  cache: AgentCacheStatus | null
   downloads: DownloadState[]
   uploads: UploadState[]
   webUpdate: WebUpdateState | null
@@ -102,6 +108,7 @@ let snapshot: {
   state: null,
   health: null,
   config: null,
+  cache: null,
   downloads: [],
   uploads: [],
   webUpdate: null,
@@ -188,7 +195,14 @@ async function probe(): Promise<void> {
     } catch {
       uploads = []
     }
-    setSnapshot({ available: true, health, state, config, webUpdate, uploads, error: null })
+    // 本地读缓存代理状态（用量与命中情况）：失败不影响代理可用性判断。
+    let cache: AgentCacheStatus | null = null
+    try {
+      cache = await agentApi.getCache()
+    } catch {
+      cache = null
+    }
+    setSnapshot({ available: true, health, state, config, cache, webUpdate, uploads, error: null })
     // 代理侧已有会话（含自动续期后的最新令牌）：**逐台**同步给宿主应用 ——
     // 快照里的 session 只有主服务端那一份，多服务端下必须遍历 servers[] 才能都拿到。
     //
@@ -214,6 +228,7 @@ async function probe(): Promise<void> {
         health: null,
         state: null,
         config: null,
+        cache: null,
         downloads: [],
         uploads: [],
         webUpdate: null,
@@ -611,6 +626,14 @@ export function useAgent(): UseAgentResult {
     await probe()
   }, [])
 
+  const refreshCache = useCallback(async (): Promise<void> => {
+    try {
+      setSnapshot({ cache: await agentApi.getCache() })
+    } catch {
+      // 单次取数失败不改判定：保留上一次的用量快照，等下次轮询再试。
+    }
+  }, [])
+
   const refreshDownloads = useCallback(async (): Promise<void> => {
     const result = await agentApi.getDownloads()
     setSnapshot({ downloads: result.items })
@@ -685,6 +708,7 @@ export function useAgent(): UseAgentResult {
     remount,
     reconnectServer,
     refresh,
+    refreshCache,
     refreshDownloads,
     refreshUploads,
     applyWebUpdate

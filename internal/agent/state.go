@@ -202,8 +202,21 @@ type MountState struct {
 	RepoName     string `json:"repo_name"`
 	AllocationID string `json:"allocation_id"`
 	LeaseID      string `json:"lease_id"`
-	TargetIQN    string `json:"target_iqn"`
-	Portal       string `json:"portal"`
+	// TargetIQN / Portal 是**本次实际连接**的目标与门户。
+	//
+	// ⚠️ 启用了本地读缓存时不等于服务端下发的值：连接走本机代理（门户 127.0.0.1:3261、
+	// IQN iqn.2024-01.local.vault:vcache-<alloc>），代理再去连服务端目标。实测会话
+	// （session_probe）与卸载断链都用这里的生效值，否则会去断一条根本不存在的会话。
+	TargetIQN string `json:"target_iqn"`
+	Portal    string `json:"portal"`
+	// CacheEnabled 记录"本次挂载时该库是否被用户开启了缓存"；CacheActive 表示缓存
+	// **真的生效了**（代理已注册目标且连接走代理）。两者可能不一致，原因见 CacheError。
+	//
+	// 为什么不只存一个：用户在页面上看到的是"缓存开关已开"，若静默回退直连他会以为
+	// 缓存正在工作（用量恒为 0 却找不到原因）。CacheError 给出回退原因，界面据此如实提示。
+	CacheEnabled bool   `json:"cache_enabled,omitempty"`
+	CacheActive  bool   `json:"cache_active,omitempty"`
+	CacheError   string `json:"cache_error,omitempty"`
 	// ServerKey / ServerURL / ServerName 标识这条挂载属于**哪台**服务端。
 	//
 	// 多服务端下这是必须的：心跳、挂载点回写、租约释放都必须发给"当初受理这次挂载的那台"

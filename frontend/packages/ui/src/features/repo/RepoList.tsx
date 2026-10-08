@@ -12,6 +12,7 @@ import { PageShell } from '../../components/PageShell'
 import { StatusTag } from '../../components/StatusTag'
 import { useApi } from '../../api/provider'
 import type { RepoDTO } from '../../api/types'
+import { useAgent } from '../../hooks/useAgent'
 import { useAuth } from '../../hooks/useAuth'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
@@ -308,6 +309,7 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
   const api = useApi()
   const { t } = useI18n()
   const { user } = useAuth()
+  const agent = useAgent()
   const [keyword, setKeyword] = useState('')
   // 展示形式只影响用户端（管理端是一张运维表，形态切换对它没有意义）。
   // 初值取本地记住的那一份：用户上次选了列表，刷新/重开客户端仍是列表。
@@ -319,6 +321,16 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
   }
   // 挂载配置弹窗只服务当前点开的这一个库（弹窗在列表这一层只保留一份，避免每张卡都挂一个）。
   const [settingsRepo, setSettingsRepo] = useState<RepoDTO | null>(null)
+
+  // 缓存用量与命中情况会随读写持续变化：页面在时按 10s 轮询一次（离开页面即停）。
+  // 管理端是运维表、不展示缓存，跳过轮询。单个轮询器放在这一层：放到卡片里会变成每张卡一个。
+  const refreshCache = agent.refreshCache
+  useEffect(() => {
+    if (!agent.available || isSuperAdmin) return
+    void refreshCache()
+    const timer = window.setInterval(() => void refreshCache(), 10000)
+    return () => window.clearInterval(timer)
+  }, [agent.available, isSuperAdmin, refreshCache])
 
   const reposQuery = useQuery({
     queryKey: ['repos', isSuperAdmin ? 'all' : 'mine'],

@@ -104,14 +104,28 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	// 幂等的挂载，也不谎报"已经挂好了"。
 	if existing, _, ok := e.a.store.GetMount(allocationID); ok && existing.State == MountStateMounted {
 		active, verified := e.a.probeMountSession(ctx, allocationID)
-		if mountIdempotent(existing, active, verified) {
-			if latest, _, ok := e.a.store.GetMount(allocationID); ok {
-				return &latest, nil
+		if mounted := mountIdempotent(existing, active, verified); mounted {
+			if e.mountCacheSatisfied(req, existing) {
+				if latest, _, ok := e.a.store.GetMount(allocationID); ok {
+					return &latest, nil
+				}
+				return &existing, nil
 			}
-			return &existing, nil
+			// 缓存开关与既有记录不一致（用户刚在设置里开了/关了缓存）：**先卸载再按新设置挂载**。
+			//
+			// 为什么不能就地重挂：生效 IQN 换了一侧，旧会话的磁盘仍在线、挂载点仍占用 ——
+			// 直接连新 IQN 会得到"同一块卷两个 iSCSI 设备"，找盘脚本按容量取编号最小的那个，
+			// 会挂到错的一块上（详见 disconnectStaleTargets）。先卸载把旧会话与挂载点收拾干净。
+			e.a.logger.Info("缓存开关与既有挂载不一致，先卸载再按新设置挂载",
+				"allocation_id", allocationID,
+				"cache_enabled_record", existing.CacheEnabled, "cache_active_record", existing.CacheActive)
+			if err := e.unmountLocked(ctx, allocationID); err != nil {
+				return nil, err
+			}
+		} else {
+			e.a.logger.Info("记录是已挂载但本机已无活动会话，按实际未挂载重新挂载",
+				"allocation_id", allocationID, "target_iqn", existing.TargetIQN)
 		}
-		e.a.logger.Info("记录是已挂载但本机已无活动会话，按实际未挂载重新挂载",
-			"allocation_id", allocationID, "target_iqn", existing.TargetIQN)
 	}
 	// 归属服务端先定下来：后面的 RequestMount、心跳、挂载点回写、租约释放都发给它。
 	serverKey, err := e.resolveMountServerKey(req, allocationID)
@@ -160,6 +174,37 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	}
 
 	mode := e.resolveMode(req, spec)
+
+	// 生效门户与生效 IQN：库启用了本地读缓存时走**本机代理**（下发 → 代理 → 本地建联代理），
+	// 否则直连服务端下发的目标。
+	//
+	// 缓存不可用（端口占用、后端不可达、CHAP、配额不足…）一律**回退直连**，绝不因为缓存
+	// 把挂载搞失败：缓存只是加速手段，不是挂载的前置条件（见 cacheproxy.go 文件头）。
+	effectivePortalAddr, effectivePortalPort := spec.PortalAddress, portalPort(spec)
+	effectiveIQN := spec.TargetIQN
+	cacheEnabled, cacheActive := false, false
+	cacheErr := ""
+	if pref, ok := e.repoPref(req.RepoID); ok && pref.CacheEnabled {
+		cacheEnabled = true
+		// EnsureTarget 会（首次时）打开本机门户、拨号服务端目标并注册本地 IQN。
+		// 用挂载请求的 ctx：拨号本身就是挂载路径的一部分，请求取消时它也该停。
+		if err := e.a.cache.EnsureTarget(ctx, cacheTargetRequest{
+			AllocationID:   allocationID,
+			BackendAddress: spec.PortalAddress,
+			BackendPort:    portalPort(spec),
+			BackendIQN:     spec.TargetIQN,
+			AuthMode:       spec.AuthMode,
+		}); err != nil {
+			cacheErr = err.Error()
+			e.a.logger.Warn("本地读缓存代理不可用，回退直连服务端目标",
+				"allocation_id", allocationID, "error", err)
+		} else {
+			cacheActive = true
+			effectivePortalAddr, effectivePortalPort = cachePortalHostPort()
+			effectiveIQN = cacheTargetIQN(allocationID)
+		}
+	}
+
 	ms := &MountState{
 		RepoID: strings.TrimSpace(req.RepoID),
 		// 库名同时决定盘符模式的卷标与目录模式的目录名（见 mountAt）。
@@ -170,16 +215,19 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		ServerURL:    serverURL,
 		ServerName:   serverName,
 		LeaseID:      spec.LeaseID,
-		TargetIQN:    spec.TargetIQN,
-		Portal:       net.JoinHostPort(spec.PortalAddress, strconv.Itoa(portalPort(spec))),
+		TargetIQN:    effectiveIQN,
+		Portal:       net.JoinHostPort(effectivePortalAddr, strconv.Itoa(effectivePortalPort)),
+		CacheEnabled: cacheEnabled,
+		CacheActive:  cacheActive,
+		CacheError:   cacheErr,
 		MountMode:    mode,
 		State:        MountStateMounting,
 		// 服务端阶段（准备磁盘/下发目标）已经走完，接下来是本机的会话建立与磁盘上线。
 		Phase: MountPhaseConnecting,
 	}
 	rt := &mountRuntime{
-		PortalAddress:    spec.PortalAddress,
-		PortalPort:       portalPort(spec),
+		PortalAddress:    effectivePortalAddr,
+		PortalPort:       effectivePortalPort,
 		AuthMode:         spec.AuthMode,
 		ChapUser:         spec.ChapUser,
 		ChapSecret:       spec.ChapSecret,
@@ -258,11 +306,19 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	// 只有 stage=connect 时，用户与支持人员都无法判断是网络/防火墙、目标名写错还是 CHAP
 	// 不对 —— 而这三种原因的处置方式完全不同（真实反馈："根本没法定位错误"）。
 	failConnect := func(stage string, cause error) (*MountState, error) {
-		portal := net.JoinHostPort(spec.PortalAddress, strconv.Itoa(portalPort(spec)))
-		detail, tcp := connectDiagnostics(ctx, spec, portalPort(spec))
+		portal := net.JoinHostPort(effectivePortalAddr, strconv.Itoa(effectivePortalPort))
+		detail, tcp := connectDiagnosticsFor(ctx, effectivePortalAddr, effectivePortalPort,
+			effectiveIQN, spec.AuthMode, spec.ChapUser)
+		// 缓存模式下生效门户是本机回环地址，它几乎不可能"网络不通"——真正断的大多是
+		// **代理到服务端**那一段。不把后端门户的可达性打出来，用户在 127.0.0.1 上排查毫无头绪。
+		if cacheActive {
+			backend := net.JoinHostPort(spec.PortalAddress, strconv.Itoa(portalPort(spec)))
+			btcp, _ := probePortalTCP(ctx, spec.PortalAddress, portalPort(spec))
+			detail += " backend_portal=" + backend + " backend_tcp=" + btcp
+		}
 		return failWithDetail(stage, cause, detail, map[string]any{
 			"portal":     portal,
-			"target_iqn": spec.TargetIQN,
+			"target_iqn": effectiveIQN,
 			"auth_mode":  clientAuthMode(spec.AuthMode),
 			"tcp":        tcp,
 		})
@@ -279,13 +335,15 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	}
 	// 服务已确认在运行：主机状态直接置为就绪（界面横幅自动消失），不再跑一次 PowerShell。
 	e.a.markISCSIServiceRunning()
-	if err := e.a.iscsi.EnsurePortal(ctx, spec.PortalAddress, portalPort(spec)); err != nil {
+	if err := e.a.iscsi.EnsurePortal(ctx, effectivePortalAddr, effectivePortalPort); err != nil {
 		return fail("portal", err)
 	}
+	// 单会话硬前提：生效 IQN 可能刚因"缓存开关"换了一侧，先把**另一侧**的残留会话断掉。
+	e.disconnectStaleTargets(ctx, effectiveIQN, spec.TargetIQN, cacheTargetIQN(allocationID))
 	if err := e.a.iscsi.Connect(ctx, iscsiinitiator.ConnectOptions{
-		TargetIQN:     spec.TargetIQN,
-		PortalAddress: spec.PortalAddress,
-		PortalPort:    portalPort(spec),
+		TargetIQN:     effectiveIQN,
+		PortalAddress: effectivePortalAddr,
+		PortalPort:    effectivePortalPort,
 		AuthMode:      clientAuthMode(spec.AuthMode),
 		ChapUser:      spec.ChapUser,
 		ChapSecret:    spec.ChapSecret,
@@ -297,7 +355,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	}); err != nil {
 		return failConnect("connect", err)
 	}
-	if err := e.a.iscsi.WaitConnected(ctx, spec.TargetIQN, connectWaitTimeout); err != nil {
+	if err := e.a.iscsi.WaitConnected(ctx, effectiveIQN, connectWaitTimeout); err != nil {
 		return failConnect("wait_connected", err)
 	}
 
@@ -610,6 +668,15 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 		}
 	}
 
+	// ④b 注销本地缓存目标（关掉它的 L2 文件、logout 代理到服务端的会话）。
+	//
+	// 必须在**断开本机会话之后**：本机发起端还在读的时候回收后端，会让仍在飞的命令失败。
+	// 幂等：没启用过缓存（或门户根本没开）时是空操作，因此无需按 CacheEnabled 分叉。
+	if err := e.a.cache.ReleaseTarget(allocationID); err != nil {
+		e.a.logger.Warn("注销本地缓存目标失败（继续卸载）",
+			"allocation_id", allocationID, "error", err)
+	}
+
 	// ⑤ 回写 release（失败不影响本地已卸载的事实）。
 	// 发给**这条件挂载所属的那台**服务端（见 Agent.mountClient）：拿 A 的租约去 B 上释放，
 	// B 只会告诉你"没这条租约"，而 A 那边要到租约自然过期才回收。
@@ -661,6 +728,44 @@ func (e *mountEngine) disconnectSession(ctx context.Context, targetIQN string, m
 		}
 	}
 	return err
+}
+
+// disconnectStaleTargets 断开该分配在**生效目标之外**残留的 iSCSI 会话（尽力而为）。
+//
+// 为什么必须有（硬前提）：生效 IQN 会随"缓存开关"变化 —— 缓存开启走本地代理 IQN
+// （iqn.2024-01.local.vault:vcache-<alloc>），关闭则直连服务端 IQN。开关来回切之后，
+// 另一侧若还留着会话，同一块卷会以两个 iSCSI 设备同时在线：Windows 里就是两块同容量的盘，
+// 盘符/卷标互相打架，而 volume_find_iscsi_disk.ps1 只按"容量 + BusType 取编号最小"找盘，
+// 会挂到错的那块上（见 cacheproxy.go 关于 Vendor/Product 覆盖的同类说明）。
+//
+// 只断另一侧、不断生效侧：生效侧的会话由后续 Connect 幂等复用或重建。
+func (e *mountEngine) disconnectStaleTargets(ctx context.Context, effectiveIQN string, candidates ...string) {
+	effectiveIQN = strings.TrimSpace(effectiveIQN)
+	seen := make(map[string]bool, len(candidates))
+	for _, iqn := range candidates {
+		iqn = strings.TrimSpace(iqn)
+		key := strings.ToLower(iqn)
+		if iqn == "" || seen[key] || strings.EqualFold(iqn, effectiveIQN) {
+			continue
+		}
+		seen[key] = true
+		connected, err := e.a.iscsi.IsConnected(ctx, iqn)
+		if err != nil {
+			// 查不出来就跳过（不猜）：发起端不可用等问题会在下面的 Connect 暴露。
+			e.a.logger.Warn("查询残留 iSCSI 会话失败（继续挂载）", "target_iqn", iqn, "error", err)
+			continue
+		}
+		if !connected {
+			continue
+		}
+		e.a.logger.Info("断开生效目标之外的残留 iSCSI 会话",
+			"target_iqn", iqn, "effective_iqn", effectiveIQN)
+		if err := e.a.iscsi.Disconnect(ctx, iqn); err != nil {
+			// device_in_use 等失败不中断挂载：残留会话会在服务端放行/磁盘下线后自行消失，
+			// 而且这里拿不到它的磁盘号去下线（那是卸载流程的职责）。
+			e.a.logger.Warn("断开残留 iSCSI 会话失败（继续挂载）", "target_iqn", iqn, "error", err)
+		}
+	}
 }
 
 // mountPointGone 判断挂载点是否确实已经不存在（移除报错后的幂等兜底）。
@@ -1076,6 +1181,15 @@ func (e *mountEngine) repoPref(repoID string) (RepoMountPref, bool) {
 	return pref, ok
 }
 
+// mountCacheSatisfied 判断既有挂载记录的缓存形态是否已经满足**当前**的每库缓存开关。
+//
+// 判据用 CacheActive（缓存真的生效了）而非 CacheEnabled：上次"想开却回退直连"的记录
+// 应当在下一次挂载时**再试一次** —— 回退原因可能是暂时性的（端口被占、后端一时不可达）。
+func (e *mountEngine) mountCacheSatisfied(req MountRequest, ms MountState) bool {
+	pref, ok := e.repoPref(req.RepoID)
+	return ms.CacheActive == (ok && pref.CacheEnabled)
+}
+
 // resolveMode 确定本次挂载模式：请求 > 每库配置 > 服务端下发 > 本地默认。
 //
 // 每库配置排在服务端下发之前：它是用户在这台机器上**确认过**的选择（弹窗里存下来的），
@@ -1158,21 +1272,27 @@ func connectDiagnostics(ctx context.Context, spec *MountSpec, port int) (detail,
 	if spec == nil {
 		return "", portalTCPFailed
 	}
-	tcp, latency := probePortalTCP(ctx, spec.PortalAddress, port)
+	return connectDiagnosticsFor(ctx, spec.PortalAddress, port, spec.TargetIQN, spec.AuthMode, spec.ChapUser)
+}
+
+// connectDiagnosticsFor 是 connectDiagnostics 的显式参数版本：缓存模式下生效门户/IQN
+// 与服务端下发值不同（见 mount 的"生效门户与生效 IQN"），诊断必须报告**实际连的那个**。
+func connectDiagnosticsFor(ctx context.Context, portalHost string, port int, targetIQN, authMode, chapUser string) (detail, tcp string) {
+	tcp, latency := probePortalTCP(ctx, portalHost, port)
 	if tcp == portalTCPReachable {
 		tcp = fmt.Sprintf("%s(%dms)", portalTCPReachable, latency.Milliseconds())
 	}
-	auth := strings.TrimSpace(spec.AuthMode)
+	auth := strings.TrimSpace(authMode)
 	if auth == "" {
 		auth = "none"
 	}
 	parts := []string{
-		"portal=" + net.JoinHostPort(spec.PortalAddress, strconv.Itoa(port)),
-		"target=" + spec.TargetIQN,
+		"portal=" + net.JoinHostPort(portalHost, strconv.Itoa(port)),
+		"target=" + strings.TrimSpace(targetIQN),
 		"auth=" + auth,
 		"tcp=" + tcp,
 	}
-	if user := strings.TrimSpace(spec.ChapUser); user != "" {
+	if user := strings.TrimSpace(chapUser); user != "" {
 		parts = append(parts, "chap_user="+user)
 	}
 	return strings.Join(parts, " "), tcp

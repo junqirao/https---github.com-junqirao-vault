@@ -35,6 +35,12 @@ type session struct {
 	initiatorName string
 	discovery     bool
 
+	// iqn and h are the target this session logged in to, resolved once at login
+	// from the portal's registry. Commands are executed by h, so two sessions on
+	// the same connection-serving portal can be backed by different targets.
+	iqn string
+	h   Handler
+
 	statSN uint32
 	// expCmdSN is published by the connection reader with a lock-free CAS so
 	// that recording an arriving command never contends with a command that is
@@ -217,6 +223,12 @@ func (s *session) negotiate(csg uint8, keys map[string]string) (class, detail ui
 		if c, d := s.applySessionKeys(keys); c != 0 {
 			return c, d, nil
 		}
+		// A normal session that never named a registered target cannot be
+		// routed anywhere, so it is refused here rather than failing later with
+		// no handler to execute its commands.
+		if !s.discovery && s.h == nil {
+			return 0x02, 0x03, nil // initiator error: target not found
+		}
 		if v, err := strconv.Atoi(strings.TrimSpace(keys["maxrecvdatasegmentlength"])); err == nil && v > 0 {
 			s.initiatorMaxRecvDSL = v
 		}
@@ -228,17 +240,25 @@ func (s *session) negotiate(csg uint8, keys map[string]string) (class, detail ui
 }
 
 // applySessionKeys records the session identity keys (InitiatorName,
-// SessionType, TargetName) and validates the target name. Either negotiation
-// stage may carry them.
+// SessionType, TargetName) and resolves the target. Either negotiation stage
+// may carry them: initiators that send only the auth keys in the security stage
+// defer SessionType and TargetName to the operational one, so a stage with no
+// target name resolves nothing and lets the next stage decide.
 func (s *session) applySessionKeys(keys map[string]string) (class, detail uint8) {
 	if v := strings.TrimSpace(keys["initiatorname"]); v != "" {
 		s.initiatorName = v
 	}
 	switch strings.ToLower(strings.TrimSpace(keys["sessiontype"])) {
 	case "", "normal":
-		if name := strings.TrimSpace(keys["targetname"]); name != "" && !strings.EqualFold(name, s.t.cfg.TargetIQN) {
+		name := strings.TrimSpace(keys["targetname"])
+		if name == "" {
+			return 0, 0
+		}
+		h, iqn, ok := s.t.lookup(name)
+		if !ok {
 			return 0x02, 0x03 // initiator error: target not found
 		}
+		s.h, s.iqn = h, iqn
 	case "discovery":
 		s.discovery = true
 	default:
@@ -261,7 +281,7 @@ func (s *session) operationalResponse(keys map[string]string) [][2]string {
 		add("SessionType", "Discovery")
 		return out
 	}
-	add("TargetName", c.TargetIQN)
+	add("TargetName", s.iqn)
 	add("SessionType", "Normal")
 	add("InitialR2T", "Yes")
 	// ImmediateData must stay "No": the write path always drives R2T for the
@@ -425,7 +445,7 @@ func (s *session) runCommand(ctx context.Context, pdu *iscsi.PDU) error {
 	if expLen < 0 {
 		expLen = 0
 	}
-	if capacity := s.t.h.Device().CapacityBytes(); int64(expLen) > capacity {
+	if capacity := s.h.Device().CapacityBytes(); int64(expLen) > capacity {
 		return s.sendResponse(itt, iscsi.StatusCheckCondition,
 			iscsi.IllegalRequestSense(iscsi.ASCLogicalBlockAddressOutOfRange), 0, false, false, 0)
 	}
@@ -442,7 +462,7 @@ func (s *session) runCommand(ctx context.Context, pdu *iscsi.PDU) error {
 		inLen = expLen
 	}
 
-	res, err := s.t.h.Execute(ctx, cdb, dataOut, inLen)
+	res, err := s.h.Execute(ctx, cdb, dataOut, inLen)
 	if err != nil {
 		s.log.Warn("frontend: command failed", "cdb", hex.EncodeToString(cdb[:min(16, len(cdb))]), "err", err)
 		res = Result{Status: iscsi.StatusCheckCondition, Sense: iscsi.NotReadySense()}
@@ -613,17 +633,27 @@ func (s *session) handleNOPOut(pdu *iscsi.PDU) error {
 }
 
 // handleText answers SendTargets, which is what the Windows initiator uses to
-// discover the target behind this portal.
+// discover the targets behind this portal.
 func (s *session) handleText(pdu *iscsi.PDU) error {
 	keys := iscsi.ParseText(pdu.Data)
 	var text []byte
 	query := strings.TrimSpace(keys["sendtargets"])
 	if query != "" {
-		if !strings.EqualFold(query, "all") && !strings.EqualFold(query, s.t.cfg.TargetIQN) {
-			// Unknown target name: answer with an empty list.
-			text = nil
-		} else {
-			text = iscsi.EncodeText([2]string{"TargetName", s.t.cfg.TargetIQN})
+		switch {
+		case strings.EqualFold(query, "all"):
+			names := s.t.TargetNames()
+			pairs := make([][2]string, 0, len(names))
+			for _, name := range names {
+				pairs = append(pairs, [2]string{"TargetName", name})
+			}
+			text = iscsi.EncodeText(pairs...)
+		default:
+			// A named query answers with that target only, and with an empty
+			// list when the portal does not serve it (which is how a real target
+			// reports an unknown name).
+			if _, iqn, ok := s.t.lookup(query); ok {
+				text = iscsi.EncodeText([2]string{"TargetName", iqn})
+			}
 		}
 	}
 	return s.withSeq(func(statSN, expCmdSN, maxCmdSN uint32) *iscsi.PDU {

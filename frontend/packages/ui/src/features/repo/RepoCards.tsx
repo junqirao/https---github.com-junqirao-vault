@@ -4,9 +4,10 @@ import { InfoCircleOutlined, SettingOutlined } from '@ant-design/icons'
 
 import { StatusTag } from '../../components/StatusTag'
 import type { RepoDTO } from '../../api/types'
+import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { repoUsage } from '../../utils/format'
+import { formatBytes, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import {
   RepoMountActions,
@@ -118,6 +119,71 @@ function RepoUsage({ repo, style }: { repo: RepoDTO; style?: CSSProperties }): J
         style={{ marginTop: spacing.xxs, marginBottom: 0 }}
       />
     </div>
+  )
+}
+
+/**
+ * 本地读缓存用量与命中情况：**只在启用了缓存的库上显示**（未启用时不占版面）。
+ *
+ * 三态与代理侧语义一一对应（见 internal/agent/cacheproxy.go 与 MountState）：
+ *   - cache_enabled=false → 不渲染任何东西（绝大多数库都是这个状态）；
+ *   - cache_enabled=true 但 cache_active=false → 代理不可用已**自动回退直连**：
+ *     如实写「缓存未生效」并把原因挂在 tooltip 上，不编造用量；
+ *   - cache_active=true → 从 GET /agent/cache 取该库的 L1/L2 用量与命中率。
+ *
+ * 取不到该库的统计（首次轮询未回来）时只说「缓存已生效」，不显示假数字。
+ */
+function RepoCacheUsage({
+  controller,
+  style
+}: {
+  controller: RepoMountController
+  style?: CSSProperties
+}): JSX.Element | null {
+  const { t } = useI18n()
+  const agent = useAgent()
+  const mount = controller.mount
+  if (!mount?.cache_enabled) return null
+
+  if (!mount.cache_active) {
+    return (
+      <Typography.Text
+        type="warning"
+        ellipsis={{ tooltip: mount.cache_error }}
+        style={{ fontSize: fontSize.xs, ...style }}
+      >
+        {t('repo.cache.inactive')}
+        {mount.cache_error ? `（${mount.cache_error}）` : ''}
+      </Typography.Text>
+    )
+  }
+
+  const stat = agent.cache?.targets.find((item) => item.allocation_id === mount.allocation_id)
+  if (!stat) {
+    return (
+      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, ...style }}>
+        {t('repo.cache.active')}
+      </Typography.Text>
+    )
+  }
+
+  const hitPercent = Math.round(stat.hit_rate * 100)
+  return (
+    // 整卡可点进详情，这里只读展示，事件不冒泡。
+    <Space size={spacing.md} wrap style={style} onClick={(event) => event.stopPropagation()}>
+      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+        {t('repo.cache.l1')} {formatBytes(stat.l1_used_bytes)} / {formatBytes(stat.l1_limit_bytes)}
+      </Typography.Text>
+      {/* L2 未启用（限额 0）时不显示这一段，免得写一个恒为 0 的分母。 */}
+      {stat.l2_limit_bytes > 0 ? (
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+          {t('repo.cache.l2')} {formatBytes(stat.l2_used_bytes)} / {formatBytes(stat.l2_limit_bytes)}
+        </Typography.Text>
+      ) : null}
+      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+        {t('repo.cache.hitRate')} {hitPercent}%
+      </Typography.Text>
+    </Space>
   )
 }
 
@@ -306,6 +372,9 @@ export function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardP
       <RepoTagRow repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
       <RepoUsage repo={repo} style={{ marginTop: spacing.md }} />
 
+      {/* 缓存用量与命中情况：只对启用了缓存的库出现（未启用时该组件返回 null） */}
+      <RepoCacheUsage controller={mountController} style={{ marginTop: spacing.xs }} />
+
       {/* 建库进度：只在这一刻有信息量（服务端正在预创建差异盘/目标），建完换回常驻信息行 */}
       <RepoPrepareProgress repo={repo} />
 
@@ -353,6 +422,7 @@ export function RepoRow({ repo, currentUserId, onOpen, onConfigure }: RepoCardPr
             </span>
           </div>
           <RepoPrepareProgress repo={repo} />
+          <RepoCacheUsage controller={mountController} style={{ marginTop: spacing.xxs }} />
           <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.xxs }} />
         </div>
 

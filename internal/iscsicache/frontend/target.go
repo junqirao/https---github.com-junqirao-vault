@@ -16,6 +16,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,6 +71,9 @@ type Handler interface {
 }
 
 // Config configures a Target.
+//
+// TargetIQN is only used by the single target constructor New. A portal that
+// serves several targets (see Register) leaves it empty.
 type Config struct {
 	ListenAddr string
 	TargetIQN  string
@@ -106,13 +111,19 @@ func (c *Config) normalize() {
 	}
 }
 
-// Target is a single LUN iSCSI target. Any number of sessions is accepted and
-// each session runs its commands concurrently; the Handler must be safe for
+// Target is an iSCSI portal. It serves one or more targets, each identified by
+// its IQN and backed by its own Handler; a session picks its Handler from the
+// TargetName it logs in with. Any number of sessions is accepted and each
+// session runs its commands concurrently, so every Handler must be safe for
 // concurrent use.
 type Target struct {
 	cfg Config
-	h   Handler
 	log *slog.Logger
+
+	// handlersMu guards handlers. A session resolves its Handler once, at login,
+	// while the portal may still be gaining and losing targets at runtime.
+	handlersMu sync.RWMutex
+	handlers   map[string]*targetEntry
 
 	ln     net.Listener
 	closed atomic.Bool
@@ -124,26 +135,91 @@ type Target struct {
 	tsih atomic.Uint32
 }
 
+// targetEntry is one registered target: the IQN as the caller spelled it (for
+// display) and the Handler that serves it.
+type targetEntry struct {
+	iqn string
+	h   Handler
+}
+
 // New creates a Target bound to a TCP listener.
+//
+// With a handler it behaves like the single target portal the MVP started as:
+// cfg.TargetIQN is required and becomes the only registered target. With a nil
+// handler it opens an empty portal that targets are added to with Register.
 func New(cfg Config, h Handler) (*Target, error) {
 	cfg.normalize()
-	if h == nil {
-		return nil, errors.New("frontend: handler is required")
+	t := &Target{
+		cfg:      cfg,
+		log:      cfg.Logger,
+		handlers: make(map[string]*targetEntry),
+		conns:    make(map[net.Conn]struct{}),
 	}
-	if cfg.TargetIQN == "" {
-		return nil, errors.New("frontend: target IQN is required")
+	if h != nil {
+		if cfg.TargetIQN == "" {
+			return nil, errors.New("frontend: target IQN is required")
+		}
+		t.handlers[normalizeIQN(cfg.TargetIQN)] = &targetEntry{iqn: cfg.TargetIQN, h: h}
 	}
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("frontend: listen %s: %w", cfg.ListenAddr, err)
 	}
-	return &Target{
-		cfg:   cfg,
-		h:     h,
-		log:   cfg.Logger,
-		ln:    ln,
-		conns: make(map[net.Conn]struct{}),
-	}, nil
+	t.ln = ln
+	return t, nil
+}
+
+// Register adds a target to the portal, replacing any target already registered
+// under the same IQN. IQNs are compared case insensitively, which is how
+// initiators and the login path treat them.
+func (t *Target) Register(iqn string, h Handler) error {
+	name := strings.TrimSpace(iqn)
+	if name == "" {
+		return errors.New("frontend: target IQN is required")
+	}
+	if h == nil {
+		return errors.New("frontend: handler is required")
+	}
+	t.handlersMu.Lock()
+	t.handlers[normalizeIQN(name)] = &targetEntry{iqn: name, h: h}
+	t.handlersMu.Unlock()
+	return nil
+}
+
+// Unregister removes a target. Removing an unknown IQN is a no-op, so cleanup
+// does not have to know whether the target was ever registered.
+func (t *Target) Unregister(iqn string) {
+	t.handlersMu.Lock()
+	delete(t.handlers, normalizeIQN(iqn))
+	t.handlersMu.Unlock()
+}
+
+// lookup resolves the Handler registered for an IQN.
+func (t *Target) lookup(iqn string) (Handler, string, bool) {
+	t.handlersMu.RLock()
+	e, ok := t.handlers[normalizeIQN(iqn)]
+	t.handlersMu.RUnlock()
+	if !ok {
+		return nil, "", false
+	}
+	return e.h, e.iqn, true
+}
+
+// TargetNames returns the registered IQNs, sorted, for SendTargets and logging.
+func (t *Target) TargetNames() []string {
+	t.handlersMu.RLock()
+	names := make([]string, 0, len(t.handlers))
+	for _, e := range t.handlers {
+		names = append(names, e.iqn)
+	}
+	t.handlersMu.RUnlock()
+	sort.Strings(names)
+	return names
+}
+
+// normalizeIQN is the map key form of an IQN.
+func normalizeIQN(iqn string) string {
+	return strings.ToLower(strings.TrimSpace(iqn))
 }
 
 // nextTSIH hands out a TSIH that is unique among the sessions of this portal.
@@ -175,7 +251,7 @@ func (t *Target) Close() error {
 // by cancelling a context (a signal handler, for instance) hangs forever on a
 // listener nobody is connecting to.
 func (t *Target) Serve(ctx context.Context) error {
-	t.log.Info("frontend listening", "addr", t.ln.Addr().String(), "target_iqn", t.cfg.TargetIQN)
+	t.log.Info("frontend listening", "addr", t.ln.Addr().String(), "targets", strings.Join(t.TargetNames(), ","))
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {

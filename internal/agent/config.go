@@ -43,6 +43,12 @@ type RepoMountPref struct {
 	// 而这里是**每个库独立**的表态 —— 为 true 时即使本机没有记录（甚至还没有分配）
 	// 也要挂上；为 false 时连记录都不恢复（用户明确关掉了这个库的自动挂载）。
 	AutoMount bool `json:"auto_mount"`
+	// CacheEnabled 是否为该库启用本地 iSCSI 读缓存代理。
+	//
+	// **默认关闭**，必须由用户在「存储库 → 挂载设置」里手动开启（见 cacheproxy.go）：
+	// 开启后本机到服务端目标的链路变成 本机 → 本地缓存代理 → 服务端目标，
+	// 多占用一份本地内存（L1）与磁盘（L2），这不是所有机器都适合的默认。
+	CacheEnabled bool `json:"cache_enabled,omitempty"`
 }
 
 // Config 是代理的本地配置（见 docs/agent-api.md「本地配置」）。
@@ -80,6 +86,18 @@ type Config struct {
 	UpdateChannel string `json:"update_channel"`
 	// ServerAlias 服务端别名（目录模式命名空间，见 3.4.5）。
 	ServerAlias string `json:"server_alias"`
+	// CacheL1Bytes 是本机 iSCSI 读缓存代理的 L1（内存）总预算，按已启用缓存的库均分
+	// （见 cacheproxy.go 的配额规则）。
+	CacheL1Bytes int64 `json:"cache_l1_bytes"`
+	// CacheL2Bytes 是本机 iSCSI 读缓存代理的 L2（本地磁盘文件）总预算，同样按已启用
+	// 缓存的库均分；**0 表示关闭 L2**（只做内存缓存）。
+	CacheL2Bytes int64 `json:"cache_l2_bytes"`
+	// CacheL2Dir 是 L2 缓存文件的存放目录（客户端设置里可改）。
+	//
+	// 空串表示默认位置 `<DataDir>\iscsi-cache`。非空必须是**绝对路径**：相对路径会随
+	// 进程工作目录漂移，缓存文件会出现在用户完全意想不到的地方。目录不存在时会按需创建。
+	// 改动在**下一次挂载**时生效（L2 文件路径在创建缓存目标时定下）。
+	CacheL2Dir string `json:"cache_l2_dir"`
 	// RepoMounts 按存储库 ID 保存的挂载偏好；没有条目的库跟随上面的全局默认值。
 	RepoMounts map[string]RepoMountPref `json:"repo_mounts,omitempty"`
 
@@ -88,9 +106,14 @@ type Config struct {
 	// 不落盘、不出现在 JSON 里：只为区分"用户明确关掉了免密登录"与"配置里没这项"。
 	// 后者要按默认开启处理（见 AutoLogin 注释）。
 	autoLoginSet bool
+	// cacheL2Set 记录 cache_l2_bytes 是否被**显式**配置过。
+	//
+	// 同 autoLoginSet 的用意：0 是合法取值（关闭 L2），必须与"配置里没这项"区分开，
+	// 否则用户设成 0 之后每次加载配置都会被归一回默认值。
+	cacheL2Set bool
 }
 
-// UnmarshalJSON 解析本地配置，并记录 auto_login 是否出现过。
+// UnmarshalJSON 解析本地配置，并记录 auto_login / cache_l2_bytes 是否出现过。
 //
 // 实现方式：先用 map 探一次键是否存在，再按普通结构体解析 —— 这样以后新增配置项
 // 不需要同步维护第二份字段清单（写过一份重复清单的代码最容易在加字段时漏改）。
@@ -107,6 +130,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	}
 	*c = Config(parsed)
 	_, c.autoLoginSet = probe["auto_login"]
+	_, c.cacheL2Set = probe["cache_l2_bytes"]
 	return nil
 }
 
@@ -126,6 +150,11 @@ type ConfigPatch struct {
 	StartAtLogin        *bool   `json:"start_at_login"`
 	UpdateChannel       *string `json:"update_channel"`
 	ServerAlias         *string `json:"server_alias"`
+	// CacheL1Bytes / CacheL2Bytes 是缓存代理的 L1/L2 总预算（字节）；L2 允许 0（关闭）。
+	CacheL1Bytes *int64 `json:"cache_l1_bytes"`
+	CacheL2Bytes *int64 `json:"cache_l2_bytes"`
+	// CacheL2Dir 是 L2 缓存文件目录；空串表示恢复默认位置（见 Config.CacheL2Dir）。
+	CacheL2Dir *string `json:"cache_l2_dir"`
 }
 
 // defaultConfig 返回默认配置。
@@ -144,6 +173,9 @@ func defaultConfig() Config {
 		Language:            "zh-CN",
 		StartAtLogin:        false,
 		UpdateChannel:       "stable",
+		// 缓存代理的总预算（默认值只是"上限"，实际只在用户为某个库开启缓存后才被占用）。
+		CacheL1Bytes: cacheDefaultL1Bytes,
+		CacheL2Bytes: cacheDefaultL2Bytes,
 	}
 }
 
@@ -208,6 +240,14 @@ func normalizeConfig(c Config) Config {
 	if strings.TrimSpace(c.UpdateChannel) == "" {
 		c.UpdateChannel = def.UpdateChannel
 	}
+	// 缓存预算：cache_l2_bytes 没被显式配置过时取默认值（0 是合法值，表示关闭 L2）。
+	if !c.cacheL2Set && c.CacheL2Bytes == 0 {
+		c.CacheL2Bytes = def.CacheL2Bytes
+	}
+	c.CacheL1Bytes = clampCacheL1(c.CacheL1Bytes)
+	c.CacheL2Bytes = clampCacheL2(c.CacheL2Bytes)
+	// L2 目录：空串是合法值（用默认位置），只去空白。
+	c.CacheL2Dir = strings.TrimSpace(c.CacheL2Dir)
 	// 每库挂载偏好：非法形态归一为"跟随默认"（不丢用户的自动挂载表态），目录去空白。
 	// 这里就地改 map：它只在 load / Patch 的持有锁路径上，不会被外部共享。
 	for repoID, pref := range c.RepoMounts {
@@ -230,6 +270,35 @@ func normalizeDownloadConnections(n int) int {
 		return downloadDefaultConnections
 	case n > downloadMaxConnections:
 		return downloadMaxConnections
+	default:
+		return n
+	}
+}
+
+// clampCacheL1 归一化 L1 预算：未配置（<=0）取默认值，其余按上下界裁剪。
+func clampCacheL1(n int64) int64 {
+	switch {
+	case n <= 0:
+		return cacheDefaultL1Bytes
+	case n < cacheMinL1Bytes:
+		return cacheMinL1Bytes
+	case n > cacheMaxL1Bytes:
+		return cacheMaxL1Bytes
+	default:
+		return n
+	}
+}
+
+// clampCacheL2 归一化 L2 预算：0（及旧配置里缺字段留下的 0）表示关闭 L2 —— 是否取默认值
+// 由 normalizeConfig 依据 cache_l2_set 判断；这里只做上下界裁剪。
+func clampCacheL2(n int64) int64 {
+	switch {
+	case n <= 0:
+		return 0
+	case n < cacheMinL2Bytes:
+		return cacheMinL2Bytes
+	case n > cacheMaxL2Bytes:
+		return cacheMaxL2Bytes
 	default:
 		return n
 	}
@@ -330,6 +399,31 @@ func (s *ConfigStore) Patch(p ConfigPatch) (Config, error) {
 	}
 	if p.ServerAlias != nil {
 		s.cfg.ServerAlias = strings.TrimSpace(*p.ServerAlias)
+	}
+	if p.CacheL1Bytes != nil {
+		v := *p.CacheL1Bytes
+		if v < cacheMinL1Bytes || v > cacheMaxL1Bytes {
+			return s.cfg, apperr.InvalidParam("cache_l1_bytes")
+		}
+		s.cfg.CacheL1Bytes = v
+	}
+	if p.CacheL2Bytes != nil {
+		v := *p.CacheL2Bytes
+		if v < 0 || v > cacheMaxL2Bytes || (v > 0 && v < cacheMinL2Bytes) {
+			return s.cfg, apperr.InvalidParam("cache_l2_bytes")
+		}
+		s.cfg.CacheL2Bytes = v
+		// 用户显式表过态了：0 从此表示"关闭 L2"，不再被归一成默认值。
+		s.cfg.cacheL2Set = true
+	}
+	if p.CacheL2Dir != nil {
+		v := strings.TrimSpace(*p.CacheL2Dir)
+		// 空串是合法取值（恢复默认位置）；非空必须是绝对路径，否则缓存文件会随
+		// 进程工作目录漂移到用户意想不到的地方。
+		if v != "" && !filepath.IsAbs(v) {
+			return s.cfg, apperr.InvalidParam("cache_l2_dir")
+		}
+		s.cfg.CacheL2Dir = v
 	}
 
 	s.cfg = normalizeConfig(s.cfg)

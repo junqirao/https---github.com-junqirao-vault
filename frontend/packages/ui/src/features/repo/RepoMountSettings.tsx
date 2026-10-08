@@ -17,9 +17,12 @@ export interface RepoMountSettingsState {
   mode: AgentMountMode
   dir: string
   autoMount: boolean
+  /** 是否为该库启用本地 iSCSI 读缓存代理（默认关闭，需用户手动开启）。 */
+  cacheEnabled: boolean
   setMode: (mode: AgentMountMode) => void
   setDir: (dir: string) => void
   setAutoMount: (value: boolean) => void
+  setCacheEnabled: (value: boolean) => void
   saving: boolean
   error: unknown
   /** 本地代理不可用：控件置灰（配置存在本机，没有代理就落不下去）。 */
@@ -54,6 +57,8 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
   const effectiveMode: AgentMountMode = saved?.mount_mode || config?.default_mount_mode || 'letter'
   const effectiveDir = saved?.mount_dir || config?.default_mount_dir || ''
   const effectiveAuto = saved ? saved.auto_mount : Boolean(config?.auto_mount)
+  // 缓存**默认关闭**：没有该库条目、或条目里没写，一律按关闭（与代理侧零值一致）。
+  const effectiveCache = Boolean(saved?.cache_enabled)
 
   // 目录名里的"服务端名称"与代理侧同一口径：本地别名优先，其次服务端名称，最后 vault。
   // 全局 server_alias 只在**本机只有一台**时作数：多台共用会让两台下的 `别名_库名` 撞成同一目录。
@@ -63,6 +68,7 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
   const [mode, setMode] = useState<AgentMountMode>(effectiveMode)
   const [dir, setDir] = useState(effectiveDir)
   const [autoMount, setAutoMount] = useState(effectiveAuto)
+  const [cacheEnabled, setCacheEnabled] = useState(effectiveCache)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<unknown>(null)
 
@@ -72,7 +78,8 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
     setMode(effectiveMode)
     setDir(effectiveDir)
     setAutoMount(effectiveAuto)
-  }, [repoId, effectiveMode, effectiveDir, effectiveAuto])
+    setCacheEnabled(effectiveCache)
+  }, [repoId, effectiveMode, effectiveDir, effectiveAuto, effectiveCache])
 
   // 预览按用户**正在编辑**的父目录算：改了输入框提示立刻跟着变，不用先保存再猜。
   const previewDir = effectiveMountDir(dir.trim() || config?.default_mount_dir || '', serverAlias, repoName)
@@ -86,7 +93,8 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
         // 目录一直存着（此后切回目录模式不用重填）；空串 = 用默认挂载根。
         // 存的是**父目录**，真正挂载点由代理在它下面加一层 <服务端名称>_<存储库名称>。
         mount_dir: dir.trim(),
-        auto_mount: autoMount
+        auto_mount: autoMount,
+        cache_enabled: cacheEnabled
       })
       // 刷新全局配置快照：卡片、详情页读的都是它，否则界面还显示上一次的值。
       await agent.refresh()
@@ -104,9 +112,11 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
     mode,
     dir,
     autoMount,
+    cacheEnabled,
     setMode,
     setDir,
     setAutoMount,
+    setCacheEnabled,
     saving,
     error,
     disabled: !agent.available,
@@ -115,10 +125,10 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
   }
 }
 
-/** 三个字段的展示：弹窗与详情页 tab 用同一份，避免两处配置长得不一样。 */
+/** 各字段的展示：弹窗与详情页 tab 用同一份，避免两处配置长得不一样。 */
 function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Element {
   const { t } = useI18n()
-  const { mode, dir, autoMount, disabled, previewDir } = state
+  const { mode, dir, autoMount, cacheEnabled, disabled, previewDir } = state
 
   return (
     <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
@@ -173,6 +183,16 @@ function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Elem
         <Switch checked={autoMount} disabled={disabled} onChange={state.setAutoMount} />
         <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
           {t('repo.settings.autoMountHint')}
+        </Typography.Text>
+      </div>
+
+      <div>
+        <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+          {t('repo.settings.cacheEnabled')}
+        </Typography.Text>
+        <Switch checked={cacheEnabled} disabled={disabled} onChange={state.setCacheEnabled} />
+        <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+          {t('repo.settings.cacheHint')}
         </Typography.Text>
       </div>
 

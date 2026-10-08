@@ -161,8 +161,17 @@ export function App(): JSX.Element {
    * 失败不得阻塞登录流程：仅记录错误码（绝不记录令牌），顶栏依据代理状态提示。
    */
   const pushAgentSession = useCallback(async (): Promise<void> => {
-    const targets = useAppStore.getState().servers
+    const store = useAppStore.getState()
+    const targets = store.servers
     if (targets.length === 0) return
+    // 当前活动服务端：它就是"主服务端"。代理的更新源（检查更新/自更新）等"没有服务端上下文"
+    // 的操作默认打在主服务端上，而主服务端只认**客户端显式的选择**（代理侧别无途径知道用户
+    // 在界面上切到了哪台）—— 不随会话推送一起声明，主服务端就永远停在"首台注册的那台"，
+    // 于是切换服务后"检查更新"仍打旧服务器（真实反馈）。这里把活动服务端标为 primary，
+    // 下面的 effect 已依赖 activeKey，切换时会重新推送，主服务端随之跟上。
+    // 这里的 activeKey 必须**当场从 store 取**：本回调依赖数组为空（稳定引用），
+    // 直接闭包外层那个 activeKey 会拿到首次渲染的旧值，切换服务端后仍标错主服务端。
+    const activeServerKey = store.activeKey
     const volatile = volatileSessionRef.current
     await Promise.all(
       targets.map(async (entry): Promise<void> => {
@@ -179,6 +188,8 @@ export function App(): JSX.Element {
           await agentApi.pushSession({
             // 明确归属：同一台的两种键（地址 / 实例 ID）会在代理内合并，代理回传实际键。
             server_key: entry.key,
+            // 只在活动服务端那一台上置 true（未登录的台不推会话，自然不会成为主服务端）。
+            primary: entry.key === activeServerKey,
             server_url: entry.baseUrl,
             server_instance_id: entry.instanceId ?? entry.key,
             server_name: entry.serverName || entry.baseUrl,

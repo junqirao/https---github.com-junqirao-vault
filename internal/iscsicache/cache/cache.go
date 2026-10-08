@@ -125,11 +125,22 @@ type Stats struct {
 	Evictions     atomic.Int64
 	Invalidations atomic.Int64
 	ScanBypass    atomic.Int64
+	// RequestHits counts read commands whose data came entirely from the cache
+	// (no backend read at all). It is the counter a hit rate can be computed
+	// from: the other hit counters are per block segment or per sector run.
+	RequestHits atomic.Int64
 }
 
 // Snapshot is a plain copy of the counters, for logging.
+//
+// L1UsedBytes/L1LimitBytes report how much of the L1 memory budget currently
+// holds cached blocks and what the budget is, so a caller can show occupancy
+// next to the hit counters.
 type Snapshot struct {
 	Reads, L1Hits, PartialHits, L2Hits, BackendReads, Fills, Evictions, Invalidations, ScanBypass int64
+	RequestHits                                                                                   int64
+	L1UsedBytes                                                                                   int64
+	L1LimitBytes                                                                                  int64
 }
 
 func (s *Stats) snapshot() Snapshot {
@@ -137,6 +148,7 @@ func (s *Stats) snapshot() Snapshot {
 		Reads: s.Reads.Load(), L1Hits: s.L1Hits.Load(), PartialHits: s.PartialHits.Load(),
 		L2Hits: s.L2Hits.Load(), BackendReads: s.BackendReads.Load(), Fills: s.Fills.Load(),
 		Evictions: s.Evictions.Load(), Invalidations: s.Invalidations.Load(), ScanBypass: s.ScanBypass.Load(),
+		RequestHits: s.RequestHits.Load(),
 	}
 }
 
@@ -193,8 +205,25 @@ func (c *Cache) BlockSize() int { return c.blockSize }
 // SectorSize reports the cache sector size in bytes.
 func (c *Cache) SectorSize() int { return c.sectorSize }
 
-// Stats returns a snapshot of the counters.
-func (c *Cache) Stats() Snapshot { return c.stats.snapshot() }
+// Stats returns a snapshot of the counters, including L1 occupancy.
+func (c *Cache) Stats() Snapshot {
+	s := c.stats.snapshot()
+	s.L1UsedBytes, s.L1LimitBytes = c.Usage()
+	return s
+}
+
+// Usage reports the L1 memory currently holding cached blocks and the L1
+// budget, both in bytes.
+//
+// It walks the shards, so it is meant for periodic reporting (the agent polls
+// it for the storage page), not for the read path.
+func (c *Cache) Usage() (used, limit int64) {
+	var blocks int64
+	for _, s := range c.shards {
+		blocks += int64(s.liveBlocks())
+	}
+	return blocks * int64(c.blockSize), int64(c.totalBlocks) * int64(c.blockSize)
+}
 
 // Drop discards every cached block, keeping the L2 file contents untouched
 // (the L2 index is memory only, so dropping it makes the L2 logically empty).
@@ -220,6 +249,7 @@ func (c *Cache) Read(ctx context.Context, off int64, dst []byte, src Source) err
 	}
 
 	end := off + int64(len(dst))
+	backendBefore := c.stats.BackendReads.Load()
 	for cur := off; cur < end; {
 		blk := uint64(cur / int64(c.blockSize))
 		blkStart := int64(blk) * int64(c.blockSize)
@@ -231,6 +261,12 @@ func (c *Cache) Read(ctx context.Context, off int64, dst []byte, src Source) err
 			return err
 		}
 		cur = segEnd
+	}
+	// A read that never touched the backing store was served entirely from the
+	// cache. Counted per command (not per block) so it can be reported as a hit
+	// rate the user recognises.
+	if c.stats.BackendReads.Load() == backendBefore {
+		c.stats.RequestHits.Add(1)
 	}
 	return nil
 }
@@ -500,6 +536,15 @@ func (s *shard) lookup(blk uint64) *entry {
 	e := s.blocks[blk]
 	s.mu.Unlock()
 	return e
+}
+
+// liveBlocks reports how many blocks the shard currently holds, for occupancy
+// reporting.
+func (s *shard) liveBlocks() int {
+	s.mu.Lock()
+	n := len(s.blocks)
+	s.mu.Unlock()
+	return n
 }
 
 // touch records a hit: S3-FIFO promotes an entry that was reused while sitting
