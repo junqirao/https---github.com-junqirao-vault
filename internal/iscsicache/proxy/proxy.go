@@ -75,18 +75,13 @@ type Proxy struct {
 	dev frontend.DeviceInfo
 	iqn string
 
-	// execMu guards cache coherence across sessions. Reads only share the cache,
-	// which has its own per-shard locking and single-flight fill dedup, so they
-	// take the shared lock and run concurrently: an initiator keeps many commands
-	// outstanding and collapsing them to one wastes its queue depth. Everything
-	// else takes the exclusive lock, because a write's backend update plus
-	// invalidation must not interleave with a read fill of the same range.
-	execMu sync.RWMutex
-
 	stats Stats
 }
 
-var _ frontend.Handler = (*Proxy)(nil)
+var (
+	_ frontend.Handler       = (*Proxy)(nil)
+	_ frontend.StreamHandler = (*Proxy)(nil)
+)
 
 // New validates the geometry and builds a Proxy.
 func New(cfg Config) (*Proxy, error) {
@@ -152,23 +147,17 @@ func (p *Proxy) Stats() StatsSnapshot {
 }
 
 // Execute implements frontend.Handler.
+//
+// Commands run concurrently: the cache orders its own fills against a write's
+// invalidation with a per-shard epoch, so the proxy does not serialise writes
+// against reads and an initiator can keep its full queue depth outstanding.
 func (p *Proxy) Execute(ctx context.Context, cdb []byte, dataOut []byte, inLen int) (frontend.Result, error) {
 	if len(cdb) == 0 {
 		return illegal(iscsi.ASCInvalidFieldInCDB), nil
 	}
-	// Reads only share the cache, whose per-shard locks and single-flight fill
-	// dedup make concurrent reads safe, so they take the shared lock: an
-	// initiator keeps several commands outstanding and collapsing them to one
-	// wastes its queue depth. Everything else takes the exclusive lock, because
-	// a write's backend update plus invalidation must not interleave with a read
-	// fill of the same range.
 	if cdb[0] == iscsi.SCSIRead10 || cdb[0] == iscsi.SCSIRead16 {
-		p.execMu.RLock()
-		defer p.execMu.RUnlock()
 		return p.read(ctx, cdb, inLen)
 	}
-	p.execMu.Lock()
-	defer p.execMu.Unlock()
 	switch cdb[0] {
 	case iscsi.SCSITestUnitReady:
 		return p.local(good())
@@ -206,6 +195,45 @@ func (p *Proxy) Execute(ctx context.Context, cdb []byte, dataOut []byte, inLen i
 	default:
 		return p.unsupported(cdb)
 	}
+}
+
+// ExecuteStream implements frontend.StreamHandler.
+//
+// A read with no cache in front of it is forwarded to the backing target as it
+// arrives, so the frontend can start sending Data-In before the transfer has
+// completed: that is what removes the store-and-forward hop a proxied mount
+// otherwise pays on top of a direct one.
+//
+// Anything else — a cached read, a command the cache can answer itself, a
+// backend that cannot stream — is answered through Execute and handed to the
+// sink in one piece, so the frontend still gets a valid response.
+func (p *Proxy) ExecuteStream(ctx context.Context, cdb []byte, inLen int, sink frontend.DataInSink) (frontend.Result, error) {
+	if len(cdb) == 0 {
+		return illegal(iscsi.ASCInvalidFieldInCDB), nil
+	}
+	st, streamable := p.be.(backend.Streamer)
+	// Only a passthrough read can be streamed: with a cache in front the read
+	// must run through it so a miss still fills, and the fill owns its buffer.
+	if p.c == nil && streamable && (cdb[0] == iscsi.SCSIRead10 || cdb[0] == iscsi.SCSIRead16) {
+		return p.readStream(ctx, cdb, inLen, st, sink)
+	}
+
+	res, err := p.Execute(ctx, cdb, nil, inLen)
+	if err != nil {
+		return res, err
+	}
+	if res.Release != nil {
+		defer res.Release()
+	}
+	if len(res.Data) > 0 {
+		if err := sink.Segment(0, res.Data, true, frontend.Result{
+			Status: res.Status, Sense: res.Sense, Residual: res.Residual,
+			Overflow: res.Overflow, Underflow: res.Underflow,
+		}); err != nil {
+			return frontend.Result{}, err
+		}
+	}
+	return res, nil
 }
 
 // Local commands --------------------------------------------------------------------
@@ -358,6 +386,48 @@ func (p *Proxy) bounds(params iscsi.ReadWriteParams, length int64) (frontend.Res
 		return illegal(iscsi.ASCLogicalBlockAddressOutOfRange), true
 	}
 	return frontend.Result{}, false
+}
+
+// readStream forwards a read to a streaming backend and delivers its payload to
+// sink as it arrives. It is the passthrough path of ExecuteStream: no cache, no
+// staging buffer, no waiting for the whole transfer.
+func (p *Proxy) readStream(ctx context.Context, cdb []byte, inLen int, st backend.Streamer, sink frontend.DataInSink) (frontend.Result, error) {
+	params, err := iscsi.ParseReadWrite(cdb)
+	if err != nil {
+		return p.unsupported(cdb)
+	}
+	params.BlockSize = p.dev.BlockSize
+	length := params.TransferLength()
+	if length == 0 {
+		return p.local(good())
+	}
+	if res, bad := p.bounds(params, length); bad {
+		return res, nil
+	}
+	p.stats.Reads.Add(1)
+	res, err := st.ExecStream(ctx, cdb, int(length), streamSink{dst: sink})
+	if err != nil {
+		return frontend.Result{}, err
+	}
+	return frontend.Result{
+		Status: res.Status, Sense: res.Sense, Residual: res.Residual,
+		Overflow: res.Overflow, Underflow: res.Underflow,
+	}, nil
+}
+
+// streamSink adapts the frontend's sink to the backend's, translating the
+// backend result into the frontend one.
+type streamSink struct{ dst frontend.DataInSink }
+
+func (s streamSink) Segment(off int64, data []byte, last bool, res *backend.Result) error {
+	var fr frontend.Result
+	if res != nil {
+		fr = frontend.Result{
+			Status: res.Status, Sense: res.Sense, Residual: res.Residual,
+			Overflow: res.Overflow, Underflow: res.Underflow,
+		}
+	}
+	return s.dst.Segment(off, data, last, fr)
 }
 
 // Writes ----------------------------------------------------------------------------

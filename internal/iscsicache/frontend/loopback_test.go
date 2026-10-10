@@ -192,6 +192,8 @@ func TestLoopback(t *testing.T) {
 	if firstReads != 1 {
 		t.Fatalf("backend reads = %d, want 1 after the first read", firstReads)
 	}
+	// The fill is asynchronous: wait for it so the second read is a real hit.
+	c.Wait()
 
 	again := read(0, 32)
 	if !bytes.Equal(got, again) {

@@ -19,9 +19,39 @@ import (
 
 // cmdWindow is the command window advertised in MaxCmdSN. The target executes
 // commands as they arrive, so a generous window is safe.
-const cmdWindow = 64
+//
+// It has to be generous enough that a proxy in front of this target can keep its
+// own command window in flight: the proxy's backing initiator is capped by the
+// MaxCmdSN this portal advertises, so a window equal to the client's queue depth
+// leaves the backing session permanently full and it stops accepting commands.
+const cmdWindow = 256
 
 const maxLoginIterations = 16
+
+// writeTimeout bounds a single PDU written to an unresponsive initiator. It only
+// has to outlast a stalled peer: a real failure tears the session down.
+const writeTimeout = 30 * time.Second
+
+// deadlineRefresh bounds how often a socket deadline is rewritten on the PDU
+// path. Rewriting one is not free — it takes the runtime poll lock that every
+// read and write on the fd shares — and the PDU path would otherwise pay it on
+// every PDU. A deadline is measured in seconds, so a value one refresh stale is
+// still within the configured timeout; the cost just leaves the hot path.
+const deadlineRefresh = time.Second
+
+// refreshDeadline rewrites a socket deadline at most once per deadlineRefresh.
+// last is the unix-nano time of the previous rewrite; set performs the call.
+func refreshDeadline(last *atomic.Int64, d time.Duration, set func(time.Time)) {
+	if d <= 0 {
+		return
+	}
+	now := time.Now()
+	if prev := last.Load(); prev != 0 && now.UnixNano()-prev < int64(deadlineRefresh) {
+		return
+	}
+	last.Store(now.UnixNano())
+	set(now.Add(d))
+}
 
 type session struct {
 	t    *Target
@@ -63,6 +93,11 @@ type session struct {
 	// for its data off the reader goroutine.
 	pendingMu sync.Mutex
 	pending   map[uint32]*dataOut
+
+	// readSetAt/writeSetAt hold the unix-nano time each socket deadline was last
+	// rewritten, so refreshDeadline can keep the rewrite off the per-PDU path.
+	readSetAt  atomic.Int64
+	writeSetAt atomic.Int64
 }
 
 // dataOut is one outstanding R2T: the burst the target asked for and the buffer
@@ -80,9 +115,9 @@ type dataOut struct {
 func (t *dataOut) complete() { t.finish.Do(func() { close(t.done) }) }
 
 func (s *session) readPDU() (*iscsi.PDU, error) {
-	if d := s.t.cfg.IdleTimeout; d > 0 {
-		_ = s.conn.SetReadDeadline(time.Now().Add(d))
-	}
+	refreshDeadline(&s.readSetAt, s.t.cfg.IdleTimeout, func(t time.Time) {
+		_ = s.conn.SetReadDeadline(t)
+	})
 	p, err := iscsi.ReadPDU(s.conn)
 	if err == nil {
 		s.logPDU("recv", p)
@@ -91,7 +126,9 @@ func (s *session) readPDU() (*iscsi.PDU, error) {
 }
 
 func (s *session) writePDU(p *iscsi.PDU) error {
-	_ = s.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	refreshDeadline(&s.writeSetAt, writeTimeout, func(t time.Time) {
+		_ = s.conn.SetWriteDeadline(t)
+	})
 	s.logPDU("send", p)
 	return iscsi.WritePDU(s.conn, p)
 }
@@ -462,6 +499,15 @@ func (s *session) runCommand(ctx context.Context, pdu *iscsi.PDU) error {
 		inLen = expLen
 	}
 
+	// A read that the handler can stream is forwarded as it arrives instead of
+	// waiting for the whole payload: the handler drives the sink, so this returns
+	// only once the command is closed.
+	if !isWrite && inLen > 0 {
+		if sh, ok := s.h.(StreamHandler); ok {
+			return s.runStreamedRead(ctx, itt, cdb, inLen, sh)
+		}
+	}
+
 	res, err := s.h.Execute(ctx, cdb, dataOut, inLen)
 	// The handler may have served Data from a pooled buffer; it stays borrowed
 	// until the reply has been written (or the command has failed), so the
@@ -580,36 +626,148 @@ func (s *session) dropPending(ttt uint32) {
 	s.pendingMu.Unlock()
 }
 
+// maxDataInSegment caps how much payload one Data-In PDU carries, independently
+// of what the initiator is willing to receive.
+//
+// A one-command-per-session initiator could take a whole MiB in one PDU, but a
+// target that serves several commands on one session (the backing initiator now
+// keeps the whole command window on a single session) must be able to interleave
+// their bursts. PDU-sized chunks are what makes the interleaving meaningful: a
+// chunk costs a socket write, and a burst that is one PDU is a burst nobody else
+// can get in between.
+const maxDataInSegment = 1 << 20
+
 // sendDataIn streams data as unsolicited Data-In PDUs and closes the command
 // with the status on the last one.
 //
-// StatSN is consumed once per command, not once per PDU: the field in a Data-In
-// PDU points at the StatSN that closes the command, so advancing it for every
-// PDU makes the initiator see a status sequence number it never expected and
-// drop the session.
+// The burst is sent PDU by PDU, taking sendMu only for the PDU in flight, so
+// several commands can interleave their Data-In on one connection instead of
+// queueing behind a single command's entire transfer.
+//
+// StatSN is consumed once per command, not once per PDU, and it rides only the
+// last PDU: a Data-In PDU without the S bit carries the reserved value. That is
+// what makes the interleaving legal — if every PDU of the burst carried the
+// closing StatSN, two interleaved commands would present the initiator with a
+// status sequence number that moves backwards.
 func (s *session) sendDataIn(itt uint32, data []byte, status uint8, residual uint32, overflow, underflow bool) error {
-	max := s.initiatorMaxRecvDSL
-	if max <= 0 {
-		max = DefaultMaxRecvDataSegmentLength
+	max := s.dataInChunk()
+	n := (len(data) + max - 1) / max
+	for i := 0; i < n; i++ {
+		off := i * max
+		end := off + max
+		if end > len(data) {
+			end = len(data)
+		}
+		last := end == len(data)
+		var res uint32
+		var ov, un bool
+		if last {
+			res, ov, un = residual, overflow, underflow
+		}
+		if err := s.writeDataInPDU(itt, data[off:end], uint32(off), uint32(i), last, status, res, ov, un); err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+// dataInChunk is the payload one Data-In PDU carries: what the initiator is
+// willing to receive, capped so a burst is several PDUs rather than one.
+func (s *session) dataInChunk() int {
+	max := s.initiatorMaxRecvDSL
+	if max <= 0 || max > maxDataInSegment {
+		max = maxDataInSegment
+	}
+	return max
+}
+
+// writeDataInPDU emits one Data-In PDU. It takes sendMu only for that PDU, so
+// several commands can interleave their bursts on one connection instead of
+// queueing behind a single command's entire transfer.
+//
+// Only the last PDU reserves a StatSN, and it does so at the moment it is sent,
+// so the status sequence numbers stay in the order the statuses leave the
+// target. A PDU without the S bit carries the reserved value, which is what
+// makes the interleaving legal.
+func (s *session) writeDataInPDU(itt uint32, seg []byte, bufOffset, dataSN uint32, last bool, status uint8, residual uint32, overflow, underflow bool) error {
+	var hdr iscsi.BHS
+	var pad [3]byte
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	// The whole burst shares one StatSN and must not interleave with another
-	// command's response, so it is both built and sent under the same lock.
-	statSN := s.statSN
+	var statSN uint32
+	if last {
+		statSN = s.statSN
+	}
 	expCmdSN := s.expCmdSN.Load()
-	maxCmdSN := expCmdSN + cmdWindow
+	iscsi.FillDataInHeader(&hdr, itt, iscsi.ReservedTag, statSN, expCmdSN, expCmdSN+cmdWindow,
+		dataSN, bufOffset, len(seg), last, last, status, residual, overflow, underflow)
+	bufs := net.Buffers{hdr[:], seg}
+	if p := (4 - len(seg)%4) % 4; p > 0 {
+		bufs = append(bufs, pad[:p])
+	}
+	refreshDeadline(&s.writeSetAt, writeTimeout, func(t time.Time) {
+		_ = s.conn.SetWriteDeadline(t)
+	})
+	if _, err := bufs.WriteTo(s.conn); err != nil {
+		return err
+	}
+	if last {
+		s.statSN++
+	}
+	return nil
+}
 
-	// The burst goes out as one scatter-gather write: every PDU contributes its
-	// header plus a slice of the payload, so the payload is never copied and the
-	// response costs one syscall instead of one per PDU. A streamed read is a
-	// single command carrying a large payload, which is exactly where a per-PDU
-	// copy and syscall would dominate.
+// runStreamedRead drives a read whose payload the handler delivers incrementally
+// through a sink, so the target starts forwarding before the handler has seen
+// the whole transfer.
+func (s *session) runStreamedRead(ctx context.Context, itt uint32, cdb []byte, expLen int, sh StreamHandler) error {
+	st := &dataInStream{s: s, itt: itt, expLen: expLen}
+	res, err := sh.ExecuteStream(ctx, cdb, expLen, st)
+	if err != nil {
+		s.log.Warn("frontend: streamed read failed", "err", err)
+		if !st.started {
+			return s.sendResponse(itt, iscsi.StatusCheckCondition, iscsi.NotReadySense(), 0, false, false, 0)
+		}
+		// Bytes are already on the wire, so the command can only be closed with a
+		// status; the shortfall is reported as an underflow.
+		return st.finish(iscsi.StatusCheckCondition, uint32(expLen-st.sent), false, true)
+	}
+	switch {
+	case !st.started:
+		// The handler declined to stream and answered with a plain result.
+		return s.sendResponse(itt, res.Status, res.Sense, res.Residual, res.Overflow, res.Underflow, 0)
+	case st.finished:
+		return nil
+	default:
+		// The handler streamed data but never marked the final segment.
+		return st.finish(iscsi.StatusGood, uint32(expLen-st.sent), false, expLen > st.sent)
+	}
+}
+
+// dataInStream is the sink a streamed read writes through. It re-chunks each
+// segment to the initiator's Data-In size, tracks the DataSN and offset, and
+// rides the command status on the very last PDU.
+type dataInStream struct {
+	s      *session
+	itt    uint32
+	expLen int
+
+	sent     int
+	dataSN   uint32
+	started  bool
+	finished bool
+}
+
+func (st *dataInStream) Segment(_ int64, data []byte, last bool, res Result) error {
+	st.started = true
+	max := st.s.dataInChunk()
 	n := (len(data) + max - 1) / max
-	hdrs := make([]iscsi.BHS, n)
-	bufs := make(net.Buffers, 0, 2*n+1)
-	var pad [3]byte
-	var dataSN uint32
+	if n == 0 {
+		if last {
+			return st.finish(res.Status, res.Residual, res.Overflow, res.Underflow)
+		}
+		return nil
+	}
 	for i := 0; i < n; i++ {
 		off := i * max
 		end := off + max
@@ -617,25 +775,52 @@ func (s *session) sendDataIn(itt uint32, data []byte, status uint8, residual uin
 			end = len(data)
 		}
 		seg := data[off:end]
-		last := end == len(data)
-		var res uint32
+		isLast := last && end == len(data)
+		var status uint8
+		var residual uint32
 		var ov, un bool
-		if last {
-			res, ov, un = residual, overflow, underflow
+		if isLast {
+			status, residual, ov, un = st.lastStatus(st.sent+len(seg), res)
 		}
-		iscsi.FillDataInHeader(&hdrs[i], itt, iscsi.ReservedTag, statSN, expCmdSN, maxCmdSN,
-			dataSN, uint32(off), len(seg), last, last, status, res, ov, un)
-		bufs = append(bufs, hdrs[i][:], seg)
-		if p := (4 - len(seg)%4) % 4; p > 0 {
-			bufs = append(bufs, pad[:p])
+		if err := st.s.writeDataInPDU(st.itt, seg, uint32(st.sent), st.dataSN, isLast, status, residual, ov, un); err != nil {
+			return err
 		}
-		dataSN++
+		st.sent += len(seg)
+		st.dataSN++
 	}
-	_ = s.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
-	if _, err := bufs.WriteTo(s.conn); err != nil {
+	if last {
+		st.finished = true
+	}
+	return nil
+}
+
+// lastStatus resolves the status, residual and flags for the final Data-In PDU
+// from the bytes delivered through the whole transfer. A handler that reported
+// its own shortfall (the backing target's residual) keeps it; otherwise the same
+// rule the non-streamed path applies is used, so a handler that answers without
+// streaming its payload (an INQUIRY, say) still reports the underflow the
+// initiator sizes the transfer from.
+func (st *dataInStream) lastStatus(delivered int, res Result) (status uint8, residual uint32, overflow, underflow bool) {
+	status = res.Status
+	residual, overflow, underflow = res.Residual, res.Overflow, res.Underflow
+	if !overflow && !underflow {
+		switch {
+		case delivered < st.expLen:
+			residual, underflow = uint32(st.expLen-delivered), true
+		case delivered > st.expLen:
+			residual, overflow = uint32(delivered-st.expLen), true
+		}
+	}
+	return status, residual, overflow, underflow
+}
+
+// finish closes a streamed read with a zero-length Data-In carrying the status.
+func (st *dataInStream) finish(status uint8, residual uint32, overflow, underflow bool) error {
+	if err := st.s.writeDataInPDU(st.itt, nil, uint32(st.sent), st.dataSN, true, status, residual, overflow, underflow); err != nil {
 		return err
 	}
-	s.statSN++
+	st.dataSN++
+	st.finished = true
 	return nil
 }
 

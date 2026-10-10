@@ -68,11 +68,9 @@ type BackendConfig struct {
 	MaxRecvDataSegmentLength int `yaml:"max_recv_data_segment_length"`
 	MaxBurstLength           int `yaml:"max_burst_length"`
 
-	// Sessions caps how many independent backing sessions the proxy may hold. Zero
-	// selects backend.MaxSessions. The proxy opens backend.DefaultSessions eagerly
-	// at mount time and grows towards this cap only while the client pipelines
-	// more commands than there are sessions, which is what keeps the backing
-	// queue depth from being collapsed to one.
+	// Sessions is how many independent iSCSI sessions the backend opens at mount
+	// and fans commands over, so the proxy's local hop is not pinned to one core.
+	// Zero applies the backend default.
 	Sessions int `yaml:"sessions"`
 }
 
@@ -109,6 +107,16 @@ type CacheConfig struct {
 		Threshold int   `yaml:"threshold"`
 	} `yaml:"scan_detection"`
 
+	// Fill tunes the asynchronous fill queue that populates L1 after a miss. The
+	// read path never waits on it: a full queue drops the fill and only costs a
+	// future backing read.
+	Fill struct {
+		// Workers is how many goroutines install queued fills.
+		Workers int `yaml:"workers"`
+		// QueueDepth bounds the number of queued fills.
+		QueueDepth int `yaml:"queue_depth"`
+	} `yaml:"fill"`
+
 	Prefetch struct {
 		Enabled bool `yaml:"enabled"`
 	} `yaml:"prefetch"`
@@ -136,6 +144,12 @@ func (c *CacheConfig) applyDefaults() {
 	}
 	if c.ScanDetection.Threshold == 0 {
 		c.ScanDetection.Threshold = 32
+	}
+	if c.Fill.Workers == 0 {
+		c.Fill.Workers = cache.DefaultFillWorkers
+	}
+	if c.Fill.QueueDepth == 0 {
+		c.Fill.QueueDepth = cache.DefaultFillQueueDepth
 	}
 }
 
@@ -176,11 +190,10 @@ func (c *Config) validate() error {
 
 // Stats aggregates the counters of the layers.
 type Stats struct {
-	Cache    cache.Snapshot
-	Proxy    proxy.StatsSnapshot
-	L2Slots  int
-	L2Used   int
-	Sessions int64
+	Cache   cache.Snapshot
+	Proxy   proxy.StatsSnapshot
+	L2Slots int
+	L2Used  int
 	// BlockSize is the cache block size, which is also the L2 slot size; callers
 	// use it to turn L2Slots/L2Used into bytes.
 	BlockSize int
@@ -301,6 +314,11 @@ func (s *Service) Close() error {
 		if err := s.tgt.Close(); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	// Stop the fill workers and wait for the L2 populations they started before
+	// the L2 file is closed, or a worker would write to a closed file.
+	if s.c != nil {
+		s.c.Close()
 	}
 	if s.l2 != nil {
 		if err := s.l2.Sync(); err != nil {

@@ -32,6 +32,15 @@ const (
 	// DefaultIdleTimeout closes a session whose peer went away without logging
 	// out, so the single-session slot is not leaked forever.
 	DefaultIdleTimeout = 30 * time.Minute
+	// DefaultSocketBufferSize is the per-direction socket buffer the target asks
+	// the kernel for on every accepted connection.
+	//
+	// A Data-In PDU is written in one call, and the kernel only takes what its
+	// send buffer has room for: with the default buffer a one MiB PDU is written
+	// in many partial calls as the peer drains it, which on Windows turns a single
+	// transfer into a storm of WSASend syscalls. Sizing the buffer to hold a full
+	// PDU lets each one leave in a single call.
+	DefaultSocketBufferSize = 4 << 20
 )
 
 // DeviceInfo is the LUN identity the target reports.
@@ -77,6 +86,24 @@ type Handler interface {
 	Execute(ctx context.Context, cdb []byte, dataOut []byte, inLen int) (Result, error)
 }
 
+// DataInSink is the target's side of a streamed read. A handler that streams
+// hands the payload over through Segment instead of returning it in Result.Data.
+type DataInSink interface {
+	// Segment delivers data at its byte offset within the transfer. last marks
+	// the final segment, whose res carries the command's status and residual.
+	Segment(offset int64, data []byte, last bool, res Result) error
+}
+
+// StreamHandler is an optional Handler extension. A handler that implements it
+// can deliver a read's payload incrementally, so the target forwards each
+// segment as it arrives instead of buffering the whole transfer first.
+//
+// ExecuteStream must deliver the whole payload through sink or return an error;
+// an implementation that cannot stream may simply call sink once.
+type StreamHandler interface {
+	ExecuteStream(ctx context.Context, cdb []byte, inLen int, sink DataInSink) (Result, error)
+}
+
 // Config configures a Target.
 //
 // TargetIQN is only used by the single target constructor New. A portal that
@@ -92,6 +119,10 @@ type Config struct {
 	MaxRecvDataSegmentLength int
 	MaxBurstLength           int
 	FirstBurstLength         int
+
+	// SocketBufferSize is the read/write socket buffer requested on every accepted
+	// connection. Zero applies DefaultSocketBufferSize.
+	SocketBufferSize int
 
 	IdleTimeout time.Duration
 	Logger      *slog.Logger
@@ -112,6 +143,9 @@ func (c *Config) normalize() {
 	}
 	if c.IdleTimeout <= 0 {
 		c.IdleTimeout = DefaultIdleTimeout
+	}
+	if c.SocketBufferSize <= 0 {
+		c.SocketBufferSize = DefaultSocketBufferSize
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -301,6 +335,10 @@ func (t *Target) serveConn(ctx context.Context, conn net.Conn) {
 
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
+		// Size the socket buffers so a full Data-In PDU leaves in one write, and a
+		// burst of them is not throttled by the default buffer.
+		_ = tc.SetReadBuffer(t.cfg.SocketBufferSize)
+		_ = tc.SetWriteBuffer(t.cfg.SocketBufferSize)
 		// Detect a peer that vanished without closing the session.
 		_ = tc.SetKeepAlive(true)
 		_ = tc.SetKeepAlivePeriod(30 * time.Second)

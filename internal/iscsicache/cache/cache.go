@@ -1,15 +1,21 @@
 // Package cache implements the multi-level read cache of the iSCSI read-cache
 // proxy: an L1 in-memory block cache with per-sector validity, an optional L2
-// file-backed cache, S3-FIFO eviction, single-flight block fills and
+// file-backed cache, S3-FIFO eviction, asynchronous block fills and
 // sequential-scan admission control.
 //
 // The cache is read-only: writes never populate an entry, they invalidate it.
 // Entries therefore carry a valid bitmap only, never a dirty bitmap.
+//
+// A miss is served straight from the backing store and the sectors it read are
+// handed to a fill worker, so the read never waits for an entry to be allocated
+// and installed. Fills and invalidations are ordered by a per-shard epoch: a
+// fill captures the epoch before it reads and only installs while the shard
+// still carries it, so a write's invalidation either drops the fill or runs
+// before it — it can never leave pre-write data behind.
 package cache
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -23,10 +29,21 @@ const (
 	DefaultShards     = 256
 )
 
-// sourceReadAttempts bounds the single-flight retry loop. A waiter that joins a
-// fill for a different sector range of the same block re-runs the fill for its
-// own range; two passes are normally enough.
-const sourceReadAttempts = 4
+// Defaults for the asynchronous fill queue.
+const (
+	// DefaultFillWorkers is how many goroutines install queued fills.
+	DefaultFillWorkers = 4
+	// DefaultFillQueueDepth bounds the number of queued fills.
+	DefaultFillQueueDepth = 1024
+)
+
+// scanBuckets is how many independent sequential-scan states the detector
+// keeps, one per 1 MiB region (scanBucketShift). Fanning the state out keeps a
+// scan's bookkeeping off other streams' read path.
+const (
+	scanBuckets     = 64
+	scanBucketShift = 20
+)
 
 // Source is the backing store the cache reads from. ReadAt must fill exactly
 // len(p) bytes at byte offset off. The cache always aligns both the offset and
@@ -69,6 +86,13 @@ type Config struct {
 	// requests that mark a stream as a scan. Defaults to 32.
 	ScanThreshold int
 
+	// FillWorkers is how many goroutines consume the fill queue. Defaults to
+	// DefaultFillWorkers.
+	FillWorkers int
+	// FillQueueDepth bounds the fill queue. Defaults to DefaultFillQueueDepth. A
+	// full queue drops a fill, never a read.
+	FillQueueDepth int
+
 	L2     L2
 	Logger *slog.Logger
 }
@@ -94,6 +118,12 @@ func (c *Config) normalize() error {
 	}
 	if c.ScanThreshold <= 0 {
 		c.ScanThreshold = 32
+	}
+	if c.FillWorkers <= 0 {
+		c.FillWorkers = DefaultFillWorkers
+	}
+	if c.FillQueueDepth <= 0 {
+		c.FillQueueDepth = DefaultFillQueueDepth
 	}
 	if c.BlockSize%c.SectorSize != 0 {
 		return fmt.Errorf("cache: block size %d is not a multiple of sector size %d", c.BlockSize, c.SectorSize)
@@ -159,17 +189,41 @@ type Cache struct {
 	sectorsPer  int
 	totalBlocks int
 
-	shards  []*shard
-	flights flightGroup
-	scan    *scanDetector
-	l2      L2
-	log     *slog.Logger
+	shards []*shard
+	scan   *scanDetector
+	l2     L2
+	log    *slog.Logger
 
-	// l2Sem bounds how many L2 populations may be in flight and l2Pending tracks
-	// them, so an invalidation can wait for the writes it must not be overtaken
-	// by. Both are nil/unused when the cache has no L2.
-	l2Sem     chan struct{}
-	l2Pending sync.WaitGroup
+	// l2Sem bounds how many L2 populations may be in flight and the fence orders
+	// them against an invalidation, which must wait for the populations already
+	// in flight before it drops a sector they carry pre-write data for. Both are
+	// unused when the cache has no L2.
+	l2Sem chan struct{}
+	fence l2Fence
+
+	// l2Gate orders a read's L2 lookup against an invalidation. A write holds it
+	// exclusively across its epoch bump and its L2 drop, so a sector a read takes
+	// out of L2 is either gone from L2 (the read started after the drop) or the
+	// fill it feeds is rejected by the epoch check.
+	l2Gate sync.RWMutex
+
+	// The fill queue decouples the read path from populating L1. fillCh is
+	// deliberately never closed: a racing enqueue after Close would otherwise
+	// panic, and a fill that runs into a shut cache only costs a future backing
+	// read. fillPending counts the fills queued or being installed; Wait and
+	// Close block on it until the queue has drained (fillCond), and exitCh then
+	// tells the workers to leave.
+	fillCh chan fillReq
+	fillWG sync.WaitGroup
+	closed atomic.Bool
+	exitCh chan struct{}
+
+	// fillPending is incremented before a fill is queued and decremented once a
+	// worker has installed it, so it is zero exactly when the queue is empty. The
+	// increment is a plain atomic: the read path never takes fillMu.
+	fillPending atomic.Int64
+	fillMu      sync.Mutex
+	fillCond    *sync.Cond
 
 	stats Stats
 }
@@ -201,8 +255,12 @@ func New(cfg Config) (*Cache, error) {
 		totalBlocks: int(total),
 		l2:          cfg.L2,
 		log:         cfg.Logger,
-		scan:        &scanDetector{enabled: cfg.ScanEnabled, threshold: cfg.ScanThreshold},
+		scan:        newScanDetector(cfg.ScanEnabled, cfg.ScanThreshold),
+		fillCh:      make(chan fillReq, cfg.FillQueueDepth),
+		exitCh:      make(chan struct{}),
 	}
+	c.fence.cond = sync.NewCond(&c.fence.mu)
+	c.fillCond = sync.NewCond(&c.fillMu)
 	c.shards = make([]*shard, cfg.Shards)
 	for i := range c.shards {
 		c.shards[i] = newShard(c, per, cfg.NewQuotaPct, cfg.HighWatermark, cfg.LowWatermark)
@@ -210,7 +268,51 @@ func New(cfg Config) (*Cache, error) {
 	if c.l2 != nil {
 		c.l2Sem = make(chan struct{}, l2WriteConcurrency)
 	}
+	for i := 0; i < cfg.FillWorkers; i++ {
+		c.fillWG.Add(1)
+		go c.fillWorker()
+	}
 	return c, nil
+}
+
+// Close stops the fill workers once the queue has drained and waits for the L2
+// populations they started. It must run before the L2 store is closed, or a
+// worker would write to a closed file.
+func (c *Cache) Close() {
+	if !c.closed.CompareAndSwap(false, true) {
+		return
+	}
+	// No new fills are accepted now, so once the pending count reaches zero the
+	// queue is empty and the workers can be told to leave.
+	c.waitFills()
+	close(c.exitCh)
+	c.fillWG.Wait()
+	if c.l2 != nil {
+		c.fence.wait(c.fence.target())
+	}
+}
+
+// Wait blocks until the fills queued so far have been installed and their L2
+// populations have completed. It is a synchronisation point for tests; the read
+// path never calls it.
+func (c *Cache) Wait() {
+	c.waitFills()
+	if c.l2 != nil {
+		c.fence.wait(c.fence.target())
+	}
+}
+
+// waitFills blocks until every fill queued before the call has been installed.
+//
+// It waits on the pending count rather than on queue sentinels: a sentinel per
+// worker only proves the fill was dequeued, because a fast worker can consume a
+// later sentinel while another is still installing an earlier fill.
+func (c *Cache) waitFills() {
+	c.fillMu.Lock()
+	defer c.fillMu.Unlock()
+	for c.fillPending.Load() != 0 {
+		c.fillCond.Wait()
+	}
 }
 
 // BlockSize reports the cache block size in bytes.
@@ -242,17 +344,17 @@ func (c *Cache) Usage() (used, limit int64) {
 // Drop discards every cached block, keeping the L2 file contents untouched
 // (the L2 index is memory only, so dropping it makes the L2 logically empty).
 func (c *Cache) Drop() {
-	c.drainL2()
+	if c.l2 != nil {
+		c.l2Gate.Lock()
+		defer c.l2Gate.Unlock()
+	}
+	// Dropping a shard bumps its epoch, so a fill that was reading before the
+	// drop is rejected instead of re-populating what the drop just discarded.
 	for _, s := range c.shards {
 		s.drop()
 	}
-}
-
-// drainL2 waits for the background L2 populations to finish. It is called by the
-// operations that must not be overtaken by a write already in flight.
-func (c *Cache) drainL2() {
 	if c.l2 != nil {
-		c.l2Pending.Wait()
+		c.fence.wait(c.fence.target())
 	}
 }
 
@@ -295,8 +397,10 @@ func (c *Cache) Read(ctx context.Context, off int64, dst []byte, src Source) err
 				cur = segEnd
 				continue
 			}
-			// A partly valid entry falls through to readSegment, which accounts
-			// for the partial hit and fills only the missing sectors.
+			// A partly valid entry falls through to serveMiss, which fills only the
+			// missing sectors. Counted here because after the miss the entry's state
+			// is no longer distinguishable from a cold one.
+			c.stats.PartialHits.Add(1)
 		} else {
 			// The block is absent, so the request can be served by loading the
 			// whole run of consecutive absent blocks with one backend read. A
@@ -321,7 +425,7 @@ func (c *Cache) Read(ctx context.Context, off int64, dst []byte, src Source) err
 				continue
 			}
 		}
-		if err := c.readSegment(ctx, blk, blkStart, cur, dst[cur-off:segEnd-off], src); err != nil {
+		if err := c.serveMiss(ctx, blk, blkStart, cur, dst[cur-off:segEnd-off], src); err != nil {
 			return err
 		}
 		cur = segEnd
@@ -335,35 +439,49 @@ func (c *Cache) Read(ctx context.Context, off int64, dst []byte, src Source) err
 	return nil
 }
 
-func (c *Cache) readSegment(ctx context.Context, blk uint64, blkStart, off int64, dst []byte, src Source) error {
-	sh := c.shard(blk)
-	if e := sh.lookup(blk); e != nil {
-		if e.copyIfValid(blkStart, off, dst, c.sectorSize) {
-			sh.touch(e)
-			c.stats.L1Hits.Add(1)
-			return nil
-		}
-		c.stats.PartialHits.Add(1)
-	}
-
+// serveMiss serves [off, off+len(dst)) inside block blk straight from L2 or the
+// backing store and hands the sector run it read to a fill worker.
+//
+// The read deliberately does not go through the block path: no entry is
+// allocated, no single-flight guard is taken and no 64 KiB buffer is zeroed on
+// the read's critical path. Those costs are what made a cold random read slower
+// through the proxy than a direct connection, and they are all paid by the
+// worker once the client has already been served.
+func (c *Cache) serveMiss(ctx context.Context, blk uint64, blkStart, off int64, dst []byte, src Source) error {
 	s0, s1 := c.sectorRange(blkStart, off, int64(len(dst)))
-	for attempt := 0; attempt < sourceReadAttempts; attempt++ {
-		err := c.flights.do(blk, func() error { return c.fillBlock(ctx, blk, blkStart, s0, s1, src) })
+	n := s1 - s0 + 1
+	sec := int64(c.sectorSize)
+	start := blkStart + int64(s0)*sec
+	buf := make([]byte, int64(n)*sec)
+
+	// The epoch is captured before the data is read, never after: an invalidation
+	// always follows the write it belongs to, so a fill whose epoch was captured
+	// after a bump is guaranteed to be reading post-write data, and one captured
+	// before a bump is rejected at install time.
+	epoch := c.shard(blk).epoch.Load()
+	fromL2 := false
+	if c.l2 != nil {
+		c.l2Gate.RLock()
+		ok, err := c.l2.ReadSectors(blk, s0, n, buf)
+		c.l2Gate.RUnlock()
 		if err != nil {
+			c.log.Warn("cache: l2 read failed", "block", blk, "err", err)
+		} else if ok {
+			fromL2 = true
+			c.stats.L2Hits.Add(1)
+		}
+	}
+	if !fromL2 {
+		if err := src.ReadAt(ctx, start, buf); err != nil {
 			return err
 		}
-		e := sh.lookup(blk)
-		if e != nil && e.rangeValid(s0, s1) {
-			if !e.copyIfValid(blkStart, off, dst, c.sectorSize) {
-				return errors.New("cache: entry reported valid range but copy failed")
-			}
-			sh.touch(e)
-			return nil
-		}
+		c.stats.BackendReads.Add(1)
 	}
-	// Contention fallback: read straight from the backing store.
-	c.log.Warn("cache: fill did not converge, bypassing cache", "block", blk, "sector0", s0, "sector1", s1)
-	return c.readAligned(ctx, off, dst, src)
+	copy(dst, buf[off-start:])
+	// Data that came out of L2 is already there: only a backing read needs to
+	// populate it.
+	c.enqueueFill(blk, int(start-blkStart), buf, epoch, !fromL2)
+	return nil
 }
 
 // blockEnd returns the exclusive end of blk's byte range, clipped to end.
@@ -395,12 +513,21 @@ func (c *Cache) fillRun(ctx context.Context, start, end int64, dst []byte, src S
 	if readStart != start || readEnd != end {
 		buf, staging = make([]byte, readEnd-readStart), true
 	}
+	bs := int64(c.blockSize)
+	firstBlk := uint64(readStart / bs)
+	lastBlk := uint64((readEnd - 1) / bs)
+	// Every covered shard's epoch is captured before the read, so a write that
+	// invalidates any of them while the backing store is being read drops the
+	// whole install instead of publishing data the write has made stale.
+	epochs := make([]uint64, lastBlk-firstBlk+1)
+	for i := range epochs {
+		epochs[i] = c.shard(firstBlk + uint64(i)).epoch.Load()
+	}
 	if err := src.ReadAt(ctx, readStart, buf); err != nil {
 		return err
 	}
 	c.stats.BackendReads.Add(1)
 
-	bs := int64(c.blockSize)
 	for off := readStart; off < readEnd; {
 		blk := uint64(off / bs)
 		blkStart := int64(blk) * bs
@@ -408,7 +535,7 @@ func (c *Cache) fillRun(ctx context.Context, start, end int64, dst []byte, src S
 		if segEnd > readEnd {
 			segEnd = readEnd
 		}
-		c.shard(blk).install(blk, buf[off-readStart:segEnd-readStart], int(off-blkStart))
+		c.installValidated(blk, int(off-blkStart), buf[off-readStart:segEnd-readStart], epochs[blk-firstBlk], false)
 		off = segEnd
 	}
 	c.stats.Fills.Add(1)
@@ -418,96 +545,127 @@ func (c *Cache) fillRun(ctx context.Context, start, end int64, dst []byte, src S
 	return nil
 }
 
-// fillBlock makes the sectors [s0,s1] of blk valid inside its entry, loading
-// whatever is missing from L2 and then from src. It runs under the block's
-// single-flight guard so only one goroutine writes an entry at a time.
-func (c *Cache) fillBlock(ctx context.Context, blk uint64, blkStart int64, s0, s1 int, src Source) error {
-	sh := c.shard(blk)
-	e := sh.lookup(blk)
-	if e != nil && e.rangeValid(s0, s1) {
-		return nil
-	}
-
-	var pending []l2Seg
-	for _, r := range e.missingRuns(s0, s1) {
-		n := r[1] - r[0] + 1
-		buf := make([]byte, n*c.sectorSize)
-		fromL2 := false
-		if c.l2 != nil {
-			ok, err := c.l2.ReadSectors(blk, r[0], n, buf)
-			if err != nil {
-				c.log.Warn("cache: l2 read failed", "block", blk, "err", err)
-			} else if ok {
-				fromL2 = true
-				c.stats.L2Hits.Add(1)
-			}
-		}
-		if !fromL2 {
-			off := blkStart + int64(r[0]*c.sectorSize)
-			if err := src.ReadAt(ctx, off, buf); err != nil {
-				return err
-			}
-			c.stats.BackendReads.Add(1)
-		}
-		pending = append(pending, l2Seg{sector: r[0], data: buf})
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-
-	if e == nil {
-		e = sh.insert(blk)
-		if e == nil {
-			return errors.New("cache: failed to allocate entry")
-		}
-	}
-	for _, p := range pending {
-		copy(e.data[p.sector*c.sectorSize:], p.data)
-		n := len(p.data) / c.sectorSize
-		for i := 0; i < n; i++ {
-			e.setValid(p.sector + i)
-		}
-	}
-	c.stats.Fills.Add(1)
-	c.enqueueL2Write(blk, pending)
-	return nil
+// fillReq is one sector run a worker installs into L1, optionally populating L2.
+type fillReq struct {
+	blk      uint64
+	blockOff int
+	data     []byte
+	epoch    uint64
+	writeL2  bool
 }
 
-// l2Seg is a just filled sector run, handed to a background L2 population.
-type l2Seg struct {
-	sector int
-	data   []byte
-}
-
-// enqueueL2Write populates L2 with a freshly filled block without putting the
-// file write on the read's critical path: the client is served as soon as the
-// data is in L1, and the L2 write runs in the background. Ordering against
-// invalidation is preserved by Cache.Invalidate draining these writes, which is
-// a complete fence because the caller serialises reads and writes.
+// enqueueFill hands a just read sector run to the fill workers.
 //
-// When the bounded queue is saturated the population is skipped: L2 is a
-// secondary cache, so dropping a write costs a future backend read, never
-// correctness or latency.
-func (c *Cache) enqueueL2Write(blk uint64, segs []l2Seg) {
-	if c.l2 == nil || len(segs) == 0 {
+// The queue is bounded and a full queue drops the fill: the read it came from
+// has already been served, so a dropped fill only costs a future backing read.
+// That is also why the enqueue never blocks — a cold random workload enqueues
+// one fill per read, and making the read wait for queue space would put the
+// queue's backpressure back on the client.
+func (c *Cache) enqueueFill(blk uint64, blockOff int, data []byte, epoch uint64, writeL2 bool) {
+	if c.closed.Load() {
 		return
 	}
+	// Counted before the send so a concurrent waitFills that observes zero cannot
+	// miss this fill: the worker only decrements after installing it.
+	c.fillPending.Add(1)
 	select {
-	case c.l2Sem <- struct{}{}:
+	case c.fillCh <- fillReq{blk: blk, blockOff: blockOff, data: data, epoch: epoch, writeL2: writeL2}:
 	default:
+		c.fillPending.Add(-1)
+	}
+}
+
+func (c *Cache) fillWorker() {
+	defer c.fillWG.Done()
+	for {
+		select {
+		case <-c.exitCh:
+			return
+		case req := <-c.fillCh:
+			c.stats.Fills.Add(1)
+			c.installValidated(req.blk, req.blockOff, req.data, req.epoch, req.writeL2)
+			c.fillDone()
+		}
+	}
+}
+
+// fillDone drops the fill from the pending count and wakes waitFills when the
+// queue has fully drained.
+func (c *Cache) fillDone() {
+	if c.fillPending.Add(-1) == 0 {
+		c.fillMu.Lock()
+		c.fillCond.Broadcast()
+		c.fillMu.Unlock()
+	}
+}
+
+// installValidated publishes a filled sector run into the block's entry and
+// schedules its L2 population, dropping the run when the shard was invalidated
+// after the data was read.
+//
+// The epoch check, the copy and the valid-bit update share one shard critical
+// section. An invalidation therefore either bumped the epoch first — and the run
+// is dropped — or runs after the run installed, and clears what it installed. It
+// can never clear the bits and then have the run mark them valid with pre-write
+// data.
+func (c *Cache) installValidated(blk uint64, blockOff int, data []byte, epoch uint64, writeL2 bool) {
+	if len(data) == 0 {
 		return
 	}
-	c.l2Pending.Add(1)
-	go func() {
-		defer c.l2Pending.Done()
-		defer func() { <-c.l2Sem }()
-		for _, s := range segs {
-			n := len(s.data) / c.sectorSize
-			if err := c.l2.WriteSectors(blk, s.sector, n, s.data); err != nil {
-				c.log.Warn("cache: l2 write failed", "block", blk, "err", err)
-			}
+	ss := c.sectorSize
+	first := blockOff / ss
+	last := (blockOff + len(data)) / ss
+
+	sh := c.shard(blk)
+	sh.mu.Lock()
+	if sh.epoch.Load() != epoch {
+		sh.mu.Unlock()
+		return
+	}
+	e := sh.blocks[blk]
+	if e == nil {
+		e = &entry{blk: blk, data: make([]byte, c.blockSize)}
+		sh.blocks[blk] = e
+		e.q = queueNew
+		sh.newQ = append(sh.newQ, e)
+		sh.maintainLocked()
+	}
+	installed := false
+	for i := first; i < last; i++ {
+		if e.valid.Load()&(1<<uint(i)) != 0 {
+			// An already valid sector was loaded by another fill of the same
+			// range; leaving it keeps a concurrent reader's copy consistent.
+			continue
 		}
-	}()
+		start := i * ss
+		copy(e.data[start:start+ss], data[start-blockOff:start-blockOff+ss])
+		e.setValid(i)
+		installed = true
+	}
+	if installed && writeL2 && c.l2 != nil {
+		select {
+		case c.l2Sem <- struct{}{}:
+			// The sequence number is allocated inside the same critical section as
+			// the epoch check, so an invalidation is guaranteed to see every
+			// population that carries pre-write data.
+			c.fence.enqueue()
+			sh.mu.Unlock()
+			go c.writeL2(blk, first, data)
+			return
+		default:
+		}
+	}
+	sh.mu.Unlock()
+}
+
+// writeL2 populates L2 with a sector run and releases its slot in the fence, so
+// an invalidation waits for the populations that carry pre-write data.
+func (c *Cache) writeL2(blk uint64, firstSector int, data []byte) {
+	defer func() { <-c.l2Sem }()
+	defer c.fence.complete()
+	if err := c.l2.WriteSectors(blk, firstSector, len(data)/c.sectorSize, data); err != nil {
+		c.log.Warn("cache: l2 write failed", "block", blk, "err", err)
+	}
 }
 
 // Invalidate drops [off, off+length) from both cache levels. It must complete
@@ -517,12 +675,18 @@ func (c *Cache) Invalidate(off, length int64) {
 		return
 	}
 	c.stats.Invalidations.Add(1)
-	// A background L2 population enqueued by an earlier read of this range must
-	// not land after the sectors below are dropped, or it would resurrect stale
-	// data. The caller serialises this invalidation against reads (it holds the
-	// proxy's exclusive lock), so draining here is a complete fence: no new
-	// population can be enqueued while we run.
-	c.drainL2()
+	if c.l2 != nil {
+		// Held across the epoch bumps and the L2 drop below: a read's L2 lookup
+		// either completes before the bumps — and the fill it feeds is rejected by
+		// the epoch check — or starts after the drop and cannot see the sectors the
+		// write just made stale.
+		c.l2Gate.Lock()
+		defer c.l2Gate.Unlock()
+	}
+
+	// The bump and the clear share one critical section per block, and the bump
+	// runs first so no fill can still be validated against the pre-write epoch
+	// afterwards.
 	end := off + length
 	for cur := off; cur < end; {
 		blk := uint64(cur / int64(c.blockSize))
@@ -534,6 +698,7 @@ func (c *Cache) Invalidate(off, length int64) {
 		s0, s1 := c.sectorRange(blkStart, cur, segEnd-cur)
 		sh := c.shard(blk)
 		sh.mu.Lock()
+		sh.epoch.Add(1)
 		if e := sh.blocks[blk]; e != nil {
 			for i := s0; i <= s1; i++ {
 				e.clearValid(i)
@@ -543,9 +708,28 @@ func (c *Cache) Invalidate(off, length int64) {
 			}
 		}
 		sh.mu.Unlock()
-		if c.l2 != nil {
-			c.l2.InvalidateSectors(blk, s0, s1-s0+1)
+		cur = segEnd
+	}
+	if c.l2 == nil {
+		return
+	}
+
+	// An L2 population enqueued before a bump carries pre-write data and must not
+	// land after the drop below, or it would resurrect it. The bump above is what
+	// makes this wait a complete fence: a population can only be enqueued from
+	// inside the critical section that validated the fill's epoch, so every
+	// population allocated before this target is one that ran before a bump. The
+	// target is fixed, so reads enqueueing later populations cannot make it spin.
+	c.fence.wait(c.fence.target())
+	for cur := off; cur < end; {
+		blk := uint64(cur / int64(c.blockSize))
+		blkStart := int64(blk) * int64(c.blockSize)
+		segEnd := blkStart + int64(c.blockSize)
+		if segEnd > end {
+			segEnd = end
 		}
+		s0, s1 := c.sectorRange(blkStart, cur, segEnd-cur)
+		c.l2.InvalidateSectors(blk, s0, s1-s0+1)
 		cur = segEnd
 	}
 }
@@ -613,29 +797,6 @@ func (e *entry) copyIfValid(blkStart, off int64, dst []byte, sectorSize int) boo
 	return true
 }
 
-// missingRuns returns the sub-ranges of [s0,s1] whose sectors are not valid.
-func (e *entry) missingRuns(s0, s1 int) [][2]int {
-	var runs [][2]int
-	start := -1
-	for i := s0; i <= s1; i++ {
-		valid := e != nil && e.valid.Load()&(1<<uint(i)) != 0
-		if valid {
-			if start >= 0 {
-				runs = append(runs, [2]int{start, i - 1})
-				start = -1
-			}
-			continue
-		}
-		if start < 0 {
-			start = i
-		}
-	}
-	if start >= 0 {
-		runs = append(runs, [2]int{start, s1})
-	}
-	return runs
-}
-
 // shard -------------------------------------------------------------------------
 
 const (
@@ -649,6 +810,13 @@ const (
 type shard struct {
 	c  *Cache
 	mu sync.Mutex
+
+	// epoch is the shard's generation. Invalidate and drop bump it; a fill
+	// captures it before reading and only installs while it is unchanged, which
+	// is what orders an asynchronous install against an invalidation. It is
+	// bumped under mu but read with a plain atomic load, so capturing it does not
+	// put the shard lock on the read path.
+	epoch atomic.Uint64
 
 	blocks map[uint64]*entry
 	newQ   []*entry
@@ -713,52 +881,12 @@ func (s *shard) touch(e *entry) {
 	s.mu.Unlock()
 }
 
-// insert registers a new entry for blk and returns it.
-func (s *shard) insert(blk uint64) *entry {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if e, ok := s.blocks[blk]; ok {
-		return e
-	}
-	e := &entry{blk: blk, data: make([]byte, s.c.blockSize)}
-	s.blocks[blk] = e
-	e.q = queueNew
-	s.newQ = append(s.newQ, e)
-	s.maintainLocked()
-	return e
-}
-
-// install stores buf, the bytes of blk starting at blockOff, into the block's
-// entry and marks the sectors it covers valid, creating the entry when needed.
-//
-// Sectors that are already valid are skipped: their content came from the same
-// backing range, and leaving them untouched keeps a bulk fill that overlaps
-// another one from rewriting bytes a concurrent reader may be copying.
-func (s *shard) install(blk uint64, buf []byte, blockOff int) {
-	ss := s.c.sectorSize
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e := s.blocks[blk]
-	if e == nil {
-		e = &entry{blk: blk, data: make([]byte, s.c.blockSize)}
-		s.blocks[blk] = e
-		e.q = queueNew
-		s.newQ = append(s.newQ, e)
-		s.maintainLocked()
-	}
-	for i := blockOff / ss; i < (blockOff+len(buf))/ss; i++ {
-		if e.valid.Load()&(1<<uint(i)) != 0 {
-			continue
-		}
-		start := i * ss
-		copy(e.data[start:start+ss], buf[start-blockOff:start-blockOff+ss])
-		e.setValid(i)
-	}
-}
-
 func (s *shard) drop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// The bump invalidates every fill that was reading before the drop, so none of
+	// them can re-populate what this just discarded.
+	s.epoch.Add(1)
 	s.blocks = make(map[uint64]*entry, s.capacity)
 	s.newQ, s.midQ, s.oldQ = nil, nil, nil
 }
@@ -815,39 +943,51 @@ func (s *shard) maintainLocked() {
 	}
 }
 
-// flightGroup -------------------------------------------------------------------
+// l2Fence -----------------------------------------------------------------------
 
-type flightGroup struct {
-	mu    sync.Mutex
-	calls map[uint64]*flightCall
+// l2Fence orders the background L2 populations against an invalidation.
+//
+// enqueue is called inside the shard critical section that validated a fill's
+// epoch, so a population carrying pre-write data is always allocated before the
+// bump that invalidates it. Invalidate therefore snapshots a target after its
+// bumps and waits for that many completions, and because the target is fixed,
+// reads enqueueing later populations cannot make the wait spin.
+type l2Fence struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	next uint64
+	done uint64
 }
 
-type flightCall struct {
-	done chan struct{}
-	err  error
+// enqueue allocates the population's slot in the fence.
+func (f *l2Fence) enqueue() {
+	f.mu.Lock()
+	f.next++
+	f.mu.Unlock()
 }
 
-func (g *flightGroup) do(key uint64, fn func() error) error {
-	g.mu.Lock()
-	if c, ok := g.calls[key]; ok {
-		g.mu.Unlock()
-		<-c.done
-		return c.err
-	}
-	if g.calls == nil {
-		g.calls = make(map[uint64]*flightCall)
-	}
-	c := &flightCall{done: make(chan struct{})}
-	g.calls[key] = c
-	g.mu.Unlock()
+// complete records that one population finished.
+func (f *l2Fence) complete() {
+	f.mu.Lock()
+	f.done++
+	f.mu.Unlock()
+	f.cond.Broadcast()
+}
 
-	c.err = fn()
+// target returns the number of populations enqueued so far.
+func (f *l2Fence) target() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.next
+}
 
-	g.mu.Lock()
-	delete(g.calls, key)
-	g.mu.Unlock()
-	close(c.done)
-	return c.err
+// wait blocks until target populations have completed.
+func (f *l2Fence) wait(target uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for f.done < target {
+		f.cond.Wait()
+	}
 }
 
 // scanDetector ------------------------------------------------------------------
@@ -855,25 +995,42 @@ func (g *flightGroup) do(key uint64, fn func() error) error {
 // scanDetector implements the sequential-scan admission rule: a run of
 // consecutive requests whose start equals the previous end marks a scan, and
 // the stream is then served without populating the cache.
+//
+// The state is fanned out over one bucket per 1 MiB region, so a stream only
+// ever locks the bucket its region maps to and concurrent streams on different
+// regions do not contend on the read path.
 type scanDetector struct {
-	mu        sync.Mutex
 	enabled   bool
 	threshold int
-	lastEnd   int64
-	run       int
+	buckets   []scanBucket
+}
+
+type scanBucket struct {
+	mu      sync.Mutex
+	lastEnd int64
+	run     int
+}
+
+func newScanDetector(enabled bool, threshold int) *scanDetector {
+	return &scanDetector{
+		enabled:   enabled,
+		threshold: threshold,
+		buckets:   make([]scanBucket, scanBuckets),
+	}
 }
 
 func (d *scanDetector) observe(off, length int64) bool {
 	if !d.enabled {
 		return false
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if off == d.lastEnd {
-		d.run++
+	b := &d.buckets[(uint64(off)>>scanBucketShift)%scanBuckets]
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if off == b.lastEnd {
+		b.run++
 	} else {
-		d.run = 0
+		b.run = 0
 	}
-	d.lastEnd = off + length
-	return d.run >= d.threshold
+	b.lastEnd = off + length
+	return b.run >= d.threshold
 }

@@ -104,6 +104,8 @@ func TestLiveEndToEndThroughCache(t *testing.T) {
 	}
 
 	first := read(0, 8)
+	// The fill is asynchronous: wait for it so the second read is a real hit.
+	svc.Cache().Wait()
 	before := svc.Cache().Stats()
 	second := read(0, 8)
 	after := svc.Cache().Stats()

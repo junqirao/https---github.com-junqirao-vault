@@ -279,7 +279,7 @@ func TestInquiryIsTruncatedToAllocationLength(t *testing.T) {
 }
 
 func TestReadIsCached(t *testing.T) {
-	p, be, _ := newTestProxy(t, true)
+	p, be, c := newTestProxy(t, true)
 	ctx := context.Background()
 
 	res, err := p.Execute(ctx, read10(0, 8), nil, 4096)
@@ -295,6 +295,8 @@ func TestReadIsCached(t *testing.T) {
 	if be.readCount() != 1 {
 		t.Fatalf("backend reads = %d, want 1", be.readCount())
 	}
+	// The fill is asynchronous: wait for it before expecting a hit.
+	c.Wait()
 
 	// The same range again must be served from L1.
 	res2, err := p.Execute(ctx, read10(0, 8), nil, 4096)
@@ -389,13 +391,15 @@ func TestWriteLengthMismatch(t *testing.T) {
 }
 
 func TestUnmapInvalidatesRanges(t *testing.T) {
-	p, be, _ := newTestProxy(t, true)
+	p, be, c := newTestProxy(t, true)
 	ctx := context.Background()
 
 	// Warm the whole first block.
 	if _, err := p.Execute(ctx, read10(0, 32), nil, 16384); err != nil {
 		t.Fatalf("warm read: %v", err)
 	}
+	// The fill is asynchronous: wait for it before the unmap invalidates ranges.
+	c.Wait()
 	if be.readCount() != 1 {
 		t.Fatalf("backend reads = %d", be.readCount())
 	}

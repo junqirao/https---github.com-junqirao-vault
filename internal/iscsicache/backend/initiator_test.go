@@ -24,18 +24,18 @@ func TestHandleNOPInDoesNotConsumeCmdSN(t *testing.T) {
 	defer srv.Close()
 
 	it := &Initiator{
-		conn:      cli,
-		log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		cmdSN:     7,
-		expStatSN: 9,
+		conn: cli,
+		log:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
+	it.cmdSN.Store(7)
+	it.expStatSN.Store(9)
 
 	nopIn := iscsi.NewPDU(iscsi.OpNOPIn, []byte("ping"))
 	nopIn.Header.SetITT(0xabcd)
 	nopIn.Header.SetTTT(0x1234)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- it.handleNOPIn(context.Background(), &nopIn.Header, nopIn.Data) }()
+	go func() { errCh <- it.handleNOPIn(&nopIn.Header, nopIn.Data) }()
 
 	reply, err := iscsi.ReadPDU(srv)
 	if err != nil {
@@ -51,16 +51,23 @@ func TestHandleNOPInDoesNotConsumeCmdSN(t *testing.T) {
 		t.Fatalf("NOP-Out must echo the NOP-In ITT/TTT: itt=%#x ttt=%#x",
 			reply.Header.ITT(), reply.Header.TTT())
 	}
-	if it.cmdSN != 7 {
-		t.Fatalf("handleNOPIn consumed a CmdSN: want 7, got %d", it.cmdSN)
+	if got := it.cmdSN.Load(); got != 7 {
+		t.Fatalf("handleNOPIn consumed a CmdSN: want 7, got %d", got)
 	}
 }
 
-// TestAdoptSequenceTracksTarget checks that the initiator re-reads the sequence
-// numbers the target advertises, so a drift corrects itself instead of wedging
-// the session.
+// TestAdoptSequenceTracksTarget checks that the initiator re-reads the status
+// sequence number and the command window the target advertises, so both correct
+// themselves on every response.
+//
+// A pipelined initiator must NOT copy the target's ExpCmdSN into its own CmdSN:
+// several commands are already on the wire, and moving the counter backwards
+// would reissue a sequence number the target has already seen.
 func TestAdoptSequenceTracksTarget(t *testing.T) {
-	it := &Initiator{cmdSN: 5, expStatSN: 6}
+	it := &Initiator{}
+	it.cmdSN.Store(5)
+	it.expStatSN.Store(6)
+	it.windowCh = make(chan struct{})
 
 	var h iscsi.BHS
 	h.SetStatSN(11)
@@ -68,14 +75,14 @@ func TestAdoptSequenceTracksTarget(t *testing.T) {
 	h.SetMaxCmdSN(40)
 	it.adoptSequence(&h)
 
-	if it.expStatSN != 12 {
-		t.Errorf("expStatSN = %d, want 12", it.expStatSN)
+	if got := it.expStatSN.Load(); got != 12 {
+		t.Errorf("expStatSN = %d, want 12", got)
 	}
-	if it.cmdSN != 12 {
-		t.Errorf("cmdSN = %d, want 12", it.cmdSN)
+	if got := it.cmdSN.Load(); got != 5 {
+		t.Errorf("cmdSN = %d, want the initiator's own 5, not the target's ExpCmdSN", got)
 	}
-	if it.maxCmdSN != 40 {
-		t.Errorf("maxCmdSN = %d, want 40", it.maxCmdSN)
+	if got := it.maxCmdSN.Load(); got != 40 {
+		t.Errorf("maxCmdSN = %d, want 40", got)
 	}
 }
 
@@ -200,7 +207,7 @@ func TestLoginCHAPHandshake(t *testing.T) {
 		},
 		conn:             cli,
 		log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
-		cmdSN:            1,
+		windowCh:         make(chan struct{}),
 		ourMaxRecvDSL:    DefaultMaxRecvDataSegmentLength,
 		targetMaxRecvDSL: DefaultMaxRecvDataSegmentLength,
 		maxBurstLength:   DefaultMaxBurstLength,

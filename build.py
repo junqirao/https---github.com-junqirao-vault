@@ -99,6 +99,7 @@ LINUX_SERVER_TARGET = "vault-server-linux-amd64"
 CLIENT_SOURCE_PATHS = [
     "frontend",
     "internal/agent",
+    "internal/iscsicache",
     "internal/platform",
     "internal/updatepkg",
     "cmd/vault-agent",

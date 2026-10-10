@@ -35,22 +35,59 @@ const (
 )
 
 // e2eLUN is an in-memory block device. Its Exec is deliberately allocation-cheap
-// so the measurement reflects the proxy, not the fake storage. An optional
-// service time models a backing target over a real link: with a round trip on
-// every command the backing throughput is the queue depth times the command size
-// over the round trip, which is the regime where the proxy's own queue depth is
-// what decides the result.
-type e2eLUN struct {
-	data []byte
-	lat  time.Duration
+// so the measurement reflects the proxy, not the fake storage.
+//
+// e2eLink is the storage link the backing target sits behind: a round trip
+// charged to every command and a byte-serial bandwidth shared by every
+// connection crossing it.
+//
+// It is the missing half of the local-only benchmark. With both the proxy and
+// the storage on loopback the local TCP stack is the bottleneck and the two-hop
+// design measures only its own copy cost. A real mount is the opposite: the
+// array is behind a link that is far slower than the local stack, so the link
+// is the floor for both a direct mount and a proxied one, and the question the
+// benchmark has to answer is whether the proxy keeps the link busy. A direct
+// mount does that by keeping its command window in flight on one session; a
+// proxy that cannot keep as many commands in flight leaves the same link idle
+// and reports a fraction of direct even though its per-command work is cheap.
+type e2eLink struct {
+	rtt time.Duration
+	bw  int64 // bytes per second, 0 = unlimited
+
+	// mu serialises the bytes on the wire. A link carries one transfer at a
+	// time whoever is sending, so the aggregate bandwidth is exactly bw however
+	// many connections share it. Propagation (rtt) is charged outside the lock,
+	// because it overlaps across commands.
+	mu sync.Mutex
 }
 
-func newE2ELUN(lat time.Duration) *e2eLUN {
+// roundTrip charges one command: propagation first, then its bytes on the wire.
+func (l *e2eLink) roundTrip(n int) {
+	if l == nil {
+		return
+	}
+	if l.rtt > 0 {
+		time.Sleep(l.rtt)
+	}
+	if l.bw <= 0 || n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	time.Sleep(time.Duration(float64(n) / float64(l.bw) * float64(time.Second)))
+	l.mu.Unlock()
+}
+
+type e2eLUN struct {
+	data []byte
+	link *e2eLink
+}
+
+func newE2ELUN(link *e2eLink) *e2eLUN {
 	d := make([]byte, e2eDeviceMB<<20)
 	for i := range d {
 		d[i] = byte(i / e2eBlockSize)
 	}
-	return &e2eLUN{data: d, lat: lat}
+	return &e2eLUN{data: d, link: link}
 }
 
 func (m *e2eLUN) Info() backend.DeviceInfo {
@@ -64,9 +101,6 @@ func (m *e2eLUN) Info() backend.DeviceInfo {
 func (m *e2eLUN) Close() error { return nil }
 
 func (m *e2eLUN) Exec(_ context.Context, cdb []byte, _ []byte, _ int) (*backend.Result, error) {
-	if m.lat > 0 {
-		time.Sleep(m.lat)
-	}
 	switch cdb[0] {
 	case iscsi.SCSIRead10, iscsi.SCSIRead16:
 		p, err := iscsi.ParseReadWrite(cdb)
@@ -75,6 +109,7 @@ func (m *e2eLUN) Exec(_ context.Context, cdb []byte, _ []byte, _ int) (*backend.
 		}
 		off := int64(p.LBA) * e2eBlockSize
 		n := int64(p.Blocks) * e2eBlockSize
+		m.link.roundTrip(int(n))
 		if off < 0 || off+n > int64(len(m.data)) {
 			return &backend.Result{Status: iscsi.StatusCheckCondition,
 				Sense: iscsi.IllegalRequestSense(iscsi.ASCLogicalBlockAddressOutOfRange)}, nil
@@ -86,8 +121,10 @@ func (m *e2eLUN) Exec(_ context.Context, cdb []byte, _ []byte, _ int) (*backend.
 		// the returned bytes (writes are no-ops), so sharing them is safe.
 		return &backend.Result{Status: iscsi.StatusGood, Data: m.data[off : off+n]}, nil
 	case iscsi.SCSIWrite10, iscsi.SCSIWrite16:
+		m.link.roundTrip(0)
 		return &backend.Result{Status: iscsi.StatusGood}, nil
 	default:
+		m.link.roundTrip(0)
 		return &backend.Result{Status: iscsi.StatusCheckCondition,
 			Sense: iscsi.IllegalRequestSense(iscsi.ASCInvalidCommandOperationCode)}, nil
 	}
@@ -121,8 +158,9 @@ func (s *e2eStack) close() {
 func e2eLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // e2eEndpoint is a target the benchmark dials. The concurrent benchmark gives
-// every worker its own session, so it needs the address rather than one client:
-// a single session is strictly serial and hides the backing queue depth.
+// every worker its own client session, so it needs the address rather than one
+// client: a single client session is strictly serial and hides the client's own
+// queue depth.
 type e2eEndpoint struct {
 	addr string
 	iqn  string
@@ -131,9 +169,9 @@ type e2eEndpoint struct {
 
 // e2eStartStorage brings up the backing target the product would talk to: the
 // in-memory LUN behind a passthrough proxy and its own target.
-func e2eStartStorage(b *testing.B, ctx context.Context, lat time.Duration) *e2eEndpoint {
+func e2eStartStorage(b *testing.B, ctx context.Context, link *e2eLink) *e2eEndpoint {
 	b.Helper()
-	lun := newE2ELUN(lat)
+	lun := newE2ELUN(link)
 	storageProxy, err := proxy.New(proxy.Config{
 		Backend: lun, TargetIQN: "iqn.e2e:storage", Logger: e2eLogger(),
 	})
@@ -154,24 +192,17 @@ func e2eStartStorage(b *testing.B, ctx context.Context, lat time.Duration) *e2eE
 }
 
 // e2eStartProxy puts the module under test in front of the storage endpoint.
-// When pooled, the backing initiator is a session pool exactly as portal.go
-// wires it, so the benchmark measures the pool's queue depth and not one
-// session's.
-func e2eStartProxy(b *testing.B, ctx context.Context, cached, pooled bool, lat time.Duration) *e2eEndpoint {
+// The backing initiator is a fixed pool of pipelining sessions, so the proxy
+// fans commands over several sockets exactly as the product does and the local
+// hop is not pinned to one core.
+func e2eStartProxy(b *testing.B, ctx context.Context, cached bool, link *e2eLink) *e2eEndpoint {
 	b.Helper()
-	storage := e2eStartStorage(b, ctx, lat)
+	storage := e2eStartStorage(b, ctx, link)
 
-	dialCfg := backend.Config{
+	be, err := backend.DialPool(ctx, backend.Config{
 		Address: storage.addr, TargetIQN: storage.iqn,
 		IOTimeout: 10 * time.Second, DialTimeout: 5 * time.Second, Logger: e2eLogger(),
-	}
-	var be backend.Backend
-	var err error
-	if pooled {
-		be, err = backend.DialPool(ctx, dialCfg)
-	} else {
-		be, err = backend.Dial(ctx, dialCfg)
-	}
+	})
 	if err != nil {
 		b.Fatalf("backing dial: %v", err)
 	}
@@ -221,7 +252,7 @@ func e2eDial(b *testing.B, ctx context.Context, addr, iqn string) *backend.Initi
 func startE2E(b *testing.B, cached bool) *e2eStack {
 	b.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	ep := e2eStartProxy(b, ctx, cached, false, 0)
+	ep := e2eStartProxy(b, ctx, cached, nil)
 	return &e2eStack{
 		client: e2eDial(b, ctx, ep.addr, ep.iqn),
 		stop:   func() { cancel(); ep.stop() },
@@ -233,7 +264,7 @@ func startE2E(b *testing.B, cached bool) *e2eStack {
 func startE2EDirect(b *testing.B) *e2eStack {
 	b.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	ep := e2eStartStorage(b, ctx, 0)
+	ep := e2eStartStorage(b, ctx, nil)
 	return &e2eStack{
 		client: e2eDial(b, ctx, ep.addr, ep.iqn),
 		stop:   func() { cancel(); ep.stop() },
@@ -387,14 +418,14 @@ func BenchmarkEndToEndReadConcurrent(b *testing.B) {
 		b.Run("direct/"+name, func(b *testing.B) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			ep := e2eStartStorage(b, ctx, 0)
+			ep := e2eStartStorage(b, ctx, nil)
 			defer ep.stop()
 			e2eRunReadsParallel(b, ctx, ep, size, true, workers)
 		})
 		b.Run("proxy-stream/"+name, func(b *testing.B) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			ep := e2eStartProxy(b, ctx, false, true, 0)
+			ep := e2eStartProxy(b, ctx, false, nil)
 			defer ep.stop()
 			e2eRunReadsParallel(b, ctx, ep, size, true, workers)
 		})
@@ -419,16 +450,52 @@ func BenchmarkEndToEndReadLatency(b *testing.B) {
 		b.Run("direct/"+name, func(b *testing.B) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			ep := e2eStartStorage(b, ctx, e2eBackendLatency)
+			ep := e2eStartStorage(b, ctx, &e2eLink{rtt: e2eBackendLatency})
 			defer ep.stop()
 			e2eRunReadsParallel(b, ctx, ep, size, true, workers)
 		})
 		b.Run("proxy-stream/"+name, func(b *testing.B) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			ep := e2eStartProxy(b, ctx, false, true, e2eBackendLatency)
+			ep := e2eStartProxy(b, ctx, false, &e2eLink{rtt: e2eBackendLatency})
 			defer ep.stop()
 			e2eRunReadsParallel(b, ctx, ep, size, true, workers)
 		})
+	}
+}
+
+// BenchmarkEndToEndLink is the production topology: the array is behind a link
+// far slower than the local stack, so the link — not the local TCP stack — is
+// what both a direct mount and a proxied one are limited by.
+//
+// A direct mount keeps its whole command window in flight on one session and
+// fills the link. The proxy has to do the same through its backing sessions.
+// The ratio proxy/direct here is the number the product is judged on: a proxy
+// that keeps the link as busy as a direct mount approaches 1.0 however much its
+// per-command work costs, and one that cannot keep the same number of commands
+// in flight reports the ratio its backing queue depth allows.
+func BenchmarkEndToEndLink(b *testing.B) {
+	const linkBW = 1250 << 20 // 10 GbE, ~1.25 GB/s
+	newLink := func() *e2eLink { return &e2eLink{rtt: 400 * time.Microsecond, bw: linkBW} }
+
+	for _, size := range []int64{64 << 10, 1 << 20} {
+		name := e2eSizeName(size)
+		for _, workers := range []int{8, 32} {
+			qd := fmt.Sprintf("qd%d", workers)
+			b.Run("direct/"+qd+"/"+name, func(b *testing.B) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				ep := e2eStartStorage(b, ctx, newLink())
+				defer ep.stop()
+				e2eRunReadsParallel(b, ctx, ep, size, true, workers)
+			})
+			b.Run("proxy/"+qd+"/"+name, func(b *testing.B) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				ep := e2eStartProxy(b, ctx, false, newLink())
+				defer ep.stop()
+				e2eRunReadsParallel(b, ctx, ep, size, true, workers)
+			})
+		}
 	}
 }

@@ -91,6 +91,11 @@ func (rt *targetRuntime) stats() Stats {
 // connection is torn down and in-flight commands fail.
 func (rt *targetRuntime) close() error {
 	var errs []error
+	// Stop the fill workers and wait for the L2 populations they started before
+	// the L2 file is closed, or a worker would write to a closed file.
+	if rt.c != nil {
+		rt.c.Close()
+	}
 	if rt.l2 != nil {
 		if err := rt.l2.Sync(); err != nil {
 			errs = append(errs, err)
@@ -205,16 +210,18 @@ func (rt *targetRuntime) build(_ context.Context, log *slog.Logger, tc TargetCon
 	}
 
 	c, err := cache.New(cache.Config{
-		BlockSize:     cc.BlockSize,
-		SectorSize:    cc.SectorSize,
-		L1Bytes:       cc.L1.SizeBytes,
-		NewQuotaPct:   cc.Eviction.NewQuotaPct,
-		HighWatermark: cc.Eviction.HighWatermark,
-		LowWatermark:  cc.Eviction.LowWatermark,
-		ScanEnabled:   *cc.ScanDetection.Enabled,
-		ScanThreshold: cc.ScanDetection.Threshold,
-		L2:            l2Store,
-		Logger:        log.With("component", "cache"),
+		BlockSize:      cc.BlockSize,
+		SectorSize:     cc.SectorSize,
+		L1Bytes:        cc.L1.SizeBytes,
+		NewQuotaPct:    cc.Eviction.NewQuotaPct,
+		HighWatermark:  cc.Eviction.HighWatermark,
+		LowWatermark:   cc.Eviction.LowWatermark,
+		ScanEnabled:    *cc.ScanDetection.Enabled,
+		ScanThreshold:  cc.ScanDetection.Threshold,
+		FillWorkers:    cc.Fill.Workers,
+		FillQueueDepth: cc.Fill.QueueDepth,
+		L2:             l2Store,
+		Logger:         log.With("component", "cache"),
 	})
 	if err != nil {
 		return err

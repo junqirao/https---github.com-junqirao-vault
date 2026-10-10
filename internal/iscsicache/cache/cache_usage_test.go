@@ -24,10 +24,11 @@ func TestUsageReportsL1Occupancy(t *testing.T) {
 		t.Fatalf("预算是块大小的整数倍且为正，实际 %d", limit)
 	}
 
-	// 读一个扇区 → 该块被纳入索引。
+	// 读一个扇区 → 该块被纳入索引（回填是异步的，Wait 等它装完）。
 	if err := c.Read(ctx, 0, make([]byte, ss), src); err != nil {
 		t.Fatalf("read: %v", err)
 	}
+	c.Wait()
 	used, _ = c.Usage()
 	if used != int64(bs) {
 		t.Fatalf("读一个扇区后占用应为 1 个块（%d 字节），实际 %d", bs, used)
@@ -37,6 +38,7 @@ func TestUsageReportsL1Occupancy(t *testing.T) {
 	if err := c.Read(ctx, ss, make([]byte, ss), src); err != nil {
 		t.Fatalf("read: %v", err)
 	}
+	c.Wait()
 	if got, _ := c.Usage(); got != used {
 		t.Fatalf("同一块内的读不应新增占用：%d → %d", used, got)
 	}
@@ -45,6 +47,7 @@ func TestUsageReportsL1Occupancy(t *testing.T) {
 	if err := c.Read(ctx, int64(bs), make([]byte, ss), src); err != nil {
 		t.Fatalf("read: %v", err)
 	}
+	c.Wait()
 	if got, _ := c.Usage(); got != used+int64(bs) {
 		t.Fatalf("跨块读后占用应为 2 个块（%d 字节），实际 %d", 2*bs, got)
 	}
@@ -76,6 +79,8 @@ func TestRequestHitsCountsWholeCommands(t *testing.T) {
 	if err := c.Read(ctx, 0, make([]byte, bs), src); err != nil {
 		t.Fatalf("read: %v", err)
 	}
+	// 回填是异步的：等它装完，第二次读才可能整条命中。
+	c.Wait()
 	if st := c.Stats(); st.RequestHits != 0 {
 		t.Fatalf("首次读必然回源，RequestHits 应为 0，实际 %d", st.RequestHits)
 	}

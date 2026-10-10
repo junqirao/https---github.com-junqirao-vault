@@ -79,3 +79,22 @@ type Backend interface {
 	// Close terminates the session.
 	Close() error
 }
+
+// DataInSink receives the payload of a streamed read as it arrives from the
+// backing target.
+//
+// Segment is called from the session reader while the transfer is in progress,
+// so it must finish with data before it returns: the reader reuses its segment
+// buffer for the next PDU.
+type DataInSink interface {
+	// Segment delivers data at its byte offset within the transfer. last marks
+	// the final segment, and res carries the command's status and residual.
+	Segment(offset int64, data []byte, last bool, res *Result) error
+}
+
+// Streamer is an optional Backend extension: a read whose payload is delivered
+// incrementally instead of being buffered whole. It is what lets a proxy forward
+// a transfer as it arrives rather than only after its last byte.
+type Streamer interface {
+	ExecStream(ctx context.Context, cdb []byte, inLen int, sink DataInSink) (*Result, error)
+}

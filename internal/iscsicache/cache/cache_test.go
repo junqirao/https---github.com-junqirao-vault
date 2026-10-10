@@ -108,6 +108,8 @@ func TestReadFillsL1AndHits(t *testing.T) {
 	if src.count() != 1 {
 		t.Fatalf("backend reads after a miss = %d, want 1", src.count())
 	}
+	// The fill is asynchronous: wait for it before expecting a hit.
+	c.Wait()
 
 	// Only the requested sector is filled: the cache does not prefetch the rest
 	// of the block.
@@ -132,6 +134,7 @@ func TestReadFillsL1AndHits(t *testing.T) {
 	if src.count() != 2 {
 		t.Fatalf("backend reads after a partial hit = %d, want 2", src.count())
 	}
+	c.Wait()
 	if st := c.Stats(); st.PartialHits != 1 || st.Fills != 2 {
 		t.Fatalf("stats = %+v", st)
 	}
@@ -216,6 +219,8 @@ func TestPartialFillThenRemainingSectors(t *testing.T) {
 	if err := c.Read(ctx, 0, buf, src); err != nil {
 		t.Fatalf("read: %v", err)
 	}
+	// Wait for the fill so the block holds sector 0 before the rest is dropped.
+	c.Wait()
 	// Drop the last three sectors of the block.
 	c.Invalidate(ss, 3*ss)
 
@@ -313,6 +318,7 @@ func TestScanDetectionDisabled(t *testing.T) {
 			t.Fatalf("read %d: %v", i, err)
 		}
 	}
+	c.Wait()
 	if st := c.Stats(); st.ScanBypass != 0 || st.Fills != 10 {
 		t.Fatalf("stats = %+v", st)
 	}
@@ -337,9 +343,12 @@ func TestDropEmptiesL1(t *testing.T) {
 	}
 }
 
-// TestSingleFlightReadsBackendOnce checks that concurrent readers of the same
-// block range share one fill.
-func TestSingleFlightReadsBackendOnce(t *testing.T) {
+// TestConcurrentReadsSameBlockAreCorrect checks that concurrent readers of the
+// same block each get correct data. Fills are asynchronous and are no longer
+// deduplicated across readers (a pure miss bypasses the block path entirely), so
+// the readers may each cost a backing read; what must hold is that none sees
+// torn or inconsistent data and that the block is cached once the fills land.
+func TestConcurrentReadsSameBlockAreCorrect(t *testing.T) {
 	const bs, ss = 16 << 10, 4 << 10
 	release := make(chan struct{})
 	src := &blockingSource{fake: newFakeSource(ss, 4<<20), release: release}
@@ -361,24 +370,43 @@ func TestSingleFlightReadsBackendOnce(t *testing.T) {
 			expectPattern(t, ss, 0, buf)
 		}()
 	}
-	// Let the readers pile up on the single flight, then let the fill finish.
+	// Let the readers pile up on the backend, then let the reads finish.
 	close(release)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
 		t.Fatalf("concurrent read: %v", err)
 	}
-	if got := src.fake.count(); got != 1 {
-		t.Fatalf("backend reads = %d, want 1 shared fill", got)
+	if got := src.fake.count(); got < 1 || got > readers {
+		t.Fatalf("backend reads = %d, want between 1 and %d", got, readers)
+	}
+
+	// Once the fills land, the block is cached and a re-read costs nothing.
+	c.Wait()
+	if err := c.Read(ctx, 0, make([]byte, ss), src); err != nil {
+		t.Fatalf("read after fill: %v", err)
+	}
+	if got := src.fake.count(); got > readers {
+		t.Fatalf("a read after the fills installed missed the cache: reads = %d", got)
 	}
 }
 
 type blockingSource struct {
 	fake    *fakeSource
 	release chan struct{}
+	// entered, when set, receives once as ReadAt is entered, so a test can order
+	// an invalidation after the read has captured its epoch but before it has the
+	// data back.
+	entered chan struct{}
 }
 
 func (b *blockingSource) ReadAt(ctx context.Context, off int64, p []byte) error {
+	if b.entered != nil {
+		select {
+		case b.entered <- struct{}{}:
+		default:
+		}
+	}
 	<-b.release
 	return b.fake.ReadAt(ctx, off, p)
 }
@@ -427,6 +455,10 @@ type fakeL2 struct {
 	sects   map[uint64]map[int][]byte
 	// gate, when set, blocks every WriteSectors until it is closed.
 	gate chan struct{}
+	// entered, when set, receives once as WriteSectors is entered (before the
+	// gate), so a test can order an invalidation after a population has been
+	// enqueued in the fence.
+	entered chan struct{}
 }
 
 func newFakeL2(secSize int) *fakeL2 {
@@ -449,6 +481,12 @@ func (f *fakeL2) ReadSectors(blk uint64, sec, n int, dst []byte) (bool, error) {
 }
 
 func (f *fakeL2) WriteSectors(blk uint64, sec, n int, src []byte) error {
+	if f.entered != nil {
+		select {
+		case f.entered <- struct{}{}:
+		default:
+		}
+	}
 	if f.gate != nil {
 		<-f.gate
 	}
@@ -486,8 +524,8 @@ func (f *fakeL2) has(blk uint64, sec, n int) bool {
 }
 
 // TestReadPopulatesL2InBackground pins that a miss still reaches L2: the write
-// is asynchronous, so it is only guaranteed to have landed once an operation
-// that fences on it (Drop) has returned.
+// is asynchronous, so it is only guaranteed to have landed once Wait (which
+// fences on the fill and its L2 population) has returned.
 func TestReadPopulatesL2InBackground(t *testing.T) {
 	const ss = 4 << 10
 	src := newFakeSource(ss, 4<<20)
@@ -498,7 +536,7 @@ func TestReadPopulatesL2InBackground(t *testing.T) {
 	if err := c.Read(context.Background(), 0, buf, src); err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	c.Drop()
+	c.Wait()
 	if !l2.has(0, 0, 1) {
 		t.Fatal("the read did not populate the L2")
 	}
@@ -514,11 +552,21 @@ func TestInvalidateWaitsForBackgroundL2Write(t *testing.T) {
 	gated := make(chan struct{})
 	l2 := newFakeL2(ss)
 	l2.gate = gated
+	l2.entered = make(chan struct{}, 1)
 	c := newTestCache(t, testOpts{l2: l2})
 
 	buf := make([]byte, ss)
 	if err := c.Read(context.Background(), 0, buf, src); err != nil {
 		t.Fatalf("read: %v", err)
+	}
+
+	// Wait until the population has been handed to L2. Because the fill worker
+	// enqueues it in the fence before starting the write, seeing it enter
+	// WriteSectors guarantees the invalidation below has something to wait for.
+	select {
+	case <-l2.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the L2 population never started")
 	}
 
 	// The population is blocked in WriteSectors, so the invalidation must still
@@ -538,5 +586,110 @@ func TestInvalidateWaitsForBackgroundL2Write(t *testing.T) {
 
 	if l2.has(0, 0, 1) {
 		t.Fatal("the invalidated sector is still present in the L2")
+	}
+}
+
+// TestAsyncFillDropsOnInvalidate pins the epoch rule that makes an asynchronous
+// fill safe: a fill that captured its epoch before a write and read pre-write
+// data must be dropped when the invalidation lands while it is in the backend.
+func TestAsyncFillDropsOnInvalidate(t *testing.T) {
+	const ss = 4 << 10
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	src := &blockingSource{fake: newFakeSource(ss, 4<<20), release: release, entered: entered}
+	c := newTestCache(t, testOpts{})
+	ctx := context.Background()
+
+	// The read captures its epoch, then blocks in the backend before it has the
+	// data back.
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Read(ctx, 0, make([]byte, ss), src) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the read never reached the backend")
+	}
+
+	// Invalidate while the read is in flight: its fill must be rejected.
+	c.Invalidate(0, ss)
+	close(release)
+	if err := <-errCh; err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	c.Wait()
+
+	// The dropped fill must not have published anything, so the block is still
+	// cold and the next read goes back to the backend.
+	if err := c.Read(ctx, 0, make([]byte, ss), src); err != nil {
+		t.Fatalf("read after invalidate: %v", err)
+	}
+	if got := src.fake.count(); got != 2 {
+		t.Fatalf("backend reads = %d, want 2 (the pre-invalidate fill was resurrected)", got)
+	}
+}
+
+// TestInvalidatedFillDoesNotResurrectInL2 checks the same epoch rule for the L2
+// population: a fill reading pre-invalidate data must not land in L2 after the
+// invalidation has dropped the range.
+func TestInvalidatedFillDoesNotResurrectInL2(t *testing.T) {
+	const ss = 4 << 10
+	l2 := newFakeL2(ss)
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	src := &blockingSource{fake: newFakeSource(ss, 4<<20), release: release, entered: entered}
+	c := newTestCache(t, testOpts{l2: l2})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Read(context.Background(), 0, make([]byte, ss), src) }()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the read never reached the backend")
+	}
+	c.Invalidate(0, ss)
+	close(release)
+	if err := <-errCh; err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	c.Wait()
+
+	if l2.has(0, 0, 1) {
+		t.Fatal("a fill that read pre-invalidate data resurrected a sector in L2")
+	}
+}
+
+// TestFillQueueDropKeepsServing pins that a bounded fill queue only ever drops a
+// fill: with a depth-1 queue and one worker most fills are dropped, and the reads
+// that produced them must still be served correctly.
+func TestFillQueueDropKeepsServing(t *testing.T) {
+	const bs, ss = 16 << 10, 4 << 10
+	src := newFakeSource(ss, 64<<20)
+	c, err := New(Config{
+		BlockSize: bs, SectorSize: ss, L1Bytes: 1 << 20, Shards: 4,
+		FillWorkers: 1, FillQueueDepth: 1,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	const n = 64
+	for i := 0; i < n; i++ {
+		off := int64(i) * bs
+		buf := make([]byte, ss)
+		if err := c.Read(ctx, off, buf, src); err != nil {
+			t.Fatalf("read %d: %v", i, err)
+		}
+		expectPattern(t, ss, off, buf)
+	}
+	// Distinct blocks never hit, so every read cost exactly one backend read: a
+	// dropped fill never affected the read that produced it.
+	if got := src.count(); got != n {
+		t.Fatalf("backend reads = %d, want %d", got, n)
+	}
+	// Wait drains whatever survived the queue and returns; the cache stays usable.
+	c.Wait()
+	if err := c.Read(ctx, 0, make([]byte, ss), src); err != nil {
+		t.Fatalf("read after Wait: %v", err)
 	}
 }
