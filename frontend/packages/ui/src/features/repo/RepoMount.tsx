@@ -40,6 +40,8 @@ export interface RepoMountController {
   pending: boolean
   /** 本次操作请求进行中。 */
   busy: boolean
+  /** 取消请求进行中（状态标签里的「取消」按钮据此置灰）。 */
+  cancelling: boolean
   /**
    * 可执行挂载（代理可用、库已就绪，且已有分配或本人有权自建分配）。
    *
@@ -65,6 +67,8 @@ export interface RepoMountController {
   error: unknown
   mountRepo: () => Promise<void>
   unmountRepo: () => Promise<void>
+  /** 取消**进行中**的挂载（仅挂载中有用）。 */
+  cancelMount: () => Promise<void>
   openMountDir: () => Promise<void>
 }
 
@@ -82,6 +86,9 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
   const { t } = useI18n()
   const queryClient = useQueryClient()
   const [busy, setBusy] = useState(false)
+  // 取消请求进行中：与 busy **分开**。挂载是一次长时间同步请求，挂载期间 busy 一直为真；
+  // 若用 busy 置灰「取消」按钮，用户在最需要取消的时候反而点不动。
+  const [cancelling, setCancelling] = useState(false)
   const [error, setError] = useState<unknown>(null)
 
   // 代理不可用时既无法挂载也拿不到本地挂载状态，直接跳过请求。
@@ -180,6 +187,20 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     }
   }, [agent, invalidate, mount])
 
+  const cancelMount = useCallback(async (): Promise<void> => {
+    if (!mount) return
+    setError(null)
+    setCancelling(true)
+    try {
+      await agent.cancelMount({ allocation_id: mount.allocation_id })
+      await invalidate()
+    } catch (err) {
+      setError(err)
+    } finally {
+      setCancelling(false)
+    }
+  }, [agent, invalidate, mount])
+
   const openMountDir = useCallback(async (): Promise<void> => {
     // 会话已断时挂载点不存在，打开只会报"路径不存在"（mounted 已含实测会话判定）。
     if (!mount || !mounted) return
@@ -201,12 +222,14 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     pending,
     resolving,
     busy,
+    cancelling,
     canMount,
     canUnmount,
     disabledReason,
     error,
     mountRepo,
     unmountRepo,
+    cancelMount,
     openMountDir
   }
 }
@@ -294,7 +317,13 @@ export function RepoMountStateTag({ controller }: RepoMountActionsProps): JSX.El
     >
       {/* 错误只用一个红色感叹号展示：本次请求错误与本机残留错误由 MountStateCell 合并成
           多行悬浮详情（用户反馈：两个标记很乱）。 */}
-      <MountStateCell mount={controller.mount} requestError={controller.error} />
+      <MountStateCell
+        mount={controller.mount}
+        requestError={controller.error}
+        // 挂载中在状态标签里给一个文字「取消」按钮（仅挂载中有用）。
+        onCancel={() => void controller.cancelMount()}
+        cancelling={controller.cancelling}
+      />
     </span>
   )
 }

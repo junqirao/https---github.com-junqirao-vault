@@ -9,6 +9,7 @@
  */
 import { ApiError, businessErrorFrom } from './errors'
 import type {
+  AgentCacheHistory,
   AgentCacheStatus,
   AgentConfig,
   AgentEvent,
@@ -572,6 +573,16 @@ export const agentApi = {
     return request({ method: 'POST', path: '/agent/remount', body: input, timeoutMs: MOUNT_TIMEOUT_MS })
   },
 
+  /**
+   * 取消一个**进行中**的挂载（幂等）。
+   *
+   * 代理会 kill 掉正在跑的 PowerShell 并让挂载按失败收场（清理现场后删除记录）。
+   * 挂载已结束（没有进行中的那次）时 `cancelled` 为 false，不报错。
+   */
+  cancelMount(input: { allocation_id: string }): Promise<{ ok: true; cancelled: boolean }> {
+    return request({ method: 'POST', path: '/agent/mount/cancel', body: input })
+  },
+
   /** 把母盘拷贝到本地：202 立即返回；同一磁盘已在下载时返回既有任务。 */
   startDiskDownload(input: {
     disk_id: string
@@ -665,6 +676,11 @@ export const agentApi = {
    */
   getCache(): Promise<AgentCacheStatus> {
     return request<AgentCacheStatus>({ method: 'GET', path: '/agent/cache' })
+  },
+
+  /** 近 5 分钟的缓存指标采样（每 5 秒一点，按库分组），供"缓存指标曲线"弹窗使用。 */
+  getCacheHistory(): Promise<AgentCacheHistory> {
+    return request<AgentCacheHistory>({ method: 'GET', path: '/agent/cache/history' })
   },
 
   patchConfig(patch: Partial<AgentConfig>): Promise<{ config: AgentConfig }> {

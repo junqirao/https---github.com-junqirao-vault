@@ -102,6 +102,14 @@ type Agent struct {
 	// 这些库不再被自动挂载，避免用户点了卸载却马上被 auto_mount 挂回来。
 	manualUnmounts manualUnmountGuard
 
+	// mountMu / mountCancels 记录**进行中挂载**的取消函数（按 allocation）。
+	//
+	// 为什么需要它（真实反馈）：挂载在服务端下发与 iSCSI 连接阶段是同步重活，某一步长时间
+	// 卡住时界面只能一直转圈、没有任何中止手段 —— 用户要求"能取消"。登记后即可经
+	// POST /agent/mount/cancel 取消（kill 掉正在跑的 PowerShell 并让流程按失败收场）。
+	mountMu      sync.Mutex
+	mountCancels map[string]context.CancelFunc
+
 	// hostMu / host 是本机就绪状态（当前只有 iSCSI 发起端）：启动时只读探测一次，
 	// 未就绪期间低频复检。预检的定位是"提前告知"而非"提前失败"——不阻断启动，界面挂横幅。
 	hostMu sync.RWMutex
@@ -195,6 +203,7 @@ func New(opt Options) (*Agent, error) {
 
 		subRunning:        make(map[string]bool),
 		eventsUnsupported: make(map[string]bool),
+		mountCancels:      make(map[string]context.CancelFunc),
 		renewLastAt:       make(map[string]int64),
 		renewBlocked:      make(map[string]bool),
 		authRetryLastAt:   make(map[string]int64),

@@ -145,34 +145,59 @@ export function mountSessionLive(mount: AgentMountState | undefined): boolean | 
  */
 export function MountStateCell({
   mount,
-  requestError
+  requestError,
+  onCancel,
+  cancelling
 }: {
   mount: AgentMountState | undefined
   /** 本次操作的请求错误（可选）；与挂载状态错误合并展示。 */
   requestError?: unknown
+  /** 取消**进行中**的挂载；提供且当前为 mounting 时，状态标签里会出现「取消」文字按钮。 */
+  onCancel?: () => void
+  /** 取消请求进行中（按钮置灰）。 */
+  cancelling?: boolean
 }): JSX.Element {
   const { t } = useI18n()
   const lines = mountErrorLines(mount, requestError, t)
   if (!mount) {
     return lines.length > 0 ? <MountErrorMarker lines={lines} /> : <Tag>{t('repo.mount.notMounted')}</Tag>
   }
+  const mounting = mount.state === 'mounting'
   // 挂载中优先显示**细粒度阶段**（"服务端正在创建 iSCSI 目标"这类）：服务端侧的挂载是
   // 同步重活（准备虚拟磁盘 + PowerShell 下发 iSCSI 目标，实测数十秒），只显示"挂载中"
   // 用户无从知道卡在哪一步（真实反馈）。未知阶段（新代理旧界面）回退成通用"挂载中"，
   // 绝不把原始 key 露到界面上。
-  const phase = mount.state === 'mounting' ? mount.phase : undefined
+  const phase = mounting ? mount.phase : undefined
   const phaseKey = phase ? `mount.phase.${phase}` : ''
+  const phaseText = phaseKey && hasKey(phaseKey) ? t(phaseKey) : t('state.mount.mounting')
   // 记录说"已挂载"、但代理实测本机已无活动会话：如实显示"已断开"。
   // 显示"已挂载"就是界面在撒谎（真实诉求："按钮应以实际为准，看对应的 iSCSI 连接是否在活动中的"）。
   const sessionLost = mount.state === 'mounted' && mountSessionLive(mount) === false
-  const tag = phaseKey && hasKey(phaseKey) ? (
+  // 挂载中在状态标签**内部**加一个文字「取消」按钮：挂载可能长时间卡在某一阶段，用户需要
+  // 一个中止入口（真实反馈："一直卡在建立 iSCSI 会话，不能停止，卡死了"）。只在挂载中有用。
+  const cancelButton =
+    mounting && onCancel ? (
+      <Button
+        type="link"
+        size="small"
+        disabled={cancelling}
+        onClick={onCancel}
+        style={{ padding: 0, height: 'auto', fontSize: 12 }}
+      >
+        {t('mount.cancel')}
+      </Button>
+    ) : null
+  const tag = mounting ? (
     <Tag
       icon={<LoadingOutlined spin />}
       color="processing"
       bordered={false}
       style={{ borderRadius: radius.sm, marginInlineEnd: 0 }}
     >
-      {t(phaseKey)}
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+        {phaseText}
+        {cancelButton}
+      </span>
     </Tag>
   ) : sessionLost ? (
     <Tooltip title={t('agent.mount.sessionLost')}>

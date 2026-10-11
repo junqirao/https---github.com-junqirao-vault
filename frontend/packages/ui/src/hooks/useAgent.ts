@@ -70,6 +70,8 @@ export interface UseAgentResult {
   mount: (input: AgentMountInput) => Promise<AgentMountState>
   unmount: (input: AgentUnmountInput) => Promise<void>
   remount: (input: { allocation_id: string }) => Promise<AgentMountState>
+  /** 取消一个**进行中**的挂载（幂等；仅挂载中有效）。 */
+  cancelMount: (input: { allocation_id: string }) => Promise<void>
   /**
    * 手动重连服务端（顶栏"未连接"旁的"重试"按钮）。
    *
@@ -677,6 +679,16 @@ export function useAgent(): UseAgentResult {
     [refresh]
   )
 
+  const cancelMount = useCallback(
+    async (input: { allocation_id: string }): Promise<void> => {
+      await agentApi.cancelMount(input)
+      // 取消是异步收场的：代理的挂载流程随后按失败清理并删除记录，这里先刷一次让状态尽快
+      // 反映；最终状态由代理推送的 unmount 事件兜底。
+      await refresh()
+    },
+    [refresh]
+  )
+
   const reconnectServer = useCallback(async (serverKey?: string): Promise<AgentServerState> => {
     try {
       // 代理已把失败计数清零并把阶段置回 connecting，这里落一次快照让标签立刻变回"连接中"
@@ -706,6 +718,7 @@ export function useAgent(): UseAgentResult {
     mount,
     unmount,
     remount,
+    cancelMount,
     reconnectServer,
     refresh,
     refreshCache,

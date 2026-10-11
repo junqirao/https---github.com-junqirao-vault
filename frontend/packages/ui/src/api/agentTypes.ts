@@ -98,6 +98,12 @@ export interface AgentMountState {
   cache_active?: boolean
   /** 缓存未生效（回退直连）的原因；仅 cache_enabled=true 且 cache_active=false 时非空。 */
   cache_error?: string
+  /**
+   * 本次挂载是否处于**直连模式**（绕过本机代理，来自 repo_mounts[id].direct_mode）。
+   *
+   * true 时该库没有经过代理，界面上的「监控」入口置灰（无读写 IOPS 数据）。
+   */
+  direct_mode?: boolean
 }
 
 export type DownloadStatus = 'running' | 'done' | 'failed' | 'canceled'
@@ -304,12 +310,21 @@ export interface AgentRepoMountPref {
   /**
    * 是否为该库启用**本地 iSCSI 读缓存代理**（每个库独立，**默认关闭**）。
    *
-   * 开启后本机到服务端的链路变成 本机发起端 → 本地缓存代理（127.0.0.1:3261）→ 服务端目标：
+   * 开启后本机到服务端的链路变成 本机发起端 → 本地缓存代理（127.0.0.1:随机端口）→ 服务端目标：
    * 多占用一份本机内存（L1）与磁盘（L2，总量在「客户端设置」里配，按已启用的库均分）。
    * 代理不可用时会**自动回退直连**服务端目标（挂载照常成功，卡片提示「缓存未生效」）。
    * 改动需要**重新挂载**这个库才生效。
+   *
+   * ⚠️ 未开启缓存也会经过本机代理（纯透传，可监控读写 IOPS）；只有 direct_mode 才绕过代理。
    */
   cache_enabled?: boolean
+  /**
+   * 是否为该库启用**直连模式**（每个库独立，**默认关闭**）。
+   *
+   * 打开后该库绕过本机代理，直接连接服务端下发的目标 —— 链路最短，但没有读写 IOPS 监控
+   * （界面上的「监控」入口置灰）。改动需要**重新挂载**这个库才生效。
+   */
+  direct_mode?: boolean
 }
 
 /** GET /agent/config 与 PATCH /agent/config。 */
@@ -403,6 +418,34 @@ export interface AgentCacheStatus {
   targets: AgentCacheTargetStatus[]
   /** 最近一次打开门户失败的原因（如端口被占用）；正常时为空。 */
   error?: string
+}
+
+/**
+ * 单个库某一刻的缓存计数采样点（GET /agent/cache/history 的元素）。
+ *
+ * reads/hits/writes/backend_reads 是**累计值**：曲线用的速率与命中率按相邻点差分计算
+ * （目标重建时计数归零，负差分按无数据处理）；l1/l2_used_bytes 是采样时刻的瞬时值。
+ *
+ * reads/writes 是**代理观测到的命令数**（与缓存是否命中/是否已绑定无关），因此只要流量
+ * 经过代理，IOPS 曲线就有数；hits 是整条读完全命中的次数，命中率 = Δhits/Δreads。
+ */
+export interface AgentCacheSample {
+  /** 采样时刻（Unix 秒）。 */
+  t: number
+  reads: number
+  hits: number
+  writes: number
+  backend_reads: number
+  l1_used_bytes: number
+  l2_used_bytes: number
+}
+
+/** 近 5 分钟的缓存指标滑动窗口（GET /agent/cache/history）。 */
+export interface AgentCacheHistory {
+  /** 采样间隔（秒）：换算速率以它为准，不要硬编码。 */
+  interval_sec: number
+  /** 以 allocation_id 为键，值为按时间升序的采样点。 */
+  targets: Record<string, AgentCacheSample[]>
 }
 
 /** GET /agent/identity 与 POST /agent/identity/install 的响应（永不含私钥与证书原文）。 */

@@ -63,6 +63,10 @@ type L2 interface {
 	WriteSectors(blk uint64, sec, n int, src []byte) error
 	// InvalidateSectors drops n sectors starting at sector sec of block blk.
 	InvalidateSectors(blk uint64, sec, n int)
+	// Drop forgets every sector. It backs Cache.Drop, which a whole-device
+	// invalidation (UNMAP, WRITE SAME) uses to keep L2 from serving sectors a
+	// write has made stale.
+	Drop()
 }
 
 // Config configures a Cache.
@@ -207,6 +211,20 @@ type Cache struct {
 	// fill it feeds is rejected by the epoch check.
 	l2Gate sync.RWMutex
 
+	// l2InvCh and l2InvWG implement InvalidateAsync: the L1 half of an
+	// invalidation runs synchronously on the caller, the L2 half is queued here
+	// and drained by l2InvWorker. They are nil/unused when the cache has no L2.
+	l2InvCh chan l2InvReq
+	l2InvWG sync.WaitGroup
+
+	// l2InvN is how many deferred L2 drops are queued or in progress. It is
+	// raised under l2Gate before an invalidation bumps L1 and lowered by the
+	// worker once the drop lands. ReadCachedBoth holds l2Gate for read across its
+	// L2 lookups and skips L2 while it is non-zero: a non-zero count means some
+	// completed write's sector is still in L2, which a read would otherwise serve
+	// stale.
+	l2InvN atomic.Int64
+
 	// The fill queue decouples the read path from populating L1. fillCh is
 	// deliberately never closed: a racing enqueue after Close would otherwise
 	// panic, and a fill that runs into a shut cache only costs a future backing
@@ -232,6 +250,21 @@ type Cache struct {
 // cache: when this many writes are already outstanding a miss simply skips
 // populating L2 instead of delaying the read.
 const l2WriteConcurrency = 8
+
+// defaultL2InvQueueDepth bounds the deferred L2 invalidations queued by
+// InvalidateAsync. A full queue drops the L2 half of an invalidation: L1 — the
+// level a caller that answers locally reads from — is already invalidated
+// synchronously, so a dropped L2 drop only leaves a sector the deferred path was
+// never going to serve.
+const defaultL2InvQueueDepth = 1024
+
+// l2InvReq is one deferred L2 invalidation: the byte range and the fence target
+// captured after its L1 bumps, so the worker waits out exactly the populations
+// that could carry pre-write data.
+type l2InvReq struct {
+	off, length int64
+	target      uint64
+}
 
 // New creates a Cache.
 func New(cfg Config) (*Cache, error) {
@@ -267,6 +300,9 @@ func New(cfg Config) (*Cache, error) {
 	}
 	if c.l2 != nil {
 		c.l2Sem = make(chan struct{}, l2WriteConcurrency)
+		c.l2InvCh = make(chan l2InvReq, defaultL2InvQueueDepth)
+		c.l2InvWG.Add(1)
+		go c.l2InvWorker()
 	}
 	for i := 0; i < cfg.FillWorkers; i++ {
 		c.fillWG.Add(1)
@@ -287,6 +323,9 @@ func (c *Cache) Close() {
 	c.waitFills()
 	close(c.exitCh)
 	c.fillWG.Wait()
+	// The L2 invalidation worker only drops in-memory index entries, so it needs no
+	// drain before the store closes; stopping it here is enough.
+	c.l2InvWG.Wait()
 	if c.l2 != nil {
 		c.fence.wait(c.fence.target())
 	}
@@ -341,8 +380,9 @@ func (c *Cache) Usage() (used, limit int64) {
 	return blocks * int64(c.blockSize), int64(c.totalBlocks) * int64(c.blockSize)
 }
 
-// Drop discards every cached block, keeping the L2 file contents untouched
-// (the L2 index is memory only, so dropping it makes the L2 logically empty).
+// Drop discards every cached block from both levels. It backs a whole-device
+// invalidation (UNMAP, WRITE SAME): the L2 index must be cleared too, or a
+// subsequent read would serve a sector the invalidation just discarded.
 func (c *Cache) Drop() {
 	if c.l2 != nil {
 		c.l2Gate.Lock()
@@ -355,6 +395,7 @@ func (c *Cache) Drop() {
 	}
 	if c.l2 != nil {
 		c.fence.wait(c.fence.target())
+		c.l2.Drop()
 	}
 }
 
@@ -562,6 +603,12 @@ func (c *Cache) ReadCached(off int64, dst []byte) bool {
 		return false
 	}
 	c.stats.Reads.Add(1)
+	return c.readCachedL1(off, dst)
+}
+
+// readCachedL1 is ReadCached's body without the request accounting, so
+// ReadCachedBoth can try L1 first and fall through to L2 for what it misses.
+func (c *Cache) readCachedL1(off int64, dst []byte) bool {
 	bs := int64(c.blockSize)
 	end := off + int64(len(dst))
 	for cur := off; cur < end; {
@@ -596,6 +643,149 @@ func (c *Cache) ReadCached(off int64, dst []byte) bool {
 	}
 	c.stats.RequestHits.Add(1)
 	return true
+}
+
+// ReadCachedBoth serves [off, off+len(dst)) from the cache, using L2 to cover
+// whatever L1 misses and promoting the sectors it took out of L2 back into L1.
+// It reports false unless every covered sector was available, in which case the
+// caller reads the range from the backing store.
+//
+// It is the read path of the transparent proxy: ReadCached is L1 only, so
+// without this the L2 file cache is written but never read back.
+func (c *Cache) ReadCachedBoth(off int64, dst []byte) bool {
+	if len(dst) == 0 {
+		return true
+	}
+	if off < 0 {
+		return false
+	}
+	c.stats.Reads.Add(1)
+	if c.readCachedL1(off, dst) {
+		return true
+	}
+	if c.l2 == nil {
+		return false
+	}
+	return c.readCachedL1L2(off, dst)
+}
+
+// l2Promote is one sector run a read took out of L2, queued for installation
+// into L1 once the whole request is known to hit.
+type l2Promote struct {
+	blk      uint64
+	blockOff int
+	data     []byte
+	epoch    uint64
+}
+
+// readCachedL1L2 completes a read that readCachedL1 could not serve, taking the
+// missing segments from L2.
+//
+// l2Gate is held for read across the L2 lookups and the epoch captures. A write
+// raises l2InvN under it before it bumps L1 and defers the L2 drop, so a read
+// either observes a pending drop and reports a miss, or runs while no drop is
+// pending — and then no L1 bump can interleave, because the writer's raise is
+// itself blocked on this read lock. The sectors in L2 are therefore either
+// current or absent, never a completed write's pre-write data.
+func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
+	bs := int64(c.blockSize)
+	ss := int64(c.sectorSize)
+	end := off + int64(len(dst))
+
+	c.l2Gate.RLock()
+	defer c.l2Gate.RUnlock()
+	if c.l2InvN.Load() != 0 {
+		// A recent write's L2 drop has not landed yet; L2 may still hold the
+		// sectors it will discard, so treat the range as a miss.
+		return false
+	}
+
+	var l1Hits int64
+	var promotes []l2Promote
+	for cur := off; cur < end; {
+		blk := uint64(cur / bs)
+		blkStart := int64(blk) * bs
+		segEnd := blkStart + bs
+		if segEnd > end {
+			segEnd = end
+		}
+		s0, s1 := c.sectorRange(blkStart, cur, segEnd-cur)
+		sh := c.shard(blk)
+		if e := sh.lookup(blk); e != nil && e.copyIfValid(blkStart, cur, dst[cur-off:segEnd-off], c.sectorSize) {
+			sh.touch(e)
+			l1Hits++
+			cur = segEnd
+			continue
+		}
+		n := s1 - s0 + 1
+		start := blkStart + int64(s0)*ss
+		buf := make([]byte, int64(n)*ss)
+		ok, err := c.l2.ReadSectors(blk, s0, n, buf)
+		if err != nil {
+			c.log.Warn("cache: l2 read failed", "block", blk, "err", err)
+			return false
+		}
+		if !ok {
+			// Neither level holds the whole segment: report a plain miss. Nothing
+			// has been committed to the counters, and the caller re-reads the
+			// range from the backing store.
+			return false
+		}
+		copy(dst[cur-off:segEnd-off], buf[cur-start:])
+		promotes = append(promotes, l2Promote{blk: blk, blockOff: int(start - blkStart), data: buf, epoch: sh.epoch.Load()})
+		cur = segEnd
+	}
+
+	c.stats.L1Hits.Add(l1Hits)
+	c.stats.L2Hits.Add(int64(len(promotes)))
+	c.stats.RequestHits.Add(1)
+	// writeL2 is false: the data came out of L2, so only L1 needs it.
+	for _, p := range promotes {
+		c.enqueueFill(p.blk, p.blockOff, p.data, p.epoch, false)
+	}
+	return true
+}
+
+// FillObserved installs bytes teed from a read the caller forwarded to the
+// backing store instead of answering locally, so a miss still warms the cache
+// from the traffic it carried. Only the sector-aligned interior of data is
+// installed: a read can begin or end mid sector, and publishing a partial
+// sector would let a later hit hand back a torn sector, so the sliver at either
+// end is left to a future read.
+//
+// The fill is asynchronous and best effort, like the per-block miss path: a
+// full queue drops it and only costs a future backing read, and an invalidation
+// that bumps a covered shard before the install drops it rather than publishing
+// data the write has made stale.
+func (c *Cache) FillObserved(off int64, data []byte) {
+	if len(data) == 0 || off < 0 || c.closed.Load() {
+		return
+	}
+	ss := int64(c.sectorSize)
+	start := off
+	if r := start % ss; r != 0 {
+		start += ss - r
+	}
+	end := off + int64(len(data))
+	end -= end % ss
+	if end <= start {
+		return
+	}
+	c.stats.BackendReads.Add(1)
+	bs := int64(c.blockSize)
+	writeL2 := c.l2 != nil
+	for cur := start; cur < end; {
+		blk := uint64(cur / bs)
+		blkStart := int64(blk) * bs
+		segEnd := blkStart + bs
+		if segEnd > end {
+			segEnd = end
+		}
+		from := int(cur - off)
+		epoch := c.shard(blk).epoch.Load()
+		c.enqueueFill(blk, int(cur-blkStart), data[from:from+int(segEnd-cur)], epoch, writeL2)
+		cur = segEnd
+	}
 }
 
 // StreamFill installs a read's payload into L1 while the read is being
@@ -821,10 +1011,74 @@ func (c *Cache) Invalidate(off, length int64) {
 		c.l2Gate.Lock()
 		defer c.l2Gate.Unlock()
 	}
+	c.invalidateL1(off, length)
+	if c.l2 == nil {
+		return
+	}
+	// The bump above is what makes this wait a complete fence: a population can
+	// only be enqueued from inside the critical section that validated the fill's
+	// epoch, so every population allocated before this target is one that ran
+	// before a bump. The target is fixed, so reads enqueueing later populations
+	// cannot make it spin.
+	c.fence.wait(c.fence.target())
+	c.l2Drop(off, length)
+}
 
-	// The bump and the clear share one critical section per block, and the bump
-	// runs first so no fill can still be validated against the pre-write epoch
+// InvalidateAsync drops [off, off+length) from L1 synchronously and defers the
+// L2 drop to a background worker.
+//
+// It exists for a caller that answers reads from L1 and L2 (the transparent
+// proxy): the synchronous L1 bump is what keeps a read that follows a write from
+// returning pre-write data, while the L2 half is pure latency on the write path
+// — it waits out in-flight L2 populations (background file writes) and walks the
+// L2 index. Deferring it takes that wait off the write's critical path.
+//
+// The deferred drop is made safe for the read path by l2InvN: raised under l2Gate
+// before the L1 bump, so ReadCachedBoth skips L2 until the drop has landed. A
+// full queue therefore cannot simply drop the request (that would leave L2 stale
+// or the count stuck); it falls back to doing the L2 drop inline.
+func (c *Cache) InvalidateAsync(off, length int64) {
+	if length <= 0 {
+		return
+	}
+	c.stats.Invalidations.Add(1)
+	if c.l2 == nil {
+		c.invalidateL1(off, length)
+		return
+	}
+	// Raise the pending count before the L1 bump: a read that consults L2 holds
+	// l2Gate for read, so it either sees the raised count and skips L2, or its
+	// lookups finished before the count was raised — in which case no bump has
+	// happened yet and the sectors it read are still current.
+	c.l2Gate.Lock()
+	c.l2InvN.Add(1)
+	c.l2Gate.Unlock()
+
+	c.invalidateL1(off, length)
+
+	// Captured after the bumps but before the drop, so the worker waits out every
+	// population that could carry pre-write data without waiting on ones enqueued
 	// afterwards.
+	req := l2InvReq{off: off, length: length, target: c.fence.target()}
+	select {
+	case c.l2InvCh <- req:
+	default:
+		// Queue full: drop the L2 half inline instead of stranding the pending
+		// count, which would keep every read off L2. The fence is waited outside
+		// l2Gate for the same reason the worker does.
+		c.fence.wait(req.target)
+		c.l2Gate.Lock()
+		c.l2Drop(off, length)
+		c.l2InvN.Add(-1)
+		c.l2Gate.Unlock()
+	}
+}
+
+// invalidateL1 bumps every covered shard's epoch and clears the covered blocks'
+// valid bits. It is the synchronous, in-memory half of an invalidation: cheap
+// (no I/O, no fence) and required for correctness, since it is what makes a read
+// that follows a write miss L1 rather than return pre-write data.
+func (c *Cache) invalidateL1(off, length int64) {
 	end := off + length
 	for cur := off; cur < end; {
 		blk := uint64(cur / int64(c.blockSize))
@@ -848,17 +1102,13 @@ func (c *Cache) Invalidate(off, length int64) {
 		sh.mu.Unlock()
 		cur = segEnd
 	}
-	if c.l2 == nil {
-		return
-	}
+}
 
-	// An L2 population enqueued before a bump carries pre-write data and must not
-	// land after the drop below, or it would resurrect it. The bump above is what
-	// makes this wait a complete fence: a population can only be enqueued from
-	// inside the critical section that validated the fill's epoch, so every
-	// population allocated before this target is one that ran before a bump. The
-	// target is fixed, so reads enqueueing later populations cannot make it spin.
-	c.fence.wait(c.fence.target())
+// l2Drop removes [off, off+length) from the L2 index. It must run after the L1
+// bumps and after the fence has drained the populations that carried pre-write
+// data, and under l2Gate so a concurrent L2 lookup cannot see a stale sector.
+func (c *Cache) l2Drop(off, length int64) {
+	end := off + length
 	for cur := off; cur < end; {
 		blk := uint64(cur / int64(c.blockSize))
 		blkStart := int64(blk) * int64(c.blockSize)
@@ -869,6 +1119,30 @@ func (c *Cache) Invalidate(off, length int64) {
 		s0, s1 := c.sectorRange(blkStart, cur, segEnd-cur)
 		c.l2.InvalidateSectors(blk, s0, s1-s0+1)
 		cur = segEnd
+	}
+}
+
+// l2InvWorker drains the deferred L2 invalidations queued by InvalidateAsync.
+//
+// The fence is waited outside l2Gate: a read that arrives while the drop is
+// pending sees l2InvN and skips L2, so there is no need to keep reads off the
+// gate for the (potentially slow) wait on in-flight L2 populations. The gate is
+// taken only for the drop itself, which is a memory-index update.
+func (c *Cache) l2InvWorker() {
+	defer c.l2InvWG.Done()
+	for {
+		select {
+		case <-c.exitCh:
+			return
+		case req := <-c.l2InvCh:
+			c.fence.wait(req.target)
+			c.l2Gate.Lock()
+			c.l2Drop(req.off, req.length)
+			// Lowered last, under the gate: a read that acquires l2Gate after this
+			// sees a drained L2 and may use it again.
+			c.l2InvN.Add(-1)
+			c.l2Gate.Unlock()
+		}
 	}
 }
 

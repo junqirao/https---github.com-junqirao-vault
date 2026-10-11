@@ -36,9 +36,13 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("POST /agent/mount", a.handleMount)
 	mux.HandleFunc("POST /agent/unmount", a.handleUnmount)
 	mux.HandleFunc("POST /agent/remount", a.handleRemount)
+	// 取消一个**进行中**的挂载（kill 掉正在跑的 PowerShell，流程按失败收场；幂等）。
+	mux.HandleFunc("POST /agent/mount/cancel", a.handleMountCancel)
 	mux.HandleFunc("GET /agent/mounts", a.handleListMounts)
 	// 本机 iSCSI 读缓存代理的用量与命中情况（客户端存储库页面展示，见 cacheproxy.go）。
 	mux.HandleFunc("GET /agent/cache", a.handleCacheStatus)
+	// 近 5 分钟的缓存指标采样（存储库页面"缓存指标曲线"弹窗）。
+	mux.HandleFunc("GET /agent/cache/history", a.handleCacheHistory)
 
 	mux.HandleFunc("GET /agent/config", a.handleGetConfig)
 	mux.HandleFunc("PATCH /agent/config", a.handlePatchConfig)
@@ -413,6 +417,24 @@ func (a *Agent) handleUnmount(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handleMountCancel 取消一个**进行中**的挂载（POST /agent/mount/cancel）。
+//
+// 为什么需要它（真实反馈："一直卡在建立 iSCSI 会话，不能停止，卡死了"）：挂载在服务端下发与
+// iSCSI 连接阶段是同步重活，某一步长时间卡住（后端不可达导致 iSCSI 登录迟迟不返回等）时，
+// 界面只能一直转圈、没有任何中止手段。取消会 kill 掉正在跑的 PowerShell 并让挂载按失败收场
+// （清理现场后删除记录），见 Agent.CancelMount。
+//
+// 幂等：没有进行中的挂载时返回 cancelled=false，不报错（界面无需区分）。
+func (a *Agent) handleMountCancel(w http.ResponseWriter, r *http.Request) {
+	var req unmountRequest
+	if err := decodeJSON(r, &req); err != nil {
+		a.writeError(w, err)
+		return
+	}
+	cancelled := a.CancelMount(req.AllocationID)
+	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cancelled": cancelled})
+}
+
 // handleRemount 重新挂载指定分配。
 func (a *Agent) handleRemount(w http.ResponseWriter, r *http.Request) {
 	var req unmountRequest
@@ -440,6 +462,11 @@ func (a *Agent) handleListMounts(w http.ResponseWriter, _ *http.Request) {
 // "缓存用量/命中情况"；门户没开（没有任何库启用缓存）时 running=false、targets 为空。
 func (a *Agent) handleCacheStatus(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, a.cache.Status())
+}
+
+// handleCacheHistory 返回近 5 分钟的缓存指标采样（每 5 秒一点，见 cacheproxy.go）。
+func (a *Agent) handleCacheHistory(w http.ResponseWriter, _ *http.Request) {
+	a.writeJSON(w, http.StatusOK, a.cache.History())
 }
 
 // ---- 本地配置 ----
@@ -479,6 +506,10 @@ type repoMountPrefRequest struct {
 	// ⚠️ 这是**整条偏好替换**（见 SetRepoMountPref）：调用方必须把它与 mount_mode/mount_dir/
 	// auto_mount 一起回传，只发其中几项会把没发的项重置为默认值。
 	CacheEnabled bool `json:"cache_enabled"`
+	// DirectMode 是否为该库启用直连模式（跳过本机代理，默认关闭）。
+	//
+	// 同样属于**整条偏好替换**的一部分，必须与其它字段一起回传。
+	DirectMode bool `json:"direct_mode"`
 }
 
 // handleSetRepoMountPref 写入单个存储库的挂载偏好（每个库各自独立，互不影响）。
@@ -498,6 +529,7 @@ func (a *Agent) handleSetRepoMountPref(w http.ResponseWriter, r *http.Request) {
 		MountDir:     in.MountDir,
 		AutoMount:    in.AutoMount,
 		CacheEnabled: in.CacheEnabled,
+		DirectMode:   in.DirectMode,
 	})
 	if err != nil {
 		a.writeError(w, err)

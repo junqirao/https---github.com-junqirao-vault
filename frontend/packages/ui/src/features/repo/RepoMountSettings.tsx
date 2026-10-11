@@ -19,10 +19,13 @@ export interface RepoMountSettingsState {
   autoMount: boolean
   /** 是否为该库启用本地 iSCSI 读缓存代理（默认关闭，需用户手动开启）。 */
   cacheEnabled: boolean
+  /** 是否为该库启用直连模式（跳过本机代理，默认关闭）。 */
+  directMode: boolean
   setMode: (mode: AgentMountMode) => void
   setDir: (dir: string) => void
   setAutoMount: (value: boolean) => void
   setCacheEnabled: (value: boolean) => void
+  setDirectMode: (value: boolean) => void
   saving: boolean
   error: unknown
   /** 本地代理不可用：控件置灰（配置存在本机，没有代理就落不下去）。 */
@@ -59,6 +62,8 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
   const effectiveAuto = saved ? saved.auto_mount : Boolean(config?.auto_mount)
   // 缓存**默认关闭**：没有该库条目、或条目里没写，一律按关闭（与代理侧零值一致）。
   const effectiveCache = Boolean(saved?.cache_enabled)
+  // 直连模式**默认关闭**：默认所有库都经本机代理（未开缓存也走纯透传，从而可监控）。
+  const effectiveDirect = Boolean(saved?.direct_mode)
 
   // 目录名里的"服务端名称"与代理侧同一口径：本地别名优先，其次服务端名称，最后 vault。
   // 全局 server_alias 只在**本机只有一台**时作数：多台共用会让两台下的 `别名_库名` 撞成同一目录。
@@ -69,6 +74,7 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
   const [dir, setDir] = useState(effectiveDir)
   const [autoMount, setAutoMount] = useState(effectiveAuto)
   const [cacheEnabled, setCacheEnabled] = useState(effectiveCache)
+  const [directMode, setDirectMode] = useState(effectiveDirect)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<unknown>(null)
 
@@ -79,7 +85,8 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
     setDir(effectiveDir)
     setAutoMount(effectiveAuto)
     setCacheEnabled(effectiveCache)
-  }, [repoId, effectiveMode, effectiveDir, effectiveAuto, effectiveCache])
+    setDirectMode(effectiveDirect)
+  }, [repoId, effectiveMode, effectiveDir, effectiveAuto, effectiveCache, effectiveDirect])
 
   // 预览按用户**正在编辑**的父目录算：改了输入框提示立刻跟着变，不用先保存再猜。
   const previewDir = effectiveMountDir(dir.trim() || config?.default_mount_dir || '', serverAlias, repoName)
@@ -94,7 +101,8 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
         // 存的是**父目录**，真正挂载点由代理在它下面加一层 <服务端名称>_<存储库名称>。
         mount_dir: dir.trim(),
         auto_mount: autoMount,
-        cache_enabled: cacheEnabled
+        cache_enabled: cacheEnabled,
+        direct_mode: directMode
       })
       // 刷新全局配置快照：卡片、详情页读的都是它，否则界面还显示上一次的值。
       await agent.refresh()
@@ -113,10 +121,12 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
     dir,
     autoMount,
     cacheEnabled,
+    directMode,
     setMode,
     setDir,
     setAutoMount,
     setCacheEnabled,
+    setDirectMode,
     saving,
     error,
     disabled: !agent.available,
@@ -128,7 +138,7 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
 /** 各字段的展示：弹窗与详情页 tab 用同一份，避免两处配置长得不一样。 */
 function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Element {
   const { t } = useI18n()
-  const { mode, dir, autoMount, cacheEnabled, disabled, previewDir } = state
+  const { mode, dir, autoMount, cacheEnabled, directMode, disabled, previewDir } = state
 
   return (
     <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
@@ -190,9 +200,24 @@ function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Elem
         <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
           {t('repo.settings.cacheEnabled')}
         </Typography.Text>
-        <Switch checked={cacheEnabled} disabled={disabled} onChange={state.setCacheEnabled} />
+        {/* 直连模式开着时缓存没有意义（根本不经过代理）：置灰并说明，避免用户白开 */}
+        <Switch
+          checked={cacheEnabled && !directMode}
+          disabled={disabled || directMode}
+          onChange={state.setCacheEnabled}
+        />
         <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
           {t('repo.settings.cacheHint')}
+        </Typography.Text>
+      </div>
+
+      <div>
+        <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+          {t('repo.settings.directMode')}
+        </Typography.Text>
+        <Switch checked={directMode} disabled={disabled} onChange={state.setDirectMode} />
+        <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+          {t('repo.settings.directHint')}
         </Typography.Text>
       </div>
 

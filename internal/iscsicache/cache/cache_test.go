@@ -294,6 +294,9 @@ func TestScanDetectionBypassesCache(t *testing.T) {
 		}
 		expectPattern(t, ss, int64(i)*int64(bs), buf)
 	}
+	// Fills are installed asynchronously, so drain the queue before asserting the
+	// fill count; otherwise the assertion races the fill workers.
+	c.Wait()
 	st := c.Stats()
 	if st.ScanBypass != 7 {
 		t.Fatalf("scan bypasses = %d, want 7", st.ScanBypass)
@@ -511,6 +514,12 @@ func (f *fakeL2) InvalidateSectors(blk uint64, sec, n int) {
 	}
 }
 
+func (f *fakeL2) Drop() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sects = map[uint64]map[int][]byte{}
+}
+
 func (f *fakeL2) has(blk uint64, sec, n int) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -521,6 +530,153 @@ func (f *fakeL2) has(blk uint64, sec, n int) bool {
 		}
 	}
 	return true
+}
+
+// srcPattern builds data matching fakeSource's per-sector pattern, so a test can
+// seed L2 directly and still verify a read with expectPattern.
+func srcPattern(sectorSize int, off int64, n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte((off + int64(i)) / int64(sectorSize))
+	}
+	return b
+}
+
+// TestReadCachedBothServesFromL2 pins the read path the transparent proxy uses:
+// a range absent from L1 but present in L2 is a hit, and the sectors that came
+// out of L2 are promoted into L1.
+func TestReadCachedBothServesFromL2(t *testing.T) {
+	const ss = 4 << 10
+	l2 := newFakeL2(ss)
+	if err := l2.WriteSectors(0, 0, 1, srcPattern(ss, 0, ss)); err != nil {
+		t.Fatalf("seed L2: %v", err)
+	}
+	c := newTestCache(t, testOpts{l2: l2})
+
+	buf := make([]byte, ss)
+	if !c.ReadCachedBoth(0, buf) {
+		t.Fatal("an L2 hit must be served by ReadCachedBoth")
+	}
+	expectPattern(t, ss, 0, buf)
+	if st := c.Stats(); st.L2Hits != 1 || st.RequestHits != 1 {
+		t.Fatalf("stats = %+v, want one L2 hit and one request hit", st)
+	}
+
+	// The L2 hit is promoted into L1, so the next read needs no L2 lookup.
+	c.Wait()
+	if !c.ReadCached(0, make([]byte, ss)) {
+		t.Fatal("the L2 hit should have been promoted into L1")
+	}
+}
+
+// TestReadCachedBothPartialMiss pins that a range with a sector in neither level
+// is a plain miss and does not inflate the hit counters.
+func TestReadCachedBothPartialMiss(t *testing.T) {
+	const ss = 4 << 10
+	l2 := newFakeL2(ss)
+	if err := l2.WriteSectors(0, 0, 1, srcPattern(ss, 0, ss)); err != nil {
+		t.Fatalf("seed L2: %v", err)
+	}
+	c := newTestCache(t, testOpts{l2: l2})
+
+	if c.ReadCachedBoth(0, make([]byte, 2*ss)) {
+		t.Fatal("a two-sector range with only one cached sector must miss")
+	}
+	if st := c.Stats(); st.RequestHits != 0 || st.L2Hits != 0 {
+		t.Fatalf("a partial miss must not count as a hit: %+v", st)
+	}
+}
+
+// TestReadCachedBothSkipsL2WhileInvalidationPending pins the gate that makes the
+// deferred L2 drop safe: while an invalidation is pending, L2 may still hold the
+// sectors it is about to discard, so reads must skip it.
+func TestReadCachedBothSkipsL2WhileInvalidationPending(t *testing.T) {
+	const ss = 4 << 10
+	l2 := newFakeL2(ss)
+	if err := l2.WriteSectors(0, 0, 1, srcPattern(ss, 0, ss)); err != nil {
+		t.Fatalf("seed L2: %v", err)
+	}
+	c := newTestCache(t, testOpts{l2: l2})
+
+	// A raised pending count models a deferred drop that has not landed yet.
+	c.l2InvN.Store(1)
+	if c.ReadCachedBoth(0, make([]byte, ss)) {
+		t.Fatal("ReadCachedBoth served L2 while a drop was pending")
+	}
+	c.l2InvN.Store(0)
+	if !c.ReadCachedBoth(0, make([]byte, ss)) {
+		t.Fatal("ReadCachedBoth should serve L2 once the drop has drained")
+	}
+}
+
+// TestReadCachedBothMissesStaleL2DuringInvalidateAsync pins the end-to-end
+// correctness of the asynchronous write path: a write's deferred L2 drop lags
+// its synchronous L1 bump, and a read arriving in that window must not be served
+// the pre-write sector still sitting in L2.
+func TestReadCachedBothMissesStaleL2DuringInvalidateAsync(t *testing.T) {
+	const ss = 4 << 10
+	src := newFakeSource(ss, 4<<20)
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	l2 := newFakeL2(ss)
+	l2.gate = gate
+	l2.entered = entered
+	c := newTestCache(t, testOpts{l2: l2})
+
+	// Fill L1 and start the L2 population; it blocks in WriteSectors, so the
+	// population is in flight and the invalidation's fence will wait on it.
+	if err := c.Read(context.Background(), 0, make([]byte, ss), src); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the L2 population never started")
+	}
+
+	// The write invalidates L1 synchronously and defers the L2 drop, which cannot
+	// land until the in-flight population completes.
+	c.InvalidateAsync(0, ss)
+
+	// L1 was dropped and L2 must be skipped, so the read misses even though the
+	// (now stale) sector is still physically present in L2.
+	if c.ReadCachedBoth(0, make([]byte, ss)) {
+		t.Fatal("ReadCachedBoth served a stale L2 sector during an invalidation")
+	}
+
+	// Releasing the population lets the fence drain and the deferred drop land.
+	close(gate)
+	deadline := time.Now().Add(2 * time.Second)
+	for l2.has(0, 0, 1) {
+		if time.Now().After(deadline) {
+			t.Fatal("the deferred L2 drop never landed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestDropClearsL2 pins that a whole-device invalidation (UNMAP, WRITE SAME)
+// clears L2 as well as L1, so a later read cannot serve a discarded sector.
+func TestDropClearsL2(t *testing.T) {
+	const ss = 4 << 10
+	src := newFakeSource(ss, 4<<20)
+	l2 := newFakeL2(ss)
+	c := newTestCache(t, testOpts{l2: l2})
+
+	if err := c.Read(context.Background(), 0, make([]byte, ss), src); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	c.Wait()
+	if !l2.has(0, 0, 1) {
+		t.Fatal("the read should have populated L2")
+	}
+	c.Drop()
+	if l2.has(0, 0, 1) {
+		t.Fatal("Drop must clear L2, or a later read would serve a discarded sector")
+	}
+	if c.ReadCachedBoth(0, make([]byte, ss)) {
+		t.Fatal("nothing should be cached after Drop")
+	}
 }
 
 // TestReadPopulatesL2InBackground pins that a miss still reaches L2: the write
@@ -586,6 +742,55 @@ func TestInvalidateWaitsForBackgroundL2Write(t *testing.T) {
 
 	if l2.has(0, 0, 1) {
 		t.Fatal("the invalidated sector is still present in the L2")
+	}
+}
+
+// TestInvalidateAsyncDoesNotWaitForL2Population pins the property the transparent
+// proxy's write path depends on: unlike Invalidate
+// (TestInvalidateWaitsForBackgroundL2Write), InvalidateAsync returns without
+// waiting on an L2 population already in flight. A write must not stall the I→T
+// pump on the L2 store, and the deferred worker still drops the sector once the
+// fence it captured has drained.
+func TestInvalidateAsyncDoesNotWaitForL2Population(t *testing.T) {
+	const ss = 4 << 10
+	src := newFakeSource(ss, 4<<20)
+	gated := make(chan struct{})
+	l2 := newFakeL2(ss)
+	l2.gate = gated
+	l2.entered = make(chan struct{}, 1)
+	c := newTestCache(t, testOpts{l2: l2})
+
+	if err := c.Read(context.Background(), 0, make([]byte, ss), src); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	// Seeing the population enter WriteSectors guarantees it was enqueued in the
+	// fence before the invalidation captures its target.
+	select {
+	case <-l2.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the L2 population never started")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.InvalidateAsync(0, ss)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("InvalidateAsync blocked on an in-flight L2 population")
+	}
+
+	// Releasing the population must not resurrect the sector: the worker drops it
+	// once the fence target it captured has drained.
+	close(gated)
+	deadline := time.Now().Add(2 * time.Second)
+	for l2.has(0, 0, 1) {
+		if time.Now().After(deadline) {
+			t.Fatal("the L2 sector survived the asynchronous invalidation")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -691,5 +896,43 @@ func TestFillQueueDropKeepsServing(t *testing.T) {
 	c.Wait()
 	if err := c.Read(ctx, 0, make([]byte, ss), src); err != nil {
 		t.Fatalf("read after Wait: %v", err)
+	}
+}
+
+// TestFillObservedInstallsAlignedInterior pins the tee path's fill contract:
+// bytes observed on a forwarded read warm the cache, but only the sector
+// aligned interior of the run — a partial sector at either end is left cold so
+// a later hit can never hand back a torn sector.
+func TestFillObservedInstallsAlignedInterior(t *testing.T) {
+	const bs, ss = 16 << 10, 4 << 10
+	c := newTestCache(t, testOpts{})
+
+	// A sector aligned run installs whole.
+	aligned := make([]byte, 2*ss)
+	for i := range aligned {
+		aligned[i] = byte((4*ss + int64(i)) / ss)
+	}
+	c.FillObserved(4*ss, aligned)
+	c.Wait()
+	buf := make([]byte, 2*ss)
+	if !c.ReadCached(4*ss, buf) {
+		t.Fatal("对齐的观测填充应命中")
+	}
+	expectPattern(t, ss, 4*ss, buf)
+
+	// An unaligned run that starts 1000 bytes into sector 1 and ends mid sector 4
+	// covers sectors 2 and 3 in full.
+	off := int64(ss) + 1000
+	unaligned := make([]byte, 3*ss)
+	for i := range unaligned {
+		unaligned[i] = byte((off + int64(i)) / ss)
+	}
+	c.FillObserved(off, unaligned)
+	c.Wait()
+	if !c.ReadCached(2*ss, make([]byte, ss)) {
+		t.Fatal("观测填充应命中内缩后的完整扇区")
+	}
+	if c.ReadCached(ss, make([]byte, ss)) {
+		t.Fatal("起点未对齐的部分扇区不应被填充")
 	}
 }

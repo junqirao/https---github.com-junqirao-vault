@@ -10,37 +10,31 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"vault/internal/iscsicache"
+	"vault/internal/iscsiproxy"
 )
 
-// 客户端本地 iSCSI 读缓存代理：**一个客户端一个代理，一个代理下挂多个 iSCSI 目标**。
+// 客户端本地 iSCSI 读缓存代理（v2：透传 TCP + 旁路读缓存）。
 //
-// 设计要点（见 .trae/documents/客户端iSCSI读缓存实装方案.md）：
+// v2 与 v1 的终止式代理是两种实现：
 //
-//   - 门户只有一个，固定监听 127.0.0.1:3261。本机发起端只要连这个地址就够了，
-//     每个"启用了缓存的存储库"在门户里注册成自己的目标（按 IQN 路由到各自的 Handler）。
-//   - 代理目标的 IQN **必须与服务端下发的 IQN 不同**：Windows 侧的
-//     initiator_is_connected / initiator_wait_connected / initiator_disconnect 三个脚本
-//     用"短名（IQN 冒号后部分）包含匹配"找会话，两者短名互为子串就会串台。
+//   - 门户不再终止 iSCSI 会话，而是把发起端的 TCP 连接逐帧透传到服务端目标；
+//     登录、CHAP、协商全部端到端进行，代理不持有任何凭证。
+//   - 每个"启用了缓存的库"注册成自己的目标，各自监听一个 127.0.0.1 随机端口：
+//     发起端登录的是后端目标的**真实 IQN**，两个目标不能共用一个端口。
+//   - 代理只在旁路观测：读未命中就透传并把返回的数据 tee 进缓存；读全命中才吞掉命令、
+//     本地合成 Data-In 代答；写命令转发前失效对应范围（见 internal/iscsiproxy）。
 //   - L1/L2 预算是**客户端总量**（用户在客户端设置里配），按已启用缓存的库**均分**；
 //     配额在创建目标时定下，运行中不重算（重算会让已缓存的数据被突然判定为超额）。
-//   - 代理不可用（端口占用、后端不可达、后端 CHAP 认证失败、配额不足）时挂载流程回退直连
-//     服务端目标 —— 缓存是加速手段，绝不能变成挂载的前置条件。
+//   - 代理不可用（后端不可达、配额不足、端口占用…）时挂载流程回退直连服务端目标 ——
+//     缓存是加速手段，绝不能变成挂载的前置条件。
 const (
-	// cachePortalAddr 门户监听地址。固定端口：本机发起端只配一次门户地址，
-	// 换成动态端口只会让"连不上"更难排查。
-	cachePortalAddr = "127.0.0.1:3261"
-
-	// cacheIQNPrefix 本地代理目标的 IQN 前缀（见文件头关于短名串台的说明）。
-	cacheIQNPrefix = "iqn.2024-01.local.vault:vcache-"
-
-	// 厂商/型号：显式覆盖，保证代理盘与直连盘在 INQUIRY 上可区分。
+	// cacheIQNPrefix 是 v1 终止式代理用过、现已废弃的本地目标 IQN 前缀。
 	//
-	// 为什么必须覆盖：volume_find_iscsi_disk.ps1 只按"容量 + BusType=iSCSI"找盘并取编号
-	// 最小者，代理盘与直连盘若长得一样（同样的 Vendor/Product/Serial），就可能挂到直连盘上。
-	cacheVendor  = "VAULT"
-	cacheProduct = "Vault Cache Disk"
+	// v2 生效 IQN = 后端目标真实 IQN，不再使用它；保留只为在挂载时把升级前残留的
+	// v1 vcache 会话断干净（见 mount.go 的 disconnectStaleTargets）。
+	cacheIQNPrefix = "iqn.2024-01.local.vault:vcache-"
 
 	// 缓存预算的默认值与上下界（字节）。缓存只在用户为某个库开启后才真正占用。
 	cacheDefaultL1Bytes = 512 << 20
@@ -58,14 +52,14 @@ type cacheTargetRequest struct {
 	// AllocationID 同时是门户内的目标 key（同一分配重复挂载时据此幂等复用）。
 	AllocationID string
 	// BackendAddress/BackendPort/BackendIQN 是服务端下发的目标：代理从它取数据。
+	//
+	// 代理只拨 TCP，不持有凭证：目标认证（CHAP）由发起端与服务端**端到端**完成。
 	BackendAddress string
 	BackendPort    int
 	BackendIQN     string
-	// AuthMode 是服务端下发的认证方式：none（默认）或 chap（单向 CHAP）。
-	AuthMode string
-	// ChapUser/ChapSecret 是 CHAP 凭证（仅 AuthMode=chap 时使用）；明文只在本次挂载下发。
-	ChapUser   string
-	ChapSecret string
+	// CacheEnabled 该库是否开启缓存：false 时目标只做纯透传（不占 L1/L2 配额），
+	// 但仍经过本机代理，从而读写 IOPS 可被监控。
+	CacheEnabled bool
 }
 
 // cacheManager 持有客户端唯一的缓存门户，管理其中的多个目标。
@@ -79,10 +73,47 @@ type cacheManager struct {
 	// 但一旦启动，门户必须挂在 Agent 的长生命周期 context 上 —— 用挂载请求的 ctx
 	// 会让门户在挂载返回后立刻被取消。
 	ctx     context.Context
-	portal  *iscsicache.Portal
+	portal  *iscsiproxy.Portal
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	lastErr string
+
+	// historyMu 保护 history：采样 goroutine 写、HTTP 读。
+	historyMu sync.Mutex
+	// history 按库（分配）保留近 5 分钟的采样点，见 CacheHistory。
+	history map[string][]CacheSample
+}
+
+// 缓存指标历史：近 5 分钟的滑动窗口（60 点 × 5s），供客户端"缓存指标曲线"弹窗展示。
+const (
+	// cacheHistoryInterval 相邻两个采样点的间隔。
+	cacheHistoryInterval = 5 * time.Second
+	// cacheHistoryPoints 是每个库保留的采样点数。
+	cacheHistoryPoints = 60
+)
+
+// CacheSample 是单个库在某一刻的计数快照。速率与命中率由前端按相邻点差分计算，
+// 代理只如实记录累计值（重启/重建目标时计数归零，前端对负差分按无数据处理）。
+type CacheSample struct {
+	// T 是采样时刻（Unix 秒）。
+	T int64 `json:"t"`
+	// Reads/Hits 是读命令数与整命令命中数的累计值。
+	Reads int64 `json:"reads"`
+	Hits  int64 `json:"hits"`
+	// Writes/BackendReads 是写命令数与回后端读次数的累计值。
+	Writes       int64 `json:"writes"`
+	BackendReads int64 `json:"backend_reads"`
+	// L1UsedBytes/L2UsedBytes 是采样时刻的缓存占用（瞬时值，不做差分）。
+	L1UsedBytes int64 `json:"l1_used_bytes"`
+	L2UsedBytes int64 `json:"l2_used_bytes"`
+}
+
+// CacheHistory 是 GET /agent/cache/history 的响应：按库分组的滑动窗口。
+type CacheHistory struct {
+	// IntervalSec 是采样间隔；前端换算速率以它为准，而不是硬编码。
+	IntervalSec int64 `json:"interval_sec"`
+	// Targets 以 allocation_id 为键，值为按时间升序的采样点。
+	Targets map[string][]CacheSample `json:"targets"`
 }
 
 // newCacheManager 构造缓存代理管理器（此时不打开任何监听）。
@@ -90,10 +121,11 @@ func newCacheManager(cfg *ConfigStore, logger *slog.Logger) *cacheManager {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &cacheManager{cfg: cfg, logger: logger}
+	return &cacheManager{cfg: cfg, logger: logger, history: map[string][]CacheSample{}}
 }
 
-// Start 记录缓存代理的生命周期 context；门户在首次使用时才真正打开。
+// Start 记录缓存代理的生命周期 context（门户在首次使用时才真正打开），
+// 并启动指标采样：近 5 分钟滑动窗口，供"缓存指标曲线"弹窗使用。
 func (m *cacheManager) Start(ctx context.Context) {
 	if ctx == nil {
 		return
@@ -101,6 +133,81 @@ func (m *cacheManager) Start(ctx context.Context) {
 	m.mu.Lock()
 	m.ctx = ctx
 	m.mu.Unlock()
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		m.sampleLoop(ctx)
+	}()
+}
+
+// sampleLoop 每 5 秒为门户中的每个库记一个采样点。门户懒启动、库动态增删，
+// 因此每轮都现取现算；被移除的库其历史随之丢弃（曲线只对仍在用的库有意义）。
+func (m *cacheManager) sampleLoop(ctx context.Context) {
+	ticker := time.NewTicker(cacheHistoryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			m.sample(now)
+		}
+	}
+}
+
+// sample 记录一轮采样。
+func (m *cacheManager) sample(now time.Time) {
+	p := m.runningPortal()
+	if p == nil {
+		return
+	}
+	m.historyMu.Lock()
+	defer m.historyMu.Unlock()
+	alive := map[string]bool{}
+	for _, key := range p.Keys() {
+		stats, ok := p.Stats(key)
+		if !ok {
+			continue
+		}
+		alive[key] = true
+		cs := stats.Cache
+		point := CacheSample{
+			T:     now.Unix(),
+			Reads: stats.Proxy.Reads,
+			Hits:  cs.RequestHits,
+			// Writes/Reads 都取代理**观测到的命令数**：与缓存是否命中无关，
+			// 前端据此画出的 IOPS 反映真实经过代理的负载。
+			Writes:       stats.Proxy.Writes,
+			BackendReads: cs.BackendReads,
+			L1UsedBytes:  cs.L1UsedBytes,
+		}
+		if stats.BlockSize > 0 {
+			point.L2UsedBytes = int64(stats.L2Used) * int64(stats.BlockSize)
+		}
+		series := append(m.history[key], point)
+		if len(series) > cacheHistoryPoints {
+			series = series[len(series)-cacheHistoryPoints:]
+		}
+		m.history[key] = series
+	}
+	for key := range m.history {
+		if !alive[key] {
+			delete(m.history, key)
+		}
+	}
+}
+
+// History 返回近 5 分钟的采样窗口（GET /agent/cache/history）。
+func (m *cacheManager) History() CacheHistory {
+	m.historyMu.Lock()
+	defer m.historyMu.Unlock()
+	out := make(map[string][]CacheSample, len(m.history))
+	for key, series := range m.history {
+		cp := make([]CacheSample, len(series))
+		copy(cp, series)
+		out[key] = cp
+	}
+	return CacheHistory{IntervalSec: int64(cacheHistoryInterval / time.Second), Targets: out}
 }
 
 // Close 停止门户并回收所有目标（会 flush L2 文件、logout 后端）。
@@ -125,7 +232,7 @@ func (m *cacheManager) Close() error {
 }
 
 // portalForUse 返回正在运行的门户；未启动时按需打开（懒启动）。
-func (m *cacheManager) portalForUse() (*iscsicache.Portal, error) {
+func (m *cacheManager) portalForUse() (*iscsiproxy.Portal, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.portal != nil {
@@ -134,9 +241,8 @@ func (m *cacheManager) portalForUse() (*iscsicache.Portal, error) {
 	if m.ctx == nil {
 		return nil, errors.New("cache: 缓存代理尚未启动")
 	}
-	p, err := iscsicache.NewPortal(iscsicache.PortalConfig{
-		ListenAddr: cachePortalAddr,
-		Logger:     m.logger.With("component", "iscsi-cache"),
+	p, err := iscsiproxy.NewPortal(iscsiproxy.PortalConfig{
+		Logger: m.logger.With("component", "iscsi-cache"),
 	})
 	if err != nil {
 		m.lastErr = err.Error()
@@ -151,21 +257,25 @@ func (m *cacheManager) portalForUse() (*iscsicache.Portal, error) {
 			m.logger.Warn("本地 iSCSI 缓存代理已停止", "error", err)
 		}
 	}()
-	m.logger.Info("本地 iSCSI 缓存代理已启动", "addr", p.Addr().String())
+	// 版本日志：让用户一眼看出客户端跑的是哪一版缓存实现（v2 = 透传 TCP + 旁路读缓存）。
+	m.logger.Info("本地 iSCSI 读缓存代理已启动", "engine", iscsiproxy.Version)
 	return p, nil
 }
 
 // runningPortal 返回已打开的门户（未打开时为 nil），供只读查询使用。
-func (m *cacheManager) runningPortal() *iscsicache.Portal {
+func (m *cacheManager) runningPortal() *iscsiproxy.Portal {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.portal
 }
 
-// EnsureTarget 为该库注册/复用缓存目标。幂等：key 已在门户中时直接返回。
+// EnsureTarget 为该库注册/复用代理目标。幂等：key 已在门户中时直接返回。
 //
-// 返回错误表示这个库这次用不上缓存（端口占用、后端不可达、后端认证失败、配额不足等）——
-// 调用方据此**回退直连**，而不是让挂载失败。
+// 开缓存的库注册带缓存的代理目标；**未开缓存的库也走这里**，只是注册成纯透传目标
+// （不占 L1/L2 配额），从而每块盘都有一条经过代理的链路、读写 IOPS 都可被观测。
+//
+// 返回错误表示这个库这次用不上代理（后端不可达、端口占用等）——调用方据此**回退直连**，
+// 而不是让挂载失败。
 func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest) error {
 	allocationID := strings.TrimSpace(req.AllocationID)
 	if allocationID == "" {
@@ -175,32 +285,55 @@ func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest)
 	if err != nil {
 		return err
 	}
-	l1, l2 := m.quota()
-	if l1 < cacheMinL1Bytes {
-		return fmt.Errorf("cache: 每库 L1 配额 %d 字节低于下限", l1)
+
+	// 只有开缓存的库才申请 L1/L2 配额；未开缓存的库走纯透传，不参与配额分母。
+	var cc iscsiproxy.CacheConfig
+	if req.CacheEnabled {
+		l1, l2 := m.quota()
+		if l1 < cacheMinL1Bytes {
+			return fmt.Errorf("cache: 每库 L1 配额 %d 字节低于下限", l1)
+		}
+		cc = iscsiproxy.CacheConfig{
+			L1Bytes: l1,
+			// 与 v1 一致：默认开启顺序扫描准入，连续大顺序读不冲掉热点。
+			ScanEnabled:   true,
+			ScanThreshold: 32,
+		}
+		if l2 >= cacheMinL2Bytes {
+			cc.L2 = iscsiproxy.L2Config{
+				Enabled:   true,
+				Path:      cacheL2Path(m.cfg.Get().CacheL2Dir, allocationID),
+				SizeBytes: l2,
+			}
+		}
 	}
 
-	cc := iscsicache.CacheConfig{}
-	cc.L1.SizeBytes = l1
-	if l2 >= cacheMinL2Bytes {
-		cc.L2.Enabled = true
-		cc.L2.Path = cacheL2Path(m.cfg.Get().CacheL2Dir, allocationID)
-		cc.L2.SizeBytes = l2
-	}
-	return p.Add(ctx, iscsicache.TargetConfig{
-		Key:       allocationID,
-		TargetIQN: cacheTargetIQN(allocationID),
-		Backend: iscsicache.BackendConfig{
-			Address:   net.JoinHostPort(strings.TrimSpace(req.BackendAddress), strconv.Itoa(cacheBackendPort(req.BackendPort))),
+	addr := net.JoinHostPort(strings.TrimSpace(req.BackendAddress), strconv.Itoa(cacheBackendPort(req.BackendPort)))
+	if err := p.Add(ctx, iscsiproxy.TargetConfig{
+		Key: allocationID,
+		Backend: iscsiproxy.BackendConfig{
+			Address:   addr,
 			TargetIQN: strings.TrimSpace(req.BackendIQN),
-			// 认证透传给自研后端发起端：none 直连，chap 走单向 CHAP 登录握手。
-			Auth:     strings.TrimSpace(req.AuthMode),
-			Username: req.ChapUser,
-			Secret:   req.ChapSecret,
 		},
-		Vendor:  cacheVendor,
-		Product: cacheProduct,
-	})
+		Cache:   cc,
+		NoCache: !req.CacheEnabled,
+	}); err != nil {
+		return err
+	}
+	m.logger.Info("本地 iSCSI 代理目标已启用",
+		"engine", iscsiproxy.Version, "allocation_id", allocationID,
+		"backend", addr, "cache", req.CacheEnabled)
+	return nil
+}
+
+// TargetAddr 返回某库在本机代理上的监听地址（挂载链路把它当作**生效门户**）。
+// 门户未打开或该库未注册时 ok 为 false。
+func (m *cacheManager) TargetAddr(allocationID string) (host string, port int, ok bool) {
+	p := m.runningPortal()
+	if p == nil {
+		return "", 0, false
+	}
+	return p.TargetAddr(strings.TrimSpace(allocationID))
 }
 
 // ReleaseTarget 注销该库的缓存目标并回收其 L2 文件。幂等。
@@ -260,7 +393,7 @@ type CacheStatus struct {
 type CacheTargetStatus struct {
 	// AllocationID 与挂载记录、存储库卡片一一对应。
 	AllocationID string `json:"allocation_id"`
-	// TargetIQN 是本地门户为该库公示的 IQN（挂载链路上实际连接的那个）。
+	// TargetIQN 是挂载链路上实际登录的 IQN。v2 透传代理用它对应的后端目标真实 IQN。
 	TargetIQN string `json:"target_iqn"`
 	// L1UsedBytes/L1LimitBytes 是内存缓存占用与配额。
 	L1UsedBytes  int64 `json:"l1_used_bytes"`
@@ -308,7 +441,11 @@ func (m *cacheManager) Status() CacheStatus {
 		return st
 	}
 	st.Running = true
-	st.Addr = p.Addr().String()
+	// v2 每个库各监听一个随机端口，没有单一门户地址：这里回显首个目标的监听地址，
+	// 仅作展示；真正的生效门户逐库由 TargetAddr 取。
+	if a := p.Addr(); a != nil {
+		st.Addr = a.String()
+	}
 	for _, key := range p.Keys() {
 		stats, ok := p.Stats(key)
 		if !ok {
@@ -316,12 +453,15 @@ func (m *cacheManager) Status() CacheStatus {
 		}
 		iqn, _ := p.TargetIQN(key)
 		cs := stats.Cache
+		// Reads 取代理观测到的读命令数（而非缓存的命中计数）：命中率 = 整条命中 / 读命令，
+		// 这样在缓存尚未绑定或首读未命中时读 IOPS 也如实非 0。
+		reads := stats.Proxy.Reads
 		ts := CacheTargetStatus{
 			AllocationID: key,
 			TargetIQN:    iqn,
 			L1UsedBytes:  cs.L1UsedBytes,
 			L1LimitBytes: cs.L1LimitBytes,
-			Reads:        cs.Reads,
+			Reads:        reads,
 			RequestHits:  cs.RequestHits,
 			L1Hits:       cs.L1Hits,
 			PartialHits:  cs.PartialHits,
@@ -334,28 +474,15 @@ func (m *cacheManager) Status() CacheStatus {
 			ts.L2UsedBytes = int64(stats.L2Used) * slot
 			ts.L2LimitBytes = int64(stats.L2Slots) * slot
 		}
-		if cs.Reads > 0 {
-			ts.HitRate = float64(cs.RequestHits) / float64(cs.Reads)
+		if reads > 0 {
+			ts.HitRate = float64(cs.RequestHits) / float64(reads)
 		}
 		st.Targets = append(st.Targets, ts)
 	}
 	return st
 }
 
-// cachePortalHostPort 拆分门户监听地址：挂载链路要把它当作**生效门户**写进挂载记录。
-func cachePortalHostPort() (host string, port int) {
-	h, p, err := net.SplitHostPort(cachePortalAddr)
-	if err != nil {
-		return cachePortalAddr, 3261
-	}
-	n, err := strconv.Atoi(p)
-	if err != nil {
-		return h, 3261
-	}
-	return h, n
-}
-
-// cacheTargetIQN 返回某个分配在本地门户上的 IQN（见文件头关于短名串台的说明）。
+// cacheTargetIQN 返回某个分配在本地门户上的 IQN（v1 遗留命名，见 cacheIQNPrefix 的说明）。
 func cacheTargetIQN(allocationID string) string {
 	return cacheIQNPrefix + sanitizeIQNSuffix(allocationID)
 }

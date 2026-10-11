@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -57,7 +58,7 @@ func main() {
 	os.Exit(run())
 }
 
-func run() int {
+func run() (code int) {
 	// 被**双击**启动时隐藏系统自动创建的控制台窗口，避免出现"黑框"。
 	// 从 cmd/PowerShell 手工启动时该函数不会动手（控制台里还有其他进程），
 	// 所以 `-h` / `-version` 等输出依然可见。
@@ -129,6 +130,21 @@ func run() int {
 	}
 	defer logger.Close() //nolint:errcheck
 	log := logger.Logger
+
+	// 顶层兜底：任何未捕获的 panic 都要**写进日志文件**再退出。
+	//
+	// 为什么必须：代理是 Electron 的子进程，主进程会丢弃它的 stderr
+	// （见 apps/client/electron/agent.ts 的 `child.stderr.on('data', () => undefined)`），
+	// 未捕获的 panic 只打印到 stderr 就随进程消失 —— 日志文件里一片空白，用户与支持人员
+	// 无从定位（真实故障："代理挂到一半无声消失，日志里什么也没有"）。
+	// defer 顺序为 LIFO：本兜底先于上面的 logger.Close() 执行，日志仍是打开的。
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("代理主流程 panic，即将退出", "panic", r, "stack", string(debug.Stack()))
+			fmt.Fprintf(os.Stderr, "Vault-Agent panic: %v\n%s\n", r, debug.Stack())
+			code = 1
+		}
+	}()
 
 	// ---- 清理历史替换器副本（best-effort；正在运行的副本删不掉，忽略即可）----
 	agent.CleanupStaleUpdaterCopies(log)

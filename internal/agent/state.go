@@ -217,6 +217,11 @@ type MountState struct {
 	CacheEnabled bool   `json:"cache_enabled,omitempty"`
 	CacheActive  bool   `json:"cache_active,omitempty"`
 	CacheError   string `json:"cache_error,omitempty"`
+	// DirectMode 记录"本次挂载时该库是否处于直连模式"（绕过本机代理）。
+	//
+	// CacheActive 与 DirectMode 互补：直连模式下 CacheActive 恒为 false；
+	// 非直连时 CacheActive 表示代理是否真的生效（回退直连时为 false，原因见 CacheError）。
+	DirectMode bool `json:"direct_mode,omitempty"`
 	// ServerKey / ServerURL / ServerName 标识这条挂载属于**哪台**服务端。
 	//
 	// 多服务端下这是必须的：心跳、挂载点回写、租约释放都必须发给"当初受理这次挂载的那台"

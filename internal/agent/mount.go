@@ -41,6 +41,11 @@ const (
 	// 0xefff0040 的含义是"会话上仍有在线设备"，最常见的成因是 Set-Disk -IsOffline 还没真正
 	// 生效 —— 立刻重试会拿到同一个错误，所以要留一点时间给它生效。
 	unmountDisconnectBackoff = 2 * time.Second
+	// cleanupTimeout 是"失败挂载清理"的时间上限（见 mount 的 failWithDetail）。
+	//
+	// 清理与挂载自身的 ctx **解耦**（用户取消挂载时挂载 ctx 已被取消），因此需要自己的上限，
+	// 避免残留现场始终清不动而把请求无限拖住。
+	cleanupTimeout = 2 * time.Minute
 )
 
 // MountRequest 是本地挂载请求（POST /agent/mount）。
@@ -93,6 +98,13 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	unlock := e.a.locks.Lock("alloc:" + allocationID)
 	defer unlock()
 
+	// 让这次挂载可被取消（POST /agent/mount/cancel）：登记一个取消函数，取消即 kill 掉正在
+	// 跑的 PowerShell 并让流程按失败收场。defer 顺序为 LIFO：先注销登记，再取消 ctx，最后解锁。
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	e.a.registerMountCancel(allocationID, cancel)
+	defer e.a.unregisterMountCancel(allocationID)
+
 	// 幂等：同一 allocation 已挂载、且**实测本机确实还有活动会话**时，直接返回既有状态。
 	//
 	// 判据必须带上实测会话，只看记录会撒谎（真实诉求："挂载和卸载的按钮应以实际为准，
@@ -111,14 +123,16 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 				}
 				return &existing, nil
 			}
-			// 缓存开关与既有记录不一致（用户刚在设置里开了/关了缓存）：**先卸载再按新设置挂载**。
+			// 代理/缓存/直连设置与既有记录不一致（用户刚在设置里改了）：**先卸载再按新设置挂载**。
 			//
-			// 为什么不能就地重挂：生效 IQN 换了一侧，旧会话的磁盘仍在线、挂载点仍占用 ——
-			// 直接连新 IQN 会得到"同一块卷两个 iSCSI 设备"，找盘脚本按容量取编号最小的那个，
-			// 会挂到错的一块上（详见 disconnectStaleTargets）。先卸载把旧会话与挂载点收拾干净。
-			e.a.logger.Info("缓存开关与既有挂载不一致，先卸载再按新设置挂载",
+			// 为什么不能就地重挂：生效门户换了一侧（直连服务端 ↔ 本机代理），旧会话的磁盘仍在线、
+			// 挂载点仍占用 —— 而 v2 两侧 IQN 同名、只有门户不同，残留会话会让 Connect 的幂等判定
+			// 直接复用它（绕过代理），并留下"同一块卷两个 iSCSI 设备"的隐患。先卸载把旧会话与挂载点
+			// 收拾干净（v2 再次挂载时 disconnectSameNameSession 还会兜底断开同名残留）。
+			e.a.logger.Info("代理/直连设置与既有挂载不一致，先卸载再按新设置挂载",
 				"allocation_id", allocationID,
-				"cache_enabled_record", existing.CacheEnabled, "cache_active_record", existing.CacheActive)
+				"cache_enabled_record", existing.CacheEnabled, "cache_active_record", existing.CacheActive,
+				"direct_mode_record", existing.DirectMode)
 			if err := e.unmountLocked(ctx, allocationID); err != nil {
 				return nil, err
 			}
@@ -175,42 +189,47 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 
 	mode := e.resolveMode(req, spec)
 
-	// 生效门户与生效 IQN：库启用了本地读缓存时走**本机代理**（下发 → 代理 → 本地建联代理），
-	// 否则直连服务端下发的目标。
+	// 生效门户与生效 IQN：除**直连模式**外，所有库都经本机代理（本机发起端 → 代理 → 服务端）。
+	//   - 开了缓存的库：代理带读缓存（命中即本地代答）；
+	//   - 未开缓存的库：代理只做纯透传 —— 不占缓存配额，但读写 IOPS 仍可被观测。
+	// 只有用户为该库显式打开直连模式时才绕过代理，直连服务端下发的目标。
 	//
-	// 缓存不可用（端口占用、后端不可达、后端 CHAP 认证失败、配额不足…）一律**回退直连**，
-	// 绝不因为缓存把挂载搞失败：缓存只是加速手段，不是挂载的前置条件（见 cacheproxy.go 文件头）。
+	// v2 的 IQN 两侧相同（后端真实 IQN），只有门户地址不同。
+	// 代理不可用（后端不可达、端口占用…）一律**回退直连**，绝不因为代理把挂载搞失败：
+	// 代理只是加速/观测手段，不是挂载的前置条件（见 cacheproxy.go 文件头）。
 	effectivePortalAddr, effectivePortalPort := spec.PortalAddress, portalPort(spec)
+	// v2 是透传代理：发起端登录的是后端目标的**真实 IQN**，认证也端到端进行。
+	// 代理生效只把门户地址换成该库在本机代理上的监听端口，IQN 不变。
 	effectiveIQN := spec.TargetIQN
-	cacheEnabled, cacheActive := false, false
-	cacheErr := ""
-	if pref, ok := e.repoPref(req.RepoID); ok && pref.CacheEnabled {
-		cacheEnabled = true
-		// EnsureTarget 会（首次时）打开本机门户、拨号服务端目标并注册本地 IQN。
-		// 用挂载请求的 ctx：拨号本身就是挂载路径的一部分，请求取消时它也该停。
+	pref, hasPref := e.repoPref(req.RepoID)
+	directMode := hasPref && pref.DirectMode
+	cacheEnabled := hasPref && pref.CacheEnabled
+	cacheActive, cacheErr := false, ""
+	if !directMode {
+		// EnsureTarget 会（首次时）打开本机门户、为该库注册一个本机监听端口。
+		// 用挂载请求的 ctx：注册本身就是挂载路径的一部分，请求取消时它也该停。
 		if err := e.a.cache.EnsureTarget(ctx, cacheTargetRequest{
 			AllocationID:   allocationID,
 			BackendAddress: spec.PortalAddress,
 			BackendPort:    portalPort(spec),
 			BackendIQN:     spec.TargetIQN,
-			// 与直连路径同一套映射：只有 chap 需要握手，ip/none 都是无认证连接
-			// （服务端按白名单过滤时，客户端侧无需 CHAP）。
-			AuthMode:   clientAuthMode(spec.AuthMode),
-			ChapUser:   spec.ChapUser,
-			ChapSecret: spec.ChapSecret,
+			CacheEnabled:   cacheEnabled,
 		}); err != nil {
 			cacheErr = err.Error()
-			e.a.logger.Warn("本地读缓存代理不可用，回退直连服务端目标",
+			e.a.logger.Warn("本地 iSCSI 代理不可用，回退直连服务端目标",
 				"allocation_id", allocationID, "error", err)
-		} else {
+		} else if host, port, ok := e.a.cache.TargetAddr(allocationID); ok {
 			cacheActive = true
-			effectivePortalAddr, effectivePortalPort = cachePortalHostPort()
-			effectiveIQN = cacheTargetIQN(allocationID)
+			effectivePortalAddr, effectivePortalPort = host, port
+		} else {
+			cacheErr = "cache: 目标已注册但取不到监听地址"
+			e.a.logger.Warn("本地 iSCSI 代理取不到监听地址，回退直连服务端目标",
+				"allocation_id", allocationID)
 		}
 	}
 
-	// 本机发起端连**生效门户**时用的认证方式与凭证（缓存生效时为 None，见 localConnectAuth）。
-	localAuthMode, localChapUser, localChapSecret := localConnectAuth(spec, cacheActive)
+	// 本机发起端连**生效门户**时用的认证方式与凭证（见 localConnectAuth）。
+	localAuthMode, localChapUser, localChapSecret := localConnectAuth(spec)
 
 	ms := &MountState{
 		RepoID: strings.TrimSpace(req.RepoID),
@@ -227,6 +246,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		CacheEnabled: cacheEnabled,
 		CacheActive:  cacheActive,
 		CacheError:   cacheErr,
+		DirectMode:   directMode,
 		MountMode:    mode,
 		State:        MountStateMounting,
 		// 服务端阶段（准备磁盘/下发目标）已经走完，接下来是本机的会话建立与磁盘上线。
@@ -235,7 +255,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	rt := &mountRuntime{
 		PortalAddress: effectivePortalAddr,
 		PortalPort:    effectivePortalPort,
-		// 记的是**本机发起端实际用的**认证（缓存生效时为 None），不是服务端下发的值。
+		// 记的是本机发起端实际用的认证：v2 透传代理下与服务端下发值一致（CHAP 端到端）。
 		AuthMode:         localAuthMode,
 		ChapUser:         localChapUser,
 		ChapSecret:       localChapSecret,
@@ -274,7 +294,11 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		// 会话拆掉 —— 宁可留一条可见的错误，也不静默改变用户机器上的磁盘状态。
 		cleaned, cleanupErr := true, error(nil)
 		if !keepRecordOnFailure {
-			cleaned, cleanupErr = e.cleanupFailedMount(ctx, allocationID, stage)
+			// 用与本次尝试**解耦**的上下文做清理：用户点了"取消"或前端连接断开时 ctx 已被取消，
+			// 若清理也跟着取消，真实建立的 iSCSI 会话就会残留 —— 而"取消"的意义正是干净地中止。
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			cleaned, cleanupErr = e.cleanupFailedMount(cleanupCtx, allocationID, stage)
+			cleanupCancel()
 		}
 		if cleaned {
 			e.a.store.DeleteMount(allocationID)
@@ -346,13 +370,22 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	if err := e.a.iscsi.EnsurePortal(ctx, effectivePortalAddr, effectivePortalPort); err != nil {
 		return fail("portal", err)
 	}
-	// 单会话硬前提：生效 IQN 可能刚因"缓存开关"换了一侧，先把**另一侧**的残留会话断掉。
+	// 单会话硬前提：把**非生效**目标的残留会话断掉（v1 升级残留的旧代理 IQN 等）。
+	// v2 生效 IQN = 后端真实 IQN，与直连同名，故这里跳过生效侧，同名残留由下面单独处理。
 	e.disconnectStaleTargets(ctx, effectiveIQN, spec.TargetIQN, cacheTargetIQN(allocationID))
+	// v2 用后端真实 IQN：直连会话与代理会话**同名**，而 Connect 脚本的幂等判定只看 IQN
+	// （Test-SameTarget），残留的同名会话会让它直接判定"已连接"从而绕过代理，代理形同虚设
+	// （开没开缓存都一样）。因此只要走代理（cacheActive，含未开缓存的纯透传），就先显式断开
+	// 任何同名旧会话，确保随后的 Connect 一定经本机代理登录。
+	if cacheActive {
+		e.disconnectSameNameSession(ctx, effectiveIQN)
+	}
 	if err := e.a.iscsi.Connect(ctx, iscsiinitiator.ConnectOptions{
 		TargetIQN:     effectiveIQN,
 		PortalAddress: effectivePortalAddr,
 		PortalPort:    effectivePortalPort,
-		// 连的是**生效门户**：缓存生效时是本机代理，只支持 None（见 localAuthMode 的说明）。
+		// v2 透传代理：认证由发起端与服务端端到端协商，本机连接照搬服务端下发的认证
+		// （见 localConnectAuth）。
 		AuthMode:   localAuthMode,
 		ChapUser:   localChapUser,
 		ChapSecret: localChapSecret,
@@ -430,6 +463,60 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		"allocation_id", allocationID, "mount_path", mountPath,
 		"disk_number", diskNumber, "mount_mode", mode)
 	return &out, nil
+}
+
+// registerMountCancel 登记一个"进行中挂载"的取消函数（同一 allocation 覆盖旧值）。
+func (a *Agent) registerMountCancel(allocationID string, cancel context.CancelFunc) {
+	a.mountMu.Lock()
+	defer a.mountMu.Unlock()
+	if a.mountCancels == nil {
+		a.mountCancels = make(map[string]context.CancelFunc)
+	}
+	a.mountCancels[allocationID] = cancel
+}
+
+// unregisterMountCancel 注销登记（挂载流程结束，无论成败）。
+func (a *Agent) unregisterMountCancel(allocationID string) {
+	a.mountMu.Lock()
+	defer a.mountMu.Unlock()
+	delete(a.mountCancels, allocationID)
+}
+
+// CancelMount 取消一个**进行中**的挂载，返回是否确实处理了。
+//
+// 两种情况：
+//   - 有正在跑的挂载：取消它 —— 正在执行的 PowerShell 会被 kill（exec.CommandContext +
+//     WaitDelay），挂载流程随即以失败收场并清理现场。
+//   - 没有正在跑的挂载、但本机留着一条 state=mounting 的记录：这是进程重启留下的"死残留"
+//     （那条记录代表一次没跑完的挂载，已经没有任何人在推进它）。直接清掉记录，给用户一个
+//     确定的出口 —— 否则界面永远停在"正在建立 iSCSI 会话"，点取消也无反应。
+//
+// 其余情况返回 false（幂等，界面无需区分）。这就是界面"取消"按钮的落点（真实反馈：
+// "一直卡在建立 iSCSI 会话，不能停止，卡死了"）。
+func (a *Agent) CancelMount(allocationID string) bool {
+	allocationID = strings.TrimSpace(allocationID)
+	if allocationID == "" {
+		return false
+	}
+	a.mountMu.Lock()
+	cancel := a.mountCancels[allocationID]
+	a.mountMu.Unlock()
+	if cancel != nil {
+		a.logger.Info("收到取消挂载请求", "allocation_id", allocationID)
+		cancel()
+		return true
+	}
+	ms, _, ok := a.store.GetMount(allocationID)
+	if !ok || ms.State != MountStateMounting {
+		return false
+	}
+	// 残留记录不做完整 unmount：它的字段（target_iqn/session 等）未必是"已建立会话"时的值，
+	// 拿它去跑 PowerShell 只会报误导性的 "Invalid Session Id."；真残留的会话在代理进程退出时
+	// 已随监听套接字断开而被发起端清理（或由服务端停用目标后踢掉）。这里只把死记录清掉。
+	a.logger.Info("清除卡住的挂载记录", "allocation_id", allocationID)
+	a.store.DeleteMount(allocationID)
+	a.hub.Publish(Event{Type: "unmount", Data: map[string]any{"allocation_id": allocationID}})
+	return true
 }
 
 // setPhase 推进某个挂载的阶段并广播（只在 state=mounting 时生效，且只前进不回退）。
@@ -741,11 +828,14 @@ func (e *mountEngine) disconnectSession(ctx context.Context, targetIQN string, m
 
 // disconnectStaleTargets 断开该分配在**生效目标之外**残留的 iSCSI 会话（尽力而为）。
 //
-// 为什么必须有（硬前提）：生效 IQN 会随"缓存开关"变化 —— 缓存开启走本地代理 IQN
-// （iqn.2024-01.local.vault:vcache-<alloc>），关闭则直连服务端 IQN。开关来回切之后，
-// 另一侧若还留着会话，同一块卷会以两个 iSCSI 设备同时在线：Windows 里就是两块同容量的盘，
+// 为什么必须有（硬前提）：同一块卷以两个 iSCSI 设备同时在线时，Windows 里就是两块同容量的盘，
 // 盘符/卷标互相打架，而 volume_find_iscsi_disk.ps1 只按"容量 + BusType 取编号最小"找盘，
-// 会挂到错的那块上（见 cacheproxy.go 关于 Vendor/Product 覆盖的同类说明）。
+// 会挂到错的那块上。切换缓存开关时另一侧若还留着会话就会这样。
+//
+// 传进来的候选里，生效 IQN 被跳过（它由后续 Connect 幂等复用或重建）。v1 升级到 v2 后，
+// 候选里的 cacheTargetIQN 是**旧 v1 代理 IQN**（v2 已不再使用），用来把升级前残留的 vcache
+// 会话断干净。v2 生效 IQN = 后端真实 IQN，与直连同名，其残留由 disconnectSameNameSession
+// 单独处理（见调用点）。
 //
 // 只断另一侧、不断生效侧：生效侧的会话由后续 Connect 幂等复用或重建。
 func (e *mountEngine) disconnectStaleTargets(ctx context.Context, effectiveIQN string, candidates ...string) {
@@ -774,6 +864,36 @@ func (e *mountEngine) disconnectStaleTargets(ctx context.Context, effectiveIQN s
 			// 而且这里拿不到它的磁盘号去下线（那是卸载流程的职责）。
 			e.a.logger.Warn("断开残留 iSCSI 会话失败（继续挂载）", "target_iqn", iqn, "error", err)
 		}
+	}
+}
+
+// disconnectSameNameSession 断开与生效 IQN **同名**的残留会话（尽力而为）。
+//
+// 为什么必须（v2 特有的硬前提）：v2 透传代理登录的是后端目标真实 IQN，与"直连服务端"的
+// IQN 完全相同 —— 两者同名，只有门户地址不同。而 Connect 脚本的幂等判定只看 IQN 短名
+// （Test-SameTarget）：若上一次是直连、残留着同名会话，后续 Connect 会直接判定"已连接"
+// 而**绕过本机代理**，缓存永远不生效（用户看到缓存"开了但没命中"）。
+// 因此缓存生效时，先显式断开同名旧会话，确保随后的 Connect 一定经本机代理登录。
+//
+// 与 disconnectStaleTargets 的区别：那个断的是**别的** IQN（跳过生效侧），这个专门断生效
+// IQN 自身的残留。它必须发生在 EnsurePortal 之后、Connect 之前。
+func (e *mountEngine) disconnectSameNameSession(ctx context.Context, iqn string) {
+	iqn = strings.TrimSpace(iqn)
+	if iqn == "" {
+		return
+	}
+	// ⚠️ 不能先问 IsConnected 再决定要不要断。进程中途重启/崩溃会留下一条**未连接**的同名残留
+	// 会话：缓存代理的监听套接字随进程消失，发起端里那条会话随即从"已连接"变成残留 —— 它同样
+	// 会挡住随后的 Connect-IscsiTarget，真实报错："The target has already been logged in via an
+	// iSCSI session."（界面：挂载失败（阶段：connect））。之前按 IsConnected 早退，正是漏掉了这
+	// 种残留，于是挂载反复失败、怎么重试都连不上。
+	//
+	// Disconnect 是幂等的（无会话时脚本直接 action=none），因此这里一律尝试断开，不再预判。
+	e.a.logger.Info("断开同名残留 iSCSI 会话，确保经本机缓存代理登录", "target_iqn", iqn)
+	if err := e.a.iscsi.Disconnect(ctx, iqn); err != nil {
+		// 断不掉不中断挂载：下面 Connect 会复用该会话（此时缓存不生效），
+		// 但挂载本身仍可用；比"因为清理失败而整个挂载失败"更可取。
+		e.a.logger.Warn("断开同名 iSCSI 会话失败（继续挂载）", "target_iqn", iqn, "error", err)
 	}
 }
 
@@ -1190,13 +1310,18 @@ func (e *mountEngine) repoPref(repoID string) (RepoMountPref, bool) {
 	return pref, ok
 }
 
-// mountCacheSatisfied 判断既有挂载记录的缓存形态是否已经满足**当前**的每库缓存开关。
+// mountCacheSatisfied 判断既有挂载记录的门户形态是否已经满足**当前**的每库配置。
 //
-// 判据用 CacheActive（缓存真的生效了）而非 CacheEnabled：上次"想开却回退直连"的记录
-// 应当在下一次挂载时**再试一次** —— 回退原因可能是暂时性的（端口被占、后端一时不可达）。
+// 判据用 CacheActive（代理真的生效了）而非配置本身：上次"想经代理却回退直连"的记录应当
+// 在下一次挂载时**再试一次** —— 回退原因可能是暂时性的（端口被占、后端一时不可达）。
+//   - 直连模式期望 CacheActive=false（不经代理），其余期望 true（经代理）；
+//   - 缓存开关变过也要重挂：否则用户新开的缓存不会生效（代理目标带着旧缓存配置）。
 func (e *mountEngine) mountCacheSatisfied(req MountRequest, ms MountState) bool {
-	pref, ok := e.repoPref(req.RepoID)
-	return ms.CacheActive == (ok && pref.CacheEnabled)
+	pref, _ := e.repoPref(req.RepoID)
+	if ms.CacheActive != !pref.DirectMode {
+		return false
+	}
+	return ms.CacheEnabled == pref.CacheEnabled
 }
 
 // resolveMode 确定本次挂载模式：请求 > 每库配置 > 服务端下发 > 本地默认。
@@ -1247,15 +1372,11 @@ func clientAuthMode(authMode string) string {
 
 // localConnectAuth 返回本机发起端连接**生效门户**时应使用的认证方式与凭证。
 //
-// 直连服务端目标时照搬服务端下发的认证（可能是 chap）。但走缓存代理时必须用 None：
-// 生效门户是本机代理（127.0.0.1:3261），它面向回环只提供 AuthMethod=None，**不支持 CHAP**。
-// CHAP 属于"代理 → 服务端目标"那一段（凭证已在 EnsureTarget 里交给代理），本机发起端到本地
-// 门户这一环带上它，只会让本机连接直接以 "Authentication Failure" 收场
-// （真实故障：缓存开了、后端也是 chap，却拿 chap 去连本地门户）。
-func localConnectAuth(spec *MountSpec, cacheActive bool) (mode, user, secret string) {
-	if cacheActive {
-		return iscsiinitiator.AuthModeNone, "", ""
-	}
+// 无论直连服务端目标还是走本机缓存代理，认证都由发起端与服务端**端到端**协商、凭证照搬
+// 服务端下发的值：v2 是透传代理（见 cacheproxy.go 文件头），它不终止 iSCSI 会话、不参与
+// CHAP，本机发起端到代理这一环只是 TCP 透传，因此 CHAP 必须原样带上。这与 v1 终止式代理
+// （代理面向回环只提供 AuthMethod=None，必须把 CHAP 摘掉）的行为相反。
+func localConnectAuth(spec *MountSpec) (mode, user, secret string) {
 	return clientAuthMode(spec.AuthMode), spec.ChapUser, spec.ChapSecret
 }
 

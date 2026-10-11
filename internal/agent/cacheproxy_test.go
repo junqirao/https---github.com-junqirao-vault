@@ -198,62 +198,72 @@ func TestCacheStatusWithoutPortal(t *testing.T) {
 	}
 }
 
-// TestLocalConnectAuthDropsCHAPWhenCacheActive 锁定：缓存生效时本机连接必须用 None。
+// TestLocalConnectAuthKeepsCHAPWithCache 锁定：v2 透传代理下本机连接**保留** CHAP。
 //
-// 生效门户是本机缓存代理，它面向回环只提供 AuthMethod=None。把服务端下发的 chap 继续传给
-// 本机连接，会让本机对本地门户做 CHAP 并直接以 "Authentication Failure" 收场（真实故障）。
-// 而直连服务端目标时 chap 必须保留，否则会以"未鉴权"被目标拒绝。
-func TestLocalConnectAuthDropsCHAPWhenCacheActive(t *testing.T) {
+// v2 代理不终止 iSCSI 会话、不参与认证（见 cacheproxy.go 文件头）：本机发起端到代理只是
+// TCP 透传，CHAP 由发起端与服务端端到端协商。所以缓存生效与否，本机连接都应照搬服务端下发
+// 的认证（chap 就带 chap），摘掉它反而会被目标以"未鉴权"拒绝。
+// （v1 终止式代理相反：代理面向回环只提供 None，必须摘 CHAP —— 那是旧行为，已废弃。）
+func TestLocalConnectAuthKeepsCHAPWithCache(t *testing.T) {
 	chap := &MountSpec{AuthMode: "chap", ChapUser: "vault-abc", ChapSecret: "secret"}
 
-	if mode, user, secret := localConnectAuth(chap, false); mode != iscsiinitiator.AuthModeCHAP ||
+	if mode, user, secret := localConnectAuth(chap); mode != iscsiinitiator.AuthModeCHAP ||
 		user != "vault-abc" || secret != "secret" {
-		t.Fatalf("直连应保留 CHAP：mode=%q user=%q secret=%q", mode, user, secret)
+		t.Fatalf("缓存生效时也必须保留 CHAP（端到端透传）：mode=%q user=%q secret=%q", mode, user, secret)
 	}
 
-	if mode, user, secret := localConnectAuth(chap, true); mode != iscsiinitiator.AuthModeNone ||
-		user != "" || secret != "" {
-		t.Fatalf("缓存生效时必须用 None 且不带凭证：mode=%q user=%q secret=%q", mode, user, secret)
-	}
-
-	// ip 模式（服务端按白名单过滤）在客户端侧同样是"无认证连接"。
-	if mode, _, _ := localConnectAuth(&MountSpec{AuthMode: "ip"}, false); mode != iscsiinitiator.AuthModeNone {
+	// ip 模式（服务端按白名单过滤）在客户端侧是"无认证连接"。
+	if mode, _, _ := localConnectAuth(&MountSpec{AuthMode: "ip"}); mode != iscsiinitiator.AuthModeNone {
 		t.Fatalf("ip 模式应为无认证连接，实际 %q", mode)
 	}
 }
 
-// TestMountCacheSatisfied 锁定"既有挂载记录的缓存形态是否满足当前开关"。
+// TestMountCacheSatisfied 锁定"既有挂载记录的门户形态是否满足当前配置"。
 //
-// 判据用 CacheActive：上次"想开却回退直连"的记录不该被幂等命中，否则用户开了缓存却永远
-// 等不到它生效（回退原因可能是暂时性的：端口被占、后端一时不可达）。
+// 判据用 CacheActive：上次"想经代理却回退直连"的记录不该被幂等命中，否则用户永远等不到
+// 代理生效（回退原因可能是暂时性的：端口被占、后端一时不可达）。直连模式则相反，期望不经代理。
 func TestMountCacheSatisfied(t *testing.T) {
 	// 判据只读每库配置（repoPref → cfg.Get().RepoMounts），不需要状态存储/事件总线/锁表。
 	req := MountRequest{AllocationID: "alloc-1", RepoID: "repo-a"}
 	cases := []struct {
-		name        string
-		prefEnabled bool
-		hasPref     bool
-		active      bool
-		want        bool
+		name      string
+		hasPref   bool
+		direct    bool
+		prefCache bool
+		// recordActive/recordCache 是既有 MountState 里记的值。
+		recordActive bool
+		recordCache  bool
+		want         bool
 	}{
-		{"未启用 + 直连", false, true, false, true},
-		{"未启用 + 却是缓存（需回退直连）", false, true, true, false},
-		{"已启用 + 缓存生效", true, true, true, true},
-		{"已启用 + 回退直连（需重试）", true, true, false, false},
-		{"没有该库偏好 + 直连", false, false, false, true},
+		{"未启用缓存 + 经代理（期望形态）", true, false, false, true, false, true},
+		{"未启用缓存 + 回退直连（需重试）", true, false, false, false, false, false},
+		{"启用缓存 + 代理已生效", true, false, true, true, true, true},
+		{"启用缓存 + 回退直连（需重试）", true, false, true, false, false, false},
+		{"直连模式 + 未走代理（期望形态）", true, true, false, false, false, true},
+		{"直连模式 + 却走了代理（需重挂）", true, true, false, true, false, false},
+		{"缓存开关变了（记录未开、现要求开）", true, false, true, true, false, false},
+		{"没有该库偏好 + 却直连（需重挂为经代理）", false, false, false, false, false, false},
+		{"没有该库偏好 + 经代理（期望形态）", false, false, false, true, false, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			// 每次重建配置：SetRepoMountPref 是整条替换。
 			s := newCacheTestStore(t)
 			if c.hasPref {
-				if _, err := s.SetRepoMountPref("repo-a", RepoMountPref{CacheEnabled: c.prefEnabled}); err != nil {
+				if _, err := s.SetRepoMountPref("repo-a", RepoMountPref{
+					CacheEnabled: c.prefCache,
+					DirectMode:   c.direct,
+				}); err != nil {
 					t.Fatalf("写偏好失败：%v", err)
 				}
 			}
 			aa := &Agent{logger: testLogger(), cfg: s}
 			aa.engine = &mountEngine{a: aa}
-			got := aa.engine.mountCacheSatisfied(req, MountState{AllocationID: "alloc-1", CacheActive: c.active})
+			got := aa.engine.mountCacheSatisfied(req, MountState{
+				AllocationID: "alloc-1",
+				CacheActive:  c.recordActive,
+				CacheEnabled: c.recordCache,
+			})
 			if got != c.want {
 				t.Fatalf("mountCacheSatisfied = %v，期望 %v", got, c.want)
 			}

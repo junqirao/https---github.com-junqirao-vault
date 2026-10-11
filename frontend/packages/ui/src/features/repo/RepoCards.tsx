@@ -1,14 +1,15 @@
 import type { CSSProperties, MouseEvent } from 'react'
+import { useState } from 'react'
 import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
-import { InfoCircleOutlined, SettingOutlined } from '@ant-design/icons'
+import { InfoCircleOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
 
 import { StatusTag } from '../../components/StatusTag'
 import type { RepoDTO } from '../../api/types'
-import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { formatBytes, repoUsage } from '../../utils/format'
+import { repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
+import { CacheMetricsDialog } from './CacheMetricsDialog'
 import {
   RepoMountActions,
   RepoMountStateTag,
@@ -123,73 +124,61 @@ function RepoUsage({ repo, style }: { repo: RepoDTO; style?: CSSProperties }): J
 }
 
 /**
- * 本地读缓存用量与命中情况：**只在启用了缓存的库上显示**（未启用时不占版面）。
+ * 「监控」入口：动作区里一个心电图图标按钮（与「设置」按钮同款），点击打开近 5 分钟的
+ * 指标曲线弹窗。
  *
- * 三态与代理侧语义一一对应（见 internal/agent/cacheproxy.go 与 MountState）：
- *   - cache_enabled=false → 不渲染任何东西（绝大多数库都是这个状态）；
- *   - cache_enabled=true 但 cache_active=false → 代理不可用已**自动回退直连**：
- *     如实写「缓存未生效」并把原因挂在 tooltip 上，不编造用量；
- *   - cache_active=true → 从 GET /agent/cache 取该库的 L1/L2 用量与命中率。
+ * 变更（按真实反馈）：
+ *   - 只保留**心电图图标**，不再带文字，和右侧「设置」按钮外观一致；
+ *   - **所有已挂载的库**都显示这个入口（不再只限开了缓存的库）：未开缓存的库也经本机代理
+ *     （纯透传），同样能看读写 IOPS（弹窗按 cache_enabled 分两态，见 CacheMetricsDialog）；
+ *   - **直连模式**（direct_mode）下该库不经过代理、没有数据，入口**置灰**并说明原因。
  *
- * 取不到该库的统计（首次轮询未回来）时只说「缓存已生效」，不显示假数字。
- *
- * 外层套一个 block 容器：里面是 antd `Space`（inline-flex），而紧随其后的次要信息行
- * 也是一个 `Space`（inline-flex）。两个行内级元素会排在同一行、中间没有任何空隙，
- * 「命中率」和「共享数量」就黏在了一起。这里让它独占一行，空隙交给下面的 marginTop。
+ * 整卡点击 = 打开挂载目录，所以按钮自己拦住冒泡，只负责打开弹窗。
  */
-function RepoCacheUsage({
+function RepoMonitorTag({
   controller,
-  style
+  repoName
 }: {
   controller: RepoMountController
-  style?: CSSProperties
+  repoName: string
 }): JSX.Element | null {
   const { t } = useI18n()
-  const agent = useAgent()
+  const [metricsOpen, setMetricsOpen] = useState(false)
   const mount = controller.mount
-  if (!mount?.cache_enabled) return null
+  if (!mount) return null
 
-  if (!mount.cache_active) {
-    return (
-      <div style={style}>
-        <Typography.Text type="warning" ellipsis={{ tooltip: mount.cache_error }} style={{ fontSize: fontSize.xs }}>
-          {t('repo.cache.inactive')}
-          {mount.cache_error ? `（${mount.cache_error}）` : ''}
-        </Typography.Text>
-      </div>
-    )
-  }
+  const direct = Boolean(mount.direct_mode)
+  const tip = direct
+    ? t('repo.monitor.directHint')
+    : mount.cache_enabled && !mount.cache_active
+      ? `${t('repo.cache.inactive')}${mount.cache_error ? `（${mount.cache_error}）` : ''}`
+      : t('repo.monitor.hint')
 
-  const stat = agent.cache?.targets.find((item) => item.allocation_id === mount.allocation_id)
-  if (!stat) {
-    return (
-      <div style={style}>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-          {t('repo.cache.active')}
-        </Typography.Text>
-      </div>
-    )
-  }
-
-  const hitPercent = Math.round(stat.hit_rate * 100)
   return (
-    // 整卡可点进详情，这里只读展示，事件不冒泡。
-    <div style={style} onClick={(event) => event.stopPropagation()}>
-      <Space size={spacing.md} wrap>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-          {t('repo.cache.l1')} {formatBytes(stat.l1_used_bytes)} / {formatBytes(stat.l1_limit_bytes)}
-        </Typography.Text>
-        {/* L2 未启用（限额 0）时不显示这一段，免得写一个恒为 0 的分母。 */}
-        {stat.l2_limit_bytes > 0 ? (
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-            {t('repo.cache.l2')} {formatBytes(stat.l2_used_bytes)} / {formatBytes(stat.l2_limit_bytes)}
-          </Typography.Text>
-        ) : null}
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-          {t('repo.cache.hitRate')} {hitPercent}%
-        </Typography.Text>
-      </Space>
-    </div>
+    <>
+      <Tooltip title={tip}>
+        <Button
+          type="text"
+          size="small"
+          icon={<FundOutlined />}
+          aria-label={t('repo.monitor.title')}
+          disabled={direct}
+          onClick={(event) => {
+            event.stopPropagation()
+            setMetricsOpen(true)
+          }}
+        />
+      </Tooltip>
+      {direct ? null : (
+        <CacheMetricsDialog
+          open={metricsOpen}
+          allocationId={mount.allocation_id}
+          repoName={repoName}
+          cacheEnabled={Boolean(mount.cache_enabled)}
+          onClose={() => setMetricsOpen(false)}
+        />
+      )}
+    </>
   )
 }
 
@@ -266,7 +255,6 @@ function RepoActions({
           />
         </Tooltip>
       ) : null}
-      {/* 配置图标紧挨挂载按钮左侧：改的是"这一个库在本机怎么挂"，与挂载是同一处动作 */}
       <Tooltip title={t('repo.settings.title')}>
         <Button
           type="text"
@@ -276,6 +264,11 @@ function RepoActions({
           onClick={() => onConfigure(repo)}
         />
       </Tooltip>
+      {/* 监控入口放在「设置」右侧：它开的是一个普通指标弹窗。
+          必须留在动作区里 —— antd Modal 走 React portal，但合成事件仍沿 React 组件树冒泡，
+          若把弹窗挂在标题行（Card 子树内），点弹窗里任何位置都会冒泡到整卡的
+          onClick（打开挂载目录）。动作区外层已拦截冒泡，弹窗才不会被当成"点卡片"。 */}
+      <RepoMonitorTag controller={controller} repoName={repo.name} />
       <RepoMountActions controller={controller} />
     </div>
   )
@@ -378,9 +371,6 @@ export function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardP
       <RepoTagRow repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
       <RepoUsage repo={repo} style={{ marginTop: spacing.md }} />
 
-      {/* 缓存用量与命中情况：只对启用了缓存的库出现（未启用时该组件返回 null） */}
-      <RepoCacheUsage controller={mountController} style={{ marginTop: spacing.xs }} />
-
       {/* 建库进度：只在这一刻有信息量（服务端正在预创建差异盘/目标），建完换回常驻信息行 */}
       <RepoPrepareProgress repo={repo} />
 
@@ -428,7 +418,6 @@ export function RepoRow({ repo, currentUserId, onOpen, onConfigure }: RepoCardPr
             </span>
           </div>
           <RepoPrepareProgress repo={repo} />
-          <RepoCacheUsage controller={mountController} style={{ marginTop: spacing.xxs }} />
           <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.xxs }} />
         </div>
 
