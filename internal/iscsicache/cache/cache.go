@@ -545,6 +545,144 @@ func (c *Cache) fillRun(ctx context.Context, start, end int64, dst []byte, src S
 	return nil
 }
 
+// ReadCached serves [off, off+len(dst)) entirely from L1, reporting whether every
+// covered sector was valid. It never consults L2 or the backing store, so a
+// caller can use it as a fast path and fall back to a backend read when it
+// reports false.
+//
+// The range is verified before anything is copied, so a partial hit is reported
+// as a plain miss without inflating the L1 counters for the blocks that were
+// valid; a race that invalidates a block between the two passes likewise just
+// reports a miss, and the caller re-reads the range from the backing store.
+func (c *Cache) ReadCached(off int64, dst []byte) bool {
+	if len(dst) == 0 {
+		return true
+	}
+	if off < 0 {
+		return false
+	}
+	c.stats.Reads.Add(1)
+	bs := int64(c.blockSize)
+	end := off + int64(len(dst))
+	for cur := off; cur < end; {
+		blk := uint64(cur / bs)
+		blkStart := int64(blk) * bs
+		segEnd := blkStart + bs
+		if segEnd > end {
+			segEnd = end
+		}
+		s0, s1 := c.sectorRange(blkStart, cur, segEnd-cur)
+		e := c.shard(blk).lookup(blk)
+		if e == nil || !e.rangeValid(s0, s1) {
+			return false
+		}
+		cur = segEnd
+	}
+	for cur := off; cur < end; {
+		blk := uint64(cur / bs)
+		blkStart := int64(blk) * bs
+		segEnd := blkStart + bs
+		if segEnd > end {
+			segEnd = end
+		}
+		sh := c.shard(blk)
+		e := sh.lookup(blk)
+		if e == nil || !e.copyIfValid(blkStart, cur, dst[cur-off:segEnd-off], c.sectorSize) {
+			return false
+		}
+		sh.touch(e)
+		c.stats.L1Hits.Add(1)
+		cur = segEnd
+	}
+	c.stats.RequestHits.Add(1)
+	return true
+}
+
+// StreamFill installs a read's payload into L1 while the read is being
+// forwarded, so populating the cache overlaps the transfer instead of running
+// after it. It is what lets a large cached read stream to the client and still
+// fill: the store-and-forward path reads the payload whole and copies it into L1
+// before the first byte leaves, which is the whole cost of a proxied bulk read.
+//
+// Like fillRun it does not populate L2 — it serves the bulk reads that are
+// closest to a stream, and spending L2 write bandwidth on them would evict the
+// scattered hot blocks L2 exists to keep. A nil StreamFill is a no-op, so a
+// caller can stream through it unconditionally.
+type StreamFill struct {
+	c        *Cache
+	sec      int
+	start    int64
+	firstBlk uint64
+	epochs   []uint64
+}
+
+// BeginFill prepares an L1 fill for [off, off+length), capturing the covered
+// shards' epochs before any data is read. It returns nil when the range cannot
+// be installed block by block (empty, misaligned, or the cache is closing), in
+// which case the caller streams without populating.
+//
+// The epoch is captured before the read, never after: an invalidation always
+// follows the write it belongs to, so a fill whose epoch was captured after a
+// bump is guaranteed to be reading post-write data, and one captured before a
+// bump is rejected at install time.
+func (c *Cache) BeginFill(off, length int64) *StreamFill {
+	bs := int64(c.blockSize)
+	if length <= 0 || off < 0 || off%bs != 0 || length%bs != 0 || c.closed.Load() {
+		return nil
+	}
+	first := uint64(off / bs)
+	last := uint64(off/bs + length/bs - 1)
+	epochs := make([]uint64, last-first+1)
+	for i := range epochs {
+		epochs[i] = c.shard(first + uint64(i)).epoch.Load()
+	}
+	return &StreamFill{c: c, sec: c.sectorSize, start: off, firstBlk: first, epochs: epochs}
+}
+
+// Write installs the bytes delivered at off, a byte offset within the transfer,
+// into L1. It drops any sector a concurrent invalidation made stale.
+func (f *StreamFill) Write(off int64, data []byte) {
+	if f == nil {
+		return
+	}
+	bs := int64(f.c.blockSize)
+	for len(data) > 0 {
+		blockOff := int((f.start + off) % bs)
+		n := int(bs) - blockOff
+		if n > len(data) {
+			n = len(data)
+		}
+		// installValidated addresses whole sectors; an unaligned segment boundary
+		// is left uncached rather than published with a partial sector.
+		if blockOff%f.sec == 0 && n%f.sec == 0 {
+			blk := uint64((f.start + off) / bs)
+			if i := blk - f.firstBlk; i < uint64(len(f.epochs)) {
+				f.c.installValidated(blk, blockOff, data[:n], f.epochs[i], false)
+			}
+		}
+		data = data[n:]
+		off += int64(n)
+	}
+}
+
+// Done accounts a streamed read as one backend read and one fill.
+func (f *StreamFill) Done() {
+	if f == nil {
+		return
+	}
+	f.c.stats.BackendReads.Add(1)
+	f.c.stats.Fills.Add(1)
+}
+
+// Rollback drops the filled range after a failed transfer, in case a payload
+// that reached L1 came from a command that did not complete with GOOD status.
+func (f *StreamFill) Rollback() {
+	if f == nil {
+		return
+	}
+	f.c.Invalidate(f.start, int64(len(f.epochs))*int64(f.c.blockSize))
+}
+
 // fillReq is one sector run a worker installs into L1, optionally populating L2.
 type fillReq struct {
 	blk      uint64

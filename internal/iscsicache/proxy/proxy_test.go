@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"io"
 	"sync"
 	"testing"
 
 	"vault/internal/iscsicache/backend"
 	"vault/internal/iscsicache/cache"
+	"vault/internal/iscsicache/frontend"
 	"vault/internal/iscsicache/iscsi"
 )
 
@@ -136,6 +138,91 @@ func newTestProxy(t *testing.T, withCache bool) (*Proxy, *fakeBackend, *cache.Ca
 		t.Fatalf("proxy.New: %v", err)
 	}
 	return p, be, c
+}
+
+// streamBackend adds the optional Streamer extension to fakeBackend, delivering
+// a read in fixed size segments the way a real target does. When failAfter is
+// non-zero ExecStream hands over that many segments and then fails, which is how
+// a mid-transfer failure is reproduced.
+type streamBackend struct {
+	*fakeBackend
+	seg       int
+	failAfter int
+}
+
+func (s *streamBackend) ExecStream(_ context.Context, cdb []byte, inLen int, sink backend.DataInSink) (*backend.Result, error) {
+	p, err := iscsi.ParseReadWrite(cdb)
+	if err != nil {
+		return nil, err
+	}
+	off := int64(p.LBA) * testBlockSize
+	n := int64(p.Blocks) * testBlockSize
+	if off+n > int64(len(s.data)) {
+		return &backend.Result{Status: iscsi.StatusCheckCondition,
+			Sense: iscsi.IllegalRequestSense(iscsi.ASCLogicalBlockAddressOutOfRange)}, nil
+	}
+	data := s.snapshot(off, n)
+	seg := int64(s.seg)
+	if seg <= 0 {
+		seg = 64 << 10
+	}
+	s.mu.Lock()
+	s.reads++
+	s.mu.Unlock()
+	sent := 0
+	for cur := int64(0); cur < n; cur += seg {
+		end := cur + seg
+		if end > n {
+			end = n
+		}
+		last := end == n
+		var res *backend.Result
+		if last {
+			res = &backend.Result{Status: iscsi.StatusGood}
+		}
+		if err := sink.Segment(cur, data[cur:end], last, res); err != nil {
+			return nil, err
+		}
+		if s.failAfter > 0 {
+			if sent++; sent >= s.failAfter {
+				return nil, io.ErrUnexpectedEOF
+			}
+		}
+	}
+	return &backend.Result{Status: iscsi.StatusGood}, nil
+}
+
+func newTestStreamProxy(t *testing.T, seg, failAfter int) (*Proxy, *streamBackend, *cache.Cache) {
+	t.Helper()
+	be := &streamBackend{fakeBackend: newFakeBackend(), seg: seg, failAfter: failAfter}
+	c, err := cache.New(cache.Config{
+		BlockSize: 16 << 10, SectorSize: 4 << 10,
+		L1Bytes: 1 << 20, Shards: 4,
+	})
+	if err != nil {
+		t.Fatalf("cache.New: %v", err)
+	}
+	p, err := New(Config{
+		Backend: be, Cache: c, TargetIQN: "iqn.2024-01.local.vault:test",
+	})
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	return p, be, c
+}
+
+// sinkRecorder collects what a handler streams to the frontend.
+type sinkRecorder struct {
+	data   []byte
+	last   bool
+	status uint8
+}
+
+func (r *sinkRecorder) Segment(_ int64, data []byte, last bool, res frontend.Result) error {
+	r.data = append(r.data, data...)
+	r.last = last
+	r.status = res.Status
+	return nil
 }
 
 func read10(lba uint32, blocks uint16) []byte {
@@ -537,5 +624,141 @@ func TestReadBufferIsPooled(t *testing.T) {
 	next := getReadBuf(maxPooledRead + 1)
 	if &next[0] == &huge[0] {
 		t.Fatal("an oversized read buffer must not be retained by the pool")
+	}
+}
+
+// largeRead is 256 KiB at LBA 0: at or above streamReadMin, and a whole number
+// of the 16 KiB cache blocks the tests use.
+const largeRead = 256 << 10
+
+func largeReadCDB() []byte { return read10(0, uint16(largeRead/testBlockSize)) }
+
+// TestStreamedLargeReadFillsAndThenHits is the property the streaming path
+// exists for: a cold large read is forwarded segment by segment and installs its
+// payload into L1 as it passes through, so the next read of the same range is
+// served from memory without touching the backing target.
+func TestStreamedLargeReadFillsAndThenHits(t *testing.T) {
+	p, be, c := newTestStreamProxy(t, 64<<10, 0)
+	ctx := context.Background()
+	cdb := largeReadCDB()
+
+	rec := &sinkRecorder{}
+	if _, err := p.ExecuteStream(ctx, cdb, largeRead, rec); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if !rec.last || rec.status != iscsi.StatusGood {
+		t.Fatalf("stream end: last=%v status=0x%02x", rec.last, rec.status)
+	}
+	if !bytes.Equal(rec.data, be.snapshot(0, largeRead)) {
+		t.Fatal("streamed payload does not match the backing LUN")
+	}
+	if be.readCount() != 1 {
+		t.Fatalf("backend reads = %d, want 1", be.readCount())
+	}
+	if st := c.Stats(); st.BackendReads != 1 || st.RequestHits != 0 {
+		t.Fatalf("after a cold streamed read: %+v", st)
+	}
+
+	// The payload was installed as it passed through, so no wait is needed here
+	// (unlike the asynchronous fill of the small-read path).
+	rec2 := &sinkRecorder{}
+	if _, err := p.ExecuteStream(ctx, cdb, largeRead, rec2); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if be.readCount() != 1 {
+		t.Fatalf("backend reads after an L1 hit = %d, want 1", be.readCount())
+	}
+	if !bytes.Equal(rec.data, rec2.data) {
+		t.Fatal("cached payload differs from the streamed one")
+	}
+	if st := c.Stats(); st.RequestHits != 1 {
+		t.Fatalf("request hits = %d, want 1", st.RequestHits)
+	}
+}
+
+// TestStreamedLargeReadSeesWrite is the consistency property for the streaming
+// path: a range installed by a stream must not survive a write to it.
+func TestStreamedLargeReadSeesWrite(t *testing.T) {
+	p, be, c := newTestStreamProxy(t, 64<<10, 0)
+	ctx := context.Background()
+	cdb := largeReadCDB()
+
+	if _, err := p.ExecuteStream(ctx, cdb, largeRead, &sinkRecorder{}); err != nil {
+		t.Fatalf("warm read: %v", err)
+	}
+	if st := c.Stats(); st.RequestHits != 0 {
+		t.Fatalf("the first read was not cold: %+v", st)
+	}
+
+	payload := bytes.Repeat([]byte{0x5a}, 4096)
+	if _, err := p.Execute(ctx, write10(0, 8), payload, 0); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	rec := &sinkRecorder{}
+	if _, err := p.ExecuteStream(ctx, cdb, largeRead, rec); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if be.readCount() != 2 {
+		t.Fatalf("backend reads = %d, want 2 (the invalidated range must be re-read)", be.readCount())
+	}
+	if !bytes.Equal(rec.data[:4096], payload) {
+		t.Fatal("stale data was served after a write")
+	}
+	if !bytes.Equal(rec.data, be.snapshot(0, largeRead)) {
+		t.Fatal("streamed payload does not match the backing LUN after the write")
+	}
+}
+
+// TestSmallReadStillGoesThroughTheCache pins that the streaming path is opt-in
+// by size: a read below the threshold keeps the per-block cache path, including
+// its asynchronous fill.
+func TestSmallReadStillGoesThroughTheCache(t *testing.T) {
+	p, be, c := newTestStreamProxy(t, 64<<10, 0)
+	ctx := context.Background()
+
+	rec := &sinkRecorder{}
+	if _, err := p.ExecuteStream(ctx, read10(0, 8), 4096, rec); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(rec.data, be.snapshot(0, 4096)) {
+		t.Fatal("payload does not match the backing LUN")
+	}
+	if be.readCount() != 1 {
+		t.Fatalf("backend reads = %d, want 1", be.readCount())
+	}
+
+	c.Wait() // this path fills asynchronously
+	rec2 := &sinkRecorder{}
+	if _, err := p.ExecuteStream(ctx, read10(0, 8), 4096, rec2); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if be.readCount() != 1 {
+		t.Fatalf("backend reads after an L1 hit = %d, want 1", be.readCount())
+	}
+	if !bytes.Equal(rec.data, rec2.data) {
+		t.Fatal("cached payload differs from the first read")
+	}
+}
+
+// TestStreamedReadFailurePublishesNothing checks that a transfer which fails
+// part way leaves no data behind: the client is told the command failed and the
+// payload that had already arrived is dropped from L1.
+func TestStreamedReadFailurePublishesNothing(t *testing.T) {
+	p, be, c := newTestStreamProxy(t, 64<<10, 1)
+	ctx := context.Background()
+
+	rec := &sinkRecorder{}
+	if _, err := p.ExecuteStream(ctx, largeReadCDB(), largeRead, rec); err == nil {
+		t.Fatal("expected the mid-transfer failure to surface")
+	}
+	if len(rec.data) == 0 {
+		t.Fatal("the first segment should have reached the client before the failure")
+	}
+	if c.ReadCached(0, make([]byte, largeRead)) {
+		t.Fatal("a failed transfer left data in L1")
+	}
+	if be.readCount() != 1 {
+		t.Fatalf("backend reads = %d, want 1", be.readCount())
 	}
 }

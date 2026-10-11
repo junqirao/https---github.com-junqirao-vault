@@ -80,6 +80,15 @@ type session struct {
 
 	initiatorMaxRecvDSL int
 
+	// Write-path negotiation. unsolicited is InitialR2T=No and immediateData
+	// is ImmediateData=Yes, each granted only when the initiator offered it
+	// too; firstBurstLength is the negotiated unsolicited window. They default
+	// to R2T-only, which is what an initiator that does not offer the keys
+	// gets.
+	unsolicited      bool
+	immediateData    bool
+	firstBurstLength int
+
 	// sendMu serializes every PDU the target emits and guards the session
 	// sequence numbers above. Commands run concurrently, so without it two
 	// responses could stamp the same StatSN and the initiator would reset the
@@ -93,6 +102,13 @@ type session struct {
 	// for its data off the reader goroutine.
 	pendingMu sync.Mutex
 	pending   map[uint32]*dataOut
+
+	// writes routes unsolicited Data-Out PDUs (reserved transfer tag) to the
+	// write command their ITT names. The transfer is registered on the
+	// connection reader, in dispatch, because unsolicited data can arrive on
+	// the very next PDU after the command, before its goroutine has started.
+	writesMu sync.Mutex
+	writes   map[uint32]*writeTransfer
 
 	// readSetAt/writeSetAt hold the unix-nano time each socket deadline was last
 	// rewritten, so refreshDeadline can keep the rewrite off the per-PDU path.
@@ -183,7 +199,9 @@ func (s *session) login(ctx context.Context) error {
 	s.tsih = s.t.nextTSIH()
 	s.expCmdSN.Store(1)
 	s.initiatorMaxRecvDSL = DefaultMaxRecvDataSegmentLength
+	s.firstBurstLength = s.t.cfg.FirstBurstLength
 	s.pending = make(map[uint32]*dataOut)
+	s.writes = make(map[uint32]*writeTransfer)
 
 	for i := 0; i < maxLoginIterations; i++ {
 		pdu, err := s.readPDU()
@@ -320,10 +338,18 @@ func (s *session) operationalResponse(keys map[string]string) [][2]string {
 	}
 	add("TargetName", s.iqn)
 	add("SessionType", "Normal")
+	// The write path is R2T-only — the RFC 7143 §11.1.4 defaults (InitialR2T
+	// Yes, ImmediateData No). The unsolicited/immediate-data handling (the
+	// writeTransfer registered in dispatch, awaitWrite, and the reserved-TTT
+	// branch of handleDataOut) is deliberately NOT negotiated: against the
+	// real Microsoft initiator it regressed a 1 MiB write from ~8.6 ms to
+	// ~24.7 ms per command, and the self-built bench initiator did not
+	// reproduce that shape, so the proven R2T sequence stays in charge until
+	// the unsolicited path is diagnosed with a real wire trace. A session
+	// negotiated Yes/No never sends unsolicited data, so every unsolicited
+	// branch remains inert: s.unsolicited and s.immediateData keep their
+	// zero values and runCommand always takes the R2T-driven path.
 	add("InitialR2T", "Yes")
-	// ImmediateData must stay "No": the write path always drives R2T for the
-	// whole payload and has no handling for unsolicited data arriving with the
-	// command PDU, so a real initiator that is told "Yes" would desync.
 	add("ImmediateData", "No")
 	add("MaxConnections", "1")
 	add("MaxBurstLength", strconv.Itoa(c.MaxBurstLength))
@@ -456,10 +482,28 @@ func (s *session) route(ctx context.Context, pdu *iscsi.PDU) error {
 // command that fails on the connection (a write that cannot be completed, a
 // response that cannot be sent) tears the session down rather than leaving the
 // initiator waiting for a reply that will never come.
+//
+// On a session that allows unsolicited write data, the write's transfer is
+// registered here too, before the goroutine starts: the first unsolicited
+// Data-Out can be the very next PDU on the wire, and the reader must have
+// somewhere to put it. The buffer allocation it needs is the same expLen-sized
+// one the command would allocate itself a moment later.
 func (s *session) dispatch(ctx context.Context, pdu *iscsi.PDU) {
 	s.noteCommand(pdu.Header.CmdSN())
+	h := &pdu.Header
+	var w *writeTransfer
+	if !s.discovery && s.unsolicited && h.Flags()&iscsi.CmdFlagWrite != 0 {
+		if exp := int(h.ExpectedDataTransferLength()); exp > 0 &&
+			int64(exp) <= s.h.Device().CapacityBytes() {
+			w = newWriteTransfer(exp)
+			s.addWrite(h.ITT(), w)
+			if len(pdu.Data) > 0 {
+				w.push(0, pdu.Data) // immediate data, RFC 7143 §7.5.2
+			}
+		}
+	}
 	go func() {
-		if err := s.runCommand(ctx, pdu); err != nil {
+		if err := s.runCommand(ctx, pdu, w); err != nil {
 			s.log.Warn("frontend: command failed, closing session",
 				"opcode", iscsi.OpcodeName(pdu.Header.Opcode()), "err", err)
 			_ = s.conn.Close()
@@ -467,9 +511,12 @@ func (s *session) dispatch(ctx context.Context, pdu *iscsi.PDU) {
 	}()
 }
 
-func (s *session) runCommand(ctx context.Context, pdu *iscsi.PDU) error {
+func (s *session) runCommand(ctx context.Context, pdu *iscsi.PDU, w *writeTransfer) error {
 	h := &pdu.Header
 	itt := h.ITT()
+	if w != nil {
+		defer s.dropWrite(itt)
+	}
 	cdb := h.CDB()
 	flags := h.Flags()
 	expLen := int(h.ExpectedDataTransferLength())
@@ -489,9 +536,39 @@ func (s *session) runCommand(ctx context.Context, pdu *iscsi.PDU) error {
 
 	var dataOut []byte
 	if isWrite && expLen > 0 {
-		dataOut = make([]byte, expLen)
-		if err := s.receiveDataOut(ctx, itt, dataOut); err != nil {
-			return err
+		// The write payload arrives in two phases. Unsolicited data (immediate
+		// data in the command PDU plus Data-Out PDUs up to the negotiated
+		// FirstBurstLength, when InitialR2T=No) is already being collected into
+		// the transfer the reader registered; the command waits for that window
+		// to fill, then R2Ts the remainder. Without unsolicited data the
+		// transfer does not exist and the whole payload is R2T-driven, possibly
+		// starting from the immediate data an ImmediateData=Yes initiator sent.
+		if w != nil {
+			if err := s.awaitWrite(ctx, w, min(s.firstBurstLength, expLen)); err != nil {
+				return err
+			}
+			fill, err := w.state()
+			if err != nil {
+				return err
+			}
+			dataOut = w.buf
+			if fill < expLen {
+				if err := s.receiveDataOut(ctx, itt, dataOut, fill); err != nil {
+					return err
+				}
+			}
+		} else {
+			dataOut = make([]byte, expLen)
+			start := 0
+			if s.immediateData && len(pdu.Data) > 0 {
+				copy(dataOut, pdu.Data)
+				start = len(pdu.Data)
+			}
+			if start < expLen {
+				if err := s.receiveDataOut(ctx, itt, dataOut, start); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	inLen := 0
@@ -543,12 +620,13 @@ func (s *session) runCommand(ctx context.Context, pdu *iscsi.PDU) error {
 	return s.sendResponse(itt, res.Status, res.Sense, residual, overflow, underflow, 0)
 }
 
-// receiveDataOut drives the R2T sequence that collects a write payload. It runs
-// on the command's own goroutine: each burst is published as an R2T and then
-// awaited, while the connection reader routes the matching Data-Out PDUs in.
-func (s *session) receiveDataOut(ctx context.Context, itt uint32, buf []byte) error {
+// receiveDataOut drives the R2T sequence that collects the remainder of a write
+// payload, from the first byte still missing. It runs on the command's own
+// goroutine: each burst is published as an R2T and then awaited, while the
+// connection reader routes the matching Data-Out PDUs in.
+func (s *session) receiveDataOut(ctx context.Context, itt uint32, buf []byte, start int) error {
 	total := len(buf)
-	received := 0
+	received := start
 	var r2tSN uint32
 
 	for received < total {
@@ -586,8 +664,20 @@ func (s *session) receiveDataOut(ctx context.Context, itt uint32, buf []byte) er
 // handleDataOut deposits a Data-Out burst into the transfer its transfer tag
 // identifies. It runs on the connection reader, so a write never has to read
 // from the socket itself and several commands can be in flight at once.
+//
+// A Data-Out carrying the reserved transfer tag is unsolicited (InitialR2T=No,
+// RFC 7143 §7.5.2): it belongs to the write command its ITT names.
 func (s *session) handleDataOut(pdu *iscsi.PDU) {
 	h := &pdu.Header
+	if h.TTT() == iscsi.ReservedTag {
+		w := s.takeWrite(h.ITT())
+		if w == nil {
+			s.log.Warn("frontend: unsolicited Data-Out for unknown task", "itt", h.ITT())
+			return
+		}
+		w.push(int(h.BufOffset()), pdu.Data)
+		return
+	}
 	ttt := h.TTT()
 	tx := s.takePending(ttt)
 	if tx == nil {
@@ -605,6 +695,103 @@ func (s *session) handleDataOut(pdu *iscsi.PDU) {
 	if tx.err != nil || tx.got >= tx.want {
 		tx.complete()
 	}
+}
+
+// writeTransfer collects one write command's unsolicited payload: immediate
+// data that rode with the command PDU plus the Data-Out PDUs that follow it,
+// up to the negotiated FirstBurstLength. The connection reader pushes into it
+// and the command goroutine waits on notify; both meet through the mutex and
+// the channel edge.
+type writeTransfer struct {
+	buf    []byte
+	mu     sync.Mutex
+	fill   int // highest contiguous offset received
+	err    error
+	notify chan struct{} // one-slot signal of any progress
+}
+
+func newWriteTransfer(size int) *writeTransfer {
+	return &writeTransfer{buf: make([]byte, size), notify: make(chan struct{}, 1)}
+}
+
+// push deposits one data slice. The buffer is expLen sized and the data segment
+// is bounded by the negotiated MaxRecvDataSegmentLength, so a well-formed
+// initiator cannot overflow; a broken one sets err and the command fails.
+func (w *writeTransfer) push(off int, data []byte) {
+	w.mu.Lock()
+	if off+len(data) > len(w.buf) {
+		w.err = fmt.Errorf("frontend: write data at %d beyond the %d byte transfer", off+len(data), len(w.buf))
+	} else {
+		copy(w.buf[off:], data)
+		if end := off + len(data); end > w.fill {
+			w.fill = end
+		}
+	}
+	w.mu.Unlock()
+	select {
+	case w.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (w *writeTransfer) state() (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.fill, w.err
+}
+
+// unsolicitedWait bounds how long the unsolicited window is waited for. A
+// compliant initiator streams its full first burst without pause, so the wait
+// ends by progress; the timer is the escape for an initiator that stops early
+// and waits for an R2T instead, where the command continues with whatever
+// arrived and R2Ts the remainder.
+const unsolicitedWait = 200 * time.Millisecond
+
+// awaitWrite waits until the transfer has received window bytes, an error, the
+// wait budget, or the context's end. It returns with whatever arrived.
+func (s *session) awaitWrite(ctx context.Context, w *writeTransfer, window int) error {
+	var timer *time.Timer
+	var timeout <-chan time.Time
+	for {
+		fill, err := w.state()
+		if err != nil {
+			return err
+		}
+		if fill >= window {
+			return nil
+		}
+		if timer == nil {
+			timer = time.NewTimer(unsolicitedWait)
+			defer timer.Stop()
+			timeout = timer.C
+		}
+		select {
+		case <-w.notify:
+		case <-timeout:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *session) addWrite(itt uint32, w *writeTransfer) {
+	s.writesMu.Lock()
+	s.writes[itt] = w
+	s.writesMu.Unlock()
+}
+
+func (s *session) takeWrite(itt uint32) *writeTransfer {
+	s.writesMu.Lock()
+	w := s.writes[itt]
+	s.writesMu.Unlock()
+	return w
+}
+
+func (s *session) dropWrite(itt uint32) {
+	s.writesMu.Lock()
+	delete(s.writes, itt)
+	s.writesMu.Unlock()
 }
 
 func (s *session) addPending(ttt uint32, tx *dataOut) {
@@ -637,12 +824,98 @@ func (s *session) dropPending(ttt uint32) {
 // can get in between.
 const maxDataInSegment = 1 << 20
 
+// maxDataInBatch caps how much payload one socket write carries, across
+// however many Data-In PDUs it takes. Several commands interleave their bursts
+// on one connection; a batch is the granularity at which they take turns, so
+// it stays far below a whole transfer. One writev per 256 KiB instead of one
+// per PDU is a 4x cut in syscalls and sendMu acquisitions when the initiator
+// accepts only 64 KiB segments.
+const maxDataInBatch = 256 << 10
+
+// writeDataInRun emits data as consecutive Data-In PDUs in as few socket
+// writes as possible: data is chunked to what the initiator accepts and up to
+// maxDataInBatch bytes of chunks go out in one write. off is the
+// command-relative byte offset of data and dataSN the DataSN of its first
+// PDU. last marks the run as the end of the command, in which case the final
+// PDU carries the status and reserves the command's StatSN. It returns the
+// DataSN of the PDU after the run.
+func (s *session) writeDataInRun(itt uint32, data []byte, off uint32, dataSN uint32,
+	last bool, status uint8, residual uint32, overflow, underflow bool) (uint32, error) {
+	for len(data) > 0 {
+		run := data
+		if len(run) > maxDataInBatch {
+			run = run[:maxDataInBatch]
+		}
+		data = data[len(run):]
+		n, err := s.writeDataInBatch(itt, run, off, dataSN,
+			last && len(data) == 0, status, residual, overflow, underflow)
+		if err != nil {
+			return dataSN, err
+		}
+		off += uint32(len(run))
+		dataSN += uint32(n)
+	}
+	return dataSN, nil
+}
+
+// writeDataInBatch writes one batch of consecutive Data-In PDUs covering data
+// in a single socket write under one sendMu acquisition, so a burst costs one
+// lock and one writev per maxDataInBatch instead of one per PDU. It returns
+// how many PDUs it emitted. StatSN is reserved only by the PDU that closes the
+// command, and it is taken at the moment the batch is sent, so statuses keep
+// leaving the target in the order they complete.
+func (s *session) writeDataInBatch(itt uint32, data []byte, off uint32, dataSN uint32,
+	last bool, status uint8, residual uint32, overflow, underflow bool) (int, error) {
+	chunk := s.dataInChunk()
+	n := (len(data) + chunk - 1) / chunk
+	if n == 0 {
+		return 0, nil
+	}
+	var bhs iscsi.BHS
+	hdrs := make([]byte, n*len(bhs))
+	bufs := make(net.Buffers, 0, n*3)
+	var pad [3]byte
+	expCmdSN := s.expCmdSN.Load()
+
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	var statSN uint32
+	if last {
+		statSN = s.statSN
+	}
+	for i := 0; i < n; i++ {
+		seg := data[i*chunk:]
+		if len(seg) > chunk {
+			seg = seg[:chunk]
+		}
+		isLast := last && i == n-1
+		iscsi.FillDataInHeader(&bhs, itt, iscsi.ReservedTag, statSN, expCmdSN, expCmdSN+cmdWindow,
+			dataSN+uint32(i), off+uint32(i*chunk), len(seg), isLast, isLast,
+			status, residual, overflow, underflow)
+		copy(hdrs[i*len(bhs):(i+1)*len(bhs)], bhs[:])
+		bufs = append(bufs, hdrs[i*len(bhs):(i+1)*len(bhs)], seg)
+		if p := (4 - len(seg)%4) % 4; p > 0 {
+			bufs = append(bufs, pad[:p])
+		}
+	}
+	refreshDeadline(&s.writeSetAt, writeTimeout, func(t time.Time) {
+		_ = s.conn.SetWriteDeadline(t)
+	})
+	if _, err := bufs.WriteTo(s.conn); err != nil {
+		return 0, err
+	}
+	if last {
+		s.statSN++
+	}
+	return n, nil
+}
+
 // sendDataIn streams data as unsolicited Data-In PDUs and closes the command
 // with the status on the last one.
 //
-// The burst is sent PDU by PDU, taking sendMu only for the PDU in flight, so
-// several commands can interleave their Data-In on one connection instead of
-// queueing behind a single command's entire transfer.
+// The burst is sent batch by batch, taking sendMu only for the batch in
+// flight, so several commands can interleave their Data-In on one connection
+// instead of queueing behind a single command's entire transfer.
 //
 // StatSN is consumed once per command, not once per PDU, and it rides only the
 // last PDU: a Data-In PDU without the S bit carries the reserved value. That is
@@ -650,25 +923,8 @@ const maxDataInSegment = 1 << 20
 // closing StatSN, two interleaved commands would present the initiator with a
 // status sequence number that moves backwards.
 func (s *session) sendDataIn(itt uint32, data []byte, status uint8, residual uint32, overflow, underflow bool) error {
-	max := s.dataInChunk()
-	n := (len(data) + max - 1) / max
-	for i := 0; i < n; i++ {
-		off := i * max
-		end := off + max
-		if end > len(data) {
-			end = len(data)
-		}
-		last := end == len(data)
-		var res uint32
-		var ov, un bool
-		if last {
-			res, ov, un = residual, overflow, underflow
-		}
-		if err := s.writeDataInPDU(itt, data[off:end], uint32(off), uint32(i), last, status, res, ov, un); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := s.writeDataInRun(itt, data, 0, 0, true, status, residual, overflow, underflow)
+	return err
 }
 
 // dataInChunk is the payload one Data-In PDU carries: what the initiator is
@@ -760,34 +1016,24 @@ type dataInStream struct {
 
 func (st *dataInStream) Segment(_ int64, data []byte, last bool, res Result) error {
 	st.started = true
-	max := st.s.dataInChunk()
-	n := (len(data) + max - 1) / max
-	if n == 0 {
+	if len(data) == 0 {
 		if last {
 			return st.finish(res.Status, res.Residual, res.Overflow, res.Underflow)
 		}
 		return nil
 	}
-	for i := 0; i < n; i++ {
-		off := i * max
-		end := off + max
-		if end > len(data) {
-			end = len(data)
-		}
-		seg := data[off:end]
-		isLast := last && end == len(data)
-		var status uint8
-		var residual uint32
-		var ov, un bool
-		if isLast {
-			status, residual, ov, un = st.lastStatus(st.sent+len(seg), res)
-		}
-		if err := st.s.writeDataInPDU(st.itt, seg, uint32(st.sent), st.dataSN, isLast, status, residual, ov, un); err != nil {
-			return err
-		}
-		st.sent += len(seg)
-		st.dataSN++
+	var status uint8
+	var residual uint32
+	var ov, un bool
+	if last {
+		status, residual, ov, un = st.lastStatus(st.sent+len(data), res)
 	}
+	next, err := st.s.writeDataInRun(st.itt, data, uint32(st.sent), st.dataSN, last, status, residual, ov, un)
+	if err != nil {
+		return err
+	}
+	st.sent += len(data)
+	st.dataSN = next
 	if last {
 		st.finished = true
 	}

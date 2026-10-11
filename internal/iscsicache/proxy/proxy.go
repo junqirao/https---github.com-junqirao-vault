@@ -199,23 +199,29 @@ func (p *Proxy) Execute(ctx context.Context, cdb []byte, dataOut []byte, inLen i
 
 // ExecuteStream implements frontend.StreamHandler.
 //
-// A read with no cache in front of it is forwarded to the backing target as it
-// arrives, so the frontend can start sending Data-In before the transfer has
-// completed: that is what removes the store-and-forward hop a proxied mount
-// otherwise pays on top of a direct one.
+// A read is forwarded to the backing target as it arrives, so the frontend can
+// start sending Data-In before the transfer has completed: that is what removes
+// the store-and-forward hop a proxied mount otherwise pays on top of a direct
+// one. With a cache in front, a large aligned read streams too and is filled
+// from the segments as they pass through; a smaller read still runs through the
+// cache, whose per-block path is what a random workload needs.
 //
-// Anything else — a cached read, a command the cache can answer itself, a
-// backend that cannot stream — is answered through Execute and handed to the
-// sink in one piece, so the frontend still gets a valid response.
+// Anything else — a command the cache can answer itself, a backend that cannot
+// stream — is answered through Execute and handed to the sink in one piece, so
+// the frontend still gets a valid response.
 func (p *Proxy) ExecuteStream(ctx context.Context, cdb []byte, inLen int, sink frontend.DataInSink) (frontend.Result, error) {
 	if len(cdb) == 0 {
 		return illegal(iscsi.ASCInvalidFieldInCDB), nil
 	}
 	st, streamable := p.be.(backend.Streamer)
-	// Only a passthrough read can be streamed: with a cache in front the read
-	// must run through it so a miss still fills, and the fill owns its buffer.
-	if p.c == nil && streamable && (cdb[0] == iscsi.SCSIRead10 || cdb[0] == iscsi.SCSIRead16) {
-		return p.readStream(ctx, cdb, inLen, st, sink)
+	isRead := cdb[0] == iscsi.SCSIRead10 || cdb[0] == iscsi.SCSIRead16
+	if streamable && isRead {
+		if p.c == nil {
+			return p.readStream(ctx, cdb, inLen, st, sink)
+		}
+		if p.cacheableStream(cdb) {
+			return p.readStreamFilled(ctx, cdb, inLen, st, sink)
+		}
 	}
 
 	res, err := p.Execute(ctx, cdb, nil, inLen)
@@ -234,6 +240,116 @@ func (p *Proxy) ExecuteStream(ctx context.Context, cdb []byte, inLen int, sink f
 		}
 	}
 	return res, nil
+}
+
+// streamReadMin is the read size at and above which a cached read is streamed
+// rather than served through the cache's store-and-forward path.
+//
+// A payload this large spans several backend Data-In segments, so forwarding
+// each segment as it arrives overlaps the backing read with the client write.
+// Below it the payload fits a single segment and there is nothing to overlap,
+// while installing a whole run of blocks would still be paid before the first
+// byte leaves.
+const streamReadMin = 256 << 10
+
+// cacheableStream reports whether a cached read is large enough to be worth
+// streaming and aligned to the cache block, so its payload can be installed
+// block by block as it passes through.
+func (p *Proxy) cacheableStream(cdb []byte) bool {
+	params, err := iscsi.ParseReadWrite(cdb)
+	if err != nil {
+		return false
+	}
+	params.BlockSize = p.dev.BlockSize
+	length := params.TransferLength()
+	if length < streamReadMin {
+		return false
+	}
+	bs := int64(p.c.BlockSize())
+	return length%bs == 0 && int64(params.LBA)*int64(p.dev.BlockSize)%bs == 0
+}
+
+// readStreamFilled serves a large cached read by streaming. A range that is
+// already entirely in L1 is answered from memory; anything else is read from the
+// backing target once, forwarded segment by segment, and installed into L1 as it
+// passes through.
+func (p *Proxy) readStreamFilled(ctx context.Context, cdb []byte, inLen int, st backend.Streamer, sink frontend.DataInSink) (frontend.Result, error) {
+	params, err := iscsi.ParseReadWrite(cdb)
+	if err != nil {
+		return p.unsupported(cdb)
+	}
+	params.BlockSize = p.dev.BlockSize
+	length := params.TransferLength()
+	if length == 0 {
+		return p.local(good())
+	}
+	if res, bad := p.bounds(params, length); bad {
+		return res, nil
+	}
+	off := int64(params.LBA) * int64(p.dev.BlockSize)
+
+	// Warm: the whole range is in L1, so the backing target is never touched and
+	// the payload goes out as one buffer.
+	buf := getReadBuf(int(length))
+	if p.c.ReadCached(off, buf) {
+		p.stats.Reads.Add(1)
+		err := sink.Segment(0, buf, true, good())
+		putReadBuf(buf)
+		if err != nil {
+			return frontend.Result{}, err
+		}
+		return good(), nil
+	}
+	putReadBuf(buf)
+
+	// Cold: stream the payload and fill from the segments on the way past.
+	fill := p.c.BeginFill(off, length)
+	p.stats.Reads.Add(1)
+	res, err := st.ExecStream(ctx, cdb, int(length), fillSink{dst: sink, fill: fill})
+	if err != nil {
+		fill.Rollback()
+		return frontend.Result{}, err
+	}
+	if res == nil || !res.OK() {
+		// A command that did not complete must not leave data behind: a failed
+		// read can carry a payload that is meaningless, so drop what was installed.
+		fill.Rollback()
+		if res == nil {
+			return frontend.Result{}, io.ErrUnexpectedEOF
+		}
+		return frontend.Result{Status: res.Status, Sense: res.Sense}, nil
+	}
+	fill.Done()
+	return frontend.Result{
+		Status: res.Status, Sense: res.Sense, Residual: res.Residual,
+		Overflow: res.Overflow, Underflow: res.Underflow,
+	}, nil
+}
+
+// fillSink forwards each segment of a streamed read to the client and installs
+// it into L1 on the way past. It is the sink of readStreamFilled.
+//
+// The install runs after the client-facing write so forwarding is never delayed
+// by the cache, and the segment buffer is still live here: the backend recycles
+// it only once Segment has returned.
+type fillSink struct {
+	dst  frontend.DataInSink
+	fill *cache.StreamFill
+}
+
+func (s fillSink) Segment(off int64, data []byte, last bool, res *backend.Result) error {
+	var fr frontend.Result
+	if res != nil {
+		fr = frontend.Result{
+			Status: res.Status, Sense: res.Sense, Residual: res.Residual,
+			Overflow: res.Overflow, Underflow: res.Underflow,
+		}
+	}
+	err := s.dst.Segment(off, data, last, fr)
+	if err == nil {
+		s.fill.Write(off, data)
+	}
+	return err
 }
 
 // Local commands --------------------------------------------------------------------

@@ -24,14 +24,16 @@ backend:
   secret: ""
   dial_timeout: "10s"
   io_timeout: "30s"
-  max_recv_data_segment_length: 65536
+  # 256 KiB Data-In segments: big enough that the backend read and the client
+  # write stages overlap, few enough that the per-PDU cost stays negligible.
+  # 64 KiB here means 16 PDUs per MiB read and measurably lower proxy throughput.
+  max_recv_data_segment_length: 262144
   max_burst_length: 262144
-  # Upper bound on the backing sessions the proxy may run. A single session has a
-  # queue depth of one, so without a few sessions the client's queue depth is
-  # collapsed and every read pays the backing round trip on its own. The proxy
-  # opens 4 sessions at mount and grows on demand up to this cap while the client
-  # pipelines more commands than it has sessions. 0 selects the cap of 64, which
-  # matches the command window the proxy advertises to local initiators.
+  # How many independent iSCSI sessions the pool opens to the backing target
+  # before the mount is handed back. The pool is FIXED: it never grows while a
+  # workload runs and a session that dies is not replaced, so set this to at
+  # least the queue depth the client uses. 0 selects the default of 4; the
+  # maximum is 32.
   sessions: 0
 
 cache:

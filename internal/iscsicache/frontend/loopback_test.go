@@ -262,6 +262,102 @@ func TestLoopback(t *testing.T) {
 	}
 }
 
+// TestLoopbackWritePhases drives a 256 KiB write through the R2T sequence at
+// two different MaxBurstLength settings, so the remainder-splitting loop runs
+// with different burst counts. The target is pinned to R2T-only negotiation
+// (InitialR2T=Yes, ImmediateData=No), which is the proven path against the
+// real Microsoft initiator; the payload must land byte-identical either way —
+// including when read back through the cache, which proves the write
+// invalidated what it replaced.
+func TestLoopbackWritePhases(t *testing.T) {
+	cases := []struct {
+		name       string
+		firstBurst int
+		maxBurst   int
+	}{
+		{"remainder over two bursts", 192 << 10, 128 << 10},
+		{"remainder over four bursts", 64 << 10, 128 << 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const targetIQN = "iqn.2024-01.local.vault:loopback-write"
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+
+			be := newLoopBackend()
+			c, err := cache.New(cache.Config{
+				BlockSize: 16 << 10, SectorSize: 4 << 10, L1Bytes: 1 << 20, Shards: 4,
+			})
+			if err != nil {
+				t.Fatalf("cache.New: %v", err)
+			}
+			px, err := proxy.New(proxy.Config{
+				Backend: be, Cache: c, TargetIQN: targetIQN,
+				Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			})
+			if err != nil {
+				t.Fatalf("proxy.New: %v", err)
+			}
+			tgt, err := frontend.New(frontend.Config{
+				ListenAddr:       "127.0.0.1:0",
+				TargetIQN:        targetIQN,
+				FirstBurstLength: tc.firstBurst,
+				MaxBurstLength:   tc.maxBurst,
+			}, px)
+			if err != nil {
+				t.Fatalf("frontend.New: %v", err)
+			}
+			defer tgt.Close()
+			serveErr := make(chan error, 1)
+			go func() { serveErr <- tgt.Serve(ctx) }()
+
+			it, err := backend.Dial(ctx, backend.Config{
+				Address:     tgt.Addr().String(),
+				TargetIQN:   targetIQN,
+				IOTimeout:   10 * time.Second,
+				DialTimeout: 5 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("initiator dial: %v", err)
+			}
+			defer it.Close()
+
+			const blocks = 512 // 256 KiB at 512B blocks
+			payload := make([]byte, blocks*loopBlockSize)
+			for i := range payload {
+				payload[i] = byte(i * 7 / 251)
+			}
+			wcdb := make([]byte, 10)
+			wcdb[0] = iscsi.SCSIWrite10
+			binary.BigEndian.PutUint16(wcdb[7:9], blocks)
+			wres, err := it.Exec(ctx, wcdb, payload, 0)
+			if err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if !wres.OK() {
+				t.Fatalf("write status: %v", wres.Error())
+			}
+			if !bytes.Equal(be.snapshot(0, int64(len(payload))), payload) {
+				t.Fatal("the payload did not reach the backing LUN byte-identical")
+			}
+
+			rcdb := make([]byte, 10)
+			rcdb[0] = iscsi.SCSIRead10
+			binary.BigEndian.PutUint16(rcdb[7:9], blocks)
+			r, err := it.Exec(ctx, rcdb, nil, len(payload))
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if !r.OK() {
+				t.Fatalf("read back status: %v", r.Error())
+			}
+			if !bytes.Equal(r.Data, payload) {
+				t.Fatal("read back data differs from the written payload")
+			}
+		})
+	}
+}
+
 // TestLoopbackDiscoverySession drives a raw discovery login and a SendTargets
 // text request, which is the path a Windows initiator uses to enumerate the
 // targets behind a portal.

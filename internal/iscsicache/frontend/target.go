@@ -27,8 +27,14 @@ import (
 // Negotiation defaults.
 const (
 	DefaultMaxRecvDataSegmentLength = 65536
-	DefaultMaxBurstLength           = 262144
-	DefaultFirstBurstLength         = 65536
+	// A 1 MiB first burst lets a 1 MiB write (the size a benchmark like
+	// CrystalDiskMark issues) arrive entirely unsolicited — zero R2T round
+	// trips, which is what a direct Microsoft initiator-target pair negotiates
+	// between itself. FirstBurstLength must not exceed MaxBurstLength, so both
+	// default to 1 MiB; an initiator offering smaller values clamps them via
+	// negotiation.
+	DefaultMaxBurstLength   = 1 << 20
+	DefaultFirstBurstLength = 1 << 20
 	// DefaultIdleTimeout closes a session whose peer went away without logging
 	// out, so the single-session slot is not leaked forever.
 	DefaultIdleTimeout = 30 * time.Minute

@@ -196,6 +196,16 @@ type Initiator struct {
 	ourMaxRecvDSL    int
 	targetMaxRecvDSL int
 	maxBurstLength   int
+
+	// immediateData is a negotiated ImmediateData=Yes: the first slice of a
+	// write rides along with the command PDU, so the write does not wait a
+	// round trip for an R2T before any data flows. unsolicited is a negotiated
+	// InitialR2T=No: further unsolicited Data-Out PDUs may follow, up to the
+	// target's firstBurstLength. A target that does not explicitly agree keeps
+	// both off, which is the old R2T-only behaviour.
+	immediateData    bool
+	unsolicited      bool
+	firstBurstLength int
 }
 
 // streamQueueDepth is how many Data-In segments a streamed command may have
@@ -257,8 +267,22 @@ type pendingCmd struct {
 	inCh chan segment
 
 	// dataOutSN is the next DataSN for a Data-Out burst. Only the reader touches
-	// it, because only the reader answers an R2T.
+	// it, because only the reader answers an R2T — except during the
+	// unsolicited phase below, which the command goroutine owns.
 	dataOutSN uint32
+
+	// The unsolicited phase of a write: with InitialR2T=No the command
+	// goroutine streams the first burst without an R2T, and the target may
+	// already have R2Ted the remainder. The reader must not answer that R2T
+	// before the unsolicited PDUs are on the wire, because DataPDUInOrder=Yes
+	// forbids putting a task's data PDUs on the wire out of offset order; it
+	// stashes the R2T here and the command goroutine answers it right after
+	// the unsolicited phase. unsolDone is true unless an unsolicited phase is
+	// in progress; the pair is guarded by unsolMu. At most one R2T can arrive
+	// early because the negotiated MaxOutstandingR2T is 1.
+	unsolMu   sync.Mutex
+	unsolDone bool
+	earlyR2T  *iscsi.BHS
 
 	res  *Result
 	err  error
@@ -335,6 +359,9 @@ func Dial(ctx context.Context, cfg Config) (*Initiator, error) {
 		ourMaxRecvDSL:    cfg.MaxRecvDataSegmentLength,
 		targetMaxRecvDSL: DefaultMaxRecvDataSegmentLength,
 		maxBurstLength:   cfg.MaxBurstLength,
+		// RFC 7143 Appendix A default FirstBurstLength; a target that announces
+		// its own value in the login response replaces it.
+		firstBurstLength: 8192,
 	}
 	it.cmdSN.Store(1)
 	if _, err := rand.Read(it.isid[:]); err != nil {
@@ -787,14 +814,24 @@ func (it *Initiator) handleSCSIResponse(h *iscsi.BHS, seg []byte) {
 
 // handleR2T answers a Ready-To-Transfer from the reader: an R2T asks for the
 // next slice of a write payload, and replying here keeps the command goroutine
-// free to wait on its result channel.
+// free to wait on its result channel. An R2T that arrives while the command
+// goroutine is still streaming its unsolicited first burst is stashed on the
+// command instead (see pendingCmd.unsolDone); the command answers it once the
+// unsolicited phase is over.
 func (it *Initiator) handleR2T(h *iscsi.BHS) error {
 	it.adoptStatSN(h.StatSN())
 	c := it.lookup(h.ITT())
 	if c == nil {
 		return nil
 	}
-	return it.answerR2T(c, h)
+	c.unsolMu.Lock()
+	defer c.unsolMu.Unlock()
+	if c.unsolDone {
+		return it.answerR2T(c, h)
+	}
+	r2t := *h // the header lives in the reader's PDU and is reused
+	c.earlyR2T = &r2t
+	return nil
 }
 
 // answerR2T sends the Data-Out PDUs that satisfy an R2T request.
@@ -838,6 +875,57 @@ func (it *Initiator) answerR2T(c *pendingCmd, h *iscsi.BHS) error {
 		}
 		c.dataOutSN++
 		offset += chunk
+	}
+	return nil
+}
+
+// sendUnsolicited streams dataOut[from:firstBurstLength] as unsolicited
+// Data-Out PDUs (TTT reserved, RFC 7143 §7.7) and then declares the
+// unsolicited phase over, answering any R2T the target sent in the meantime.
+// It runs on the command's goroutine. unsolDone must already be false.
+//
+// writeMu is released before unsolMu is taken, so the lock pair never nests
+// with handleR2T (which takes unsolMu and then writeMu inside answerR2T).
+func (it *Initiator) sendUnsolicited(ctx context.Context, c *pendingCmd, from int) error {
+	end := len(c.dataOut)
+	if it.firstBurstLength > 0 && end > it.firstBurstLength {
+		end = it.firstBurstLength
+	}
+	it.writeMu.Lock()
+	for from < end {
+		chunk := end - from
+		if it.targetMaxRecvDSL > 0 && chunk > it.targetMaxRecvDSL {
+			chunk = it.targetMaxRecvDSL
+		}
+		p := iscsi.NewPDU(iscsi.OpDataOut, c.dataOut[from:from+chunk])
+		var flags uint8
+		if from+chunk >= end {
+			// F bit on the last unsolicited PDU of the task (RFC 7143 §7.7).
+			flags = iscsi.FlagAlwaysSet
+		}
+		p.Header.SetFlags(flags)
+		p.Header.SetLUN(0)
+		p.Header.SetITT(c.itt)
+		p.Header.SetTTT(iscsi.ReservedTag)
+		p.Header.SetExpStatSN(it.expStatSN.Load())
+		p.Header.SetDataSN(c.dataOutSN)
+		p.Header.SetBufOffset(uint32(from))
+		if err := it.writePDULocked(ctx, p); err != nil {
+			it.writeMu.Unlock()
+			return err
+		}
+		c.dataOutSN++
+		from += chunk
+	}
+	it.writeMu.Unlock()
+
+	c.unsolMu.Lock()
+	c.unsolDone = true
+	early := c.earlyR2T
+	c.earlyR2T = nil
+	c.unsolMu.Unlock()
+	if early != nil {
+		return it.answerR2T(c, early)
 	}
 	return nil
 }
@@ -946,6 +1034,14 @@ func (it *Initiator) takeCmdSN(ctx context.Context) (uint32, error) {
 func (it *Initiator) operationalKeys() [][2]string {
 	return [][2]string{
 		{"SessionType", "Normal"},
+		// R2T-only (InitialR2T=Yes, ImmediateData=No) — the pair the MVP has
+		// always run and the one proven against the real Microsoft target.
+		// Offering No/Yes made the initiator stream an unsolicited first burst
+		// and stop at the target's 8 KiB FirstBurstLength, then wait an R2T for
+		// each 256 KiB burst — extra round trips on every 1 MiB write, which is
+		// the shape that regressed CDM sequential writes. A target that counters
+		// with No/Yes still drives the unsolicited path via the negotiated
+		// flags; this only fixes what we OFFER.
 		{"InitialR2T", "Yes"},
 		{"ImmediateData", "No"},
 		{"MaxConnections", "1"},
@@ -1113,6 +1209,26 @@ func (it *Initiator) login(ctx context.Context) error {
 			if n, err := strconv.Atoi(v); err == nil && n > 0 {
 				it.targetMaxRecvDSL = n
 			}
+		}
+		// RFC 7143 §11.1.4: unsolicited data is negotiated only when BOTH sides
+		// offered InitialR2T=No, and immediate data only when BOTH offered
+		// ImmediateData=Yes. We declare Yes/No (see operationalKeys), so these
+		// stay false whatever the target echoes — every write is R2T-driven.
+		if v, ok := text["initialr2t"]; ok {
+			it.unsolicited = it.unsolicited && strings.EqualFold(strings.TrimSpace(v), "no")
+		}
+		if v, ok := text["immediatedata"]; ok {
+			it.immediateData = it.immediateData && strings.EqualFold(strings.TrimSpace(v), "yes")
+		}
+		if v, ok := text["firstburstlength"]; ok {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				it.firstBurstLength = n
+			}
+		}
+		if it.unsolicited || it.immediateData {
+			it.log.Debug("login write negotiation",
+				"initial_r2t", !it.unsolicited, "immediate_data", it.immediateData,
+				"first_burst_length", it.firstBurstLength)
 		}
 		it.log.Debug("login exchange",
 			"iter", iter, "csg", resp.Header.LoginCSG(), "nsg", resp.Header.LoginNSG(),
@@ -1339,7 +1455,7 @@ func (it *Initiator) exec(ctx context.Context, cdb []byte, dataOut []byte, buf [
 		return nil, err
 	}
 	itt := it.nextITT()
-	c := &pendingCmd{itt: itt, dataOut: dataOut, buf: buf, sink: sink, done: make(chan struct{})}
+	c := &pendingCmd{itt: itt, dataOut: dataOut, buf: buf, sink: sink, done: make(chan struct{}), unsolDone: true}
 	if sink != nil {
 		c.inCh = make(chan segment, streamQueueDepth)
 	}
@@ -1350,15 +1466,57 @@ func (it *Initiator) exec(ctx context.Context, cdb []byte, dataOut []byte, buf [
 	defer it.unregister(itt)
 
 	cmd := iscsi.BuildSCSICommand(itt, sn, it.expStatSN.Load(), 0, cdb, expLen, inLen > 0, len(dataOut) > 0)
+	// Immediate data (RFC 7143 §7.5.2): with ImmediateData negotiated to Yes
+	// the first slice of the payload rides along with the command PDU, so the
+	// write does not wait a round trip for an R2T before any data flows. It is
+	// bounded by the target's MaxRecvDataSegmentLength and FirstBurstLength,
+	// and it counts as the task's DataSN 0. With InitialR2T=No the rest of the
+	// first burst follows as unsolicited Data-Out PDUs; unsolDone is cleared
+	// before the command PDU is written, because the target may R2T the
+	// remainder the moment it sees the command and the reader must stash that
+	// R2T instead of answering before the unsolicited PDUs are on the wire.
+	unsent := 0
+	if len(dataOut) > 0 && it.immediateData {
+		imm := len(dataOut)
+		if it.firstBurstLength > 0 && imm > it.firstBurstLength {
+			imm = it.firstBurstLength
+		}
+		if it.targetMaxRecvDSL > 0 && imm > it.targetMaxRecvDSL {
+			imm = it.targetMaxRecvDSL
+		}
+		cmd.Data = dataOut[:imm]
+		unsent = imm
+		c.dataOutSN = 1
+	}
+	if len(dataOut) > 0 && it.unsolicited && it.firstBurstLength > unsent && unsent < len(dataOut) {
+		c.unsolDone = false
+		// Unsolicited Data-Out PDUs will follow this PDU, so its F bit must be
+		// clear (RFC 7143 §7.3.2). When the immediate data already covers the
+		// whole first burst none follow, and the F bit stays set. This is the
+		// only branch that lets the reader stash an early R2T, so it must not
+		// be taken when no unsolicited PDUs are coming.
+		cmd.Header.SetFlags(cmd.Header.Flags() &^ iscsi.CmdFlagFinal)
+	}
 	if it.log.Enabled(ctx, slog.LevelDebug) {
 		it.log.Debug("backend: pdu send", "opcode", "SCSICommand", "itt", itt, "cmdsn", sn,
-			"expstatsn", it.expStatSN.Load(), "expdatalen", expLen, "cdb", hex.EncodeToString(cdb[:min(16, len(cdb))]))
+			"expstatsn", it.expStatSN.Load(), "expdatalen", expLen, "immediate", unsent,
+			"cdb", hex.EncodeToString(cdb[:min(16, len(cdb))]))
 	}
 	werr := it.writePDU(ctx, cmd)
 	it.sendMu.Unlock()
 	if werr != nil {
 		it.fail(fmt.Errorf("backend: send command: %w", werr))
 		return nil, fmt.Errorf("backend: send command: %w", werr)
+	}
+
+	// Stream the rest of the first burst without waiting for an R2T. This
+	// runs on the command's goroutine, after every other command's CmdSN was
+	// already taken, so the command ordering is unaffected.
+	if !c.unsolDone {
+		if err := it.sendUnsolicited(ctx, c, unsent); err != nil {
+			it.fail(fmt.Errorf("backend: send unsolicited data: %w", err))
+			return nil, err
+		}
 	}
 
 	if c.inCh != nil {
