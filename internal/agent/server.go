@@ -390,6 +390,11 @@ type serverJob struct {
 type repoListItem struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// CapacityBytes 是库容量（建库时设定的那块盘的大小，服务端读时派生）。
+	//
+	// 本机缓存预算按库容量分摊，而挂载参数里只有"这个库"的容量：这里是一次能拿到
+	// **全部**库容量的地方，因此顺带喂给缓存管理器（见 automount.go 的 repoNames）。
+	CapacityBytes int64 `json:"capacity_bytes"`
 }
 
 // CreateUpload 调用 POST /v1/uploads 创建分块上传会话。

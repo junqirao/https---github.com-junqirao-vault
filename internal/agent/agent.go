@@ -98,6 +98,8 @@ type Agent struct {
 	downloads *downloadManager
 	// uploads 管理"本地目录 → 存储库"上传任务（内存态 + <DataDir>/uploads.json 续传记录）。
 	uploads *uploadManager
+	// usage 缓存"本机挂载卷用量"快照（客户端存储库页面展示，见 volusage.go）。
+	usage *volumeUsageCache
 	// manualUnmounts 是"本次运行被用户手动卸载过"的库（内存态，进程重启即清空）：
 	// 这些库不再被自动挂载，避免用户点了卸载却马上被 auto_mount 挂回来。
 	manualUnmounts manualUnmountGuard
@@ -212,6 +214,8 @@ func New(opt Options) (*Agent, error) {
 	a.web = newWebUpdateManager(a)
 	a.engine = &mountEngine{a: a}
 	a.cache = newCacheManager(cfg, logger)
+	// 本机挂载卷用量：按挂载点量卷空间（Windows 走 Get-Volume，见 volume.Manager.SpaceUsageOf）。
+	a.usage = newVolumeUsageCache(state.ListMounts, a.vol.SpaceUsageOf)
 	a.logUpdateKeyStatus()
 	return a, nil
 }

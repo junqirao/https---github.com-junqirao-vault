@@ -22,6 +22,25 @@ const (
 	sseMaxBuffer     = 1 << 20
 )
 
+// 事件流重连与日志策略（见 runServerEvents）。
+const (
+	// serverEventsBackoffMax 重连退避上限。
+	serverEventsBackoffMax = 30 * time.Second
+
+	// serverEventsFailLogLimit 一轮中断里最多记几条 WARN，之后静默重试。
+	//
+	// 服务端连不上时重连一直不成功，同一句话每 serverEventsBackoffMax 刷一条会把日志刷满
+	// （真实反馈：一台服务端下线一天就 900+ 条同一句话）。重试本身**不停**——服务端回来
+	// 仍能在 30s 内自动恢复，只是后续尝试降到 debug 级别，打开 log.level=debug 仍看得到现场。
+	serverEventsFailLogLimit = 3
+
+	// serverEventsStableWindow 一次订阅活过这么久才算"真的连上过"。
+	//
+	// 用来区分两种中断：稳定运行后断掉 = 新一轮故障（计数清零，重新开始报日志）；
+	// 刚连上就被掐断 = 仍处在"连不上"里（继续累计，很快转入静默）。
+	serverEventsStableWindow = 30 * time.Second
+)
+
 // streamEvents 订阅服务端 GET /v1/system/events，逐条回调事件。
 //
 // 返回语义：
@@ -123,8 +142,15 @@ func dispatchServerEvent(eventType, payload string, handle func(string, json.Raw
 // runServerEvents 持续消费**某台**服务端的事件流，直到该台不再支持或上下文结束。
 //
 // 多服务端下每台各有一条订阅协程（见 ensureEventSubscriber）：一台断了重连不影响其它台。
+//
+// 日志策略：一轮中断只报前 serverEventsFailLogLimit 次，之后**静默重试**；恢复时补一条
+// INFO，排障时据此看出"断了多久、重试了多少次"。
 func (a *Agent) runServerEvents(ctx context.Context, key string) {
 	backoff := time.Second
+	// failStreak 数连续失败次数；outageWarned 记本轮中断是否已经报过（含"已恢复"）。
+	// 两者一起把日志限制在"一轮中断的前几次"，见上面的日志策略。
+	failStreak := 0
+	outageWarned := false
 	for {
 		if ctx.Err() != nil {
 			return
@@ -142,11 +168,28 @@ func (a *Agent) runServerEvents(ctx context.Context, key string) {
 		// 事件流就绪即确认连接：SystemInfo 可能失败（10s 超时），而心跳只在**有挂载**时才发
 		// （见 lease.go 的 sweepHeartbeats），两条路都不通时界面会一直卡在"未连接"，
 		// 即使服务端其实完全可达。
+		opened := false
+		var openedAt time.Time
 		err = client.streamEvents(ctx, func(eventType string, data json.RawMessage) {
 			a.handleServerEvent(key, eventType, data)
 		}, func() {
+			opened = true
+			openedAt = time.Now()
 			a.setServerConnected(key, true, "")
+			// 中断过之后又能连上：报一条"已恢复"，本轮中断到此了结。
+			if outageWarned {
+				a.logger.Info("服务端事件流已恢复", "server", key, "failed_attempts", failStreak)
+				outageWarned = false
+			}
 		})
+
+		if opened && time.Since(openedAt) >= serverEventsStableWindow {
+			// 稳定连上过：退避与失败计数复位，下一次中断按"新一轮故障"从头报。
+			backoff = time.Second
+			failStreak = 0
+			outageWarned = false
+		}
+
 		switch {
 		case ctx.Err() != nil:
 			return
@@ -159,15 +202,27 @@ func (a *Agent) runServerEvents(ctx context.Context, key string) {
 			a.setServerConnected(key, false, "events_closed")
 		default:
 			a.setServerConnected(key, false, describeError("events", err))
-			a.logger.Warn("服务端事件流中断，稍后重试", "server", key, "error", err)
+			failStreak++
+			// 前几次报 WARN，之后静默重试：同一句话反复刷屏没有信息量（见 serverEventsFailLogLimit）。
+			if failStreak <= serverEventsFailLogLimit {
+				outageWarned = true
+				a.logger.Warn("服务端事件流中断，稍后重试",
+					"server", key, "error", err, "attempt", failStreak)
+			} else {
+				a.logger.Debug("服务端事件流仍未恢复，继续静默重试",
+					"server", key, "error", err, "attempt", failStreak)
+			}
 			// 服务端重启后会话表被清空，事件流会一直 401；这里主动用本地证书重登录，
 			// 下次循环拿到新客户端即可恢复订阅（refreshSessionTokenFor 自带节流与单飞）。
 			if isSessionExpiredError(err) {
 				retryCtx, retryCancel := context.WithTimeout(ctx, serverRequestTimeout)
-				if _, rErr := a.refreshSessionTokenFor(retryCtx, key); rErr != nil {
-					a.logger.Warn("事件流因会话失效中断，用本地证书重新登录失败", "server", key, "error", rErr)
-				}
+				_, rErr := a.refreshSessionTokenFor(retryCtx, key)
 				retryCancel()
+				// 撞上节流闸门是预期结果（说明刚重登录过），不是新故障，不记日志。
+				if rErr != nil && !isAuthRetryThrottled(rErr) && failStreak <= serverEventsFailLogLimit {
+					a.logger.Warn("事件流因会话失效中断，用本地证书重新登录失败",
+						"server", key, "error", rErr)
+				}
 			}
 		}
 
@@ -176,7 +231,7 @@ func (a *Agent) runServerEvents(ctx context.Context, key string) {
 			return
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
+		if backoff < serverEventsBackoffMax {
 			backoff *= 2
 		}
 	}

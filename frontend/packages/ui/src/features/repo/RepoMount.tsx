@@ -1,12 +1,13 @@
 import { useCallback, useMemo, useState } from 'react'
 import { Button, Tooltip, Typography } from 'antd'
+import { LoadingOutlined } from '@ant-design/icons'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { agentApi } from '../../api/agentClient'
 import { useApi } from '../../api/provider'
-import type { AgentMountState } from '../../api/agentTypes'
+import type { AgentMountState, AgentMountVolumeUsage } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
-import { useAgent } from '../../hooks/useAgent'
+import { pickMountUsage, useAgent } from '../../hooks/useAgent'
 import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
@@ -18,6 +19,14 @@ export interface RepoMountController {
   mount: AgentMountState | undefined
   /** 挂载点：盘符模式为 "E:"，目录模式为绝对目录。 */
   mountPath: string
+  /**
+   * 本机挂载卷的**实测**用量（挂载点所在卷的容量/可用/已用）。
+   *
+   * 服务端的 used_bytes 是宿主侧物理占用（写过的最高水位，客户机里删掉数据也不回落），
+   * 卡片上的「已用」用它才是用户眼里的用量（见 repoUsage）。未挂载 / 代理不可用 /
+   * 取数失败时为 undefined，界面回退服务端数字。
+   */
+  usage: AgentMountVolumeUsage | undefined
   /** 已挂载（挂载点可用、可打开）：要求记录是 mounted **且实测会话还在**。 */
   mounted: boolean
   /**
@@ -113,6 +122,12 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     // 兜底：挂载请求也带 repo_id，可据此关联到本库（例如分配列表尚未刷新时）。
     return mounts.find((item) => item.repo_id !== '' && item.repo_id === repo.id)
   }, [agent.state, allocationId, repo.id])
+
+  // 本机实测用量：与上面 mount 同一套关联规则（分配优先、repo_id 兜底）。
+  const usage = useMemo(
+    () => pickMountUsage(agent.usage, repo.id, mount?.allocation_id),
+    [agent.usage, mount?.allocation_id, repo.id]
+  )
 
   // 分配列表首次取数中："没有 allocationId"此刻只代表"还不知道"，不代表"没有分配"。
   const resolving = allocationsQuery.isLoading
@@ -215,6 +230,7 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
   return {
     mount,
     mountPath: mount?.mount_path ?? '',
+    usage,
     mounted,
     sessionLive,
     sessionLost,
@@ -264,22 +280,45 @@ export function RepoMountActions({ controller, size = 'small' }: RepoMountAction
 
   return (
     // 卡片整卡可点进详情，按钮区的事件不得冒泡触发跳转。
-    <span style={{ display: 'inline-flex', flexShrink: 0 }} onClick={(event) => event.stopPropagation()}>
+    // relative 是给"进行中"那一档用的：转圈绝对定位盖在按钮正中（见下）。
+    <span
+      style={{ position: 'relative', display: 'inline-flex', flexShrink: 0 }}
+      onClick={(event) => event.stopPropagation()}
+    >
       {working ? (
         // 进行中只留一个"置灰 + 转圈"的按钮，**不写文字**。
         //
         // 为什么不能沿用文字：挂载请求一发出，代理状态机立刻变成 mounting，showMount 翻假，
         // 按钮会换成"卸载"（而且被 pending 一起置灰）—— 用户刚点完挂载就看见"卸载"，
         // 只能理解为"点错了"或"系统反过来要求我卸载"。留空就不会说错。
-        // minWidth 与带文字的按钮对齐，避免操作前后布局跳动：64 同时罩得住小号（≈46px）
-        // 与中号（≈62px）的「挂载/卸载」文字按钮。
-        <Button
-          size={size}
-          loading
-          disabled
-          aria-label={t('common.loading')}
-          style={{ minWidth: 64 }}
-        />
+        // 宽度必须与带文字的按钮**逐像素一致**，否则一按下去按钮变宽，右侧动作区整体横移
+        // （真实反馈："loading 状态的挂载按钮比没有 loading 时宽了，会顶起来 UI"）。
+        // 定死 minWidth 做不到：图标按钮只有 ≈30px，而各语言的「挂载/卸载」长短不一，
+        // 定 64 就比中文的（≈46px）宽一截，定 46 又罩不住 ja/ko。
+        // 做法：把标签留着但设成**不可见** —— 宽度照旧由真实文字撑出来，转圈绝对定位居中盖上去。
+        // 转圈之所以放在按钮**外面**（外层 span 是 relative），是为了让按钮只剩一个子节点，
+        // 见下面那段注释。
+        <>
+          <Button size={size} disabled aria-label={t('common.loading')}>
+            {/* 标签取"这次操作结束后按钮会显示的那个词"：中/日/韩的「挂载」「卸载」等宽，
+                点下去到结束全程宽度不变；个别语言两词长短不同，也只变到"本该有的宽度"。
+                必须让按钮**只有一个子节点**：antd 只在此时才对「挂载」这类两个汉字的文字做
+                "中间插空格"处理（Button 的 needInserted），少了这一步会比真按钮窄一个空格。 */}
+            <span style={{ visibility: 'hidden' }}>{showMount ? t('action.mount') : t('action.unmount')}</span>
+          </Button>
+          <span
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none'
+            }}
+          >
+            <LoadingOutlined spin />
+          </span>
+        </>
       ) : showMount ? (
         <Tooltip title={disabledReason}>
           <span style={{ display: 'inline-block' }}>

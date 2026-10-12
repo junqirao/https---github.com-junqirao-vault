@@ -151,6 +151,10 @@ func sameSession(store *stateStore, key string, want *Session) bool {
 // 单个失败只记录状态并通过 SSE 通知，不阻塞其他分配。
 func (a *Agent) restoreMounts(ctx context.Context, key string) {
 	cfg := a.cfg.Get()
+	// 先补齐"库容量索引"再挂载：缓存配额按库容量在所有开缓存的库之间分摊（见 cacheproxy.go
+	// 的 splitCacheBudget），而挂载参数里只有**本库**的容量 —— 不先补齐，先挂的库会按
+	// "平均容量"占走一大份，后挂的库只能捡剩下的。
+	a.primeRepoSizeIndex(ctx, key, cfg.RepoMounts)
 	// 补完未完成的卸载**与全局自动挂载开关无关**：它是"把没收尾的动作做完"，而且用户的
 	// 最后意图就是卸载。这段逻辑原先写在 restoreRecordedMounts 里、被 `if cfg.AutoMount`
 	// 挡着——注释写着"与开关无关"，代码却受它管；结果没开自动挂载的用户重启后，那条记录
@@ -421,16 +425,56 @@ func filterReposOnServer(targets []autoMountTarget, names map[string]string) []a
 	return out
 }
 
+// primeRepoSizeIndex 在开始挂载之前把"库容量索引"补齐。
+//
+// 为什么需要：缓存配额按库容量分摊，而挂载参数里只有本库的容量。缺了别的库的容量，先挂的
+// 库就会按"已知库的平均容量"占走一份（见 splitCacheBudget），后挂的库只能捡剩下的 ——
+// 分摊结果虽然在挂载那一刻定死、不会漂移，但和"按库容量分"的意图不符。
+//
+// 何时查询：只在"有库开了缓存、且它的容量还不知道"时查一次库列表。各库容量都已知后不再
+// 查询，所以稳态下零额外开销；查不到也不影响挂载，只是这一次的分摊退化为按平均容量看待。
+func (a *Agent) primeRepoSizeIndex(ctx context.Context, key string, prefs map[string]RepoMountPref) {
+	missing := false
+	for repoID, pref := range prefs {
+		if pref.CacheEnabled && a.cache.knownRepoSize(repoID) <= 0 {
+			missing = true
+			break
+		}
+	}
+	if !missing {
+		return
+	}
+	client, err := a.serverClientFor(key)
+	if err != nil {
+		// 没有该台的会话（退出登录/刚被移除）：这一轮本来也挂不上，静默跳过。
+		return
+	}
+	queryCtx, cancel := context.WithTimeout(ctx, serverRequestTimeout)
+	defer cancel()
+	if _, err := a.repoNames(queryCtx, client); err != nil {
+		a.logger.Warn("读取存储库容量失败，本次缓存配额按已知容量分摊",
+			"server", key, "error", err)
+	}
+}
+
 // repoNames 返回"存储库 ID -> 名称"（仅该服务端可见的库）。
+//
+// 顺带把库容量喂给缓存管理器：缓存预算按库容量分摊，而挂载参数里只带**本库**的容量，
+// 这里是唯一一次能拿到全部库容量的地方（见 cacheproxy.go 的 splitCacheBudget）。
 func (a *Agent) repoNames(ctx context.Context, client *serverClient) (map[string]string, error) {
 	repos, err := client.ListRepos(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make(map[string]string, len(repos))
+	sizes := make(map[string]int64, len(repos))
 	for _, repo := range repos {
 		out[repo.ID] = repo.Name
+		if repo.CapacityBytes > 0 {
+			sizes[repo.ID] = repo.CapacityBytes
+		}
 	}
+	a.cache.rememberRepoSizes(sizes)
 	return out, nil
 }
 

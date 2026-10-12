@@ -17,10 +17,10 @@ func newCacheTestStore(t *testing.T) *ConfigStore {
 	return store
 }
 
-// TestCacheQuotaSplitsClientBudget 锁定配额口径：**客户端总量 ÷ 已启用缓存的库数**。
+// TestCacheQuotaSplitsClientBudget 锁定配额口径：**客户端总量在开缓存的库之间按库容量分摊**。
 //
-// 用户只在客户端层面设置 L1/L2 最大空间（"一个客户端一个代理"），每个库分到的是它的一份；
-// 算错会让每个库都按满额占用，多个库一起开就把内存/磁盘吃穿。
+// 用户只在客户端层面设置 L1/L2 最大空间（"一个客户端一个代理"），每个库分到的是它按容量
+// 占比应得的一份；算错会让每个库都按满额占用，多个库一起开就把内存/磁盘吃穿。
 func TestCacheQuotaSplitsClientBudget(t *testing.T) {
 	store := newCacheTestStore(t)
 	l1, l2 := int64(4)<<30, int64(16)<<30
@@ -29,30 +29,42 @@ func TestCacheQuotaSplitsClientBudget(t *testing.T) {
 	}
 	m := newCacheManager(store, testLogger())
 
-	// 没有任何库启用缓存：按 1 计（防除零），实际不会被用到。
-	if got1, got2 := m.quota(); got1 != l1 || got2 != l2 {
-		t.Fatalf("未启用任何库时配额 = %d/%d，期望 %d/%d", got1, got2, l1, l2)
-	}
-
 	enable := func(repoID string) {
 		t.Helper()
 		if _, err := store.SetRepoMountPref(repoID, RepoMountPref{CacheEnabled: true}); err != nil {
 			t.Fatalf("启用 %s 的缓存失败：%v", repoID, err)
 		}
 	}
+	req := func(repoID string, size int64) cacheTargetRequest {
+		return cacheTargetRequest{AllocationID: "alloc-" + repoID, RepoID: repoID, RepoSizeBytes: size}
+	}
+
+	// 只有自己一个库开缓存时，配额就是总量（库容量比预算大，不触发封顶）。
 	enable("repo-a")
-	if got1, got2 := m.quota(); got1 != l1 || got2 != l2 {
+	if got1, got2 := m.quotaFor(req("repo-a", 1000<<30)); got1 != l1 || got2 != l2 {
 		t.Fatalf("1 个库时配额应等于总量：%d/%d", got1, got2)
 	}
+
+	// 容量 10:1 的两个库：份额也该是 10:1，而不是各占一半。
+	// 两个库的容量都已知（正常路径见 automount.go 的 primeRepoSizeIndex：挂载前先补齐索引，
+	// 否则先挂的库会按"平均容量"占一份，后挂的只能捡剩下的）。
 	enable("repo-b")
-	if got1, got2 := m.quota(); got1 != l1/2 || got2 != l2/2 {
-		t.Fatalf("2 个库时配额应各占一半：%d/%d", got1, got2)
+	m.rememberRepoSize("repo-a", 1000<<30)
+	m.rememberRepoSize("repo-b", 100<<30)
+	gotA, _ := m.quotaFor(req("repo-a", 1000<<30))
+	gotB, _ := m.quotaFor(req("repo-b", 100<<30))
+	if gotA <= gotB*8 || gotA >= gotB*12 {
+		t.Fatalf("1000 GiB 与 100 GiB 的库应分到约 10:1：%d/%d", gotA, gotB)
 	}
-	// 关掉缓存开关的库不计入分母。
+	if gotA+gotB > l1 {
+		t.Fatalf("两个库合计 %d 超过 L1 总量 %d", gotA+gotB, l1)
+	}
+
+	// 关掉缓存开关的库既不参与分摊，也不该挤占别人的份额。
 	if _, err := store.SetRepoMountPref("repo-b", RepoMountPref{CacheEnabled: false}); err != nil {
 		t.Fatalf("关闭 repo-b 的缓存失败：%v", err)
 	}
-	if got1, _ := m.quota(); got1 != l1 {
+	if got1, _ := m.quotaFor(req("repo-a", 1000<<30)); got1 != l1 {
 		t.Fatalf("关闭一个库后配额应回到总量：%d", got1)
 	}
 
@@ -61,7 +73,7 @@ func TestCacheQuotaSplitsClientBudget(t *testing.T) {
 	if _, err := store.Patch(ConfigPatch{CacheL2Bytes: &zero}); err != nil {
 		t.Fatalf("关闭 L2 失败：%v", err)
 	}
-	if _, got2 := m.quota(); got2 != 0 {
+	if _, got2 := m.quotaFor(req("repo-a", 1000<<30)); got2 != 0 {
 		t.Fatalf("L2 设为 0 时配额应为 0，实际 %d", got2)
 	}
 }

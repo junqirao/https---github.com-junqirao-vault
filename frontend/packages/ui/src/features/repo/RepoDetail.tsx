@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Alert, Button, Descriptions, Dropdown, Form, Input, InputNumber, Modal, Progress, Space, Tabs } from 'antd'
+import { Alert, Button, Descriptions, Dropdown, Form, Input, InputNumber, Modal, Space, Tabs } from 'antd'
 import type { MenuProps } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -9,10 +9,11 @@ import { LoadingState } from '../../components/LoadingState'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
 import { StatusTag } from '../../components/StatusTag'
+import { UsageBar } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
+import { pickMountUsage, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
-import { palette, spacing } from '../../tokens/palette'
 import { formatTime, repoUsage } from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
@@ -49,6 +50,7 @@ const PARENT_ACTIONS: ParentAction[] = [
 export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserName, onBack }: RepoDetailProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
+  const agent = useAgent()
   const queryClient = useQueryClient()
   const [error, setError] = useState<unknown>(null)
   const [editOpen, setEditOpen] = useState(false)
@@ -61,6 +63,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     queryKey: ['repo', repoId],
     queryFn: () => api.getRepo(repoId)
   })
+
+  // 概览里的「已用」也要是本机实测值（见下面 repoUsage 的说明）：页面在时按 10s 轮询。
+  useAgentUsagePolling(true)
 
   const refresh = (): void => {
     void queryClient.invalidateQueries({ queryKey: ['repo', repoId] })
@@ -111,8 +116,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   if (repoQuery.isLoading) return <LoadingState text={t('common.loading')} />
 
   const repo = repoQuery.data
-  // 用量口径与卡片、管理端表格一致（分母 = 库容量，见 repoUsage）。
-  const { percent: usagePercent, text: usageText } = repoUsage(repo)
+  // 用量口径与卡片一致（分母 = 库容量，见 repoUsage）。本机挂着这个库时用本机**实测**的
+  // 卷用量：服务端的 used_bytes 是宿主侧物理占用（写过的最高水位，删了也不回落）。
+  const { percent: usagePercent, text: usageText } = repoUsage(repo, pickMountUsage(agent.usage, repo?.id))
 
   const openEdit = (target: RepoDTO): void => {
     editForm.setFieldsValue({
@@ -201,13 +207,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                   <Descriptions.Item label={t('repo.used')}>
                     <div style={{ minWidth: 160 }}>
                       <div>{usageText}</div>
-                      <Progress
-                        percent={usagePercent}
-                        size="small"
-                        strokeColor={palette.accent}
-                        trailColor={palette.neutralFill}
-                        style={{ marginBottom: 0, marginTop: spacing.xxs }}
-                      />
+                      <UsageBar percent={usagePercent} />
                     </div>
                   </Descriptions.Item>
                   <Descriptions.Item label={t('field.maxDiffDisks')}>{repo?.max_diff_disks ?? '-'}</Descriptions.Item>

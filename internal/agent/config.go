@@ -95,11 +95,16 @@ type Config struct {
 	UpdateChannel string `json:"update_channel"`
 	// ServerAlias 服务端别名（目录模式命名空间，见 3.4.5）。
 	ServerAlias string `json:"server_alias"`
-	// CacheL1Bytes 是本机 iSCSI 读缓存代理的 L1（内存）总预算，按已启用缓存的库均分
-	// （见 cacheproxy.go 的配额规则）。
+	// CacheL1Bytes 是本机 iSCSI 读缓存代理的 L1（内存）**总上限**：所有开了缓存的库都在这一个
+	// 数里，按各自库容量占比分摊（见 cacheproxy.go 的 splitCacheBudget）。
+	//
+	// 它不是"每个库各拿这么多"，也不是必须用满：没有库开缓存时一个字节都不占。
 	CacheL1Bytes int64 `json:"cache_l1_bytes"`
-	// CacheL2Bytes 是本机 iSCSI 读缓存代理的 L2（本地磁盘文件）总预算，同样按已启用
-	// 缓存的库均分；**0 表示关闭 L2**（只做内存缓存）。
+	// CacheL2Bytes 是本机 iSCSI 读缓存代理的 L2（本地磁盘文件）总上限，分摊规则同上；
+	// **0 表示关闭 L2**（只做内存缓存）。
+	//
+	// 该配多大可以看 GET /agent/cache 的 recommend（按本机已知的库容量估算），
+	// 口径是"库容量的 5%"，客户端设置页会把推荐值显示在输入框后面。
 	CacheL2Bytes int64 `json:"cache_l2_bytes"`
 	// CacheL2Dir 是 L2 缓存文件的存放目录（客户端设置里可改）。
 	//

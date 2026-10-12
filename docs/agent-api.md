@@ -365,6 +365,41 @@ GET  /agent/mounts
   ↑ {items:[MountState...]}
 ```
 
+## 本机挂载卷用量
+
+存储库卡片上的「已用」由**客户端自己量**（服务端的 `used_bytes` 不参与展示，原因见下）。
+
+```
+GET /agent/usage
+  ↑ {items:[MountVolumeUsage...]}
+  # 只列本机 state="mounted" 的记录，一条一块盘。取数失败的那一条 error 非空、total_bytes=0，
+  # 界面按"没有实测值"处理（回退服务端数字）；保留该条是为了可诊断：为什么这块盘读不到。
+
+MountVolumeUsage = {
+  allocation_id, repo_id,
+  mount_path, mount_mode, state,      # letter 模式为 "E:"；directory 模式为绝对目录
+  total_bytes, free_bytes, used_bytes,   # used = total - free（文件系统口径）
+  file_system,                        # 可选：NTFS 等
+  checked_at,                         # 本次实测时刻（毫秒时间戳）
+  error                               # 可选："阶段:稳定错误码"，如 usage:platform.ps_failed
+}
+```
+
+为什么要客户端自己量（真实反馈："会一直记录最高水位，而不是真实已用"）：服务端的「已用」是
+**宿主侧物理占用** —— Windows 上是差异盘 VHDX 的**文件大小**（`internal/platform/winvhd`），
+Linux 上是 thin 池的独占块。客户机里删掉数据不会让它回落，卡片上的数字于是永远停在"写过的
+最高水位"，不是用户眼里的"这块库用了多少"。后者只有本机挂载着的那个卷知道，所以：
+
+- 这里量、本机界面看，**不上报服务端**：服务端不关心用量；配额仍按宿主侧占用算 —— 那是
+  存储设备真实吃掉的空间，也是防超卖的底线（若按"客户机里还剩多少数据"算，写入后再删掉
+  就可以绕过配额）；
+- 取数走一次 PowerShell（`Get-Volume`，见 `volume.Manager.SpaceUsageOf`），代理侧按
+  `volumeUsageTTL`（15s）缓存快照、并发请求只让一路真去测，界面按 10s 轮询不会每次都起进程；
+- directory 模式的挂载点是**卷挂载点**（`Add-PartitionAccessPath`）：按路径解析到的仍是被挂上
+  的那个卷，不会量成承载这个目录的宿主盘；
+- 未挂载的库不在快照里，界面回退服务端数字（有本机实测值时标签会变成「已用（本机）」并给出
+  说明，免得两个口径看着像打架）。
+
 ## 本地读缓存（iSCSI 缓存代理）
 
 客户端本地读加速：**一个客户端只起一个代理进程**（内嵌在 Vault-Agent 内），代理在
@@ -381,11 +416,17 @@ GET /agent/cache
 CacheStatus = {
   running:bool,                 # 门户是否已打开（**懒启动**：首个库启用缓存时创建）
   addr,                         # 门户监听地址（running 时有值），如 "127.0.0.1:3261"
-  l1_limit_bytes, l2_limit_bytes,   # 客户端总量预算（L2 为 0 表示关闭 L2）
-  l1_quota_bytes, l2_quota_bytes,   # 当前**均分**给每个启用缓存的库的配额（总量 / 库数）
-  enabled_repos:int,            # 已启用缓存的库数（决定配额分母）
+  l1_limit_bytes, l2_limit_bytes,   # 客户端总量**上限**（L2 为 0 表示关闭 L2）
+  enabled_repos:int,            # 已启用缓存的库数（配额分摊集合的规模）
+  known_repo_bytes, known_repos,    # 本机**已知容量**的库合计与个数（分摊与推荐值的依据）
+  recommend:CacheRecommend,     # 按已知库容量估算的推荐预算（设置页显示在配置项后面）
   targets:[CacheTargetStatus...],   # 按库（分配）汇总的用量与命中情况
   error                         # 可选：最近一次打开门户失败的原因（如端口被占用）
+}
+
+CacheRecommend = {              # 逐库分到多少没有单一数字，看 targets[].*_limit_bytes
+  l1_bytes, l2_bytes,           # 推荐的两级预算；basis_repos 为 0 时均为 0（还没数据）
+  basis_bytes, basis_repos      # 估算依据：已知容量的库合计 / 个数
 }
 
 CacheTargetStatus = {
@@ -405,7 +446,13 @@ CacheTargetStatus = {
 
 - **设面只按客户端**：L1/L2 总量在「客户端设置」里配（`PATCH /agent/config` 的
   `cache_l1_bytes` / `cache_l2_bytes`，见「本地配置」），**是否启用按库配**
-  （`POST /agent/repo-mounts/{repo_id}` 的 `cache_enabled`）。总量由所有已启用缓存的库均分。
+  （`POST /agent/repo-mounts/{repo_id}` 的 `cache_enabled`）。总量是**上限**，在所有已启用
+  缓存的库之间按**库容量占比**分摊（1 TB 的库分到的份额是 100 GB 的 10 倍），单库不超过
+  自身容量；容量未知的库按"已知库的平均容量"看待（一个都不知时退化为按库数均分）。
+  分摊结果在挂载时定下，逐库配额见 `targets[].l1_limit_bytes` / `l2_limit_bytes`。
+- **库容量从哪来**：不做额外查询 —— 挂载参数里的 `disk_size_bytes`（服务端下发）与
+  `GET /v1/repos` 的 `capacity_bytes`（代理在会话建立后、开始挂载前为分摊取一次）都会记进
+  本机索引，`known_repo_bytes` / `known_repos` 与 `recommend` 都由它算。
 - **懒启动**：没有任何库启用缓存时不开门户；第一个库启用并挂载时才创建监听。
 - **回退直连**：门户建不起来（如 3261 被占用）时，库照常挂载，只是回退直连服务端目标，
   原因记在该库挂载状态的 `cache_error` 里。
@@ -656,10 +703,12 @@ POST  /agent/repo-mounts/{repo_id}
 从配置文件读取到越界值时按「<=0 取默认 4、>8 取 8」归一化。
 
 `cache_l1_bytes` / `cache_l2_bytes` 是本机 iSCSI 读缓存代理的 **L1（内存）/ L2（本地磁盘
-文件）总量预算**（字节），前者默认 512MiB、后者默认 4GiB。语义是**客户端总量**：设面只按
-客户端设置，一个客户端只起一个代理，多个已启用缓存的库**均分**这份总量（见
-`GET /agent/cache` 的 `l1_quota_bytes` / `l2_quota_bytes`）。配额在**挂载建立时定下，运行中
-不重算**，因此：
+文件）总量上限**（字节），前者默认 512MiB、后者默认 4GiB。语义是**客户端总量上限**：设面只
+按客户端设置，一个客户端只起一个代理，所有已启用缓存的库在这一个数里按**库容量占比**分摊
+（1 TB 的库分到的份额是 100 GB 的 10 倍；单库不超过自身容量；容量未知按已知库的平均容量）。
+逐库分到多少见 `GET /agent/cache` 的 `targets[].l1_limit_bytes` / `l2_limit_bytes`，该配多大
+见同接口的 `recommend`（按库容量估算：L2 取库容量的 5%，L1 取 L2 的 1/8）。配额在
+**挂载建立时定下，运行中不重算**，因此：
 
 - **取值范围**：L1 必须落在 `[64MiB, 64GiB]`；L2 允许 **0（= 关闭 L2，只做内存缓存）**，
   非 0 时必须落在 `[256MiB, 1TiB]`。越界时 PATCH 返回 `system.invalid_param`

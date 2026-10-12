@@ -106,6 +106,36 @@ export interface AgentMountState {
   direct_mode?: boolean
 }
 
+/**
+ * 本机某块**已挂载卷**的真实空间占用（GET /agent/usage 的 items[]）。
+ *
+ * 为什么需要它：服务端的 used_bytes 是**宿主侧物理占用**（Windows 上是差异盘 VHDX 的
+ * 文件大小），客户机里删掉数据也不会回落 —— 卡片上的"已用"于是永远停在写过的最高水位，
+ * 而不是用户眼里的"这块库用了多少"。后者只有本机挂载着的那个卷知道，所以由代理在本机量、
+ * 本机界面看，**不上报服务端**（服务端不关心用量；配额仍按宿主侧占用算）。
+ *
+ * 只有 state='mounted' 的记录会出现在这里；取数失败的那一条 error 非空、total_bytes=0，
+ * 界面按"没有实测值"处理（回退服务端数字），保留该条是为了诊断"为什么读不到"。
+ */
+export interface AgentMountVolumeUsage {
+  /** 与挂载记录、存储库卡片一一对应。 */
+  allocation_id: string
+  repo_id: string
+  /** letter 模式为 "E:"；directory 模式为绝对目录（实测的就是它所在的那个卷）。 */
+  mount_path: string
+  mount_mode?: AgentMountMode
+  state?: AgentMountStatus
+  /** 卷容量 / 可用空间；used_bytes = total_bytes - free_bytes（文件系统口径）。 */
+  total_bytes: number
+  free_bytes: number
+  used_bytes: number
+  file_system?: string
+  /** 本次实测时刻（毫秒时间戳）。 */
+  checked_at?: number
+  /** 取数失败的原因（"阶段:稳定错误码"）；非空时 total_bytes 为 0。 */
+  error?: string
+}
+
 export type DownloadStatus = 'running' | 'done' | 'failed' | 'canceled'
 
 /**
@@ -346,14 +376,17 @@ export interface AgentConfig {
   /** 是否用本地客户端证书免密登录（identity.json 存在时生效）。 */
   auto_login: boolean
   /**
-   * 本地读缓存代理的 **L1（内存）总预算**（字节）：客户端总量，在已启用缓存的库之间均分。
+   * 本地读缓存代理的 **L1（内存）总上限**（字节）：所有开了缓存的库都在这一个数里，
+   * 按各自**库容量占比**分摊（见 GET /agent/cache 的 recommend 与 targets[].l1_limit_bytes）。
    *
-   * 用户只在这一层设置（一个客户端一个代理）；某个库分到多少由代理按"已启用缓存的库数"算。
+   * 它不是"每个库各拿这么多"，也不必须用满：没有库开缓存时一个字节都不占。
    */
   cache_l1_bytes: number
   /**
-   * 本地读缓存代理的 **L2（本地磁盘文件）总预算**（字节）：同样是客户端总量、按库均分。
+   * 本地读缓存代理的 **L2（本地磁盘文件）总上限**（字节）：同样是总量、按库容量占比分摊。
    * **0 表示关闭 L2**（只做内存缓存），是合法取值。
+   *
+   * 该配多大可以看 GET /agent/cache 的 `recommend.l2_bytes`（按库容量估算）。
    */
   cache_l2_bytes: number
   /**
@@ -399,6 +432,23 @@ export interface AgentCacheTargetStatus {
 }
 
 /**
+ * "该配多大缓存"的估算值（GET /agent/cache 的 recommend）。
+ *
+ * 估算**不查服务端**：只用本机已经知道的库容量（挂载参数里的 disk_size_bytes、
+ * GET /v1/repos 的 capacity_bytes），刚装上、还没挂过库的客户端 basis_repos 为 0，
+ * 界面此时不显示推荐值。
+ */
+export interface AgentCacheRecommend {
+  /** 推荐的两级预算（字节）；basis_repos 为 0 时是 0。 */
+  l1_bytes: number
+  l2_bytes: number
+  /** 估算依据：本机已知容量的库合计（字节）。 */
+  basis_bytes: number
+  /** 估算依据：本机已知容量的库个数。 */
+  basis_repos: number
+}
+
+/**
  * 本地 iSCSI 读缓存代理的对外状态（GET /agent/cache）。
  *
  * 门户是**懒启动**的：没有任何库启用缓存时不监听任何端口（running=false，targets 为空）。
@@ -407,14 +457,20 @@ export interface AgentCacheStatus {
   running: boolean
   /** 门户监听地址（未运行时为空）。 */
   addr?: string
-  /** 客户端总量预算。 */
+  /**
+   * 客户端总量预算。逐库分到多少见 targets[].l1_limit_bytes（按库容量占比分摊，
+   * 不再有"每个库都一样"的单一配额数字）。
+   */
   l1_limit_bytes: number
   l2_limit_bytes: number
-  /** 当前均分给每个启用缓存的库的配额。 */
-  l1_quota_bytes: number
-  l2_quota_bytes: number
-  /** 已启用缓存的库数（配额分母）。 */
+  /** 已启用缓存的库数（分摊集合的规模）。 */
   enabled_repos: number
+  /** 本机已知容量的库合计（字节），分摊与推荐值都按它算。 */
+  known_repo_bytes: number
+  /** 本机已知容量的库个数（0 表示还没有数据）。 */
+  known_repos: number
+  /** 按已知库容量估算的推荐预算，界面显示在两个配置项后面。 */
+  recommend: AgentCacheRecommend
   targets: AgentCacheTargetStatus[]
   /** 最近一次打开门户失败的原因（如端口被占用）；正常时为空。 */
   error?: string

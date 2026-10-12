@@ -12,7 +12,7 @@ import { PageShell } from '../../components/PageShell'
 import { StatusTag } from '../../components/StatusTag'
 import { useApi } from '../../api/provider'
 import type { RepoDTO } from '../../api/types'
-import { useAgent } from '../../hooks/useAgent'
+import { useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { useAuth } from '../../hooks/useAuth'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
@@ -332,6 +332,10 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
     return () => window.clearInterval(timer)
   }, [agent.available, isSuperAdmin, refreshCache])
 
+  // 卡片上的「已用」取本机挂载卷的实测值（见 repoUsage）：同样按 10s 轮询，同一个轮询器
+  // 也只放这一层。管理端是运维表（看的是服务端口径），不轮询。
+  useAgentUsagePolling(!isSuperAdmin)
+
   const reposQuery = useQuery({
     queryKey: ['repos', isSuperAdmin ? 'all' : 'mine'],
     queryFn: () => api.listRepos({ limit: 200 })
@@ -362,7 +366,8 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
       { title: t('field.mode'), dataIndex: 'mode', key: 'mode', width: 200, render: (value: string) => repoModeLabel(value) },
       { title: t('field.group'), dataIndex: 'group', key: 'group', render: (value?: string) => value || '-' },
       {
-        // 与卡片同一口径（分母 = 库容量，见 repoUsage）；表格里只出文字，不出进度条。
+        // 管理端表格看的是**服务端口径**（宿主侧物理占用，分母 = 库容量，见 repoUsage）：
+        // 运维要的是"这块盘在存储上占了多大"，与客户端卡片的本机实测值是两回事。
         title: t('repo.used'),
         key: 'size',
         render: (_value, repo) => repoUsage(repo).text

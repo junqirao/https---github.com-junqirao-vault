@@ -4,6 +4,8 @@ import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message
 import { InfoCircleOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
 
 import { StatusTag } from '../../components/StatusTag'
+import { UsageBar } from '../../components/UsageBar'
+import type { AgentMountVolumeUsage } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
@@ -97,28 +99,46 @@ function RepoTagRow({
   )
 }
 
-/** 用量：口径统一在 repoUsage（分母 = 库容量），这里只负责画。 */
-function RepoUsage({ repo, style }: { repo: RepoDTO; style?: CSSProperties }): JSX.Element {
+/**
+ * 用量：口径统一在 repoUsage（分母 = 库容量），这里只负责画。
+ *
+ * 本机挂着这个库时（`usage` 有值）画的是**本机实测**的卷用量：服务端的数字是宿主侧
+ * 物理占用（写过的最高水位，客户机里删了也不回落），用户眼里的"用了多少"只有本机
+ * 挂载着的那个卷知道。标签仍是「已用」（不给它挂「（本机）」后缀：同一列里两个口径的
+ * 标签长短不一反而像两件事），口径差异由悬浮说明交代。
+ */
+function RepoUsage({
+  repo,
+  usage,
+  style
+}: {
+  repo: RepoDTO
+  /** 本机实测用量（未挂载 / 取不到时为空，回退服务端数字）。 */
+  usage?: AgentMountVolumeUsage
+  style?: CSSProperties
+}): JSX.Element {
   const { t } = useI18n()
-  const { percent, text } = repoUsage(repo)
+  const { percent, text } = repoUsage(repo, usage)
+  const local = usage !== undefined && usage.total_bytes > 0
   return (
     <div style={style}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-          {t('repo.used')}
-        </Typography.Text>
+        {local ? (
+          <Tooltip title={t('repo.usedLocalHint')}>
+            <Typography.Text type="secondary" style={{ fontSize: fontSize.sm, cursor: 'help' }}>
+              {t('repo.used')}
+            </Typography.Text>
+          </Tooltip>
+        ) : (
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+            {t('repo.used')}
+          </Typography.Text>
+        )}
         <Typography.Text ellipsis={{ tooltip: text }} style={{ fontSize: fontSize.sm }}>
           {text}
         </Typography.Text>
       </div>
-      <Progress
-        percent={percent}
-        showInfo={false}
-        size="small"
-        strokeColor={palette.accent}
-        trailColor={palette.neutralFill}
-        style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-      />
+      <UsageBar percent={percent} />
     </div>
   )
 }
@@ -131,7 +151,10 @@ function RepoUsage({ repo, style }: { repo: RepoDTO; style?: CSSProperties }): J
  *   - 只保留**心电图图标**，不再带文字，和右侧「设置」按钮外观一致；
  *   - **所有已挂载的库**都显示这个入口（不再只限开了缓存的库）：未开缓存的库也经本机代理
  *     （纯透传），同样能看读写 IOPS（弹窗按 cache_enabled 分两态，见 CacheMetricsDialog）；
- *   - **直连模式**（direct_mode）下该库不经过代理、没有数据，入口**置灰**并说明原因。
+ *   - **直连模式**（direct_mode）下该库不经过代理、没有数据，入口**置灰**并说明原因；
+ *   - 入口**始终占位**（未挂载也画，只是置灰）：它是动作区里的固定一档，跟着挂载状态出现/
+ *     消失会让各库的按钮排长短不一，卡片之间对不齐（真实反馈："会导致 UI 不整齐"）。
+ *     看不了就置灰，不隐藏 —— 顺便也告诉用户"挂上之后这里能看指标"。
  *
  * 整卡点击 = 打开挂载目录，所以按钮自己拦住冒泡，只负责打开弹窗。
  */
@@ -141,18 +164,20 @@ function RepoMonitorTag({
 }: {
   controller: RepoMountController
   repoName: string
-}): JSX.Element | null {
+}): JSX.Element {
   const { t } = useI18n()
   const [metricsOpen, setMetricsOpen] = useState(false)
   const mount = controller.mount
-  if (!mount) return null
-
-  const direct = Boolean(mount.direct_mode)
-  const tip = direct
-    ? t('repo.monitor.directHint')
-    : mount.cache_enabled && !mount.cache_active
-      ? `${t('repo.cache.inactive')}${mount.cache_error ? `（${mount.cache_error}）` : ''}`
-      : t('repo.monitor.hint')
+  // 看不了的两态：本机没挂载这个库（压根没有这块盘）/ 直连模式（不过代理，没数据）。
+  const cannotView = mount === undefined || Boolean(mount?.direct_mode)
+  const tip =
+    mount === undefined
+      ? t('repo.monitor.unmountedHint')
+      : mount.direct_mode
+        ? t('repo.monitor.directHint')
+        : mount.cache_enabled && !mount.cache_active
+          ? `${t('repo.cache.inactive')}${mount.cache_error ? `（${mount.cache_error}）` : ''}`
+          : t('repo.monitor.hint')
 
   return (
     <>
@@ -162,14 +187,15 @@ function RepoMonitorTag({
           size="small"
           icon={<FundOutlined />}
           aria-label={t('repo.monitor.title')}
-          disabled={direct}
+          disabled={cannotView}
           onClick={(event) => {
             event.stopPropagation()
             setMetricsOpen(true)
           }}
         />
       </Tooltip>
-      {direct ? null : (
+      {/* 弹窗只在能看的时候挂：没挂载时连 allocation_id 都没有，直连模式进去也只会是空图。 */}
+      {mount && !mount.direct_mode ? (
         <CacheMetricsDialog
           open={metricsOpen}
           allocationId={mount.allocation_id}
@@ -177,7 +203,7 @@ function RepoMonitorTag({
           cacheEnabled={Boolean(mount.cache_enabled)}
           onClose={() => setMetricsOpen(false)}
         />
-      )}
+      ) : null}
     </>
   )
 }
@@ -369,7 +395,7 @@ export function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardP
       </div>
 
       <RepoTagRow repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
-      <RepoUsage repo={repo} style={{ marginTop: spacing.md }} />
+      <RepoUsage repo={repo} usage={mountController.usage} style={{ marginTop: spacing.md }} />
 
       {/* 建库进度：只在这一刻有信息量（服务端正在预创建差异盘/目标），建完换回常驻信息行 */}
       <RepoPrepareProgress repo={repo} />
@@ -421,8 +447,9 @@ export function RepoRow({ repo, currentUserId, onOpen, onConfigure }: RepoCardPr
           <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.xxs }} />
         </div>
 
-        {/* 用量固定宽度：多行之间进度条与数值才能对齐着扫 */}
-        <RepoUsage repo={repo} style={{ flex: '0 0 auto', width: 180 }} />
+        {/* 用量固定宽度：多行之间进度条与数值才能对齐着扫。宽度按最长文案留（「已用」+ 最宽的
+            "999 GB / 999 GB"）：挤到 180 时标签与数值贴在一起、条也短得像条线，读起来是一团。 */}
+        <RepoUsage repo={repo} usage={mountController.usage} style={{ flex: '0 0 auto', width: 240 }} />
 
         <RepoActions
           repo={repo}

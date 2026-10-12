@@ -10,8 +10,8 @@ import (
 const (
 	testBlock  = 16 << 10
 	testSector = 4 << 10
-	// Three slots plus the super block.
-	testSize = SuperBlockSize + 3*testBlock
+	// Three slots, one index page and the super block.
+	testSize = SuperBlockSize + indexPageSize + 3*testBlock
 )
 
 func openTestL2(t *testing.T, store Store, namespace string) *File {
@@ -283,5 +283,129 @@ func TestSyncAndClose(t *testing.T) {
 	}
 	if err := f.Close(); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+}
+
+// TestReopenRestoresIndex is the point of the persisted index: a cache that was
+// closed cleanly is still there the second time the file is opened.
+func TestReopenRestoresIndex(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	want := pattern(2*testSector, 0x33)
+	if err := f.WriteSectors(7, 0, 2, want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	again := openTestL2(t, store, "ns")
+	if again.UsedSlots() != 1 {
+		t.Fatalf("used slots after reopen = %d, want 1", again.UsedSlots())
+	}
+	got := make([]byte, 2*testSector)
+	ok, err := again.ReadSectors(7, 0, 2, got)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !ok {
+		t.Fatal("a block cached before the restart is a miss after it")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("payload not preserved across a restart")
+	}
+}
+
+// TestUncleanCloseDropsIndex checks the crash rule: until Close marks the file
+// cleanly closed the previous mapping is not reloaded, so an invalidation the
+// session only applied in memory cannot come back from disk.
+func TestUncleanCloseDropsIndex(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	if err := f.WriteSectors(7, 0, 1, pattern(testSector, 0x44)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	again := openTestL2(t, store, "ns")
+	if again.UsedSlots() != 0 {
+		t.Fatalf("used slots = %d after an unclean stop, want 0", again.UsedSlots())
+	}
+	if ok, _ := again.ReadSectors(7, 0, 1, make([]byte, testSector)); ok {
+		t.Fatal("a block from an unclean session is still readable")
+	}
+}
+
+// TestInvalidationSurvivesReopen checks that dropped sectors stay dropped: the
+// flushed index has to describe the invalidated state, not just the cached one.
+func TestInvalidationSurvivesReopen(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	if err := f.WriteSectors(3, 0, 3, pattern(3*testSector, 0x55)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f.InvalidateSectors(3, 1, 1)
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	again := openTestL2(t, store, "ns")
+	if ok, _ := again.ReadSectors(3, 1, 1, make([]byte, testSector)); ok {
+		t.Fatal("an invalidated sector came back after a restart")
+	}
+	for _, sec := range []int{0, 2} {
+		if ok, _ := again.ReadSectors(3, sec, 1, make([]byte, testSector)); !ok {
+			t.Fatalf("sector %d was lost across a restart", sec)
+		}
+	}
+}
+
+// TestDropSurvivesReopen checks that a whole device invalidation is persisted.
+func TestDropSurvivesReopen(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	for blk := uint64(1); blk <= 3; blk++ {
+		if err := f.WriteSectors(blk, 0, 1, pattern(testSector, byte(blk))); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	f.Drop()
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	again := openTestL2(t, store, "ns")
+	if again.UsedSlots() != 0 {
+		t.Fatalf("used slots = %d after a persisted drop, want 0", again.UsedSlots())
+	}
+}
+
+// TestTornIndexPageIsIgnored checks the page checksum: a page that was only
+// partly written must be rejected instead of trusted.
+func TestTornIndexPageIsIgnored(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	if err := f.WriteSectors(7, 0, 1, pattern(testSector, 0x66)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Corrupt one record of the first index page.
+	b := make([]byte, 1)
+	if err := store.ReadAt(b, SuperBlockSize+indexHdrSize); err != nil {
+		t.Fatalf("read index page: %v", err)
+	}
+	b[0] ^= 0xff
+	if err := store.WriteAt(b, SuperBlockSize+indexHdrSize); err != nil {
+		t.Fatalf("write index page: %v", err)
+	}
+
+	again := openTestL2(t, store, "ns")
+	if again.UsedSlots() != 0 {
+		t.Fatalf("used slots = %d from a torn page, want 0", again.UsedSlots())
 	}
 }

@@ -33,9 +33,20 @@ const (
 	authRetryMinInterval = 10 * time.Second
 )
 
+// retryThrottledCode 是"刚重登录过，本次跳过"的错误码（见 authRetryTooSoon）。
+const retryThrottledCode = "agent.auth_retry_throttled"
+
 // authRetryTooSoon 表示刚重登录过，本次跳过（调用方沿用原错误）。
 func authRetryTooSoon() error {
-	return apperr.New("agent.auth_retry_throttled", http.StatusTooManyRequests)
+	return apperr.New(retryThrottledCode, http.StatusTooManyRequests)
+}
+
+// isAuthRetryThrottled 判断错误是否为"撞上重登录的节流闸门"。
+//
+// 这是**预期**结果（说明刚刚已经重登录过，见 authRetryMinInterval），不是新故障；
+// 调用方据此不要把它当成"重登录失败"记日志。
+func isAuthRetryThrottled(err error) bool {
+	return err != nil && apperr.CodeOf(err) == retryThrottledCode
 }
 
 // errCertRenewBlocked 表示证书已被判定为不可用（吊销/过期/未登记），不再自动重登录。

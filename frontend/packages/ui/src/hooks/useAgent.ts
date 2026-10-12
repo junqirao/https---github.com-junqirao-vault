@@ -19,6 +19,7 @@ import type {
   AgentHealth,
   AgentMountMode,
   AgentMountState,
+  AgentMountVolumeUsage,
   AgentServerState,
   AgentSessionState,
   AgentState,
@@ -59,6 +60,13 @@ export interface UseAgentResult {
   config: AgentConfig | null
   /** 本地读缓存代理状态（来自 GET /agent/cache）；代理不可用时为 null。 */
   cache: AgentCacheStatus | null
+  /**
+   * 本机**挂载卷的真实用量**（来自 GET /agent/usage）；没有本机挂载/代理不可用时为空。
+   *
+   * 服务端的「已用」是宿主侧物理占用（写过的最高水位，客户机里删掉数据也不回落），
+   * 卡片要显示"用户眼里的用了多少"只能靠这个本机实测值（见 pickMountUsage）。
+   */
+  usage: AgentMountVolumeUsage[]
   /** 代理不可用时的错误；其余失败由调用方按需展示。 */
   error: unknown
   /** 母盘下载任务（来自 download 事件与 GET /agent/downloads）。 */
@@ -82,6 +90,8 @@ export interface UseAgentResult {
   refresh: () => Promise<void>
   /** 拉取一次本地读缓存代理状态（用量会随读写变化，由界面按需轮询）。 */
   refreshCache: () => Promise<void>
+  /** 拉取一次本机挂载卷用量（随客户机读写变化，由页面按需轮询）。 */
+  refreshUsage: () => Promise<void>
   /** 拉取一次下载任务列表（用于页面挂载时恢复进行中/历史状态）。 */
   refreshDownloads: () => Promise<void>
   /** 拉取一次上传任务列表（用于页面挂载时恢复进行中/历史状态）。 */
@@ -101,6 +111,7 @@ let snapshot: {
   health: AgentHealth | null
   config: AgentConfig | null
   cache: AgentCacheStatus | null
+  usage: AgentMountVolumeUsage[]
   downloads: DownloadState[]
   uploads: UploadState[]
   webUpdate: WebUpdateState | null
@@ -111,6 +122,7 @@ let snapshot: {
   health: null,
   config: null,
   cache: null,
+  usage: [],
   downloads: [],
   uploads: [],
   webUpdate: null,
@@ -204,7 +216,14 @@ async function probe(): Promise<void> {
     } catch {
       cache = null
     }
-    setSnapshot({ available: true, health, state, config, cache, webUpdate, uploads, error: null })
+    // 本机挂载卷的**真实**用量：失败按"没有实测值"处理（界面回退服务端数字）。
+    let usage: AgentMountVolumeUsage[] = []
+    try {
+      usage = (await agentApi.getUsage()).items
+    } catch {
+      usage = []
+    }
+    setSnapshot({ available: true, health, state, config, cache, usage, webUpdate, uploads, error: null })
     // 代理侧已有会话（含自动续期后的最新令牌）：**逐台**同步给宿主应用 ——
     // 快照里的 session 只有主服务端那一份，多服务端下必须遍历 servers[] 才能都拿到。
     //
@@ -231,6 +250,7 @@ async function probe(): Promise<void> {
         state: null,
         config: null,
         cache: null,
+        usage: [],
         downloads: [],
         uploads: [],
         webUpdate: null,
@@ -433,14 +453,14 @@ function applyEvent(event: AgentEvent): void {
     }
     case 'server': {
       const key = resolveEventServerKey(current, event.server_key)
-      // 只在"连接状态真的翻转"时提示：phase 变化（connecting → disconnected）本身不是
-      // 用户事件，每次都弹提示会把顶栏的自动重连刷成一串通知。还没有快照时按"未连接"看待
-      // （于是只会在"连上"时提示，不会为一条 connecting → disconnected 弹"已断开"）。
+      // 连上不弹提示：多服务端会同时连上，每台都弹就成了一串通知，顶栏状态本身就是提示。
+      // "断开"仍是用户事件，保留提示；phase 变化（connecting → disconnected）不算翻转，
+      // 否则自动重连也会被刷成一串通知。
       const wasConnected =
         ((current?.servers ?? []).find((item) => item.server_key === key) ?? current?.server)?.connected ?? false
       if (current) setSnapshot({ state: applyServerEvent(current, event) })
-      if (wasConnected !== event.connected) {
-        notify(event.connected ? t('agent.event.serverConnected') : t('agent.event.serverDisconnected'))
+      if (wasConnected && !event.connected) {
+        notify(t('agent.event.serverDisconnected'))
       }
       return
     }
@@ -616,6 +636,42 @@ export function useAgentEventNotifier(): void {
   }, [message])
 }
 
+/**
+ * 从本机用量快照里挑出某个库的**实测**用量（客户端存储库卡片/详情用）。
+ *
+ * 快照里只会有**本机正挂着**的库，所以"挑到了"就等于"这块盘在本机挂着"；挑不到
+ * （未挂载 / 代理不可用 / 取数失败）返回 undefined，界面回退服务端的数字。
+ */
+export function pickMountUsage(
+  items: AgentMountVolumeUsage[] | undefined,
+  repoId?: string,
+  allocationId?: string
+): AgentMountVolumeUsage | undefined {
+  // 取数失败的那一条（error 非空、total_bytes=0）不算实测值：它给不出"用了多少"。
+  const usable = (item: AgentMountVolumeUsage): boolean => item.total_bytes > 0 && !item.error
+  const hit = allocationId ? items?.find((item) => item.allocation_id === allocationId && usable(item)) : undefined
+  if (hit) return hit
+  if (!repoId) return undefined
+  return items?.find((item) => item.repo_id === repoId && usable(item))
+}
+
+/**
+ * 页面级轮询"本机挂载卷用量"（离开页面即停）。
+ *
+ * 与缓存状态同样的做法（见 RepoList 的说明）：轮询器放在页面这一层，放卡片里会变成
+ * 每张卡一个。代理侧另有 15s 的取数缓存（见 internal/agent/volusage.go），所以按 10s
+ * 问并不会每 10s 真去起一个 PowerShell。
+ */
+export function useAgentUsagePolling(enabled: boolean): void {
+  const { available, refreshUsage } = useAgent()
+  useEffect(() => {
+    if (!available || !enabled) return
+    void refreshUsage()
+    const timer = window.setInterval(() => void refreshUsage(), 10000)
+    return () => window.clearInterval(timer)
+  }, [available, enabled, refreshUsage])
+}
+
 /** 本地代理状态与挂载操作（单例订阅 + SSE 实时更新）。 */
 export function useAgent(): UseAgentResult {
   const current = useSyncExternalStore(subscribeSnapshot, getSnapshot, getSnapshot)
@@ -633,6 +689,15 @@ export function useAgent(): UseAgentResult {
       setSnapshot({ cache: await agentApi.getCache() })
     } catch {
       // 单次取数失败不改判定：保留上一次的用量快照，等下次轮询再试。
+    }
+  }, [])
+
+  const refreshUsage = useCallback(async (): Promise<void> => {
+    try {
+      const result = await agentApi.getUsage()
+      setSnapshot({ usage: result.items })
+    } catch {
+      // 同理：单次取数失败保留上一次的实测值（卸载后代理快照里就没有那一条了）。
     }
   }, [])
 
@@ -722,6 +787,7 @@ export function useAgent(): UseAgentResult {
     reconnectServer,
     refresh,
     refreshCache,
+    refreshUsage,
     refreshDownloads,
     refreshUploads,
     applyWebUpdate

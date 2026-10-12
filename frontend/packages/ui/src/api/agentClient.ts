@@ -22,6 +22,7 @@ import type {
   AgentLog,
   AgentMountMode,
   AgentMountState,
+  AgentMountVolumeUsage,
   AgentRepoMountPref,
   AgentServerState,
   AgentSessionState,
@@ -676,6 +677,17 @@ export const agentApi = {
    */
   getCache(): Promise<AgentCacheStatus> {
     return request<AgentCacheStatus>({ method: 'GET', path: '/agent/cache' })
+  },
+
+  /**
+   * 读取**本机挂载卷的真实用量**：本机各已挂载库所在卷的容量/可用/已用（见 agentTypes）。
+   *
+   * 服务端的 used_bytes 是宿主侧物理占用（写过的最高水位），卡片上的"已用"用这里的
+   * 实测值才是用户眼里的用量；没有本机挂载时返回空列表。取数要跑一次 PowerShell，
+   * 代理侧有 15s 缓存，界面按 10s 轮询不会每次都真去量。
+   */
+  getUsage(): Promise<{ items: AgentMountVolumeUsage[] }> {
+    return request<{ items: AgentMountVolumeUsage[] }>({ method: 'GET', path: '/agent/usage' })
   },
 
   /** 近 5 分钟的缓存指标采样（每 5 秒一点，按库分组），供"缓存指标曲线"弹窗使用。 */

@@ -209,7 +209,11 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		// EnsureTarget 会（首次时）打开本机门户、为该库注册一个本机监听端口。
 		// 用挂载请求的 ctx：注册本身就是挂载路径的一部分，请求取消时它也该停。
 		if err := e.a.cache.EnsureTarget(ctx, cacheTargetRequest{
-			AllocationID:   allocationID,
+			AllocationID: allocationID,
+			// 库 ID 与库容量都要带上：缓存配额是按**库容量**在所有开缓存的库之间分摊的
+			// （见 cacheproxy.go 的 splitCacheBudget），这两个字段就是分摊用的键与权重。
+			RepoID:         req.RepoID,
+			RepoSizeBytes:  spec.DiskSizeBytes,
 			BackendAddress: spec.PortalAddress,
 			BackendPort:    portalPort(spec),
 			BackendIQN:     spec.TargetIQN,

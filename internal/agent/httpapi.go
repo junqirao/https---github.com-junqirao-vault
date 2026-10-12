@@ -39,6 +39,8 @@ func (a *Agent) localMux() http.Handler {
 	// 取消一个**进行中**的挂载（kill 掉正在跑的 PowerShell，流程按失败收场；幂等）。
 	mux.HandleFunc("POST /agent/mount/cancel", a.handleMountCancel)
 	mux.HandleFunc("GET /agent/mounts", a.handleListMounts)
+	// 本机挂载卷的**真实**用量（客户端存储库卡片展示，见 volusage.go）。
+	mux.HandleFunc("GET /agent/usage", a.handleMountVolumeUsage)
 	// 本机 iSCSI 读缓存代理的用量与命中情况（客户端存储库页面展示，见 cacheproxy.go）。
 	mux.HandleFunc("GET /agent/cache", a.handleCacheStatus)
 	// 近 5 分钟的缓存指标采样（存储库页面"缓存指标曲线"弹窗）。

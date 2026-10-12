@@ -110,10 +110,13 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
       .catch((err: unknown) => {
         if (!cancelled) setError(err)
       })
+    // 缓存推荐值按"本机已知的库容量"估算，库容量会随后台挂载/服务端列表变化：
+    // 只靠进入本页前留下的快照可能已经过时，这里主动取一次（本页不轮询，取一次就够）。
+    void agent.refreshCache()
     return () => {
       cancelled = true
     }
-  }, [agent.available])
+  }, [agent.available, agent.refreshCache])
 
   // 一次性取回"当前服务端那份证书"与"本机全部证书"：
   // 前者决定本页显示"已装/未装/属于其他服务端"，后者用于列出其他服务端的证书并单独撤销。
@@ -142,6 +145,16 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
 
   const patch = (values: Partial<AgentConfig>): void => {
     setConfig((prev) => (prev ? { ...prev, ...values } : prev))
+  }
+
+  // 缓存推荐值：代理按"本机已知的库容量"估算（GET /agent/cache 的 recommend）。
+  // 一个库容量都还不知道时不显示推荐 —— 无从估算，显示一个拍脑袋的数字反而误导。
+  const cacheRecommend = agent.cache && agent.cache.recommend.basis_repos > 0 ? agent.cache.recommend : null
+
+  // 套用推荐值只改本地草稿，用户点"保存"才落盘（与这一页其他字段一致）。
+  const applyCacheRecommend = (): void => {
+    if (!cacheRecommend) return
+    patch({ cache_l1_bytes: cacheRecommend.l1_bytes, cache_l2_bytes: cacheRecommend.l2_bytes })
   }
 
   // 选择 L2 缓存目录：系统目录选择器 → 写进本地 config（保存时随表单一起提交）。
@@ -407,6 +420,33 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
               {t('settings.cache.l2Hint', { min: CACHE_L2_MIN_MIB })}
             </Typography.Text>
           </div>
+          {cacheRecommend ? (
+            <div>
+              <Space size={spacing.sm} wrap align="center">
+                <Typography.Text>
+                  {t('settings.cache.recommend', {
+                    l1: formatBytes(cacheRecommend.l1_bytes),
+                    l2: formatBytes(cacheRecommend.l2_bytes),
+                  })}
+                </Typography.Text>
+                <Button size="small" disabled={disabled || !config} onClick={applyCacheRecommend}>
+                  {t('settings.cache.recommendApply')}
+                </Button>
+              </Space>
+              <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+                {t('settings.cache.recommendBasis', {
+                  repos: cacheRecommend.basis_repos,
+                  size: formatBytes(cacheRecommend.basis_bytes),
+                })}
+                {' · '}
+                {t('settings.cache.recommendHint')}
+              </Typography.Text>
+            </div>
+          ) : (
+            <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+              {t('settings.cache.recommendUnknown')}
+            </Typography.Text>
+          )}
           <div>
             <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
               {t('settings.cache.l2Dir')}
