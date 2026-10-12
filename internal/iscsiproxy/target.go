@@ -28,8 +28,6 @@ const (
 	// maxPending bounds the per-session in-flight command table. A full table
 	// drops the observation, never the command.
 	maxPending = 256
-	// socketBuffer is applied to both sockets, following the v1 tuning.
-	socketBuffer = 4 << 20
 	// scanBuckets mirrors the cache package's sequential-scan detector fan-out.
 	scanBuckets = 64
 )
@@ -434,11 +432,13 @@ func closeCache(c *cache.Cache, f *l2.File) error {
 }
 
 // tuneSocket applies the latency and buffer tuning shared by the design.
+//
+// 只开 TCP_NODELAY。**不要**强制 SO_RCVBUF/SO_SNDBUF：实测把收发缓冲钉到 4 MiB
+// 反而让顺序大写在队列深度 ≥4 时更慢（详见 live_test 的写基准），保持系统默认
+// 自适应缓冲才与零解析 TCP 转发的表现相当。
 func tuneSocket(c net.Conn) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		_ = tc.SetReadBuffer(socketBuffer)
-		_ = tc.SetWriteBuffer(socketBuffer)
 	}
 }
 

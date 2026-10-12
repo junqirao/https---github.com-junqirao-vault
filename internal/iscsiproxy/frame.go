@@ -76,21 +76,36 @@ func (f *frame) data() []byte { return f.body[f.ahsLen:] }
 
 // read reads exactly one PDU. The returned frame aliases the reader's buffers.
 func (fr *frameReader) read() (*frame, error) {
+	h, err := fr.readHeader()
+	if err != nil {
+		return nil, err
+	}
+	if err := fr.readBody(h); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// readHeader reads the BHS, any AHS and the header digest, stopping before the
+// data segment. The frame's body holds only the AHS bytes (nil when none). The
+// caller must then consume the data segment with readBody (buffered) or
+// streamBody (cut-through); both also consume the trailing padding and digest.
+func (fr *frameReader) readHeader() (*frame, error) {
 	h := &fr.f
 	h.hasHD, h.hasDD = false, false
+	h.padLen = 0
+	h.body = nil
 	if _, err := io.ReadFull(fr.r, h.hdr[:]); err != nil {
 		return nil, err
 	}
 	h.ahsLen = h.hdr.AHSLength() * 4
-	dataLen := h.hdr.DataSegmentLength()
-	n := h.ahsLen + dataLen
-	if cap(fr.buf) < n {
-		fr.buf = make([]byte, n)
-	}
-	h.body = fr.buf[:n]
 	// Field order per RFC 7143: BHS, AHS, header digest, data, padding, data digest.
 	if h.ahsLen > 0 {
-		if _, err := io.ReadFull(fr.r, h.body[:h.ahsLen]); err != nil {
+		if cap(fr.buf) < h.ahsLen {
+			fr.buf = make([]byte, h.ahsLen)
+		}
+		h.body = fr.buf[:h.ahsLen]
+		if _, err := io.ReadFull(fr.r, h.body); err != nil {
 			return nil, err
 		}
 	}
@@ -100,24 +115,45 @@ func (fr *frameReader) read() (*frame, error) {
 			return nil, err
 		}
 	}
+	return h, nil
+}
+
+// readBody reads the data segment of the PDU from readHeader into the frame body
+// (after any AHS bytes), then consumes the padding and data digest.
+func (fr *frameReader) readBody(h *frame) error {
+	dataLen := h.hdr.DataSegmentLength()
+	total := h.ahsLen + dataLen
+	if cap(fr.buf) < total {
+		fr.buf = make([]byte, total)
+	}
+	if h.ahsLen > 0 {
+		copy(fr.buf[:h.ahsLen], h.body)
+	}
+	h.body = fr.buf[:total]
 	if dataLen > 0 {
 		if _, err := io.ReadFull(fr.r, h.body[h.ahsLen:]); err != nil {
-			return nil, err
+			return err
 		}
 	}
+	return fr.readTail(h, dataLen)
+}
+
+// readTail consumes the alignment padding and data digest that follow a data
+// segment of dataLen bytes.
+func (fr *frameReader) readTail(h *frame, dataLen int) error {
 	h.padLen = (4 - dataLen%4) % 4
 	if h.padLen > 0 {
 		if _, err := io.ReadFull(fr.r, h.pad[:h.padLen]); err != nil {
-			return nil, err
+			return err
 		}
 	}
 	h.hasDD = fr.digests != nil && fr.digests.data.Load()
 	if h.hasDD {
 		if _, err := io.ReadFull(fr.r, h.dd[:]); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return h, nil
+	return nil
 }
 
 // writeCoalesce caps the frame size flattened into a single Write. Go's
