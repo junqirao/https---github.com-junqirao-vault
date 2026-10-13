@@ -135,7 +135,25 @@ export function mountSessionLive(mount: AgentMountState | undefined): boolean | 
 }
 
 /**
- * 挂载状态的统一展示：无记录时显示"未挂载"。
+ * 挂载状态那块**还有没有话要说**。
+ *
+ * 稳态（未挂载 / 已挂载）没有：库名前的圆点（灰 / 绿）+ 挂载按钮已经把这两个状态说全了
+ * （真实反馈："未挂载和已挂载这个标签去掉，有绿色的指示器就够了"）。要说话的只有三种：
+ *   - 转场中（挂载中 / 卸载中）：用户想知道卡在哪一步，还要一个中止入口；
+ *   - 异常（错误 / 被服务端断开 / 已断开）：不写就等于默认"一切正常"；
+ *   - 本次操作报错（requestError）：有一段报错可看，得给个入口。
+ * 判定与 MountStateCell 的渲染口径是同一套（它只在这个函数为真时才会画出东西）。
+ */
+export function mountStateNoteworthy(mount: AgentMountState | undefined, requestError: unknown): boolean {
+  if (requestError) return true
+  if (!mount) return false
+  // 记录说"已挂载"但实测没有活动会话（盘实际不在）：要写出来，见 mountSessionLive。
+  if (mount.state === 'mounted') return mountSessionLive(mount) === false
+  return true
+}
+
+/**
+ * 挂载状态的统一展示：**只在有话要说时**才画出东西（稳态返回 null，见下）。
  *
  * 两类失败合并成**一个**红色感叹号：
  *   - 本次操作的请求错误（requestError，如刚点挂载失败）；
@@ -156,12 +174,14 @@ export function MountStateCell({
   onCancel?: () => void
   /** 取消请求进行中（按钮置灰）。 */
   cancelling?: boolean
-}): JSX.Element {
+}): JSX.Element | null {
   const { t } = useI18n()
+  // 稳态不画（"未挂载" / "已挂载"两个标签就是这么撤掉的）：那一刻标签只是把圆点已经说过的
+  // 话再说一遍，卡片一多就全是"已挂载""未挂载"在刷屏。
+  if (!mountStateNoteworthy(mount, requestError)) return null
   const lines = mountErrorLines(mount, requestError, t)
-  if (!mount) {
-    return lines.length > 0 ? <MountErrorMarker lines={lines} /> : <Tag>{t('repo.mount.notMounted')}</Tag>
-  }
+  // 走到这里又没记录 ⇒ 只有 requestError 这一种可能（见 mountStateNoteworthy）：只剩标记。
+  if (!mount) return <MountErrorMarker lines={lines} />
   const mounting = mount.state === 'mounting'
   // 挂载中优先显示**细粒度阶段**（"服务端正在创建 iSCSI 目标"这类）：服务端侧的挂载是
   // 同步重活（准备虚拟磁盘 + PowerShell 下发 iSCSI 目标，实测数十秒），只显示"挂载中"

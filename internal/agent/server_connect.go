@@ -74,7 +74,7 @@ func (a *Agent) reconnectServerIfNeeded(ctx context.Context, key string) {
 
 	before := a.serverStateBefore(key)
 
-	// 先亮出"连接中"：界面据此显示转圈的连接中标签，而不是"未连接"（真实诉求）。
+	// 先亮出"连接中"：界面据此不把它当成"未连接"（不遮内容区、不出"重试"按钮）。
 	// 这里用会广播的 setServerPhase：一次证书登录最长要等 sessionProbeTimeout，
 	// 界面必须在这之前就看到"连接中"，而不是等失败结果回来。
 	a.setServerPhase(key, ServerPhaseConnecting)

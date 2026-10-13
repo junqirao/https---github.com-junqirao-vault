@@ -79,10 +79,16 @@ func run() error {
 
 	err = svc.Start(ctx)
 	st := svc.Stats()
+	// l2_restored/l2_unverified/l2_dropped say what this run got out of the L2
+	// snapshot it inherited and what it could not use; a non-zero dropped is the
+	// one number worth looking at, because it counts reads that would have been
+	// answered from a slot a later write had already taken over.
 	logger.Info("proxy stopped",
 		"reads", st.Proxy.Reads, "writes", st.Proxy.Writes,
 		"l1_hits", st.Cache.L1Hits, "partial_hits", st.Cache.PartialHits,
-		"l2_hits", st.Cache.L2Hits, "backend_reads", st.Cache.BackendReads)
+		"l2_hits", st.Cache.L2Hits, "backend_reads", st.Cache.BackendReads,
+		"l2_restored", st.L2Restored, "l2_unverified", st.L2Unverified,
+		"l2_dropped", st.L2Dropped)
 	return err
 }
 

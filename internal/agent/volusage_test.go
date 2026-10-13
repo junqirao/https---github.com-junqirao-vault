@@ -209,6 +209,67 @@ func TestVolumeUsageSingleFlight(t *testing.T) {
 	}
 }
 
+// TestVolumeUsageRemeasuresAfterMountChange 锁定"挂载/卸载后立刻重测"：待测卷集合一变，
+// TTL 内的旧快照立刻作废。
+//
+// 真实反馈："挂载磁盘后要马上更新容量信息" —— 只按 TTL 缓存的话，挂载完成后的第一次问询
+// 命中的是挂载前那一份（最长再等一个 TTL），界面上就是"盘挂上了，用量迟迟不出现"；
+// 反过来卸载后也会继续拿旧快照里那一条冒充"还挂着"。
+func TestVolumeUsageRemeasuresAfterMountChange(t *testing.T) {
+	probe := &fakeVolumeProbe{space: &domain.VolumeSpace{TotalBytes: 100, FreeBytes: 40}}
+	clock := newTestClock()
+	mounts := []MountState{}
+	cache := newVolumeUsageCache(func() []MountState { return mounts }, probe.probe)
+	cache.now = clock.now
+
+	if items := cache.snapshot(context.Background()); len(items) != 0 {
+		t.Fatalf("挂载前没有可测的卷，实际 %+v", items)
+	}
+	mounts = append(mounts, MountState{AllocationID: "a1", RepoID: "r1", MountPath: "E:", State: MountStateMounted})
+	// 挂上之后（TTL 还没过）必须重测：若复用了挂载前那份空快照，这里会拿到 0 条。
+	items := cache.snapshot(context.Background())
+	if len(items) != 1 || items[0].UsedBytes != 60 {
+		t.Fatalf("挂上之后应立刻重测，实际 %+v", items)
+	}
+	if probe.calls() != 1 {
+		t.Fatalf("空集合不产生探测、挂载后测一次，实际 %d 次", probe.calls())
+	}
+
+	mounts = mounts[:0]
+	if items := cache.snapshot(context.Background()); len(items) != 0 {
+		t.Fatalf("卸下之后（TTL 内）同样应立刻重测为空，实际 %+v", items)
+	}
+}
+
+// TestVolumeUsageRetriesAfterFailure 量失败（卷还没就绪）不缓存：下一次问询立刻重测。
+//
+// 刚挂上的一两秒里 Get-Volume 常常还看不到盘，把这个"读不到"按 TTL 记住，界面就要多等
+// 十几秒才自愈 —— 而那正是用户在等"用量怎么还没出来"的时候。量成功之后仍要回到 TTL 复用。
+func TestVolumeUsageRetriesAfterFailure(t *testing.T) {
+	probe := &fakeVolumeProbe{err: apperr.New(apperr.CodeUnavailable, 503)}
+	mounts := []MountState{{AllocationID: "a1", RepoID: "r1", MountPath: "E:", State: MountStateMounted}}
+	cache, _ := newTestVolumeUsageCache(mounts, probe)
+
+	cache.snapshot(context.Background())
+	cache.snapshot(context.Background())
+	if probe.calls() != 2 {
+		t.Fatalf("失败的快照不该被复用（TTL 内也要重测），实际 %d 次", probe.calls())
+	}
+
+	probe.mu.Lock()
+	probe.err = nil
+	probe.space = &domain.VolumeSpace{TotalBytes: 100, FreeBytes: 40}
+	probe.mu.Unlock()
+
+	if items := cache.snapshot(context.Background()); len(items) != 1 || items[0].UsedBytes != 60 {
+		t.Fatalf("卷就绪后应量到真实用量，实际 %+v", items)
+	}
+	cache.snapshot(context.Background())
+	if probe.calls() != 3 {
+		t.Fatalf("量成功之后应回到 TTL 复用，实际 %d 次", probe.calls())
+	}
+}
+
 // TestUsageSnapshotWithoutCache 未初始化（如单测里直接构造 Agent）时给空列表而不是 panic/报错。
 func TestUsageSnapshotWithoutCache(t *testing.T) {
 	a := &Agent{}

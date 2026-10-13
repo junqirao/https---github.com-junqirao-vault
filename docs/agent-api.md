@@ -28,7 +28,7 @@ iSCSI 挂载涉及：连接 iSCSI 目标、把磁盘上线、分配盘符或目�
 POST   /agent/session
   ↓ {server_url, server_instance_id, server_name,
      alias?,             # 可选：客户端为**本机**给该台起的别名（目录模式的挂载点命名用）
-     token, user_id, username, expires_at, cert_sha256,
+     token, user_id, username, role?, expires_at, cert_sha256,
      server_key?,        # 可选：指明这是哪一台（省略时按 instance_id / server_url 推导）
      primary?}           # 可选：把该台设为主服务端（见下）；首台注册时自动成为主服务端
   ↑ {ok:true, server_key}   # 回传该会话实际归属的服务端键（同一台的两种键在代理内会合并）
@@ -88,8 +88,10 @@ Go 默认的证书链校验。渲染进程侧的同名信任由 Electron 主进�
 - **复检间隔**：30s；
 - **放弃条件**：**连续失败 2 次**即停手，并把 `server.phase` 置为 `disconnected`
   （`fail_count` 记在上限上）。无休止重试只会刷满日志，用户也永远分不清"还在连"和"连不上"；
-- **手动重试**：界面在"未连接"旁给"重试"按钮，调下面的接口。重试会**清零失败计数**并立即
-  试一次，成功前 `phase` 回到 `connecting`（界面显示转圈的"连接中"，不显示"未连接"）。
+- **手动重试**：界面在顶栏给"重试"按钮，调下面的接口。重试会**清零失败计数**并立即
+  试一次，成功前 `phase` 回到 `connecting`（不算断开：界面不据此出"重试"按钮）。
+  （顶栏那条"通没通"不由 `phase` 体现 —— 顶栏给的是渲染进程直连服务端测出的往返毫秒数，
+  `phase` 是代理到服务端的链路状态，两者不是一回事。）
 
 ```
 POST /agent/server/reconnect      # 界面"重试"按钮：清零失败计数 + 立即重连一次
@@ -120,7 +122,7 @@ DELETE /agent/identity                                     # 都不带：删"活
   ↑ {ok:true}
 POST /agent/identity/login           # 用本地证书免密登录
   ↓ {server_url?, instance_id?}      # 都省略时用"活动"身份
-  ↑ {token, expires_at, user:{id, username}, ...}
+  ↑ {token, expires_at, user:{id, username, role}, ...}
 
 AgentIdentity = {
   installed:bool,
@@ -152,7 +154,7 @@ GET /agent/state
       # 以下三个是单服务端时代的**兼容字段**，一律取主服务端那一台：
       server:{url, instance_id, name, connected, phase, fail_count, last_error,
               server_key, primary, alias},
-      user:{id, username},
+      user:{id, username, role},       # role：super_admin | user（界面据此决定管理端入口）
       session:SessionView,             # 可选：主服务端会话（未推送会话时缺省）
       mounts:[MountState...],
       auto_mount:bool,
@@ -167,12 +169,12 @@ AgentServerState = {
   url, instance_id, name,
   alias,                             # 本机给该台起的别名（挂载目录命名用），可空
   # phase / fail_count：连接阶段与**连续**失败次数。界面据此区分"正在连"与"连不上" ——
-  #   connecting   ：正在连接/自动重连（界面显示转圈的"连接中"，**不显示**"未连接"）；
+  #   connecting   ：正在连接/自动重连（不算断开：界面不据此出"重试"按钮、不遮内容区）；
   #   connected    ：已连接；
-  #   disconnected ：自动重连次数已用尽（界面显示"未连接" + 手动重试按钮）。
+  #   disconnected ：自动重连次数已用尽（界面给出手动重试按钮）。
   # fail_count 达上限后代理不再自动重连，等界面调 POST /agent/server/reconnect。
   connected, phase, fail_count, last_error,
-  user:{id, username},               # 仅 /agent/state 返回
+  user:{id, username, role},         # 仅 /agent/state 返回；role 同 /agent/state 的 user
   session:SessionView                # 仅 /agent/state 返回；未推送会话时缺省
 }
 ```
@@ -196,10 +198,13 @@ HostState = {
 }
 
 SessionView = {
-  server_url, token, expires_at, user_id, username
+  server_url, token, expires_at, user_id, username,
+  role                     # super_admin | user；旧版代理不带该字段
 }
 # session 只在本机 127.0.0.1 的本地接口上返回（与 /agent/identity 同信任级别），
 # 渲染进程据此在代理**自动续期**后更新自己持有的令牌。
+# role 必须一并透出：续期/无会话自动重连是渲染进程**拿不到服务端原始响应**的唯一路径，
+# 少了它界面只能用本地缓存的旧角色 —— 用户被降级后顶栏仍留着"管理控制台"入口。
 
 UpdateInfo = {
   channel, current_version,
@@ -395,10 +400,18 @@ Linux 上是 thin 池的独占块。客户机里删掉数据不会让它回落�
   就可以绕过配额）；
 - 取数走一次 PowerShell（`Get-Volume`，见 `volume.Manager.SpaceUsageOf`），代理侧按
   `volumeUsageTTL`（15s）缓存快照、并发请求只让一路真去测，界面按 10s 轮询不会每次都起进程；
+  TTL 只是"一份快照最长能有多旧"：**挂载集合一变（挂上/卸下）或上次没量成功就立刻重测**
+  （真实反馈："挂载磁盘后要马上更新容量信息"），否则挂载完成后的第一次问询会命中挂载前那一份，
+  界面上就是"盘已经挂上了，用量却迟迟不出现"；
 - directory 模式的挂载点是**卷挂载点**（`Add-PartitionAccessPath`）：按路径解析到的仍是被挂上
   的那个卷，不会量成承载这个目录的宿主盘；
-- 未挂载的库不在快照里，界面回退服务端数字（有本机实测值时标签会变成「已用（本机）」并给出
-  说明，免得两个口径看着像打架）。
+- 未挂载的库不在快照里，客户端界面**不报用量**：「已用」的用量写 `-`（不知道）、上限照报
+  （库容量），进度条置灰且不叠百分数 —— 文案形如 `- / 1000 MB`（服务端回退值是宿主侧最高水位，
+  报出来会被读成"我这块盘用了这么多"）；管理端仍看服务端口径（运维要的就是宿主占用，
+  「已用 / 上限」照旧）。
+- 客户端挂载成功后**追问一小会儿**这块卷的用量（1s 一次、最多 20s，见 `awaitMountUsage`）：
+  卷刚就绪的那一两秒 `Get-Volume` 往往还量不到容量，这一小会儿界面在 `-` 与进度条上显示
+  loading（"正在读"），量到就撤 —— 用户点完挂载该马上看到数字，而不是一个看起来像"没挂上"的 `-`。
 
 ## 本地读缓存（iSCSI 缓存代理）
 
@@ -434,6 +447,9 @@ CacheTargetStatus = {
   target_iqn,                   # 本地门户为该库公示的 IQN（挂载链路上实际连接的）
   l1_used_bytes, l1_limit_bytes,   # 内存缓存占用与配额
   l2_used_bytes, l2_limit_bytes,   # L2 文件占用与配额（未启用 L2 时均为 0）
+  l2_restored, l2_unverified,      # 打开 L2 时从快照恢复的槽数 / 其中还没用槽上的 stamp 核实的槽数
+  # l2_unverified 随读取逐步归零；正常关闭后重开不会被核实过就是 0（干净关闭的快照直接可信）
+  l2_dropped,                   # 核实失败的槽数（索引指向的槽已被改作他用，本次按未命中处理）
   reads,                        # 读命令数
   request_hits,                 # **整条命令**完全由缓存满足的次数
   l1_hits, partial_hits, l2_hits, backend_reads,   # 分段细粒度计数

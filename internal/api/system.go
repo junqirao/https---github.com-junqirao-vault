@@ -93,6 +93,27 @@ func (r *Router) handleSystemHealth(w http.ResponseWriter, req *http.Request) {
 	r.writeJSON(w, code, status)
 }
 
+// systemPingPath 是极简探针的路径。
+//
+// 单独提成常量是因为它有个**第二用途**：访问日志要为它开例外（见 middlewareAccessLog）
+// —— 每 10 秒一条的探针日志只会把有用的行冲走，两处用同一个字面量容易改漏。
+const systemPingPath = "/v1/system/ping"
+
+// handleSystemPing 是给客户端界面"量一次往返"用的极简探针：立刻回 204，不查库、不探宿主、不碰磁盘。
+//
+// 为什么不能让 health 顶替它：health 名字像探针，干的却是重活 —— ping 数据库、查 iSCSI 服务、
+// 探白名单卷的文件系统（Windows 上查 iSCSI 要起 PowerShell，单次以秒计）。客户端拿它当探针，
+// 测出来的是"服务端当时有多忙"，不是"来回一趟多远"：真机反馈同一台机器上界面显示 2000ms+，
+// 而随手一测不到 1ms。反过来 health 在本机有毛病时会回 503，界面又会把"服务端内部有问题"
+// 误报成"网络不通"。
+//
+// 匿名可访问（与 info / health 同级）：它不携带任何信息，只证明"请求到得了、服务还活着"。
+func (r *Router) handleSystemPing(w http.ResponseWriter, _ *http.Request) {
+	// 204 属于默认可缓存的响应：不显式禁掉，中间层一旦缓存住，界面上的指标就永远停在某一次读数上。
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // handleClientCheck 匿名版本兼容判定。
 func (r *Router) handleClientCheck(w http.ResponseWriter, req *http.Request) {
 	var in clientCheckRequest

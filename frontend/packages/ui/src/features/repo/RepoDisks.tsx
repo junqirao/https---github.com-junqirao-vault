@@ -24,6 +24,13 @@ import { MountActionButtons, MountDialog, mountSessionLive } from '../mount/Moun
 export interface RepoDisksProps {
   repoId: string
   isSuperAdmin: boolean
+  /**
+   * 调用者能否管理这个库（超管 / 库所有者 / 被授予 manage 的成员）。
+   *
+   * 与 isSuperAdmin 分开：分配区依赖用户列表（只有超管拉得到），而释放分配、压缩、删除磁盘
+   * 属于对库的管理，非库所有者点进详情页只能看，这些入口必须收起来。
+   */
+  canManage: boolean
   currentUserId: string
   /** 当前用户的显示名：非管理员无法拉取用户列表，用于自己的分配列回退显示。 */
   currentUserName: string
@@ -53,7 +60,7 @@ function diskMountState(allocs: AllocationDTO[]): AllocationState | null {
 }
 
 /** 存储库下的磁盘列表：磁盘 + 分配（谁在用/挂载）+ 挂载与卸载 + 回收空间与异步删除。 */
-export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName }: RepoDisksProps): JSX.Element {
+export function RepoDisks({ repoId, isSuperAdmin, canManage, currentUserId, currentUserName }: RepoDisksProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const queryClient = useQueryClient()
@@ -365,7 +372,7 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
               onOpenPath={(path) => void agentApi.openPath(path).catch((err: unknown) => setError(err))}
             />
             {allocs
-              .filter((alloc) => isSuperAdmin || alloc.user_id === currentUserId)
+              .filter((alloc) => canManage || alloc.user_id === currentUserId)
               .map((alloc) => (
                 <Button key={alloc.id} type="link" size="small" danger onClick={() => setPendingRelease(alloc)}>
                   {t('action.release')}
@@ -376,17 +383,22 @@ export function RepoDisks({ repoId, isSuperAdmin, currentUserId, currentUserName
                 {t('disk.copyToLocal')}
               </Button>
             ) : null}
-            <Button
-              type="link"
-              size="small"
-              onClick={() => compactMutation.mutate(disk.id)}
-              loading={compactMutation.isPending && compactMutation.variables === disk.id}
-            >
-              {t('action.compact')}
-            </Button>
-            <Button type="link" size="small" danger onClick={() => setPendingDelete(disk)}>
-              {t('common.delete')}
-            </Button>
+            {/* 压缩与删除动的是库里的盘：只有能管理这个库的人才有入口。 */}
+            {canManage ? (
+              <>
+                <Button
+                  type="link"
+                  size="small"
+                  onClick={() => compactMutation.mutate(disk.id)}
+                  loading={compactMutation.isPending && compactMutation.variables === disk.id}
+                >
+                  {t('action.compact')}
+                </Button>
+                <Button type="link" size="small" danger onClick={() => setPendingDelete(disk)}>
+                  {t('common.delete')}
+                </Button>
+              </>
+            ) : null}
           </Space>
         )
       }

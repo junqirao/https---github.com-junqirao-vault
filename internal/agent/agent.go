@@ -438,7 +438,7 @@ func (a *Agent) setSession(key string, session *Session, primary bool) string {
 	if primary {
 		a.store.SetPrimary(serverKey)
 	}
-	a.store.SetUser(serverKey, UserState{ID: session.UserID, Username: session.Username})
+	a.store.SetUser(serverKey, UserState{ID: session.UserID, Username: session.Username, Role: session.Role})
 	a.setEventsSupported(serverKey, true)
 	// 新会话已建立：解除"需要重新登录"标记，重新允许自动续期（只解这一台）。
 	a.renewMu.Lock()
@@ -579,7 +579,7 @@ func (a *Agent) setServerPhase(key, phase string) {
 // last_error 任一变化时广播 server 事件（事件带 server_key，界面据此只更新那一台）。
 //
 // 为什么把 phase 与 fail_count 也算进"变化"：界面靠它们区分"正在连"与"连不上"
-// （connecting 显示转圈的"连接中"，fail_count 达上限才显示"未连接 + 重试"）。
+// （connecting 与 disconnected 的后果不同：前者不遮内容区，后者才给"重试"按钮）。
 // 只比 connected 的话，一个"没连上、但一直在重连"的代理在界面上永远不动。
 func (a *Agent) publishServerIfChanged(key string, before ServerState) {
 	after, ok := a.store.Server(key)

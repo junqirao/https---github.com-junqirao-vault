@@ -9,11 +9,12 @@ import { LoadingState } from '../../components/LoadingState'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
 import { StatusTag } from '../../components/StatusTag'
-import { UsageBar } from '../../components/UsageBar'
+import { UsageBar, UsageValueText } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
-import { pickMountUsage, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
+import { pickMountUsage, repoUsageLoading, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
+import { spacing } from '../../tokens/palette'
 import { formatTime, repoUsage } from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
@@ -116,9 +117,32 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   if (repoQuery.isLoading) return <LoadingState text={t('common.loading')} />
 
   const repo = repoQuery.data
+  // 这个库我现在能不能管理：真源是服务端下发的权限等级（manage = 超管 / 库所有者 / 被授予
+  // manage 的成员，见 docs/implementation.md 9.3）。老服务端不带这个字段时回退到"超管或库所有者"
+  // —— 宁可少展示管理入口，也不能把它摆给只能看的成员：非库所有者点进详情页只能看，
+  // 按钮却全都亮着，点下去只会撞 403。
+  const canManage = repo
+    ? repo.permission
+      ? repo.permission === 'manage'
+      : isSuperAdmin || repo.owner_id === currentUserId
+    : isSuperAdmin
   // 用量口径与卡片一致（分母 = 库容量，见 repoUsage）。本机挂着这个库时用本机**实测**的
   // 卷用量：服务端的 used_bytes 是宿主侧物理占用（写过的最高水位，删了也不回落）。
-  const { percent: usagePercent, text: usageText } = repoUsage(repo, pickMountUsage(agent.usage, repo?.id))
+  const mountUsage = pickMountUsage(agent.usage, repo?.id)
+  const {
+    percent: usagePercent,
+    usedText: usageUsedText,
+    totalText: usageTotalText,
+    measured: usageMeasured
+  } = repoUsage(repo, mountUsage, !isSuperAdmin)
+  // 未挂载时客户端不报用量、条置灰（见 RepoCards 的 RepoUsage）：那一刻服务端回退值是
+  // "删了也不回落的最高水位"，用量写 `-`；上限照报，仍是"已用 / 上限"那一行文案。
+  // 管理端是例外：运维看的正是宿主侧占用，那个绝对数在这里是有效信息（与表格同口径）。
+  const usageMuted = !isSuperAdmin && !usageMeasured
+  // 刚挂上、实测用量还在取数：把 `-` 与条都换成转圈（见 useAgent 的 repoUsageLoading）。
+  // 只在客户端那条路上成立 —— 管理端显示的是服务端口径，本机实测值到位后只是换个口径，
+  // 不该拿转圈盖住一个已经有效的数字。
+  const usageLoading = !isSuperAdmin && repoUsageLoading(agent.usagePending, repo?.id, usageMeasured)
 
   const openEdit = (target: RepoDTO): void => {
     editForm.setFieldsValue({
@@ -145,30 +169,42 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
         <>
           {/* 与列表卡片同一套"挂载/卸载"联动按钮：进了详情也不必退回列表才能挂载。
               库记录可能还没查回来（加载中/出错），此时不渲染。 */}
-          {repo ? <RepoDetailMountActions repo={repo} currentUserId={currentUserId} /> : null}
+          {/* read 成员只能看：挂载/卸载后端都不放行，按钮就不摆出来。 */}
+          {repo && repo.permission !== 'read' ? (
+            <RepoDetailMountActions repo={repo} currentUserId={currentUserId} />
+          ) : null}
           <Button onClick={onBack}>{t('common.back')}</Button>
-          <Button onClick={() => repo && openEdit(repo)} disabled={!repo}>
-            {t('common.edit')}
-          </Button>
-          <Dropdown menu={parentMenu}>
-            <Button loading={parentMutation.isPending}>{t('repo.parent.title')}</Button>
-          </Dropdown>
-          <Button
-            onClick={() => {
-              copyForm.setFieldsValue({ new_repo_name: `${repo?.name ?? 'repo'}-copy` })
-              setCopyOpen(true)
-            }}
-          >
-            {t('action.copy')}
-          </Button>
-          <Button danger onClick={() => setDeleteOpen(true)}>
-            {t('common.delete')}
-          </Button>
+          {/* 管理类操作只对能管理这个库的人展示（非库所有者点详情只能看）。 */}
+          {canManage ? (
+            <>
+              <Button onClick={() => repo && openEdit(repo)} disabled={!repo}>
+                {t('common.edit')}
+              </Button>
+              <Dropdown menu={parentMenu}>
+                <Button loading={parentMutation.isPending}>{t('repo.parent.title')}</Button>
+              </Dropdown>
+              <Button
+                onClick={() => {
+                  copyForm.setFieldsValue({ new_repo_name: `${repo?.name ?? 'repo'}-copy` })
+                  setCopyOpen(true)
+                }}
+              >
+                {t('action.copy')}
+              </Button>
+              <Button danger onClick={() => setDeleteOpen(true)}>
+                {t('common.delete')}
+              </Button>
+            </>
+          ) : null}
         </>
       }
     >
       {error ? <ErrorNotice error={error} /> : null}
       {repoQuery.error ? <ErrorNotice error={repoQuery.error} /> : null}
+      {/* 只能看的库（非所有者 / read、mount 成员）说清楚为什么没有管理入口。 */}
+      {repo && !canManage ? (
+        <Alert type="info" showIcon message={t('repo.detail.readOnly')} style={{ marginBottom: spacing.md }} />
+      ) : null}
 
       <Tabs
         // 用户端默认落在「设置」：卡片「详情」进来看的就是"这个库在本机怎么挂"。
@@ -206,8 +242,10 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                       口径与卡片、管理端表格一致（分母 = 库容量，见 repoUsage）。 */}
                   <Descriptions.Item label={t('repo.used')}>
                     <div style={{ minWidth: 160 }}>
-                      <div>{usageText}</div>
-                      <UsageBar percent={usagePercent} />
+                      <div>
+                        <UsageValueText usedText={usageUsedText} totalText={usageTotalText} loading={usageLoading} />
+                      </div>
+                      <UsageBar percent={usagePercent} muted={usageMuted} loading={usageLoading} />
                     </div>
                   </Descriptions.Item>
                   <Descriptions.Item label={t('field.maxDiffDisks')}>{repo?.max_diff_disks ?? '-'}</Descriptions.Item>
@@ -216,11 +254,16 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               </SectionCard>
             )
           },
-          {
-            key: 'members',
-            label: t('repo.detail.members'),
-            children: <RepoMembers repoId={repoId} isSuperAdmin={isSuperAdmin} />
-          },
+          // 可管理成员是管理信息：只有能管这个库的人才看得到这一页。
+          ...(canManage
+            ? [
+                {
+                  key: 'members',
+                  label: t('repo.detail.members'),
+                  children: <RepoMembers repoId={repoId} isSuperAdmin={isSuperAdmin} />
+                }
+              ]
+            : []),
           {
             key: 'disks',
             label: t('repo.detail.disks'),
@@ -228,6 +271,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               <RepoDisks
                 repoId={repoId}
                 isSuperAdmin={isSuperAdmin}
+                canManage={canManage}
                 currentUserId={currentUserId}
                 currentUserName={currentUserName}
               />

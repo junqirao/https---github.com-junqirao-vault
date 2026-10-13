@@ -144,7 +144,7 @@ func (a *Agent) applyRefreshedSession(key string, session *Session) {
 	}
 	// 用写回后的键：同一台若因拿到实例 ID 而改键，后续的节流/阻断状态也要跟着它。
 	resolved := a.store.SetSession(key, session)
-	a.store.SetUser(resolved, UserState{ID: session.UserID, Username: session.Username})
+	a.store.SetUser(resolved, UserState{ID: session.UserID, Username: session.Username, Role: session.Role})
 	a.renewMu.Lock()
 	delete(a.renewBlocked, resolved)
 	a.renewMu.Unlock()
@@ -316,5 +316,8 @@ func sessionView(s *Session) map[string]any {
 		"expires_at": s.ExpiresAt,
 		"user_id":    s.UserID,
 		"username":   s.Username,
+		// Role 必须随会话透出：续期/自动重登录是渲染进程**拿不到服务端原始响应**的唯一路径，
+		// 少了它，界面只能用本地缓存的旧角色，于是被降级的用户顶栏里仍然留着管理端入口。
+		"role": s.Role,
 	}
 }

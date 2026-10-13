@@ -243,8 +243,8 @@ func serverView(snap ServerSnapshot, primary, withSession bool) map[string]any {
 		"name":        snap.State.Name,
 		"alias":       snap.State.Alias,
 		"connected":   snap.State.Connected,
-		// phase / fail_count 是"连接阶段与连续失败次数"：界面据此在连接中显示转圈的
-		// "连接中"（而不是"未连接"），并在失败达上限后给出"重试"按钮（见 state.go）。
+		// phase / fail_count 是"连接阶段与连续失败次数"：界面据此只在重连次数用尽后给出
+		// "重试"按钮，并在连接中不遮住内容区（见 state.go）。
 		"phase":      snap.State.Phase,
 		"fail_count": snap.State.FailCount,
 		"last_error": snap.State.LastError,
@@ -252,7 +252,7 @@ func serverView(snap ServerSnapshot, primary, withSession bool) map[string]any {
 	if !withSession {
 		return view
 	}
-	view["user"] = map[string]any{"id": snap.User.ID, "username": snap.User.Username}
+	view["user"] = map[string]any{"id": snap.User.ID, "username": snap.User.Username, "role": snap.User.Role}
 	if snap.Session != nil {
 		view["session"] = sessionView(snap.Session)
 	}
@@ -287,7 +287,7 @@ func (a *Agent) handleState(w http.ResponseWriter, _ *http.Request) {
 	}
 	// 兼容字段：单服务端时代的形状，一律取主服务端那一台。
 	payload["server"] = serverView(primarySnap, true, false)
-	payload["user"] = map[string]any{"id": primarySnap.User.ID, "username": primarySnap.User.Username}
+	payload["user"] = map[string]any{"id": primarySnap.User.ID, "username": primarySnap.User.Username, "role": primarySnap.User.Role}
 	// 本机 127.0.0.1 本地接口：透出当前会话（含令牌），渲染进程据此在续期后更新自己的令牌。
 	if primarySnap.Session != nil {
 		payload["session"] = sessionView(primarySnap.Session)

@@ -713,6 +713,14 @@ type CacheTargetStatus struct {
 	// L2UsedBytes/L2LimitBytes 是 L2 文件占用与配额（未启用 L2 时为 0）。
 	L2UsedBytes  int64 `json:"l2_used_bytes"`
 	L2LimitBytes int64 `json:"l2_limit_bytes"`
+	// L2Restored 是本次打开 L2 文件时从快照恢复的槽数；干净关闭后重开也走这条路。
+	// L2Unverified 是其中**还没核实**的槽数：这些槽的索引来自上一次未正常关闭的会话，
+	// 要读到它时用槽上的 stamp 核对过才敢用，因此会随读取逐步归零。
+	L2Restored   int `json:"l2_restored"`
+	L2Unverified int `json:"l2_unverified"`
+	// L2Dropped 是核实失败的槽数：索引指向的槽已被后来的写改作他用，读到这里本会拿到
+	// 别的块的数据，现已按未命中处理。持续增长说明索引落盘跟不上写入，可以据此调大预算。
+	L2Dropped int `json:"l2_dropped"`
 	// Reads 是读命令数；RequestHits 是**整条命令**完全由缓存满足的次数。
 	Reads       int64 `json:"reads"`
 	RequestHits int64 `json:"request_hits"`
@@ -780,6 +788,9 @@ func (m *cacheManager) Status() CacheStatus {
 			L2Hits:       cs.L2Hits,
 			BackendReads: cs.BackendReads,
 			Writes:       stats.Proxy.Writes,
+			L2Restored:   stats.L2Restored,
+			L2Unverified: stats.L2Unverified,
+			L2Dropped:    stats.L2Dropped,
 		}
 		if stats.BlockSize > 0 && stats.L2Slots > 0 {
 			slot := int64(stats.BlockSize)

@@ -197,6 +197,15 @@ type Stats struct {
 	// BlockSize is the cache block size, which is also the L2 slot size; callers
 	// use it to turn L2Slots/L2Used into bytes.
 	BlockSize int
+	// L2Restored/L2Unverified say how the L2 file was reopened: how many slots
+	// the snapshot held and how many of them still have to be confirmed against
+	// their slot stamp. Both are zero after a clean stop, and Unverified falls
+	// as the entries are read.
+	L2Restored   int
+	L2Unverified int
+	// L2Dropped counts restored entries the stamps disproved: reads that would
+	// have been answered from a slot another write had taken over.
+	L2Dropped int
 }
 
 // Service is a running proxy instance.
@@ -288,6 +297,9 @@ func (s *Service) Stats() Stats {
 	if s.l2 != nil {
 		st.L2Slots = s.l2.Slots()
 		st.L2Used = s.l2.UsedSlots()
+		st.L2Restored = s.l2.Restored()
+		st.L2Unverified = s.l2.Unverified()
+		st.L2Dropped = s.l2.Dropped()
 	}
 	return st
 }

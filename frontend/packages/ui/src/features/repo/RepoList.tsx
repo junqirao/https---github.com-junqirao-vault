@@ -10,6 +10,7 @@ import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { StatusTag } from '../../components/StatusTag'
+import { usageColor } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { RepoDTO } from '../../api/types'
 import { useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
@@ -147,7 +148,9 @@ function QuotaOverview({ repos }: { repos: RepoDTO[] }): JSX.Element | null {
           percent={percent}
           showInfo={false}
           size="small"
-          strokeColor={palette.accent}
+          // 与库卡片同一条分档规则（见 components/UsageBar 的 usageColor）：配额也是"占比"，
+          // 同一页上两处条子一套颜色，免得一条橙一条蓝看着像两种口径。
+          strokeColor={usageColor(percent)}
           trailColor={palette.neutralFill}
           style={{ marginTop: spacing.xxs, marginBottom: 0 }}
         />

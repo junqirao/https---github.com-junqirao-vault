@@ -7,11 +7,11 @@ import { agentApi } from '../../api/agentClient'
 import { useApi } from '../../api/provider'
 import type { AgentMountState, AgentMountVolumeUsage } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
-import { pickMountUsage, useAgent } from '../../hooks/useAgent'
+import { pickMountUsage, repoUsageLoading, useAgent } from '../../hooks/useAgent'
 import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
-import { MountStateCell, mountSessionLive, openTargetOf } from '../mount/MountControls'
+import { MountStateCell, mountSessionLive, mountStateNoteworthy, openTargetOf } from '../mount/MountControls'
 
 /** 存储库卡片上的挂载能力控制器。 */
 export interface RepoMountController {
@@ -24,7 +24,8 @@ export interface RepoMountController {
    *
    * 服务端的 used_bytes 是宿主侧物理占用（写过的最高水位，客户机里删掉数据也不回落），
    * 卡片上的「已用」用它才是用户眼里的用量（见 repoUsage）。未挂载 / 代理不可用 /
-   * 取数失败时为 undefined，界面回退服务端数字。
+   * 取数失败时为 undefined，此时客户端不报用量（写 `-`）、只报上限，进度条置灰
+   * （见 RepoCards 的 RepoUsage）。
    */
   usage: AgentMountVolumeUsage | undefined
   /** 已挂载（挂载点可用、可打开）：要求记录是 mounted **且实测会话还在**。 */
@@ -47,6 +48,13 @@ export interface RepoMountController {
   failed: boolean
   /** 代理侧状态机进行中（挂载中 / 卸载中）。 */
   pending: boolean
+  /**
+   * 本库的实测用量**正在取数**（刚挂上，代理那边卷还没就绪）：界面此刻在用量处显示 loading。
+   *
+   * 与 `usage` 互补：`usage === undefined` 只说"现在没有数字"，还要分清是"正在读"（转圈）
+   * 还是"读不到"（写 `-`）—— 后者是没挂载/取数失败，前者只是再等一下就有（见 repoUsageLoading）。
+   */
+  usageLoading: boolean
   /** 本次操作请求进行中。 */
   busy: boolean
   /** 取消请求进行中（状态标签里的「取消」按钮据此置灰）。 */
@@ -128,6 +136,9 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     () => pickMountUsage(agent.usage, repo.id, mount?.allocation_id),
     [agent.usage, mount?.allocation_id, repo.id]
   )
+  // 刚挂上、用量还在路上（见 awaitMountUsage）：卡片/详情此刻在用量处显示 loading。
+  // 卡片只给客户端用户端，所以不必像详情页那样先排除管理端（那边显示的是服务端口径）。
+  const usageLoading = repoUsageLoading(agent.usagePending, repo.id, usage !== undefined)
 
   // 分配列表首次取数中："没有 allocationId"此刻只代表"还不知道"，不代表"没有分配"。
   const resolving = allocationsQuery.isLoading
@@ -231,6 +242,7 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     mount,
     mountPath: mount?.mount_path ?? '',
     usage,
+    usageLoading,
     mounted,
     sessionLive,
     sessionLost,
@@ -342,12 +354,16 @@ export function RepoMountActions({ controller, size = 'small' }: RepoMountAction
 }
 
 /**
- * 卡片标签行里的挂载状态标签（无记录时显示"未挂载"）。
+ * 卡片标签行里的挂载状态：**有话要说时才有东西**（挂载中的阶段 + 取消、已断开、错误标记）。
  *
- * 与存储库状态标签**并排**：用户一眼就能读到"库正常 / 本机未挂载"这一组状态，
- * 不必滚到卡片底部才知道本机挂没挂上。失败原因紧随其后（红色感叹号，hover 查看并可复制）。
+ * "未挂载" / "已挂载"两个标签撤掉了（真实反馈："未挂载和已挂载这个标签去掉，有绿色的
+ * 指示器就够了"）：这两个状态由库名前那颗圆点（灰 / 绿）和挂载按钮表达，标签只是重复一遍；
+ * 但转场与异常必须留着说 —— 它们才是"看着正常、其实有事"的那一类。判定见
+ * mountStateNoteworthy（与 MountStateCell 同一套口径）。
  */
-export function RepoMountStateTag({ controller }: RepoMountActionsProps): JSX.Element {
+export function RepoMountStateTag({ controller }: RepoMountActionsProps): JSX.Element | null {
+  // 稳态整块都不画：留一个空的 span 反而会在标签行里多出一道间距。
+  if (!mountStateNoteworthy(controller.mount, controller.error)) return null
   return (
     // 整卡可点进详情，标签自身的事件不得冒泡触发跳转。
     <span
@@ -367,7 +383,12 @@ export function RepoMountStateTag({ controller }: RepoMountActionsProps): JSX.El
   )
 }
 
-/** 卡片底部的挂载信息：只保留挂载点（失败原因见状态标签旁的感叹号图标）。 */
+/**
+ * 卡片底部的挂载信息：只保留挂载点（失败原因见标签行里那个红色感叹号）。
+ *
+ * 挂载点是"已挂载"的**具体证据**（挂在哪）：绿点只说"挂上了"，这里说"挂在哪"，
+ * 所以它不随「已挂载」标签一起撤。
+ */
 export function RepoMountStatus({ controller }: RepoMountActionsProps): JSX.Element | null {
   const { mountPath, mounted } = controller
   if (!mounted || !mountPath) return null

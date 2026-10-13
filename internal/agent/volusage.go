@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,9 @@ const (
 	// 每测一次都要跑一次 PowerShell（Get-Volume，约 1s），而界面按 10s 轮询：没有缓存就是
 	// 每 10s 起一个 PowerShell。有它以后开销降到"每 TTL 一次"，而用量是给人看的数字，
 	// 滞后十几秒无妨。
+	//
+	// TTL 只是"一份快照最长能有多旧"：挂载集合一变、或上次没量成功，都会立刻重测
+	// （见 volumeUsageCache.valid）—— 挂上/卸下之后的数字不能按 TTL 滞后。
 	volumeUsageTTL = 15 * time.Second
 	// volumeUsageProbeTimeout 是单块卷的取数超时（脚本自身有超时，这里只兜底）。
 	volumeUsageProbeTimeout = 15 * time.Second
@@ -52,8 +56,10 @@ type MountVolumeUsage struct {
 
 // volumeUsageCache 缓存"本机挂载卷用量"快照：一次实测喂多个轮询请求。
 type volumeUsageCache struct {
-	mu       sync.Mutex
-	items    []MountVolumeUsage
+	mu    sync.Mutex
+	items []MountVolumeUsage
+	// key 是上次实测对应的"待测卷集合"指纹（见 mountsKey）：集合一变，缓存立刻作废。
+	key      string
 	at       time.Time
 	inflight bool
 
@@ -72,13 +78,17 @@ func newVolumeUsageCache(
 	return &volumeUsageCache{ttl: volumeUsageTTL, now: time.Now, mounts: mounts, probe: probe}
 }
 
-// snapshot 返回最新快照；缓存过期时**同步**重测一次。
+// snapshot 返回最新快照；缓存不可用时**同步**重测一次。
 //
 // 为什么同步：界面第一帧就想要真实数字（后台异步刷新会让它先空一轮）。并发请求只会有
 // 一路真的去测、其余直接拿上一份快照 —— 否则多开几个页面就会把 PowerShell 排成队。
 func (c *volumeUsageCache) snapshot(ctx context.Context) []MountVolumeUsage {
+	// 指纹在锁外算：mounts 回调要去读代理的挂载记录（另一把锁），持着本锁再去读容易和
+	// 别的路径拧成环。
+	key := c.mountsKey()
+
 	c.mu.Lock()
-	if !c.at.IsZero() && c.now().Sub(c.at) < c.ttl {
+	if c.valid(key) {
 		items := c.items
 		c.mu.Unlock()
 		return items
@@ -94,9 +104,49 @@ func (c *volumeUsageCache) snapshot(ctx context.Context) []MountVolumeUsage {
 	items := c.measure(ctx)
 
 	c.mu.Lock()
-	c.items, c.at, c.inflight = items, c.now(), false
+	c.items, c.key, c.at, c.inflight = items, key, c.now(), false
 	c.mu.Unlock()
 	return items
+}
+
+// valid 判断手上这份快照还能不能复用：TTL 未到、待测卷集合没变，且上次**每条都量成功**。
+//
+// 失败的那一份不算数：刚挂上的那一两秒卷往往还没就绪（Get-Volume 取不到容量），把这个
+// "读不到"按 TTL 记住，界面就得再多等十几秒才自愈 —— 而这段时间正是用户盯着"用量怎么
+// 还没出来"的时候。
+func (c *volumeUsageCache) valid(key string) bool {
+	if c.at.IsZero() || c.key != key || c.now().Sub(c.at) >= c.ttl {
+		return false
+	}
+	for _, item := range c.items {
+		if item.Error != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// mountsKey 折出"这次要测哪些卷"的指纹（分配 ID + 挂载点）。
+//
+// 为什么要它（真实反馈："挂载磁盘后要马上更新容量信息"）：只按 TTL 缓存的话，挂载完成后的
+// 第一次问询命中的是**挂载前**那一份快照（最长还要再等一个 volumeUsageTTL）—— 界面上就是
+// "盘已经挂上了，用量却迟迟不出现"。有了指纹，挂载/卸载一发生，下一次问询立刻重测；
+// 反过来，卸载后也不会再拿旧快照里那一条冒充"还挂着"。
+func (c *volumeUsageCache) mountsKey() string {
+	mounts := c.mounts()
+	parts := make([]string, 0, len(mounts))
+	for _, ms := range mounts {
+		if ms.State != MountStateMounted {
+			continue
+		}
+		path := strings.TrimSpace(ms.MountPath)
+		if path == "" {
+			continue
+		}
+		parts = append(parts, ms.AllocationID+"\x00"+path)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\x1f")
 }
 
 // measure 逐条实测：只测 mounted 的记录（其它状态没有可读的卷），单条失败只影响该条。

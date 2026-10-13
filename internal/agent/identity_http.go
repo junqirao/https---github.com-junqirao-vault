@@ -281,6 +281,7 @@ func (a *Agent) certLogin(ctx context.Context, serverURL, instanceID string) (*S
 		CertSHA256:       pin,
 		UserID:           out.User.ID,
 		Username:         out.User.Username,
+		Role:             out.User.Role,
 		ExpiresAt:        out.ExpiresAt,
 	}, &out, nil
 }

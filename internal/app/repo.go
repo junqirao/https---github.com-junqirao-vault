@@ -572,20 +572,35 @@ func (s *RepoService) CanAccess(ctx context.Context, repoID, userID string, role
 	if err != nil {
 		return false, "", err
 	}
-	if role == domain.RoleSuperAdmin {
-		return true, domain.PermManage, nil
-	}
-	if repo.OwnerID == userID {
-		return true, domain.PermManage, nil
-	}
-	m, err := s.Store.GetRepoMember(ctx, repoID, userID)
+	perm, err := s.PermFor(ctx, repo, userID, role)
 	if err != nil {
 		return false, "", err
 	}
-	if m == nil {
+	if perm == "" {
 		return false, "", nil
 	}
-	return true, m.Perm, nil
+	return true, perm, nil
+}
+
+// PermFor 依据**已经读到**的库计算该用户的有效权限；无权限时返回空串。
+//
+// 与 CanAccess 的差别只是不再重复查库：列表接口要对每一行算权限，
+// 再按 ID 查一遍库既多余、又把查询量翻倍。
+func (s *RepoService) PermFor(ctx context.Context, repo *domain.Repository, userID string, role domain.Role) (domain.Permission, error) {
+	if role == domain.RoleSuperAdmin {
+		return domain.PermManage, nil
+	}
+	if repo.OwnerID == userID {
+		return domain.PermManage, nil
+	}
+	m, err := s.Store.GetRepoMember(ctx, repo.ID, userID)
+	if err != nil {
+		return "", err
+	}
+	if m == nil {
+		return "", nil
+	}
+	return m.Perm, nil
 }
 
 // Allocate 创建分配。共享模式创建差异盘（异步），独享模式复用已有单盘。

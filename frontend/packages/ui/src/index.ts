@@ -64,6 +64,11 @@ export {
   type UseAgentResult
 } from './hooks/useAgent'
 export { useErrorNotifier } from './hooks/useErrorNotifier'
+export {
+  SERVER_LATENCY_INTERVAL_MS,
+  useServerLatency,
+  type ServerLatency
+} from './hooks/useServerLatency'
 export { AuthProvider, useAuth, usePermission, type AuthContextValue, type SessionUser } from './hooks/useAuth'
 export {
   ServerConfigProvider,
@@ -95,6 +100,7 @@ export { StatusTag, type StatusTagProps } from './components/StatusTag'
 export { SystemDepsBanner } from './components/SystemDepsBanner'
 
 // 业务视图
+export { AboutDialog, type AboutDialogProps } from './features/about/AboutDialog'
 export { LoginForm, type LoginFormProps, type LoginFormValues } from './features/auth/LoginForm'
 export {
   BlockedNotice,

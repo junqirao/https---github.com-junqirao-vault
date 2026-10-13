@@ -79,6 +79,7 @@ export function App(): JSX.Element {
   const removeServer = useAppStore((state) => state.removeServer)
   const updateActiveServer = useAppStore((state) => state.updateActiveServer)
   const updateServerToken = useAppStore((state) => state.updateServerToken)
+  const updateServerUser = useAppStore((state) => state.updateServerUser)
 
   const volatileSessionRef = useRef<VolatileSession | null>(null)
   const unauthorizedRef = useRef<() => void>(() => undefined)
@@ -196,6 +197,8 @@ export function App(): JSX.Element {
             token,
             user_id: user.id,
             username: user.username,
+            // 角色随会话一起推给代理：代理自动续期时才能把服务端最新角色回传给界面。
+            role: user.role,
             expires_at: expiresAt ?? Date.now() + 12 * 60 * 60 * 1000,
             // 代理据此固定服务端证书指纹（自签 CA 场景）；未探测过则为空，退回默认链路校验。
             cert_sha256: entry.certSha256
@@ -233,7 +236,8 @@ export function App(): JSX.Element {
       const user: SessionUser = {
         id: session.user_id || current.userId || '',
         username: session.username || current.username || '',
-        role: current.role ?? 'user'
+        // 以**服务端最近一次的说法**为准（代理随会话回传）；旧版代理不带 role 才退回本地旧值。
+        role: session.role ?? current.role ?? 'user'
       }
       if (volatile && volatile.key === current.key) {
         if (volatile.token === session.token && volatile.expiresAt === session.expires_at) return
@@ -247,8 +251,11 @@ export function App(): JSX.Element {
       }
       if (current.token === session.token && current.tokenExpiresAt === session.expires_at) return
       updateServerToken(current.key, session.token, session.expires_at)
+      // 角色也要写回："记住我"的会话是从 store 里读角色的，只刷新令牌的话，
+      // 服务端改过角色后顶栏的管理端入口还是会留在那儿。
+      updateServerUser(current.key, user)
     },
-    [updateServerToken]
+    [updateServerToken, updateServerUser]
   )
 
   /**
@@ -279,7 +286,9 @@ export function App(): JSX.Element {
           token: response.token,
           expires_at: response.expires_at,
           user_id: response.user.id,
-          username: response.user.username
+          username: response.user.username,
+          // 证书重登录拿到的角色是服务端当场给的，必须带回去（否则界面只能用本地旧值）。
+          role: response.user.role
         })
         // 同步给本地代理：代理侧同样可能因服务端重启而持有失效令牌。
         void pushAgentSession()
@@ -370,6 +379,42 @@ export function App(): JSX.Element {
     },
     [updateActiveServer]
   )
+
+  /**
+   * 进入应用时向服务端确认一次身份（角色）。
+   *
+   * 本地缓存里的角色只是"上次登录那一刻的说法"：服务端把用户降级后，顶栏的"管理控制台"入口
+   * 会一直留着，点进去只会一路 403（入口可见性只该认服务端）。这里用 /auth/me 的答案覆盖本地。
+   * 未记住我的会话只改内存里那一份 —— 角色不落盘，否则下次启动会出现"没令牌却像已登录"。
+   */
+  useEffect(() => {
+    if (!active) return
+    const volatile = volatileSessionRef.current
+    const sameKey = volatile?.key === active.key
+    if (!active.token && !sameKey) return
+    let cancelled = false
+    void api
+      .me()
+      .then((me) => {
+        if (cancelled) return
+        const current = selectActiveServer(useAppStore.getState())
+        if (!current) return
+        const live = volatileSessionRef.current
+        if (live?.key === current.key) {
+          if (live.user.id === me.id && live.user.username === me.username && live.user.role === me.role) return
+          volatileSessionRef.current = { ...live, user: { id: me.id, username: me.username, role: me.role } }
+          return
+        }
+        if (current.userId === me.id && current.username === me.username && current.role === me.role) return
+        updateServerUser(current.key, { id: me.id, username: me.username, role: me.role })
+      })
+      .catch(() => {
+        // 拿不到就维持现状：会话真的失效时，后续请求的 401 会走已有的续期/登录流程。
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [active, api, updateServerUser])
 
   const handleLogin = useCallback(
     async (values: { username: string; password: string; remember: boolean }): Promise<void> => {

@@ -201,17 +201,37 @@ func (s *session) pumpTI() {
 		s.collectTI(f)
 		s.outMu.Lock()
 		rewriteTI(&f.hdr, s.offset)
-		if f.hdr.Opcode() >= 0x20 {
-			s.lastStat = f.hdr.StatSN()
-			s.expCmd = f.hdr.ExpCmdSN()
-			s.maxCmd = f.hdr.MaxCmdSN()
-		}
+		s.captureTargetSeq(&f.hdr)
 		err = writeFrame(s.it, f, scratch)
 		s.outMu.Unlock()
 		if err != nil {
 			return
 		}
 	}
+}
+
+// captureTargetSeq records the target's sequence numbers so an injected cache hit
+// can continue them. It must run under outMu, right where the PDU is written.
+//
+// StatSN is only taken from a PDU that actually carries one. A Data-In PDU without
+// the S bit has a reserved StatSN (the backend fills 0, RFC 7143 §10.7.4 wants
+// 0xffffffff), so taking it would twist the counter backwards. That is not
+// theoretical: one 1MiB passthrough read arrives as a dozen Data-In PDUs of which
+// only the last has the S bit, and at queue depth ≥2 a locally answered hit lands
+// in the middle of that burst. The injected StatSN was then computed from the
+// reserved value (offset+1 and friends) — the initiator saw StatSN move backwards,
+// reset the connection and re-logged in. Measured on a real machine: sequential
+// QD1 reads ran at 711MB/s, QD8 collapsed to 39MB/s with endless reconnects, while
+// 4K reads (single PDU, always with the S bit) stayed healthy.
+func (s *session) captureTargetSeq(h *iscsi.BHS) {
+	if h.Opcode() < 0x20 {
+		return
+	}
+	if h.Opcode() != iscsi.OpDataIn || h.Flags()&iscsi.DataInFlagStatus != 0 {
+		s.lastStat = h.StatSN()
+	}
+	s.expCmd = h.ExpCmdSN()
+	s.maxCmd = h.MaxCmdSN()
 }
 
 // handleCommandIT dispatches a SCSI command. It returns true when the command
@@ -449,6 +469,8 @@ func (s *session) injectLocked(cmd *iscsi.BHS, data []byte) error {
 		if last {
 			stat = statSN
 		}
+		// 非末段不带 S 位，StatSN 是保留字段，保持与后端同一个填法（0），
+		// 它不参与序号推进 —— pumpTI 也据此不采集它。
 		var hdr iscsi.BHS
 		iscsi.FillDataInHeader(&hdr, itt, iscsi.ReservedTag, stat, exp, max,
 			dataSN, bufOffset, chunk, last, true, iscsi.StatusGood, 0, false, false)

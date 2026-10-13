@@ -13,7 +13,7 @@
  *     只有 1 KB，没有删的理由；
  *   · 删除 LICENSES.chromium.html，改写一份 1 KB 左右的 THIRD-PARTY-NOTICES.txt，把许可
  *     全文的官方在线地址写在里面；
- *   · 客户端托盘菜单的「开源许可」（见 electron/main.ts）直接打开这些地址。
+ *   · 客户端「关于」（侧边栏菜单 → 关于，见 packages/ui 的 AboutDialog）直接打开这些地址。
  *
  * 合规依据：许可义务的核心是"让接收方能够获得许可与版权声明"，不是"必须把某个 9 MB 文件
  * 原样放进包里"。改外链后，接收方仍能从随包的 Electron MIT 全文 + NOTICE 里的官方地址
@@ -115,7 +115,7 @@ function buildNotice() {
     `  · Chromium 许可全文（BSD 3-Clause）：${CHROMIUM_LICENSE_URL}`,
     `  · Electron 许可全文（MIT）：${ELECTRON_LICENSE_URL}`,
     '',
-    '客户端内「开源许可」入口（系统托盘右键菜单 → 开源许可）可直接打开上述在线地址。',
+    '客户端内「关于」入口（侧边栏菜单 → 关于 → 开源许可）可直接打开上述在线地址。',
     ''
   )
   return lines.join('\r\n')

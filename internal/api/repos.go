@@ -55,6 +55,9 @@ type updateRepoRequest struct {
 // handleListRepos 列出存储库。
 //
 // 可见性：超级管理员可见全部；普通用户仅可见自己拥有的库（成员库通过 GET /{id} 访问）。
+//
+// 每一项都带调用者**自己**的权限等级（permission）：超管与库所有者是 manage，成员按被授予的
+// 级别 —— 界面据此决定这个库是"能管理"还是"只能看"，而不是把管理入口一律摆出来。
 func (r *Router) handleListRepos(w http.ResponseWriter, req *http.Request) {
 	p, err := r.principal(req)
 	if err != nil {
@@ -70,7 +73,16 @@ func (r *Router) handleListRepos(w http.ResponseWriter, req *http.Request) {
 		r.writeError(w, req, err)
 		return
 	}
-	r.writeJSON(w, http.StatusOK, map[string]any{"items": toRepoDTOs(repos)})
+	items := make([]repoDTO, 0, len(repos))
+	for i := range repos {
+		perm, err := r.deps.App.Repos().PermFor(req.Context(), &repos[i], p.UserID, p.Role)
+		if err != nil {
+			r.writeError(w, req, err)
+			return
+		}
+		items = append(items, toRepoDTOWithPerm(&repos[i], perm))
+	}
+	r.writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 // handleCreateRepo 创建存储库。
@@ -123,9 +135,13 @@ func (r *Router) handleCreateRepo(w http.ResponseWriter, req *http.Request) {
 }
 
 // handleGetRepo 查询存储库详情。
+//
+// 响应带上调用者对该库的有效权限（permission）：非所有者（成员）点进详情页时只能看，
+// 界面需要这个等级才知道该收起哪些管理入口。
 func (r *Router) handleGetRepo(w http.ResponseWriter, req *http.Request) {
 	id := chi.URLParam(req, "id")
-	if _, err := r.requireRepoPerm(req, id, domain.PermRead); err != nil {
+	_, perm, err := r.repoPerm(req, id, domain.PermRead)
+	if err != nil {
 		r.writeError(w, req, err)
 		return
 	}
@@ -134,7 +150,7 @@ func (r *Router) handleGetRepo(w http.ResponseWriter, req *http.Request) {
 		r.writeError(w, req, err)
 		return
 	}
-	r.writeJSON(w, http.StatusOK, toRepoDTO(repo))
+	r.writeJSON(w, http.StatusOK, toRepoDTOWithPerm(repo, perm))
 }
 
 // handleUpdateRepo 更新存储库。

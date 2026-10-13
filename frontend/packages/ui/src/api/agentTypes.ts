@@ -193,6 +193,13 @@ export interface AgentServerState {
 export interface AgentUserState {
   id: string
   username: string
+  /**
+   * 服务端下发的角色（super_admin | user）。
+   *
+   * 界面据此决定要不要显示管理端入口 —— 必须以服务端最近一次的说法为准，
+   * 本地缓存的旧角色会让被降级的用户继续看到入口。旧版代理不带该字段。
+   */
+  role?: Role
 }
 
 export interface AgentUpdateState {
@@ -228,6 +235,13 @@ export interface AgentSessionState {
   expires_at: number
   user_id: string
   username: string
+  /**
+   * 该会话用户的服务端角色（super_admin | user）；旧版代理不带该字段。
+   *
+   * 自动续期/证书重登录是渲染进程拿不到服务端原始响应的唯一路径：没有它，界面只能用本地
+   * 缓存的旧角色，角色被改动后顶栏的"管理控制台"入口会继续留着。
+   */
+  role?: Role
 }
 
 /**
@@ -571,6 +585,13 @@ export interface ServerSession {
   token: string
   user_id: string
   username: string
+  /**
+   * 该会话用户的服务端角色（super_admin | user）。
+   *
+   * 随会话一起推给代理保存：代理后续自动续期时才能把**服务端最新的角色**回传给界面，
+   * 而不是让界面一直用本地缓存的旧角色（被降级后顶栏仍留着管理端入口）。
+   */
+  role?: Role
   expires_at: number
   /**
    * 服务端证书 DER 的 SHA-256（小写十六进制）。

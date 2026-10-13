@@ -125,6 +125,14 @@ type repoDTO struct {
 	ClientConfig  map[string]any `json:"client_config,omitempty"`
 	// Pool 是否为池化共享库：建库时已把差异盘池建好并发布，分配即用（挂载免等）。
 	Pool bool `json:"pool"`
+	// Permission 是**调用者自己**对这个库的有效权限等级（read | mount | manage）。
+	//
+	// 与 OwnerID 各说一件事：OwnerID 是归属，Permission 是"我现在能对它做什么"。
+	// 界面据此决定这个库是"能管理"还是"只能看"：库的所有者与超级管理员是 manage，
+	// 成员按被授予的级别，非成员为空。少了它，界面只能拿"是不是超管"当判据，
+	// 于是非库所有者点进详情页也会看到「编辑 / 母盘 / 复制 / 删除」——
+	// 点下去只会撞 403（真实反馈：非库所有者点详情只能看详情、不能管理）。
+	Permission string `json:"permission,omitempty"`
 	// Prepare 建库进度：state=creating 时前端据此显示"正在派生差异盘 3/5"。
 	Prepare   *repoPrepareDTO `json:"prepare,omitempty"`
 	CreatedAt int64           `json:"created_at"`
@@ -167,12 +175,14 @@ func toRepoDTO(r *domain.Repository) repoDTO {
 	return dto
 }
 
-func toRepoDTOs(repos []domain.Repository) []repoDTO {
-	out := make([]repoDTO, 0, len(repos))
-	for i := range repos {
-		out = append(out, toRepoDTO(&repos[i]))
-	}
-	return out
+// toRepoDTOWithPerm 在 toRepoDTO 之上补上调用者在该库上的有效权限。
+//
+// 只有"查库"的两个接口（GET /repos、GET /repos/{id}）会填它：它们的响应直接决定界面
+// 展示哪些管理入口。其余响应的库要么刚由调用者创建（必然是自己的），要么与权限展示无关。
+func toRepoDTOWithPerm(r *domain.Repository, perm domain.Permission) repoDTO {
+	dto := toRepoDTO(r)
+	dto.Permission = string(perm)
+	return dto
 }
 
 type memberDTO struct {

@@ -82,6 +82,9 @@ func (rt *targetRuntime) stats() Stats {
 	if rt.l2 != nil {
 		st.L2Slots = rt.l2.Slots()
 		st.L2Used = rt.l2.UsedSlots()
+		st.L2Restored = rt.l2.Restored()
+		st.L2Unverified = rt.l2.Unverified()
+		st.L2Dropped = rt.l2.Dropped()
 	}
 	return st
 }
@@ -358,7 +361,15 @@ func (p *Portal) Remove(key string) error {
 	}
 	p.tgt.Unregister(rt.iqn)
 	err := rt.close()
-	p.log.Info("iscsicache: target removed", "key", key, "target_iqn", rt.iqn, "err", err)
+	// What the session found in the snapshot and what it could not use: a
+	// non-zero dropped means reads that would have been answered from a slot a
+	// later write had taken over, so the log says so rather than hiding it.
+	restored, unverified, dropped := 0, 0, 0
+	if rt.l2 != nil {
+		restored, unverified, dropped = rt.l2.Restored(), rt.l2.Unverified(), rt.l2.Dropped()
+	}
+	p.log.Info("iscsicache: target removed", "key", key, "target_iqn", rt.iqn, "err", err,
+		"l2_restored", restored, "l2_unverified", unverified, "l2_dropped", dropped)
 	return err
 }
 

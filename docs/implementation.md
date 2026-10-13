@@ -2254,6 +2254,10 @@ POST   /v1/users/{id}/certificates/{cid}/revoke
 
 # 系统
 GET    /v1/system/health
+GET    /v1/system/ping                    ★ 匿名：极简探针（204，不查库/不探宿主/不碰磁盘；不进访问日志），
+                                          供客户端顶栏的延迟指标量一次真实往返（见 frontend 的
+                                          useServerLatency）—— health 会真的去查 DB/iSCSI 服务/白名单卷，
+                                          拿它当探针测出来的是"服务端有多忙"，不是网络往返
 GET    /v1/system/info                    ★ 匿名可访问：版本契约（api_version/server_version/
                                           client_compat/features/server_instance_id/server_name）
                                           + 能力探测（platform_kind? WinTarget? LVM? Hyper-V? 卷可用空间? DB 后端?）
@@ -3036,6 +3040,15 @@ A 与 B 互不信任：A 不认 CA_B 签发的任何证书，反之亦然
 | `user`（库成员，`mount`） | 该库：仅能挂载自己被分配的盘 |
 | `user`（库成员，`read`） | 该库：只读查看 |
 | `user`（非成员） | 不可见该库 |
+
+**界面表现**（只认服务端下发的权限，客户端不自己推断）
+
+| 位置 | 规则 |
+| --- | --- |
+| 顶栏「管理控制台」入口 | 仅 `super_admin` 可见。角色以服务端为准：登录/证书重登录/代理续期都会刷新本地角色，进入应用时再向 `GET /v1/auth/me` 确认一次 —— 本地缓存的旧角色会让被降级的用户继续看到入口，点进去一路 403 |
+| 存储库详情页 | 仅 `permission = manage`（超管 / 库 owner / `manage` 成员）展示「编辑 / 母盘操作 / 复制 / 删除」与「可管理成员」页；`read`、`mount` 成员只读，页面顶部说明原因 |
+| 磁盘页 | 释放**自己**的分配对所有成员开放；释放他人分配、压缩、删除磁盘仅 `manage` |
+| 接口字段 | `GET /v1/repos` 与 `GET /v1/repos/{id}` 的每一项带 `permission`（**调用者自己**对该库的有效权限），界面据此渲染；后端仍是唯一裁判，越权请求照样 403 |
 
 ### 9.4 其他安全措施
 

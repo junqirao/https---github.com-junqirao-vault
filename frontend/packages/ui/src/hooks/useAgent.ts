@@ -67,6 +67,13 @@ export interface UseAgentResult {
    * 卡片要显示"用户眼里的用了多少"只能靠这个本机实测值（见 pickMountUsage）。
    */
   usage: AgentMountVolumeUsage[]
+  /**
+   * 本机实测用量**正在取数**的键（分配 ID 与库 ID，判定见 repoUsageLoading）。
+   *
+   * 挂载刚成功时，代理那边卷往往还没就绪、量不出数字，而用户已经在等"用了多少"了。这个
+   * 窗口里界面显示 loading 而不是 `-`（见 components/UsageBar 的 loading）。
+   */
+  usagePending: string[]
   /** 代理不可用时的错误；其余失败由调用方按需展示。 */
   error: unknown
   /** 母盘下载任务（来自 download 事件与 GET /agent/downloads）。 */
@@ -112,6 +119,7 @@ let snapshot: {
   config: AgentConfig | null
   cache: AgentCacheStatus | null
   usage: AgentMountVolumeUsage[]
+  usagePending: string[]
   downloads: DownloadState[]
   uploads: UploadState[]
   webUpdate: WebUpdateState | null
@@ -123,6 +131,7 @@ let snapshot: {
   config: null,
   cache: null,
   usage: [],
+  usagePending: [],
   downloads: [],
   uploads: [],
   webUpdate: null,
@@ -251,6 +260,8 @@ async function probe(): Promise<void> {
         config: null,
         cache: null,
         usage: [],
+        // 量取用量的也是代理：它不在了就没人"正在取数"，转圈跟着停。
+        usagePending: [],
         downloads: [],
         uploads: [],
         webUpdate: null,
@@ -640,7 +651,8 @@ export function useAgentEventNotifier(): void {
  * 从本机用量快照里挑出某个库的**实测**用量（客户端存储库卡片/详情用）。
  *
  * 快照里只会有**本机正挂着**的库，所以"挑到了"就等于"这块盘在本机挂着"；挑不到
- * （未挂载 / 代理不可用 / 取数失败）返回 undefined，界面回退服务端的数字。
+ * （未挂载 / 代理不可用 / 取数失败）返回 undefined，此时客户端界面不报用量（写 `-`）、
+ * 只报上限，进度条置灰（见 RepoCards 的 RepoUsage），只有管理端仍按服务端口径显示。
  */
 export function pickMountUsage(
   items: AgentMountVolumeUsage[] | undefined,
@@ -653,6 +665,105 @@ export function pickMountUsage(
   if (hit) return hit
   if (!repoId) return undefined
   return items?.find((item) => item.repo_id === repoId && usable(item))
+}
+
+/**
+ * 「这块库的实测用量正在取数」：刚挂上，代理那边还没量出来 —— 界面此刻显示 loading，
+ * 而不是先摆一个 `-`（`-` 说的是"不知道"，这一刻其实是"正在读"，见 awaitMountUsage）。
+ *
+ * 已经拿到实测值就一律为 false：真数字优先，转圈绝不盖住它。
+ */
+export function repoUsageLoading(
+  pending: string[] | undefined,
+  repoId: string | undefined,
+  measured: boolean
+): boolean {
+  if (measured || !repoId || !pending || pending.length === 0) return false
+  return pending.includes(repoId)
+}
+
+/** 拉一次实测用量并落快照（单次失败保留上一份：等下一次轮询再试）。 */
+async function refreshUsageSnapshot(): Promise<void> {
+  try {
+    const result = await agentApi.getUsage()
+    setSnapshot({ usage: result.items })
+  } catch {
+    // 单次取数失败保留上一次的实测值（卸载后代理快照里就没有那一条了）。
+  }
+}
+
+/** 追用量的小会儿：每 1s 问一次，最多 20s（挂载完成后的那十几秒够用了）。 */
+const USAGE_CATCHUP_INTERVAL_MS = 1000
+const USAGE_CATCHUP_TIMEOUT_MS = 20000
+
+/** 标记 / 取消"正在追问用量"的键（分配 ID + 库 ID，界面按库 ID 查）。 */
+function setUsagePending(keys: string[], pending: boolean): void {
+  const current = snapshot.usagePending
+  setSnapshot({
+    usagePending: pending
+      ? [...new Set([...current, ...keys])]
+      : current.filter((item) => !keys.includes(item))
+  })
+}
+
+/**
+ * 在跑的"追问用量"任务：分配 ID → 任务。
+ *
+ * 卸载 / 取消挂载要能把对应那个停掉：否则盘已经摘了，卡片还在为一个永远不会到来的数字
+ * 转圈，得干等到超时。
+ */
+const usageCatchups = new Map<string, { keys: string[]; cancelled: boolean }>()
+
+/** 停掉某次追问（卸载 / 取消挂载）：界面立刻回到"不知道"（`-`）。 */
+function stopUsageCatchup(allocationId: string): void {
+  const task = usageCatchups.get(allocationId)
+  if (!task) return
+  task.cancelled = true
+  usageCatchups.delete(allocationId)
+  setUsagePending(task.keys, false)
+}
+
+/**
+ * 挂载成功后追问这块卷的实测用量，直到量得出来（或超时）。
+ *
+ * 为什么要追（真实反馈："挂载磁盘后要马上更新容量信息"）：
+ *   - 代理侧虽然会因挂载集合变化立刻重测（见 internal/agent/volusage.go 的 mountsKey），
+ *     但卷刚就绪的那一两秒 Get-Volume 往往还量不到容量（那一条带着 error 回来、不缓存，
+ *     下一拍才量得到）；
+ *   - 而页面轮询是 10s 一跳：不追的话，用户点完挂载要盯着"用量怎么还没出来"十几秒。
+ * 追问期间界面显示 loading（判定见 repoUsageLoading）：说的是"正在读"，而不是"读不到"。
+ *
+ * 超时就放手：剩下的交给页面那 10s 轮询，不再一直占着代理的 PowerShell。
+ */
+async function awaitMountUsage(allocationId: string): Promise<void> {
+  // 库 ID 一起记：界面是按库 ID 查的（分配 ID 只有挂载/分配那几个组件手里才有）。
+  const repoId = snapshot.state?.mounts.find((item) => item.allocation_id === allocationId)?.repo_id
+  const keys = [allocationId, repoId].filter((item): item is string => typeof item === 'string' && item !== '')
+
+  const task = { keys, cancelled: false }
+  usageCatchups.set(allocationId, task)
+  setUsagePending(keys, true)
+  try {
+    const deadline = Date.now() + USAGE_CATCHUP_TIMEOUT_MS
+    while (!task.cancelled) {
+      // 挂载请求返回前的那次 probe 可能已经把用量带回来了：先看再等，能省掉一次追问。
+      if (pickMountUsage(snapshot.usage, repoId, allocationId) !== undefined) return
+      if (Date.now() >= deadline) return
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, USAGE_CATCHUP_INTERVAL_MS)
+      })
+      if (task.cancelled) return
+      await refreshUsageSnapshot()
+    }
+  } finally {
+    // 只有自己还是当前任务时才收尾：重挂会为同一个分配另起一个任务（键一模一样），
+    // 旧任务在这里把 pending 一清，新任务刚点亮的转圈就跟着灭了。
+    // 被 stopUsageCatchup 停掉的那种（它已经删了表项、清了 pending）在这里什么都不用做。
+    if (usageCatchups.get(allocationId) === task) {
+      usageCatchups.delete(allocationId)
+      setUsagePending(keys, false)
+    }
+  }
 }
 
 /**
@@ -693,12 +804,7 @@ export function useAgent(): UseAgentResult {
   }, [])
 
   const refreshUsage = useCallback(async (): Promise<void> => {
-    try {
-      const result = await agentApi.getUsage()
-      setSnapshot({ usage: result.items })
-    } catch {
-      // 同理：单次取数失败保留上一次的实测值（卸载后代理快照里就没有那一条了）。
-    }
+    await refreshUsageSnapshot()
   }, [])
 
   const refreshDownloads = useCallback(async (): Promise<void> => {
@@ -722,6 +828,9 @@ export function useAgent(): UseAgentResult {
     async (input: AgentMountInput): Promise<AgentMountState> => {
       const result = await agentApi.mount(input)
       await refresh()
+      // 挂上了就得马上看到用量：追问这块卷的实测值（界面这段时间显示 loading，
+      // 见 awaitMountUsage）。不等它 —— 挂载按钮该立刻回到"卸载"。
+      void awaitMountUsage(input.allocation_id)
       return result.mount
     },
     [refresh]
@@ -730,6 +839,9 @@ export function useAgent(): UseAgentResult {
   const unmount = useCallback(
     async (input: AgentUnmountInput): Promise<void> => {
       await agentApi.unmount(input)
+      // 摘掉了就没有"用量正在路上"这回事了：刚挂上那次追问立刻收工，
+      // 别让卡片为一个永远不会到来的数字转圈（见 stopUsageCatchup）。
+      stopUsageCatchup(input.allocation_id)
       await refresh()
     },
     [refresh]
@@ -739,6 +851,8 @@ export function useAgent(): UseAgentResult {
     async (input: { allocation_id: string }): Promise<AgentMountState> => {
       const result = await agentApi.remount(input)
       await refresh()
+      // 重挂同样是一块"刚就绪"的卷：用量也马上跟上（见 awaitMountUsage）。
+      void awaitMountUsage(input.allocation_id)
       return result.mount
     },
     [refresh]
@@ -747,6 +861,8 @@ export function useAgent(): UseAgentResult {
   const cancelMount = useCallback(
     async (input: { allocation_id: string }): Promise<void> => {
       await agentApi.cancelMount(input)
+      // 取消掉的挂载不会再有用量：把那一次追问停掉（它只可能等来超时）。
+      stopUsageCatchup(input.allocation_id)
       // 取消是异步收场的：代理的挂载流程随后按失败清理并删除记录，这里先刷一次让状态尽快
       // 反映；最终状态由代理推送的 unmount 事件兜底。
       await refresh()

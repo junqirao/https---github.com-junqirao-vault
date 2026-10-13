@@ -138,9 +138,14 @@ type Session struct {
 	// 把探测到的指纹随会话一起推来，代理据此**固定**该指纹（TOFU），
 	// 后续心跳/挂载/事件流都按指纹校验服务端证书。为空时退回默认的链路校验。
 	CertSHA256 string `json:"cert_sha256,omitempty"`
-	// UserID / Username 当前登录用户。
+	// UserID / Username / Role 当前登录用户。
+	//
+	// Role 是**服务端下发的角色**（super_admin | user），必须随会话一起保存并由
+	// sessionView 透出：渲染进程据此决定要不要显示管理端入口（详见 sessionView）。
+	// 证书登录/续期拿到的会话同样带着它，界面才能在角色被改后立刻改口。
 	UserID   string `json:"user_id"`
 	Username string `json:"username"`
+	Role     string `json:"role,omitempty"`
 	// ExpiresAt 会话过期时间（毫秒时间戳）。
 	ExpiresAt int64 `json:"expires_at"`
 	// receivedAt 是本地收到该会话（或续期成功写回）的时刻（毫秒时间戳）。
@@ -153,9 +158,11 @@ type Session struct {
 //
 // 为什么需要它：界面此前只有 connected 这个布尔量，于是"代理正在连/重连"与"真的连不上"
 // 长得一模一样 —— 进程刚起来、会话还没推来、正在重连时，界面都显示"未连接"，用户读到的是
-// "连不上服务端"（真实反馈）。把阶段显式暴露，界面才能在连接中显示转圈的"连接中"。
+// "连不上服务端"（真实反馈）。把阶段显式暴露，界面才能把这两件事分开办：连接中不遮管理端
+// 内容区、不出"重试"按钮，真的连不上才轮到那两样。
+// （顶栏那条"通没通"由延迟指标体现 —— 渲染进程直连服务端测往返，与这里的代理链路不是一回事。）
 const (
-	// ServerPhaseConnecting 正在连接/重连服务端（界面显示"连接中"，不显示"未连接"）。
+	// ServerPhaseConnecting 正在连接/重连服务端（不算断开：界面不据此显示"未连接"）。
 	ServerPhaseConnecting = "connecting"
 	// ServerPhaseConnected 已连接。
 	ServerPhaseConnected = "connected"
@@ -165,7 +172,7 @@ const (
 
 // maxServerConnectAttempts 是"无会话时自动重连"的连续失败上限。
 //
-// 达到上限即停手并把 Phase 置为 disconnected（界面显示"未连接" + 手动重试按钮）：
+// 达到上限即停手并把 Phase 置为 disconnected（界面给出手动重试按钮）：
 // 无休止重试只会把日志刷满，用户也永远分不清"还在连"和"连不上"（真实诉求：
 // "连接失败 2 次之后不再重试，边上加一个按钮让用户手动重试，手动重试会刷新计数"）。
 const maxServerConnectAttempts = 2
@@ -191,9 +198,13 @@ type ServerState struct {
 }
 
 // UserState 描述当前登录用户。
+//
+// Role 一并给出（super_admin | user）：界面只该把它当作"服务端最近一次的说法"。
+// 用户被降级后，客户端手里的旧角色会让管理端入口继续留在顶栏，点进去只会一路 403。
 type UserState struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
+	Role     string `json:"role,omitempty"`
 }
 
 // MountState 是单个分配的挂载状态（对外契约类型）。
@@ -479,8 +490,9 @@ func (s *stateStore) loadServersLocked(loaded *persistedState) string {
 		}
 		state := item.State
 		// 进程重启后真实会话已不存在：连接状态一律复位。
-		// 阶段复位成"连接中"而不是"未连接"：进程刚起来还没试过，界面该显示转圈的
-		// "连接中"；真试过 maxServerConnectAttempts 次都失败才轮到"未连接"（真实诉求）。
+		// 阶段复位成"连接中"而不是"未连接"：进程刚起来还没试过，界面不该把它当成"连不上"
+		// （那会遮住内容区、还摆出重试按钮）；真试过 maxServerConnectAttempts 次都失败才轮到
+		// disconnected（真实诉求）。
 		state.Connected = false
 		state.Phase = ServerPhaseConnecting
 		state.FailCount = 0

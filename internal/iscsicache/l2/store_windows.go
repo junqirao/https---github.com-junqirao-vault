@@ -80,13 +80,32 @@ func openStore(path string, size int64, maxIO int) (Store, error) {
 		return nil, err
 	}
 	s := &winStore{h: h, scratch: buf, path: path}
+	// Only ever grow here. The index region of the previous snapshot can sit
+	// past the size a smaller budget implies, and Open still has to read it
+	// before the file may be trimmed, so shrinking is left to Open.
 	if size > 0 {
-		if err := s.Truncate(size); err != nil {
+		cur, err := s.fileSize()
+		if err != nil {
 			s.Close()
 			return nil, err
 		}
+		if cur < size {
+			if err := s.Truncate(size); err != nil {
+				s.Close()
+				return nil, err
+			}
+		}
 	}
 	return s, nil
+}
+
+// fileSize reports the current end of the file.
+func (s *winStore) fileSize() (int64, error) {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(s.h, &info); err != nil {
+		return 0, fmt.Errorf("l2: query size of %s: %w", s.path, err)
+	}
+	return int64(info.FileSizeHigh)<<32 | int64(info.FileSizeLow), nil
 }
 
 func (s *winStore) ReadAt(p []byte, off int64) error {

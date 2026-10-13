@@ -68,6 +68,8 @@ func (r *Router) routes() {
 	// ---- 匿名接口（认证之前必须可访问，便于排障，见 3.4.2 约束 3）----
 	r.Get("/v1/system/info", r.handleSystemInfo)
 	r.Get("/v1/system/health", r.handleSystemHealth)
+	// 极简探针：客户端顶栏的延迟指标每 10 秒打一次（见 handleSystemPing 的说明）。
+	r.Get(systemPingPath, r.handleSystemPing)
 	r.Post("/v1/system/client-check", r.handleClientCheck)
 
 	// 更新分发（匿名可访问，见 api/update.go 的取舍说明）。
@@ -263,18 +265,27 @@ func (r *Router) requireSuperAdmin(h http.HandlerFunc) http.HandlerFunc {
 
 // requireRepoPerm 校验调用者对存储库的权限，返回调用者。
 func (r *Router) requireRepoPerm(req *http.Request, repoID string, min domain.Permission) (*app.Principal, error) {
+	p, _, err := r.repoPerm(req, repoID, min)
+	return p, err
+}
+
+// repoPerm 校验调用者对存储库的权限，返回调用者与**该库上的有效权限等级**。
+//
+// 详情类接口要把这个等级透给界面（见 repoDTO.Permission）：界面据此决定展示哪些管理入口。
+// 只关心"放不放行"的调用点用 requireRepoPerm。
+func (r *Router) repoPerm(req *http.Request, repoID string, min domain.Permission) (*app.Principal, domain.Permission, error) {
 	p, err := r.principal(req)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	allowed, perm, err := r.deps.App.Repos().CanAccess(req.Context(), repoID, p.UserID, p.Role)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if !allowed || !app.PermAtLeast(perm, min) {
-		return nil, apperr.AuthForbidden().WithArg("reason", "repo_permission_denied")
+		return nil, "", apperr.AuthForbidden().WithArg("reason", "repo_permission_denied")
 	}
-	return p, nil
+	return p, perm, nil
 }
 
 // requireDiskPerm 校验调用者对某磁盘所属存储库的权限。

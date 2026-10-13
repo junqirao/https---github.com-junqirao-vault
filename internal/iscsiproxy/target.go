@@ -319,10 +319,16 @@ func (t *target) maybeBind() {
 	}
 	t.cache, t.l2 = c, l2f
 	t.mu.Unlock()
+	// L2 可能是关着的（未启用或本平台不可用），此时恢复数无意义，如实记 0。
+	l2Restored, l2Unverified := 0, 0
+	if l2f != nil {
+		l2Restored, l2Unverified = l2f.Restored(), l2f.Unverified()
+	}
 	t.log.Info("iscsiproxy: 缓存已绑定后端盘指纹",
 		"engine", Version, "key", t.key, "namespace", ns[:16],
 		"serial", desc.Serial, "wwid", desc.WWID,
-		"block_size", desc.BlockSize, "blocks", desc.BlockCount)
+		"block_size", desc.BlockSize, "blocks", desc.BlockCount,
+		"l2_restored", l2Restored, "l2_unverified", l2Unverified)
 }
 
 // close stops the listener, drops every session and releases the cache.
@@ -368,6 +374,9 @@ func (t *target) statsSnapshot() Stats {
 	if f := t.getL2(); f != nil {
 		st.L2Slots = f.Slots()
 		st.L2Used = f.UsedSlots()
+		st.L2Restored = f.Restored()
+		st.L2Unverified = f.Unverified()
+		st.L2Dropped = f.Dropped()
 	}
 	return st
 }

@@ -121,25 +121,33 @@ func TestSessionBindsCacheFromSniffedIdentity(t *testing.T) {
 // TestRewriteTI locks the target→initiator sequence rewrite: every target PDU
 // gains the injected answers on StatSN/ExpCmdSN/MaxCmdSN, and nothing else in
 // the header moves.
+//
+// Data-In 不带 S 位时 StatSN 是保留字段（后端填 0），既不改写也不采集：加 offset
+// 只会往保留字段里写一个假序号，而把它当序号读回来会让下一次命中代答的 StatSN 倒退
+// （见 captureTargetSeq 与 TestInjectedHitKeepsStatSNForward）。
 func TestRewriteTI(t *testing.T) {
 	const offset = 3
 	cases := []struct {
-		name    string
-		op      uint8
-		wantAdd bool
+		name     string
+		op       uint8
+		flags    uint8
+		wantAdd  bool // ExpCmdSN/MaxCmdSN 是否加 offset
+		wantStat bool // StatSN 是否加 offset
 	}{
-		{"NOP-In", iscsi.OpNOPIn, true},
-		{"SCSIResponse", iscsi.OpSCSIResponse, true},
-		{"DataIn", iscsi.OpDataIn, true},
-		{"R2T", iscsi.OpR2T, true},
-		{"AsyncMsg", iscsi.OpAsyncMsg, true},
-		{"Reject", iscsi.OpReject, true},
-		{"SCSICommand 是发起端方向，不该被 T→I 改写", iscsi.OpSCSICommand, false},
+		{"NOP-In", iscsi.OpNOPIn, 0, true, true},
+		{"SCSIResponse", iscsi.OpSCSIResponse, 0, true, true},
+		{"DataIn 带 S 位", iscsi.OpDataIn, iscsi.DataInFlagStatus, true, true},
+		{"DataIn 不带 S 位时 StatSN 是保留字段", iscsi.OpDataIn, 0, true, false},
+		{"R2T", iscsi.OpR2T, 0, true, true},
+		{"AsyncMsg", iscsi.OpAsyncMsg, 0, true, true},
+		{"Reject", iscsi.OpReject, 0, true, true},
+		{"SCSICommand 是发起端方向，不该被 T→I 改写", iscsi.OpSCSICommand, 0, false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var h iscsi.BHS
 			h.SetOpcode(c.op)
+			h.SetFlags(c.flags)
 			h.SetStatSN(100)
 			h.SetExpCmdSN(200)
 			h.SetMaxCmdSN(220)
@@ -147,15 +155,17 @@ func TestRewriteTI(t *testing.T) {
 			// 会盖掉 ExpCmdSN），这里直接落字节以校验它不被改写。
 			binary.BigEndian.PutUint32(h[36:40], 300)
 			rewriteTI(&h, offset)
-			want := func(base uint32) uint32 {
-				if c.wantAdd {
+			want := func(base uint32, add bool) uint32 {
+				if add {
 					return base + offset
 				}
 				return base
 			}
-			if h.StatSN() != want(100) || h.ExpCmdSN() != want(200) || h.MaxCmdSN() != want(220) {
+			if h.StatSN() != want(100, c.wantStat) ||
+				h.ExpCmdSN() != want(200, c.wantAdd) || h.MaxCmdSN() != want(220, c.wantAdd) {
 				t.Fatalf("StatSN/ExpCmdSN/MaxCmdSN = %d/%d/%d，期望 %d/%d/%d",
-					h.StatSN(), h.ExpCmdSN(), h.MaxCmdSN(), want(100), want(200), want(220))
+					h.StatSN(), h.ExpCmdSN(), h.MaxCmdSN(),
+					want(100, c.wantStat), want(200, c.wantAdd), want(220, c.wantAdd))
 			}
 			if got := binary.BigEndian.Uint32(h[36:40]); got != 300 {
 				t.Fatalf("目标方向的 ExpStatSN 被误改：%d", got)

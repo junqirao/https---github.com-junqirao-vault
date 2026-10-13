@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 
-import { getLanguage, isLanguage, setLanguage as applyLanguage, type Language, type ServerEntry } from '@vault/ui'
+import { getLanguage, isLanguage, setLanguage as applyLanguage, type Language, type Role, type ServerEntry } from '@vault/ui'
 
 import { createPersistence } from './persistence'
 
@@ -36,6 +36,13 @@ export interface AppState extends PersistedConfig {
    * 续期后的令牌会被记到活动服务端名下（另一台仍是旧令牌，下一个请求就 401）。
    */
   updateServerToken: (key: string, token: string, expiresAt: number) => void
+  /**
+   * 用续期/证书重登录得到的用户信息更新**指定**服务端的会话用户（id / 名字 / 角色）。
+   *
+   * 角色必须一起刷新：界面只该把本地这份角色当作"服务端最近一次的说法"。少了这一步，
+   * 服务端把用户降级后，顶栏的"管理控制台"入口会一直留着，点进去只会一路 403。
+   */
+  updateServerUser: (key: string, user: { id: string; username: string; role: Role }) => void
 }
 
 const persistence = createPersistence()
@@ -202,6 +209,14 @@ export const useAppStore = create<AppState>()((set, get) => {
       if (!key) return
       const servers = get().servers.map((item) =>
         item.key === key ? { ...item, token, tokenExpiresAt: expiresAt } : item
+      )
+      update({ servers })
+    },
+
+    updateServerUser: (key, user) => {
+      if (!key) return
+      const servers = get().servers.map((item) =>
+        item.key === key ? { ...item, userId: user.id, username: user.username, role: user.role } : item
       )
       update({ servers })
     }

@@ -102,6 +102,13 @@ export interface RepoDTO {
   pool: boolean
   /** 建库进度：state=creating 时用于显示"正在派生差异盘 3/5"。 */
   prepare?: RepoPrepareDTO
+  /**
+   * **调用者自己**对这个库的有效权限（read | mount | manage）；老服务端不带这个字段。
+   *
+   * 判据是"我现在能对它做什么"：库的所有者与超管是 manage，成员按被授予的级别。
+   * 界面据此决定这个库是"能管理"还是"只能看"——非库所有者点进详情页只应看到只读视图。
+   */
+  permission?: Permission
   created_at: number
   updated_at: number
 }

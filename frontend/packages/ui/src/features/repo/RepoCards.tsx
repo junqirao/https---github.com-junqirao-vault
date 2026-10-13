@@ -4,7 +4,7 @@ import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message
 import { InfoCircleOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
 
 import { StatusTag } from '../../components/StatusTag'
-import { UsageBar } from '../../components/UsageBar'
+import { UsageBar, UsageValueText } from '../../components/UsageBar'
 import type { AgentMountVolumeUsage } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
@@ -35,10 +35,12 @@ export interface RepoCardProps {
  * 直接改成绿色圆点吧，不要在图标上呼吸了，在名称前加个绿点就可以了"）：
  *   - 原来的 40px 方块（底色 + 磁盘图标 + 外圈呼吸）在网格里比库名还抢眼，
  *     而它要说的只有一句话："这块盘正挂在本机"；
- *   - 圆点不用底色、不用图标、**也不带任何动效**：呼吸灯只是把标签行的「已挂载」
- *     又重复了一遍，卡片一多反而晃眼 —— 颜色本身就够读，静止也不会漏看。
+ *   - 圆点不用底色、不用图标、**也不带任何动效**：同一个状态说一遍就够，卡片一多动效反而
+ *     晃眼 —— 颜色本身就够读，静止也不会漏看。
  *
- * 四色与标签行的说法**逐一对齐**（真实反馈："如果没有挂载则展示灰色，挂载失败展示红色"）：
+ * **这颗点就是"挂没挂上"的唯一出口**：标签行里原来那句「已挂载 / 未挂载」已经撤掉
+ * （真实反馈："未挂载和已挂载这个标签去掉，有绿色的指示器就够了"），所以四色得自己把话说全
+ * （真实反馈："如果没有挂载则展示灰色，挂载失败展示红色"）：
  *   - 已挂载 → 浅绿（successLight，小面积色块用浅一档，免得 8px 的绿压过库名）；
  *   - 未挂载（无记录）→ 灰（textTertiary）：绝大多数库都是这个状态，必须安静但可见；
  *   - 失败（错误 / 撤销 / 断线）→ 红（danger），与标签行那个红色感叹号同源（controller.failed）；
@@ -80,7 +82,16 @@ export function RepoMountDot({ controller }: { controller: RepoMountController }
   )
 }
 
-/** 标签行：库模式 + 库状态 + 本机挂载状态（三个并排读，避免"看着正常却挂载失败"的困惑）。 */
+/**
+ * 标签行：库模式 + （仅在库不"正常"时的）库状态 + （仅在有话可说时的）挂载状态。
+ *
+ * **正常不留痕**（真实反馈："存储库如果是正常的，默认不展示正常这个标签，只有异常时才展示
+ * 异常标签"、"未挂载和已挂载这个标签去掉，有绿色的指示器就够了"）：一块正常的库，用户不需要
+ * 被告知它正常 —— 满屏的「正常」「未挂载」只是噪音，还把真正要看的东西（异常、转场、错误）
+ * 淹掉。所以这一行默认只有「共享库」这样一个模式标签，库名左边那颗圆点（灰 / 绿 / 红 / 蓝）
+ * 单独承担"本机挂没挂上"。有异常时（建库中 / 封存中 / 删除中 / 异常、挂载中转场、已断开、
+ * 报错）标签才出现，出现即值得一读。
+ */
 function RepoTagRow({
   repo,
   controller,
@@ -93,37 +104,50 @@ function RepoTagRow({
   return (
     <Space size={spacing.xs} wrap style={style}>
       <Tag>{repoModeLabel(repo.mode)}</Tag>
-      <StatusTag group="repo" value={repo.state} />
+      {repo.state === 'active' ? null : <StatusTag group="repo" value={repo.state} />}
       <RepoMountStateTag controller={controller} />
     </Space>
   )
 }
 
 /**
- * 用量：口径统一在 repoUsage（分母 = 库容量），这里只负责画。
+ * 用量：口径统一在 repoUsage（分母 = 库容量，客户端只认本机实测值），这里只负责画。
  *
  * 本机挂着这个库时（`usage` 有值）画的是**本机实测**的卷用量：服务端的数字是宿主侧
  * 物理占用（写过的最高水位，客户机里删了也不回落），用户眼里的"用了多少"只有本机
  * 挂载着的那个卷知道。标签仍是「已用」（不给它挂「（本机）」后缀：同一列里两个口径的
  * 标签长短不一反而像两件事），口径差异由悬浮说明交代。
+ *
+ * **未挂载就只报上限**（真实反馈："未挂载的情况下不展示已用存储的量，那个进度条置灰就行了"、
+ * "已用那里只展示一个上限就可以了"）：那一刻没有任何本机实测值，而服务端回退值又恰恰是
+ * 那个"删了也不回落的最高水位"—— 报出来只会被读成"我这块盘用了这么多"。所以用量写 `-`
+ * （不知道，见 repoUsage），上限照报，文案就是 `- / 1000 MB`：读起来是"已用 [不知道] / 上限"，
+ * 不会把宿主占用误当成自己的用量，也不会把两个数看反。条同时**置灰且不叠百分数**：
+ * 位置和形状都还在（各张卡竖向对齐不塌），挂上之后数字与填充自然出现。
+ *
+ * **刚挂上时那个 `-` 换成转圈**（真实反馈："挂载磁盘后要马上更新容量信息，更新的时候要有
+ * loading 状态在进度条和 - 上"）：这一刻不是"不知道"，是"正在读"（见 useAgent 的
+ * awaitMountUsage / repoUsageLoading）—— 用户刚点完挂载，看到 `-` 只会以为没挂上。
  */
 function RepoUsage({
   repo,
   usage,
+  loading = false,
   style
 }: {
   repo: RepoDTO
-  /** 本机实测用量（未挂载 / 取不到时为空，回退服务端数字）。 */
+  /** 本机实测用量（未挂载 / 取不到时为空）。 */
   usage?: AgentMountVolumeUsage
+  /** 实测用量正在取数（见 RepoMountController 的 usageLoading）：`-` 与条都改成转圈。 */
+  loading?: boolean
   style?: CSSProperties
 }): JSX.Element {
   const { t } = useI18n()
-  const { percent, text } = repoUsage(repo, usage)
-  const local = usage !== undefined && usage.total_bytes > 0
+  const { percent, usedText, totalText, measured } = repoUsage(repo, usage, true)
   return (
     <div style={style}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
-        {local ? (
+        {measured ? (
           <Tooltip title={t('repo.usedLocalHint')}>
             <Typography.Text type="secondary" style={{ fontSize: fontSize.sm, cursor: 'help' }}>
               {t('repo.used')}
@@ -134,11 +158,11 @@ function RepoUsage({
             {t('repo.used')}
           </Typography.Text>
         )}
-        <Typography.Text ellipsis={{ tooltip: text }} style={{ fontSize: fontSize.sm }}>
-          {text}
+        <Typography.Text style={{ fontSize: fontSize.sm }}>
+          <UsageValueText usedText={usedText} totalText={totalText} loading={loading} />
         </Typography.Text>
       </div>
-      <UsageBar percent={percent} />
+      <UsageBar percent={percent} muted={!measured} loading={loading} />
     </div>
   )
 }
@@ -395,7 +419,12 @@ export function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardP
       </div>
 
       <RepoTagRow repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
-      <RepoUsage repo={repo} usage={mountController.usage} style={{ marginTop: spacing.md }} />
+      <RepoUsage
+        repo={repo}
+        usage={mountController.usage}
+        loading={mountController.usageLoading}
+        style={{ marginTop: spacing.md }}
+      />
 
       {/* 建库进度：只在这一刻有信息量（服务端正在预创建差异盘/目标），建完换回常驻信息行 */}
       <RepoPrepareProgress repo={repo} />
@@ -447,9 +476,15 @@ export function RepoRow({ repo, currentUserId, onOpen, onConfigure }: RepoCardPr
           <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.xxs }} />
         </div>
 
-        {/* 用量固定宽度：多行之间进度条与数值才能对齐着扫。宽度按最长文案留（「已用」+ 最宽的
-            "999 GB / 999 GB"）：挤到 180 时标签与数值贴在一起、条也短得像条线，读起来是一团。 */}
-        <RepoUsage repo={repo} usage={mountController.usage} style={{ flex: '0 0 auto', width: 240 }} />
+        {/* 用量固定宽度：多行之间进度条与数值才能对齐着扫。这个宽度同时就是条的长度
+            （窄了条短得像条线、填充比例看不出来），且容得下「已用」+ 最宽的一条文案
+            （"- / 1000 MB" 这样的"已用 / 上限"）。 */}
+        <RepoUsage
+          repo={repo}
+          usage={mountController.usage}
+          loading={mountController.usageLoading}
+          style={{ flex: '0 0 auto', width: 240 }}
+        />
 
         <RepoActions
           repo={repo}

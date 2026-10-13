@@ -3,6 +3,7 @@ import { Alert, App, Button, Checkbox, Empty, Modal, Progress, Space, Table, Tag
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ErrorNotice } from '../../components/ErrorNotice'
+import { usageColor } from '../../components/UsageBar'
 import { translateError } from '../../api/errors'
 import { useApi } from '../../api/provider'
 import type { DeviceReleaseStepDTO, PoolDeleteResult, StorageDTO } from '../../api/types'
@@ -245,9 +246,12 @@ export function StoragePoolsPanel({ open, onClose }: StoragePoolsPanelProps): JS
                   percent: Math.round(row.metadataPercent)
                 })}
               >
+                {/* 数据占用也是"占比"，与客户端库卡片用同一套分档配色（见 UsageBar 的
+                    usageColor）：池子越满条越红，扫一眼表格就知道哪个池该扩了。 */}
                 <Progress
                   percent={Math.min(100, Math.max(0, Math.round(row.dataPercent)))}
                   size="small"
+                  strokeColor={usageColor(row.dataPercent)}
                   style={{ minWidth: 90, marginBottom: 0 }}
                 />
               </Tooltip>

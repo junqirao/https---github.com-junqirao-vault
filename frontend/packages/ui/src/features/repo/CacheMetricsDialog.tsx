@@ -57,19 +57,32 @@ function EChart({ option, height }: { option: EChartsOption; height: number }): 
   return <div ref={hostRef} style={{ width: '100%', height }} />
 }
 
-/** 组装一张折线图的 option。percent 为真时 y 轴按 0..1 百分比显示。 */
+/**
+ * 组装一张折线图的 option。
+ *
+ * percent 为真时 y 轴按 0..1 百分比显示；`unit` 是"这张图的数带单位"的格式化函数
+ * （目前只有字节类的缓存占用图给）：**tooltip 与坐标轴都要走它**，否则图上只有标题栏
+ * 那一处有人话单位，鼠标一碰就是 "8388608.0" 这样一坨裸字节数（真实反馈："展示单位…
+ * 没法看"）—— 坐标轴同样会退化成裸数字，还得靠人自己去数几位数。
+ *
+ * 不带单位的图（IOPS 这类计数）不传 unit：坐标轴保持原始刻度数字 —— 拿 IOPS 的
+ * "不足 100 补一位小数"去渲染刻度会得到 "0.0 / 500 / 1000" 这种不一致的刻度。
+ */
 function lineOption(
   times: string[],
   series: Series[],
-  opts: { percent?: boolean } = {}
+  opts: { percent?: boolean; unit?: (v: number) => string } = {}
 ): EChartsOption {
+  const valueText = opts.percent ? (v: number): string => `${(v * 100).toFixed(0)}%` : opts.unit
+  const axisText = opts.percent ? (v: number): string => `${Math.round(v * 100)}%` : opts.unit
   return {
     animation: false,
-    grid: { left: 48, right: 12, top: 12, bottom: 24 },
+    // 左侧留 56：带单位的刻度标签（"1.20 GB"）比纯数字宽，48 会把首位挤掉。
+    grid: { left: 56, right: 12, top: 12, bottom: 24 },
     tooltip: {
       trigger: 'axis',
       valueFormatter: (v) =>
-        typeof v === 'number' ? (opts.percent ? `${(v * 100).toFixed(0)}%` : v.toFixed(1)) : '—'
+        typeof v === 'number' ? (valueText ?? ((x: number) => x.toFixed(1)))(v) : '—'
     },
     xAxis: {
       type: 'category',
@@ -87,7 +100,7 @@ function lineOption(
       axisLabel: {
         fontSize: 10,
         color: palette.textTertiary,
-        formatter: opts.percent ? (v: number) => `${Math.round(v * 100)}%` : '{value}'
+        formatter: axisText ?? '{value}'
       }
     },
     series: series.map((s) => ({
@@ -108,15 +121,22 @@ function MetricChart({
   title,
   series,
   format,
-  percent
+  percent,
+  unit
 }: {
   times: string[]
   title: string
   series: Series[]
+  /** 标题右侧"最新值"的渲染。 */
   format: (v: number) => string
   percent?: boolean
+  /** 数值**带单位**（字节类）：坐标轴与 tooltip 也用 format 渲染，不给则坐标轴是裸数字。 */
+  unit?: boolean
 }): JSX.Element {
-  const option = useMemo(() => lineOption(times, series, { percent }), [times, series, percent])
+  const option = useMemo(
+    () => lineOption(times, series, { percent, unit: unit ? format : undefined }),
+    [times, series, percent, unit, format]
+  )
 
   return (
     <div>
@@ -276,6 +296,7 @@ export function CacheMetricsDialog({
                 { name: 'L2', color: palette.warning, data: samples.map((s) => s.l2_used_bytes) }
               ]}
               format={formatBytes}
+              unit
             />
           ) : null}
         </div>

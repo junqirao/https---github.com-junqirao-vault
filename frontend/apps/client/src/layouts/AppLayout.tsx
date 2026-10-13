@@ -11,13 +11,13 @@ import {
   FileSearchOutlined,
   FileTextOutlined,
   HddOutlined,
-  LoadingOutlined,
+  InfoCircleOutlined,
   ReloadOutlined,
   SettingOutlined,
   TeamOutlined,
   UserOutlined
 } from '@ant-design/icons'
-import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Typography } from 'antd'
+import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Tooltip, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
@@ -29,6 +29,7 @@ import { CLIENT_VERSION } from '../config'
 import { normalizeUrl } from '../store/appStore'
 
 import {
+  AboutDialog,
   LanguageSwitcher,
   LayoutModeProvider,
   LoadingState,
@@ -45,6 +46,7 @@ import {
   useAuth,
   useI18n,
   useServerConfig,
+  useServerLatency,
   type Language
 } from '@vault/ui'
 
@@ -81,8 +83,12 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   const { servers, activeKey, active, setActive } = useServerConfig()
   const agent = useAgent()
   const agentVersion = useAgentVersion()
+  // 服务端往返延迟（顶栏指标，每 10 秒自测一次）：见下面 latencyText / latencyColor。
+  const latency = useServerLatency(active?.baseUrl)
   // 手动重连进行中（按钮转圈）：只影响按钮，不参与任何状态判定。
   const [serverRetrying, setServerRetrying] = useState(false)
+  // 「关于」弹窗：入口在侧边栏菜单（应用端在「配置」下方，管理端在末尾），内容见 AboutDialog。
+  const [aboutOpen, setAboutOpen] = useState(false)
 
   /**
    * 平台能力（匿名接口，管理端才查）：目前只用它判断「孤儿磁盘」这项菜单该不该出现。
@@ -102,7 +108,10 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   const appMenuItems: MenuProps['items'] = [
     { key: '/my-repos', icon: <CloudOutlined />, label: t('nav.myRepos') },
     { key: '/logs', icon: <FileTextOutlined />, label: t('nav.logs') },
-    { key: '/settings', icon: <SettingOutlined />, label: t('nav.settings') }
+    { key: '/settings', icon: <SettingOutlined />, label: t('nav.settings') },
+    // 「关于」紧贴「配置」之下：两者都是"这台客户端自己"的事（配置改行为，关于看版本与许可）。
+    // 被问"你那边是什么版本"时用户第一眼会往侧边栏找，排在配置下面最顺手。
+    { key: 'about', icon: <InfoCircleOutlined />, label: t('nav.about') }
   ]
 
   // 紧挨「存储」：孤儿磁盘就是存储根里"未登记却真实存在"的 VHDX，属于存储侧清理入口；
@@ -120,7 +129,10 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
     { key: '/admin/jobs', icon: <DashboardOutlined />, label: t('nav.jobs') },
     { key: '/admin/audit', icon: <AuditOutlined />, label: t('nav.audit') },
     { key: '/admin/logs', icon: <FileTextOutlined />, label: t('nav.serverLogs') },
-    { key: '/admin/system', icon: <ClusterOutlined />, label: t('nav.system') }
+    { key: '/admin/system', icon: <ClusterOutlined />, label: t('nav.system') },
+    // 管理端也留一个：关于里的版本/协议/许可是登录角色无关的，排障时不该因为"当前在管理端"就找不到。
+    // 它不是路由（key 不像上面那些以 / 开头），所以点它只开弹窗，见下面 Menu 的 onClick。
+    { key: 'about', icon: <InfoCircleOutlined />, label: t('nav.about') }
   ]
 
   const menuItems = mode === 'admin' ? adminMenuItems : appMenuItems
@@ -189,8 +201,8 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   // 排障面板逐台列出：新代理给 servers[]，旧代理退回兼容的 health.server（只有一台）。
   const serverList = agent.state?.servers?.length ? agent.state.servers : agent.health?.servers ?? []
   const serverPhase = server?.connected ? 'connected' : server?.phase
-  // "连接中"：代理正在连/自动重连。此时**不显示"未连接"**，改显示转圈的"连接中"
-  // （真实诉求：连接过程中一直挂着"未连接"，用户读到的是"连不上服务端"）。
+  // "连接中"：代理正在连/自动重连。它不再出现在顶栏（顶栏"通没通"由延迟指标说明），
+  // 只留在两处判定里：管理端不在此时遮罩（瞬时抖动不该盖死内容区），以及下面的"未连接"。
   const serverConnecting = agent.available && serverPhase === 'connecting'
   // "未连接"只在代理**明确**说"自动重连已放弃"（phase=disconnected）时才算数：这样旧版代理
   // （不带 phase）不会被误判成失败，也就不会挂出一个注定 404 的"重试"按钮。
@@ -212,8 +224,6 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
    */
   const adminBlocked = mode === 'admin' && agent.available && !server?.connected && !serverConnecting
 
-  const agentTone = !agent.available ? 'default' : server?.connected ? 'green' : serverConnecting ? 'processing' : 'orange'
-
   // 本机 iSCSI 发起程序未就绪：挂载必定失败在 connect 阶段，而错误里没有可执行信息。
   // 启动时就挂横幅提示（代理探测到状态变化会推 host 事件，横幅随之出现/消失，无需重启）。
   //
@@ -227,13 +237,44 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
       : hostWarning?.reason === 'probe_failed'
         ? 'agent.host.probe_failed'
         : 'agent.host.service_stopped'
-  const agentText = !agent.available
-    ? t('agent.state.notFound')
-    : server?.connected
-      ? t('agent.state.connected')
-      : serverConnecting
-        ? t('agent.state.connecting')
-        : t('agent.state.disconnected')
+  /**
+   * 顶栏延迟指标：数值本身就是状态。
+   *
+   * 顶栏不再挂"已连接/未连接"标签 —— 那句话既占位置，又说不清"到底有多快"；一个带颜色的
+   * 毫秒数把"通没通"和"有多快"合成一件事：测到数字就是通了（绿/黄/红按快慢），
+   * 测不到（超时/网络错/非 2xx）就是没通，显示红色的 `- ms`。
+   */
+  const latencyText = t('agent.latency.value', {
+    value: latency.down ? '-' : latency.latencyMs === undefined ? '…' : latency.latencyMs
+  })
+  // 阈值取"人眼看不出 vs 明显发钝"的分界：100ms 以内算流畅，300ms 以上算迟钝。
+  const latencyColor = latency.down
+    ? palette.danger
+    : latency.latencyMs === undefined
+      ? palette.textTertiary
+      : latency.latencyMs < 100
+        ? palette.success
+        : latency.latencyMs < 300
+          ? palette.warning
+          : palette.danger
+
+  /**
+   * 服务器选择栏的悬停提示：实例 ID + 服务地址 + 指标口径。
+   *
+   * 前两者都是"核对这台是哪台"的稳定标识，但都长（ID 是 srv-<uuid>）：常驻在顶栏上只占地方，
+   * 收进悬停提示里，要核对时一悬停就能看到完整值（顶栏上只留能一眼认出的名字）。
+   */
+  const serverTip = (
+    <span style={{ display: 'block' }}>
+      <span style={{ fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace' }}>
+        {active?.instanceId || '-'}
+      </span>
+      <br />
+      <span>{active?.baseUrl || '-'}</span>
+      <br />
+      <span style={{ opacity: 0.75 }}>{t('agent.latency.hint')}</span>
+    </span>
+  )
 
   // 手动重连：代理侧已不再自动重试（连续失败达上限），只能由用户点这里再试一次；
   // 重试会清零失败计数，代理随后重新获得自动重连机会。
@@ -363,7 +404,14 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
                 selectedKeys={[selectedKey]}
                 items={menuItems}
                 style={{ borderInlineEnd: 'none' }}
-                onClick={({ key }) => navigate(key)}
+                onClick={({ key }) => {
+                  // 「关于」是弹窗不是页面：拦下导航（key 也不进 selectedKeys，点了不会留高亮）。
+                  if (key === 'about') {
+                    setAboutOpen(true)
+                    return
+                  }
+                  navigate(key)
+                }}
               />
             </div>
             {mode === 'admin' ? (
@@ -387,45 +435,60 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
             <Space size={spacing.xs}>
               <Dropdown menu={serverMenu} trigger={['click']}>
                 <Button type="text">
-                  <Space size={6}>
-                    <ClusterOutlined />
-                    <span>{active?.serverName || active?.baseUrl || t('settings.server.noName')}</span>
-                    <DownOutlined style={{ fontSize: 10 }} />
-                  </Space>
+                  {/* 悬停提示的锚点必须是 DOM 节点（Tooltip 拿它做悬停判定与定位），
+                      所以里面用 span 而不是 Space；按钮本身的点击（开服务端下拉）不受影响。 */}
+                  <Tooltip title={serverTip} placement="bottomLeft" mouseEnterDelay={0.3}>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <span>{active?.serverName || active?.baseUrl || t('settings.server.noName')}</span>
+                      {/* 延迟指标：数字即状态，同时兼作排障面板的入口 —— 顶栏不再为它单独占一个图标位。
+                          点它要拦掉冒泡，否则服务端下拉会跟着一起弹出来。
+                          刷新按钮跟着面板标题走：面板内容会被"最近一次挂载失败"原文撑长，
+                          按钮放底部既难找、又会被内容推走；无障碍语义由 aria-label 兜住。
+                          等宽数字：免得每 10 秒刷新时整条顶栏左右微跳。 */}
+                      <Popover
+                        content={agentDetail}
+                        trigger="click"
+                        placement="bottomLeft"
+                        title={
+                          <Space size={spacing.xs}>
+                            <span>{t('agent.troubleshoot.title')}</span>
+                            <Button
+                              type="text"
+                              size="small"
+                              icon={<ReloadOutlined />}
+                              title={t('common.refresh')}
+                              aria-label={t('common.refresh')}
+                              onClick={() => void agent.refresh()}
+                            />
+                          </Space>
+                        }
+                      >
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          aria-label={t('agent.troubleshoot.title')}
+                          onClick={(event) => event.stopPropagation()}
+                          onKeyDown={(event) => {
+                            if (event.key !== 'Enter' && event.key !== ' ') return
+                            // 空格会滚页面、回车会"点"外层的按钮：都拦掉，只手动补一次 click。
+                            event.preventDefault()
+                            event.stopPropagation()
+                            event.currentTarget.click()
+                          }}
+                          style={{
+                            color: latencyColor,
+                            cursor: 'pointer',
+                            fontVariantNumeric: 'tabular-nums'
+                          }}
+                        >
+                          {latencyText}
+                        </span>
+                      </Popover>
+                      <DownOutlined style={{ fontSize: 10 }} />
+                    </span>
+                  </Tooltip>
                 </Button>
               </Dropdown>
-              {active?.instanceId ? <Tag>{active.instanceId.slice(0, 8)}</Tag> : null}
-              {/* 刷新按钮跟着标题走：面板内容会被"最近一次挂载失败"原文撑长，按钮放底部既难找、
-                  又会被内容推走；图标按钮 + 悬浮提示，无障碍语义由 aria-label 兜住。 */}
-              <Popover
-                content={agentDetail}
-                trigger="click"
-                placement="bottomLeft"
-                title={
-                  <Space size={spacing.xs}>
-                    <span>{t('agent.troubleshoot.title')}</span>
-                    <Button
-                      type="text"
-                      size="small"
-                      icon={<ReloadOutlined />}
-                      title={t('common.refresh')}
-                      aria-label={t('common.refresh')}
-                      onClick={() => void agent.refresh()}
-                    />
-                  </Space>
-                }
-              >
-                <Tag color={agentTone} style={{ cursor: 'pointer' }}>
-                  {serverConnecting ? (
-                    <Space size={4}>
-                      <LoadingOutlined />
-                      {agentText}
-                    </Space>
-                  ) : (
-                    agentText
-                  )}
-                </Tag>
-              </Popover>
               {serverExhausted ? (
                 <Button size="small" type="link" loading={serverRetrying} onClick={handleServerRetry}>
                   {t('agent.server.retry')}
@@ -461,7 +524,7 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
           </Layout.Header>
 
           {/* 内容区容器：连接遮罩只盖这一块（见 adminBlocked），顶栏与侧边栏不盖。
-              理由：顶栏上有"服务端切换 / 连接状态标签 / 重试 / 退出登录"，全屏遮住之后一旦卡在
+              理由：顶栏上有"服务端切换 / 延迟指标 / 重试 / 退出登录"，全屏遮住之后一旦卡在
               "连接中"，用户连退出登录都点不到，只能去杀进程。 */}
           <div style={{ position: 'relative', display: 'flex', flex: 1, minHeight: 0 }}>
             <Layout.Content style={{ flex: 1, minWidth: 0, background: palette.bgPage, overflow: 'auto' }}>
@@ -510,6 +573,9 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
           </div>
         </Layout>
       </Layout>
+
+      {/* 「关于」：版本、协议版本与开源许可集中在这里（入口在右上角用户菜单）。 */}
+      <AboutDialog open={aboutOpen} clientVersion={CLIENT_VERSION} onClose={() => setAboutOpen(false)} />
     </LayoutModeProvider>
   )
 }

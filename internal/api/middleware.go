@@ -151,8 +151,15 @@ func headLines(s string, n int) string {
 }
 
 // middlewareAccessLog 记录 method / path / status / duration / request_id。
+//
+// 例外：极简探针（systemPingPath）不进日志 —— 界面每 10 秒打一次，而它匿名、空响应、
+// 没有任何可审计的内容，记进来只会把有用的行冲走。
 func (r *Router) middlewareAccessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == systemPingPath {
+			next.ServeHTTP(w, req)
+			return
+		}
 		rec := &statusRecorder{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(rec, req)

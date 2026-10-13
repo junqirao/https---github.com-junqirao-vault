@@ -35,4 +35,14 @@ type Stats struct {
 	L2Slots   int
 	L2Used    int
 	BlockSize int
+	// L2Restored/L2Unverified say how the L2 file was reopened: how many slots
+	// the snapshot held and how many of them still have to be confirmed against
+	// their slot stamp. Both are zero after a clean stop, and Unverified falls
+	// as the entries are read.
+	L2Restored   int
+	L2Unverified int
+	// L2Dropped counts restored entries the stamps disproved: reads that would
+	// have been answered from a slot another write had taken over. A value that
+	// keeps growing means the index is not flushed often enough.
+	L2Dropped int
 }

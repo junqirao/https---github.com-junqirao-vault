@@ -11,7 +11,7 @@ const (
 	testBlock  = 16 << 10
 	testSector = 4 << 10
 	// Three slots, one index page and the super block.
-	testSize = SuperBlockSize + indexPageSize + 3*testBlock
+	testSize = SuperBlockSize + indexPageSize + 3*(testBlock+stampSize)
 )
 
 func openTestL2(t *testing.T, store Store, namespace string) *File {
@@ -28,6 +28,35 @@ func openTestL2(t *testing.T, store Store, namespace string) *File {
 		t.Fatalf("Open: %v", err)
 	}
 	return f
+}
+
+// openSizedL2 opens the same store with an explicit budget, letting a test
+// shrink or grow the file between two opens.
+func openSizedL2(t *testing.T, store Store, size int64) *File {
+	t.Helper()
+	f, err := Open(Config{
+		Path:       "test.bin",
+		SizeBytes:  size,
+		BlockSize:  testBlock,
+		SectorSize: testSector,
+		Namespace:  "ns",
+		Store:      store,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	return f
+}
+
+// stampOf reads the stamp sector of a slot straight from the store, the way a
+// crashed session would have left it. Slots start right after the super block.
+func stampOf(t *testing.T, store Store, num int) []byte {
+	t.Helper()
+	b := make([]byte, stampSize)
+	if err := store.ReadAt(b, SuperBlockSize+int64(num)*int64(testBlock+stampSize)); err != nil {
+		t.Fatalf("read stamp %d: %v", num, err)
+	}
+	return b
 }
 
 func pattern(n int, tag byte) []byte {
@@ -211,9 +240,9 @@ func TestNamespaceChangeRewritesSuperBlock(t *testing.T) {
 // TestGeometryChangeRewritesSuperBlock checks that a different geometry resets
 // the file instead of misinterpreting the old slots.
 func TestGeometryChangeRewritesSuperBlock(t *testing.T) {
-	store := NewMemoryStore(SuperBlockSize + 8*testBlock)
+	store := NewMemoryStore(SuperBlockSize + indexPageSize + 8*(testBlock+stampSize))
 	if _, err := Open(Config{
-		Path: "g.bin", SizeBytes: SuperBlockSize + 8*testBlock,
+		Path: "g.bin", SizeBytes: SuperBlockSize + indexPageSize + 8*(testBlock+stampSize),
 		BlockSize: testBlock, SectorSize: testSector, Namespace: "ns", Store: store,
 	}); err != nil {
 		t.Fatalf("open: %v", err)
@@ -225,7 +254,7 @@ func TestGeometryChangeRewritesSuperBlock(t *testing.T) {
 	before := binary.LittleEndian.Uint32(header[12:16])
 
 	f, err := Open(Config{
-		Path: "g.bin", SizeBytes: SuperBlockSize + 8*(2*testBlock),
+		Path: "g.bin", SizeBytes: SuperBlockSize + indexPageSize + 8*(2*testBlock+stampSize),
 		BlockSize: 2 * testBlock, SectorSize: testSector, Namespace: "ns", Store: store,
 	})
 	if err != nil {
@@ -303,6 +332,11 @@ func TestReopenRestoresIndex(t *testing.T) {
 	if again.UsedSlots() != 1 {
 		t.Fatalf("used slots after reopen = %d, want 1", again.UsedSlots())
 	}
+	// A clean close is trusted as it is, so nothing there needs confirming.
+	if again.Restored() != 1 || again.Unverified() != 0 {
+		t.Fatalf("restored/unverified = %d/%d, want 1/0 after a clean close",
+			again.Restored(), again.Unverified())
+	}
 	got := make([]byte, 2*testSector)
 	ok, err := again.ReadSectors(7, 0, 2, got)
 	if err != nil {
@@ -316,10 +350,89 @@ func TestReopenRestoresIndex(t *testing.T) {
 	}
 }
 
-// TestUncleanCloseDropsIndex checks the crash rule: until Close marks the file
-// cleanly closed the previous mapping is not reloaded, so an invalidation the
-// session only applied in memory cannot come back from disk.
-func TestUncleanCloseDropsIndex(t *testing.T) {
+// TestCrashRecoveryKeepsMatchingSlots is the crash rule in the direction that
+// saves work: a session killed without closing still leaves slots whose stamps
+// agree with the snapshot, and those are worth keeping.
+func TestCrashRecoveryKeepsMatchingSlots(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	want := pattern(testSector, 0x44)
+	if err := f.WriteSectors(7, 0, 1, want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	// No Close: the file is left the way a killed process leaves it.
+
+	again := openTestL2(t, store, "ns")
+	if again.UsedSlots() != 1 {
+		t.Fatalf("used slots = %d after a crash, want 1", again.UsedSlots())
+	}
+	if again.Restored() != 1 || again.Unverified() != 1 {
+		t.Fatalf("restored/unverified = %d/%d, want 1/1",
+			again.Restored(), again.Unverified())
+	}
+	got := make([]byte, testSector)
+	ok, err := again.ReadSectors(7, 0, 1, got)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !ok || !bytes.Equal(got, want) {
+		t.Fatal("a block whose stamp matches the snapshot was not restored")
+	}
+	// The read that confirmed the entry is what settles the counter, and the
+	// entry is not counted as dropped: the recovery did its job.
+	if again.Unverified() != 0 {
+		t.Fatalf("unverified = %d after the slot was confirmed, want 0", again.Unverified())
+	}
+	if again.Dropped() != 0 {
+		t.Fatalf("dropped = %d, want 0 for a slot that matched", again.Dropped())
+	}
+}
+
+// TestCrashRecoveryDropsRecycledSlot covers the entry a crash makes dangerous:
+// the snapshot points at a slot that a later write handed to another block.
+func TestCrashRecoveryDropsRecycledSlot(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	if err := f.WriteSectors(7, 0, 1, pattern(testSector, 0x44)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The next session reaches block 7's slot again — three slots take the ring
+	// back to where it started — and is killed before flushing the index.
+	live := openTestL2(t, store, "ns")
+	for blk := uint64(4); blk <= 6; blk++ {
+		if err := live.WriteSectors(blk, 0, 1, pattern(testSector, byte(blk))); err != nil {
+			t.Fatalf("write block %d: %v", blk, err)
+		}
+	}
+
+	again := openTestL2(t, store, "ns")
+	if ok, _ := again.ReadSectors(7, 0, 1, make([]byte, testSector)); ok {
+		t.Fatal("block 7 was served from the slot another block took over")
+	}
+	if again.UsedSlots() != 0 {
+		t.Fatalf("used slots = %d after the stale record was disproved, want 0", again.UsedSlots())
+	}
+	// The disproved entry is exactly what the dropped counter is for.
+	if again.Dropped() != 1 {
+		t.Fatalf("dropped = %d, want 1", again.Dropped())
+	}
+	if again.Unverified() != 0 {
+		t.Fatalf("unverified = %d after the only entry was settled, want 0", again.Unverified())
+	}
+}
+
+// TestCrashRecoveryCountsRecycledUnverifiedEntry covers the entry that never
+// gets read before its slot is reused: the write path hands the slot to another
+// block, and the counters have to record that the snapshot lost it just as they
+// would for a stamp that disagreed.
+func TestCrashRecoveryCountsRecycledUnverifiedEntry(t *testing.T) {
 	store := NewMemoryStore(testSize)
 	f := openTestL2(t, store, "ns")
 	if err := f.WriteSectors(7, 0, 1, pattern(testSector, 0x44)); err != nil {
@@ -328,13 +441,151 @@ func TestUncleanCloseDropsIndex(t *testing.T) {
 	if err := f.Sync(); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
+	// No Close: block 7 sits in slot 0, unverified, and the next is still 0 in
+	// the superblock, so the next write takes that slot back.
 
 	again := openTestL2(t, store, "ns")
-	if again.UsedSlots() != 0 {
-		t.Fatalf("used slots = %d after an unclean stop, want 0", again.UsedSlots())
+	if err := again.WriteSectors(9, 0, 1, pattern(testSector, 0x99)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if again.Dropped() != 1 {
+		t.Fatalf("dropped = %d after the slot was recycled, want 1", again.Dropped())
+	}
+	if again.Unverified() != 0 {
+		t.Fatalf("unverified = %d, want 0 once the entry is settled", again.Unverified())
+	}
+	if again.UsedSlots() != 1 {
+		t.Fatalf("used slots = %d, want only the new block", again.UsedSlots())
 	}
 	if ok, _ := again.ReadSectors(7, 0, 1, make([]byte, testSector)); ok {
-		t.Fatal("a block from an unclean session is still readable")
+		t.Fatal("block 7 was served from the slot block 9 took over")
+	}
+	if ok, _ := again.ReadSectors(9, 0, 1, make([]byte, testSector)); !ok {
+		t.Fatal("the block that took the slot over is not readable")
+	}
+}
+
+// TestCrashRecoveryDropsInvalidatedSectors is why the slot version exists: a
+// snapshot that predates an invalidation must not resurrect the sectors, even
+// though the index page was never rewritten.
+func TestCrashRecoveryDropsInvalidatedSectors(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	if err := f.WriteSectors(3, 0, 3, pattern(3*testSector, 0x55)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	live := openTestL2(t, store, "ns")
+	live.InvalidateSectors(3, 1, 1)
+
+	again := openTestL2(t, store, "ns")
+	// The first read has to disprove the restored record, so the slot goes away
+	// instead of serving a sector the killed session had already dropped.
+	if ok, _ := again.ReadSectors(3, 0, 1, make([]byte, testSector)); ok {
+		t.Fatal("sector 0 came back from a snapshot that predates the invalidation")
+	}
+	if again.UsedSlots() != 0 {
+		t.Fatalf("used slots = %d after the stale record was disproved, want 0", again.UsedSlots())
+	}
+	for sec := 0; sec < 3; sec++ {
+		if ok, _ := again.ReadSectors(3, sec, 1, make([]byte, testSector)); ok {
+			t.Fatalf("sector %d came back from a snapshot that predates its invalidation", sec)
+		}
+	}
+}
+
+// TestCrashRecoveryDropsForeignStamp checks that every field of the stamp is
+// part of the decision: each case rewrites it with a valid checksum, so only
+// the comparison can reject the entry.
+func TestCrashRecoveryDropsForeignStamp(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(st []byte, gen uint64)
+	}{
+		{"block", func(st []byte, _ uint64) { put64(st[stampOffBlk:], 99) }},
+		{"generation", func(st []byte, gen uint64) { put64(st[stampOffGen:], gen+1) }},
+		{"version", func(st []byte, _ uint64) { put64(st[stampOffVer:], 7) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMemoryStore(testSize)
+			f := openTestL2(t, store, "ns")
+			if err := f.WriteSectors(7, 0, 1, pattern(testSector, 0x44)); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if err := f.Sync(); err != nil {
+				t.Fatalf("sync: %v", err)
+			}
+			st := stampOf(t, store, 0)
+			tc.edit(st, f.generation)
+			put32(st[stampOffCRC:], checksum(st, stampOffCRC))
+			if err := store.WriteAt(st, SuperBlockSize); err != nil {
+				t.Fatalf("write stamp: %v", err)
+			}
+
+			again := openTestL2(t, store, "ns")
+			if ok, _ := again.ReadSectors(7, 0, 1, make([]byte, testSector)); ok {
+				t.Fatal("a slot whose stamp disagrees was served anyway")
+			}
+			if again.UsedSlots() != 0 {
+				t.Fatalf("used slots = %d, want 0", again.UsedSlots())
+			}
+		})
+	}
+}
+
+// TestBudgetChangeKeepsIndex is the reason the slots come before the index: a
+// budget that changes between two mounts has to leave the slot offsets alone,
+// or every resize would drop the cache of a share that is only ever a guess.
+func TestBudgetChangeKeepsIndex(t *testing.T) {
+	roomy := int64(SuperBlockSize + 64*(testBlock+stampSize) + indexPageSize)
+	store := NewMemoryStore(roomy)
+	f := openSizedL2(t, store, testSize)
+	want := pattern(testSector, 0x77)
+	if err := f.WriteSectors(7, 0, 1, want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	bigger := openSizedL2(t, store, roomy)
+	if bigger.UsedSlots() != 1 {
+		t.Fatalf("used slots = %d after growing the budget, want 1", bigger.UsedSlots())
+	}
+	got := make([]byte, testSector)
+	if ok, _ := bigger.ReadSectors(7, 0, 1, got); !ok || !bytes.Equal(got, want) {
+		t.Fatal("the cache was lost when the budget grew")
+	}
+	if bigger.Slots() <= f.Slots() {
+		t.Fatalf("slots = %d, want more than %d", bigger.Slots(), f.Slots())
+	}
+}
+
+// TestBudgetShrinkKeepsIndex checks the other direction: a smaller budget only
+// truncates slots off the end, it does not move the ones that remain.
+func TestBudgetShrinkKeepsIndex(t *testing.T) {
+	roomy := int64(SuperBlockSize + 64*(testBlock+stampSize) + indexPageSize)
+	store := NewMemoryStore(roomy)
+	f := openSizedL2(t, store, roomy)
+	want := pattern(testSector, 0x88)
+	if err := f.WriteSectors(7, 0, 1, want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	smaller := openSizedL2(t, store, testSize)
+	if smaller.UsedSlots() != 1 {
+		t.Fatalf("used slots = %d after shrinking the budget, want 1", smaller.UsedSlots())
+	}
+	got := make([]byte, testSector)
+	if ok, _ := smaller.ReadSectors(7, 0, 1, got); !ok || !bytes.Equal(got, want) {
+		t.Fatal("the cache was lost when the budget shrank")
 	}
 }
 
@@ -395,12 +646,13 @@ func TestTornIndexPageIsIgnored(t *testing.T) {
 	}
 
 	// Corrupt one record of the first index page.
+	off := f.indexOffset(f.slotCount, 0) + indexHdrSize
 	b := make([]byte, 1)
-	if err := store.ReadAt(b, SuperBlockSize+indexHdrSize); err != nil {
+	if err := store.ReadAt(b, off); err != nil {
 		t.Fatalf("read index page: %v", err)
 	}
 	b[0] ^= 0xff
-	if err := store.WriteAt(b, SuperBlockSize+indexHdrSize); err != nil {
+	if err := store.WriteAt(b, off); err != nil {
 		t.Fatalf("write index page: %v", err)
 	}
 

@@ -19,7 +19,7 @@ export function formatBytes(bytes: number | undefined | null): string {
 }
 
 /**
- * 存储库用量：进度条百分比 + 「已用 / 总量」文案。
+ * 存储库用量：进度条百分比 + 「已用 / 上限」文案。
  *
  * 卡片、详情页概览共用一个口径（同一台机器上这两处必须显示同一个数）；管理端表格走服务端
  * 口径 —— 运维看的是宿主占用，与客户端"这块库我用了多少"本来就不是一回事。
@@ -29,13 +29,25 @@ export function formatBytes(bytes: number | undefined | null): string {
  * 于是百分比恒为 0、进度条永远空着 —— 界面上就是"看不出用了多少"。
  * 存量老库里若还残留库级配额（>0），回退用它当分母，免得老库退化成没有分母。
  *
- * 容量也没派生出来时（0，例如盘记录已回收）分母为 0：此时只报已用量，
- * 绝不除零，也不假装进度条是 0%（那会被读成"没占用"）。
- *
- * 第二个参数是本机**实测**的卷用量（客户端挂载着这个库时才有，见 AgentMountVolumeUsage）：
+ * 分子取本机**实测**的卷用量（客户端挂载着这个库时才有，见 AgentMountVolumeUsage）：
  * 服务端的 used_bytes 是宿主侧物理占用 —— 客户机里删掉数据它也不回落，卡片上的「已用」
  * 于是永远停在写过的最高水位，不是用户眼里的用量。有实测值时以它为准（分母同样用卷容量：
  * 那就是这块盘的标称容量）。
+ *
+ * 第三个参数 `localOnly` 是客户端的规则（真实反馈："未挂载的情况下不展示已用存储的量，
+ * 那个进度条置灰就行了"、"已用那里只展示一个上限就可以了"）：没有实测值时**不拿服务端数字
+ * 兜底**，用量写 `-`（不知道），上限照报 —— 文案就是 `- / 1000 MB`。`-` 占住"已用"那个
+ * 位置：用户既不会把宿主最高水位读成自己的用量，也不会把两个数看反。管理端不传（false），
+ * 它要看的正是宿主占用那个绝对数。
+ *
+ * 别拿 `formatBytes(0)` 当"未知"：那是"确实一个字节没用"，两件事。
+ *
+ * 返回值给的是**零件**加整句：`text`（"已用 / 上限"）给管理端表格这类只要一句话的地方，
+ * `usedText` / `totalText` 两半给客户端 —— 刚挂上、用量还在取数时，「已用」那半边要换成
+ * 转圈（见 components/UsageBar 的 UsageValueText），整句没法局部替换。
+ *
+ * `measured` = 用量是不是本机实测值：置灰进度条、给「已用」标签挂悬浮说明都用它
+ * （见 RepoCards 的 RepoUsage），免得每个调用方各自判一遍。
  */
 export function repoUsage(
   repo?: {
@@ -43,18 +55,27 @@ export function repoUsage(
     capacity_bytes?: number
     quota_bytes?: number
   },
-  local?: { used_bytes?: number; total_bytes?: number }
-): { percent: number; text: string } {
+  local?: { used_bytes?: number; total_bytes?: number },
+  localOnly = false
+): { percent: number; usedText: string; totalText: string; text: string; measured: boolean } {
   const localTotal = local?.total_bytes && local.total_bytes > 0 ? local.total_bytes : 0
-  const used = localTotal > 0 ? (local?.used_bytes ?? 0) : (repo?.used_bytes ?? 0)
+  const measured = localTotal > 0
+  // 用量未知用 undefined 表示（客户端没实测到），与"用了 0 字节"区分开。
+  const used = measured ? (local?.used_bytes ?? 0) : localOnly ? undefined : (repo?.used_bytes ?? 0)
   const capacity = repo?.capacity_bytes && repo.capacity_bytes > 0 ? repo.capacity_bytes : 0
-  const total = localTotal > 0 ? localTotal : capacity > 0 ? capacity : (repo?.quota_bytes ?? 0)
-  if (total <= 0) return { percent: 0, text: formatBytes(used) }
+  const total = measured ? localTotal : capacity > 0 ? capacity : (repo?.quota_bytes ?? 0)
+  const usedText = used === undefined ? '-' : formatBytes(used)
+  // 分母为 0 = 上限根本不知道（不是"上限 0"）：只报已知的那半边，不写"上限 0"。
+  if (total <= 0) return { percent: 0, usedText, totalText: '', text: usedText, measured }
   // 超 100% 是真的会发生的：用量按"每个差异盘按容量预留"计，共享库多位用户同时在建盘时
   // 会短暂超过单份容量。钳到 100 只影响条形长度，文字仍显示真实数值。
+  const totalText = formatBytes(total)
   return {
-    percent: Math.min(100, Math.round((used / total) * 100)),
-    text: `${formatBytes(used)} / ${formatBytes(total)}`
+    percent: used === undefined ? 0 : Math.min(100, Math.round((used / total) * 100)),
+    usedText,
+    totalText,
+    text: `${usedText} / ${totalText}`,
+    measured
   }
 }
 
