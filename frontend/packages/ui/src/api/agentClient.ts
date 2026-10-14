@@ -9,6 +9,7 @@
  */
 import { ApiError, businessErrorFrom } from './errors'
 import type {
+  AgentCacheClearResult,
   AgentCacheHistory,
   AgentCacheStatus,
   AgentConfig,
@@ -693,6 +694,21 @@ export const agentApi = {
   /** 近 5 分钟的缓存指标采样（每 5 秒一点，按库分组），供"缓存指标曲线"弹窗使用。 */
   getCacheHistory(): Promise<AgentCacheHistory> {
     return request<AgentCacheHistory>({ method: 'GET', path: '/agent/cache/history' })
+  },
+
+  /**
+   * 清空某个存储库的本地读缓存内容（L1 内存缓存 + L2 文件两级一起丢），用于存储库设置里的
+   * "清空缓存"。**不**关缓存、不断会话：门户目标与挂载都留着，后续读照常重新填充。
+   *
+   * 传 repo_id 即可：缓存目标按分配 ID 注册，而界面手里只有库 ID，代理会自己按挂载记录
+   * 映射（见 internal/agent/httpapi.go 的 handleCacheClear）。该库当前没有缓存目标时返回
+   * `cleared:false`（HTTP 200，不是错误）。
+   *
+   * 必须是 POST：Electron 主进程按方法放行（只接受 GET/POST/PATCH/DELETE，见
+   * setRepoMountPref 的说明），PUT/DELETE 会被挡在代理之外。
+   */
+  clearCache(target: { repo_id?: string; allocation_id?: string }): Promise<AgentCacheClearResult> {
+    return request<AgentCacheClearResult>({ method: 'POST', path: '/agent/cache/clear', body: target })
   },
 
   patchConfig(patch: Partial<AgentConfig>): Promise<{ config: AgentConfig }> {

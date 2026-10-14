@@ -221,7 +221,12 @@ type File struct {
 	generation    uint64
 	fullMask      uint32
 
-	mu         sync.Mutex
+	// mu guards the index, the slots and the pages. Reads take it for read and
+	// hold it for the whole store transfer, so reads of different blocks run in
+	// parallel (one transfer per store shard) instead of queueing behind each
+	// other; anything that changes a slot, a page or the ring takes it for write,
+	// which is also what keeps a slot from being recycled under a read.
+	mu         sync.RWMutex
 	index      map[uint64]*slot
 	slotsByNum []*slot
 	next       int
@@ -351,16 +356,16 @@ func (f *File) SlotSize() int { return f.slotSize }
 
 // UsedSlots returns the number of slots currently holding data.
 func (f *File) UsedSlots() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return len(f.index)
 }
 
 // Restored returns how many slots the last Open found in the snapshot, whether
 // it was closed cleanly or not.
 func (f *File) Restored() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.recovered
 }
 
@@ -369,8 +374,8 @@ func (f *File) Restored() int {
 // that was closed cleanly, and falls as the reads that touch those slots
 // confirm or disprove them.
 func (f *File) Unverified() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.unverified
 }
 
@@ -381,8 +386,8 @@ func (f *File) Unverified() int {
 // keeps growing says the snapshot on disk is not being flushed as often as the
 // writes that follow it.
 func (f *File) Dropped() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.dropped
 }
 
@@ -576,6 +581,11 @@ func (f *File) writeIndexPage(page int) error {
 }
 
 // ReadSectors implements cache.L2.
+//
+// The index lock is taken for read and held across the transfer, so reads of
+// different blocks proceed in parallel instead of sharing one I/O lane. The
+// transfer is still covered: a slot can only be recycled by a writer, and a
+// writer waits for the read lock to be released.
 func (f *File) ReadSectors(blk uint64, sec, n int, dst []byte) (bool, error) {
 	if n <= 0 {
 		return true, nil
@@ -586,34 +596,47 @@ func (f *File) ReadSectors(blk uint64, sec, n int, dst []byte) (bool, error) {
 	if len(dst) < n*f.sectorSize {
 		return false, io.ErrShortBuffer
 	}
+	mask := sectorMask(sec, n)
+	// At most two passes: the first one may have to settle an entry restored
+	// from a crash, which changes slot state and so needs the write lock.
+	for attempt := 0; attempt < 2; attempt++ {
+		f.mu.RLock()
+		sl := f.index[blk]
+		if sl == nil || sl.valid&mask != mask {
+			f.mu.RUnlock()
+			return false, nil
+		}
+		if sl.verified {
+			err := f.store.ReadAt(dst[:n*f.sectorSize], f.slotOffset(sl.num, sec))
+			f.mu.RUnlock()
+			if err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		f.mu.RUnlock()
+		f.confirmEntry(blk)
+	}
+	// Still unverified after confirming it: the entry is gone, so the read is a
+	// plain miss rather than a guess.
+	return false, nil
+}
+
+// confirmEntry settles the entry for blk when it came back from a snapshot that
+// was not closed cleanly. Verification changes slot state, so it runs under the
+// write lock: an unconfirmed entry may not serve data until its stamp agrees.
+func (f *File) confirmEntry(blk uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	sl := f.index[blk]
-	if sl == nil {
-		return false, nil
+	if sl == nil || sl.verified {
+		return
 	}
-	mask := sectorMask(sec, n)
-	if sl.valid&mask != mask {
-		return false, nil
-	}
-	if !sl.verified {
-		ok, err := f.verifyLocked(sl)
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			// The slot does not hold this block under this session: an entry
-			// restored from a crash, pointing at a slot a later write recycled
-			// before the snapshot was flushed. Dropping it makes the read a
-			// plain miss instead of serving another block's bytes.
-			f.forgetSlotLocked(blk, sl)
-			return false, nil
-		}
-	}
-	if err := f.store.ReadAt(dst[:n*f.sectorSize], f.slotOffset(sl.num, sec)); err != nil {
-		return false, err
-	}
-	return true, nil
+	// A stamp that disagrees means the slot does not hold this block under this
+	// session: an entry restored from a crash, pointing at a slot a later write
+	// recycled before the snapshot was flushed. Dropping it makes the read a
+	// plain miss instead of serving another block's bytes.
+	f.ensureVerifiedLocked(sl)
 }
 
 // verifyLocked decides whether an unverified entry really describes its slot,

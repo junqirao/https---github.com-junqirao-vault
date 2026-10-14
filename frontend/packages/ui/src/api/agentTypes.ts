@@ -491,6 +491,24 @@ export interface AgentCacheStatus {
 }
 
 /**
+ * 清空某个库本地读缓存的响应（POST /agent/cache/clear）。
+ *
+ * 清的是**缓存内容**（L1 + L2 两级一起丢），不是关缓存：门户目标、iSCSI 会话与挂载都留着，
+ * 读命令照常重新填充。
+ */
+export interface AgentCacheClearResult {
+  /**
+   * 这次是否真的清掉了东西。
+   *
+   * `false` 表示该库当前**没有缓存目标可清**（没挂载、本次走了直连、或未启用缓存）——
+   * 这不是错误（HTTP 200），界面据此如实提示，而不是报一句"已清空"。
+   */
+  cleared: boolean
+  /** 实际清掉的分配 ID（一个库正常只有一条），便于界面确认与排障。 */
+  allocation_ids: string[]
+}
+
+/**
  * 单个库某一刻的缓存计数采样点（GET /agent/cache/history 的元素）。
  *
  * reads/hits/writes/backend_reads 是**累计值**：曲线用的速率与命中率按相邻点差分计算

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Input, Modal, Radio, Space, Switch, Typography, message } from 'antd'
+import { Alert, Button, Input, Modal, Popconfirm, Radio, Space, Switch, Typography, message } from 'antd'
 
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { SectionCard } from '../../components/SectionCard'
@@ -10,6 +10,7 @@ import { useAgent } from '../../hooks/useAgent'
 import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
+import { formatBytes } from '../../utils/format'
 import { effectiveMountDir } from '../../utils/mountPath'
 
 /** 单个存储库挂载配置的表单状态与保存动作（卡片弹窗与详情页 tab 共用一份）。 */
@@ -34,6 +35,17 @@ export interface RepoMountSettingsState {
   save: () => Promise<boolean>
   /** 目录模式的最终挂载点预览：父目录 + 一层 `<服务端名称>_<存储库名称>`（留空则用默认根）。 */
   previewDir: string
+  /**
+   * 该库此刻的缓存占用（L1 + L2，字节）；`null` 表示本库在门户上**没有缓存目标**
+   * （没挂载 / 走了直连 / 未启用缓存），此时不显示"清空缓存"入口。
+   */
+  cacheUsedBytes: number | null
+  /** 该库分到的缓存上限（L1 + L2，字节）；只有存在缓存目标时才有意义。 */
+  cacheLimitBytes: number
+  /** 清空缓存请求进行中。 */
+  clearing: boolean
+  /** 清空该库的缓存内容（两级都清，不断会话）；结果按"清到了没有"如实提示。 */
+  clearCache: () => Promise<void>
 }
 
 /**
@@ -76,7 +88,18 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
   const [cacheEnabled, setCacheEnabled] = useState(effectiveCache)
   const [directMode, setDirectMode] = useState(effectiveDirect)
   const [saving, setSaving] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const [error, setError] = useState<unknown>(null)
+
+  // 本库此刻在门户上的缓存目标：targets 按**分配**注册，挂载记录给出本库这次的分配，
+  // 两者对上才有目标（GET /agent/cache 的说明：未启用/回退直连的库不出现在 targets 里）。
+  // 找不到就代表本库没有缓存内容可清 —— 界面不显示清空入口，而不是摆一个点了没反应的按钮。
+  const mountAllocationId = (agent.state?.mounts ?? []).find((item) => item.repo_id === repoId)?.allocation_id
+  const cacheTarget = mountAllocationId
+    ? agent.cache?.targets.find((item) => item.allocation_id === mountAllocationId)
+    : undefined
+  const cacheUsedBytes = cacheTarget ? cacheTarget.l1_used_bytes + cacheTarget.l2_used_bytes : null
+  const cacheLimitBytes = cacheTarget ? cacheTarget.l1_limit_bytes + cacheTarget.l2_limit_bytes : 0
 
   // 代理配置是异步到齐的（也可能刚保存完被 refresh 覆盖）：生效值一变就重填表单，
   // 否则用户会看到一份"还没加载出配置"的空表单，并把空值当默认值存下去。
@@ -87,6 +110,15 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
     setCacheEnabled(effectiveCache)
     setDirectMode(effectiveDirect)
   }, [repoId, effectiveMode, effectiveDir, effectiveAuto, effectiveCache, effectiveDirect])
+
+  // 打开这份设置时主动取一次缓存状态：用量随读写一直在变，而**详情页这一层没有轮询器**
+  // （10s 轮询放在库列表那一层，离开列表就停了），只靠进入本页前的快照可能已经过时，
+  // 甚至还没有（直接刷新详情页）。取一次就够，本页不轮询（与「客户端设置」同样的做法）。
+  const refreshCache = agent.refreshCache
+  useEffect(() => {
+    if (!agent.available) return
+    void refreshCache()
+  }, [agent.available, refreshCache])
 
   // 预览按用户**正在编辑**的父目录算：改了输入框提示立刻跟着变，不用先保存再猜。
   const previewDir = effectiveMountDir(dir.trim() || config?.default_mount_dir || '', serverAlias, repoName)
@@ -116,6 +148,29 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
     }
   }
 
+  /**
+   * 清空本库的缓存内容（L1 + L2 两级），**不**改配置、不断会话：清完门户目标还在，
+   * 后续读照常重新填充（见 POST /agent/cache/clear）。
+   *
+   * 只传 repo_id：目标按分配注册而界面手里只有库 ID，映射由代理按挂载记录自己做。
+   */
+  const clearCache = async (): Promise<void> => {
+    setError(null)
+    setClearing(true)
+    try {
+      const result = await agentApi.clearCache({ repo_id: repoId })
+      // 清完用量立刻回落（否则界面还显示清空前的占用，看起来像没生效）。
+      await agent.refreshCache()
+      // 没清到东西不是失败：本库此刻没有缓存目标（没挂载/走了直连），如实说，不谎报"已清空"。
+      if (result.cleared) message.success(t('repo.settings.clearCacheDone'))
+      else message.info(t('repo.settings.clearCacheNone'))
+    } catch (err) {
+      setError(err)
+    } finally {
+      setClearing(false)
+    }
+  }
+
   return {
     mode,
     dir,
@@ -131,7 +186,11 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
     error,
     disabled: !agent.available,
     save,
-    previewDir
+    previewDir,
+    cacheUsedBytes,
+    cacheLimitBytes,
+    clearing,
+    clearCache
   }
 }
 
@@ -209,6 +268,34 @@ function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Elem
         <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
           {t('repo.settings.cacheHint')}
         </Typography.Text>
+        {/*
+          清空缓存的入口：只在**本库此刻真有缓存目标**时才出现（见 state.cacheUsedBytes）。
+          没有目标（没挂载 / 走了直连 / 未启用缓存）时本机没有任何本库的缓存内容，
+          显示一个点了也清不掉东西的按钮只会让人以为清过了。
+        */}
+        {state.cacheUsedBytes !== null ? (
+          <Space size={spacing.sm} style={{ marginTop: spacing.sm }} wrap>
+            <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+              {t('repo.settings.cacheUsage', {
+                used: formatBytes(state.cacheUsedBytes),
+                limit: formatBytes(state.cacheLimitBytes)
+              })}
+            </Typography.Text>
+            <Popconfirm
+              title={t('repo.settings.clearCacheConfirm')}
+              description={t('repo.settings.clearCacheConfirmHint')}
+              okText={t('common.confirm')}
+              cancelText={t('common.cancel')}
+              onConfirm={() => void state.clearCache()}
+            >
+              {/* 用文字按钮而不是实心按钮：这行是"看用量 + 顺手清一下"的次要动作，
+                  实心按钮会把旁边的缓存开关比下去；全站的动作入口也都是 type="link"。 */}
+              <Button type="link" size="small" loading={state.clearing} disabled={disabled}>
+                {t('repo.settings.clearCache')}
+              </Button>
+            </Popconfirm>
+          </Space>
+        ) : null}
       </div>
 
       <div>

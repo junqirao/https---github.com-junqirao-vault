@@ -13,7 +13,7 @@
  *     只有 1 KB，没有删的理由；
  *   · 删除 LICENSES.chromium.html，改写一份 1 KB 左右的 THIRD-PARTY-NOTICES.txt，把许可
  *     全文的官方在线地址写在里面；
- *   · 客户端「关于」（侧边栏菜单 → 关于，见 packages/ui 的 AboutDialog）直接打开这些地址。
+ *   · 客户端「关于」（侧边栏菜单 → 关于，见 packages/ui 的 AboutPage）直接打开这些地址。
  *
  * 合规依据：许可义务的核心是"让接收方能够获得许可与版权声明"，不是"必须把某个 9 MB 文件
  * 原样放进包里"。改外链后，接收方仍能从随包的 Electron MIT 全文 + NOTICE 里的官方地址

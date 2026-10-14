@@ -233,6 +233,24 @@ func (t *target) getL2() *l2.File {
 	return t.l2
 }
 
+// dropCache throws away every cached block of both levels and leaves the target,
+// its sessions and its L2 file in place. It backs the client's "clear cache":
+// unlike Remove, which tears the sessions down and makes the guest remount, a
+// read cache can be emptied under a live initiator.
+//
+// Reports false for a target that has no cache at all (a passthrough target).
+func (t *target) dropCache() bool {
+	if t.isClosed() {
+		return false
+	}
+	c := t.getCache()
+	if c == nil {
+		return false
+	}
+	c.Drop()
+	return true
+}
+
 // lunBlockSize returns the backing LUN's logical block size, or 0 until a READ
 // CAPACITY response has been observed.
 func (t *target) lunBlockSize() uint32 {

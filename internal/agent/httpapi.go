@@ -45,6 +45,9 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/cache", a.handleCacheStatus)
 	// 近 5 分钟的缓存指标采样（存储库页面"缓存指标曲线"弹窗）。
 	mux.HandleFunc("GET /agent/cache/history", a.handleCacheHistory)
+	// 清空某个库的本地读缓存内容（两级都清，会话与门户目标都留着）——存储库设置里的
+	// "清空缓存"。POST 而非 DELETE 的理由同上：主进程按方法放行。
+	mux.HandleFunc("POST /agent/cache/clear", a.handleCacheClear)
 
 	mux.HandleFunc("GET /agent/config", a.handleGetConfig)
 	mux.HandleFunc("PATCH /agent/config", a.handlePatchConfig)
@@ -469,6 +472,58 @@ func (a *Agent) handleCacheStatus(w http.ResponseWriter, _ *http.Request) {
 // handleCacheHistory 返回近 5 分钟的缓存指标采样（每 5 秒一点，见 cacheproxy.go）。
 func (a *Agent) handleCacheHistory(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, a.cache.History())
+}
+
+// cacheClearRequest 是清空缓存的入参：给 repo_id（界面手里只有库 ID）或
+// allocation_id，至少一个。
+type cacheClearRequest struct {
+	RepoID       string `json:"repo_id"`
+	AllocationID string `json:"allocation_id"`
+}
+
+// cacheClearResponse 汇报**实际**清掉的目标：目标按分配注册，一个库可能同时有多个
+// 分配的记录，也可能一个都没有。cleared=false 表示这次没有缓存目标可清（库没挂载、走了
+// 直连、或注册的是纯透传目标），界面据此如实提示，而不是报一句"已清空"。
+type cacheClearResponse struct {
+	Cleared       bool     `json:"cleared"`
+	AllocationIDs []string `json:"allocation_ids"`
+}
+
+// handleCacheClear 清空指定存储库的本地读缓存内容（L1 与 L2 两级，见 cacheproxy.go）。
+//
+// 缓存目标按分配注册，而界面手里只有库 ID，所以这里先把库映射到本次挂载的分配。库当前
+// 没有挂载记录时没有目标可清，直接回 cleared=false，不当作请求错误。
+func (a *Agent) handleCacheClear(w http.ResponseWriter, r *http.Request) {
+	var req cacheClearRequest
+	if err := decodeJSON(r, &req); err != nil {
+		a.writeError(w, err)
+		return
+	}
+	allocs := make([]string, 0, 1)
+	switch {
+	case strings.TrimSpace(req.AllocationID) != "":
+		allocs = append(allocs, strings.TrimSpace(req.AllocationID))
+	case strings.TrimSpace(req.RepoID) != "":
+		repoID := strings.TrimSpace(req.RepoID)
+		for _, ms := range a.store.ListMounts() {
+			if ms.RepoID == repoID && strings.TrimSpace(ms.AllocationID) != "" {
+				allocs = append(allocs, strings.TrimSpace(ms.AllocationID))
+			}
+		}
+	default:
+		a.writeError(w, apperr.InvalidParam("repo_id"))
+		return
+	}
+	cleared := make([]string, 0, len(allocs))
+	for _, id := range allocs {
+		if a.cache.ClearTarget(id) {
+			cleared = append(cleared, id)
+		}
+	}
+	a.writeJSON(w, http.StatusOK, cacheClearResponse{
+		Cleared:       len(cleared) > 0,
+		AllocationIDs: cleared,
+	})
 }
 
 // ---- 本地配置 ----

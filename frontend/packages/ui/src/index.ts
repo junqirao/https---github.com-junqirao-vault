@@ -100,7 +100,7 @@ export { StatusTag, type StatusTagProps } from './components/StatusTag'
 export { SystemDepsBanner } from './components/SystemDepsBanner'
 
 // 业务视图
-export { AboutDialog, type AboutDialogProps } from './features/about/AboutDialog'
+export { AboutPage, type AboutPageProps } from './features/about/AboutPage'
 export { LoginForm, type LoginFormProps, type LoginFormValues } from './features/auth/LoginForm'
 export {
   BlockedNotice,

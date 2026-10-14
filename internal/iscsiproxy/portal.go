@@ -114,6 +114,19 @@ func (p *Portal) Remove(key string) error {
 	return err
 }
 
+// DropCache empties the local read cache of one registered target and leaves the
+// target and its sessions alone. Reports false when the key is not registered
+// (the library is not mounted, or is not going through the proxy).
+func (p *Portal) DropCache(key string) bool {
+	p.mu.Lock()
+	t := p.targets[strings.TrimSpace(key)]
+	p.mu.Unlock()
+	if t == nil {
+		return false
+	}
+	return t.dropCache()
+}
+
 // Has reports whether a key is registered.
 func (p *Portal) Has(key string) bool {
 	p.mu.Lock()

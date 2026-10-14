@@ -475,6 +475,20 @@ CacheTargetStatus = {
 - **卸载即回收**：卸载时先断会话再注销该库在门户上的目标并回收其 L2 文件（顺序不能反，
   否则仍在飞的命令会失败）。
 
+```
+POST /agent/cache/clear            # 存储库设置里的"清空缓存"
+  ↓ {repo_id} | {allocation_id}    # 二者其一；都省略 → 400 system.invalid_param
+  ↑ {cleared:bool, allocation_ids:[string]}
+  # 清的是**缓存内容**（L1 内存缓存 + L2 文件两级一起丢），不是关缓存：
+  # 门户监听、门户上的目标、iSCSI 会话与挂载都留着，后续读命令照常走缓存路径重新填充。
+  # 已在飞的填充因分配号（epoch）被顶掉而作废，不会把旧数据写回新缓存（见 cache.Drop）。
+  # repo_id 与 allocation_id 只认本机**挂载记录**：界面手里只有库 ID，代理先经
+  #   ListMounts() 映射到该库本次挂载的分配；没挂载就没有缓存目标（直连，缓存压根不存在）
+  #   → cleared=false，**不是**错误（200）。库 ID 未知也一样是 200 + cleared=false：
+  #   没有缓存可清不该报错。
+  # allocation_ids 列出实际清掉的分配（一个库正常只有一条），便于界面确认与日志溯源。
+```
+
 ## 磁盘内容下载（把母盘拷贝到本地）
 
 把服务端的**母盘（parent）VHDX** 整盘拷贝到客户端本地目录。仅母盘可下载；

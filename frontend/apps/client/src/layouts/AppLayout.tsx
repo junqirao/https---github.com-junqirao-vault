@@ -29,7 +29,6 @@ import { CLIENT_VERSION } from '../config'
 import { normalizeUrl } from '../store/appStore'
 
 import {
-  AboutDialog,
   LanguageSwitcher,
   LayoutModeProvider,
   LoadingState,
@@ -87,8 +86,6 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   const latency = useServerLatency(active?.baseUrl)
   // 手动重连进行中（按钮转圈）：只影响按钮，不参与任何状态判定。
   const [serverRetrying, setServerRetrying] = useState(false)
-  // 「关于」弹窗：入口在侧边栏菜单（应用端在「配置」下方，管理端在末尾），内容见 AboutDialog。
-  const [aboutOpen, setAboutOpen] = useState(false)
 
   /**
    * 平台能力（匿名接口，管理端才查）：目前只用它判断「孤儿磁盘」这项菜单该不该出现。
@@ -111,7 +108,7 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
     { key: '/settings', icon: <SettingOutlined />, label: t('nav.settings') },
     // 「关于」紧贴「配置」之下：两者都是"这台客户端自己"的事（配置改行为，关于看版本与许可）。
     // 被问"你那边是什么版本"时用户第一眼会往侧边栏找，排在配置下面最顺手。
-    { key: 'about', icon: <InfoCircleOutlined />, label: t('nav.about') }
+    { key: '/about', icon: <InfoCircleOutlined />, label: t('nav.about') }
   ]
 
   // 紧挨「存储」：孤儿磁盘就是存储根里"未登记却真实存在"的 VHDX，属于存储侧清理入口；
@@ -130,9 +127,10 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
     { key: '/admin/audit', icon: <AuditOutlined />, label: t('nav.audit') },
     { key: '/admin/logs', icon: <FileTextOutlined />, label: t('nav.serverLogs') },
     { key: '/admin/system', icon: <ClusterOutlined />, label: t('nav.system') },
-    // 管理端也留一个：关于里的版本/协议/许可是登录角色无关的，排障时不该因为"当前在管理端"就找不到。
-    // 它不是路由（key 不像上面那些以 / 开头），所以点它只开弹窗，见下面 Menu 的 onClick。
-    { key: 'about', icon: <InfoCircleOutlined />, label: t('nav.about') }
+    // 管理端也留一个：关于里的版本/许可是登录角色无关的，排障时不该因为"当前在管理端"就找不到。
+    // 路径带 /admin 前缀：管理外壳的路由是挂在 /admin 下的，写 '/about' 会跳到应用端那棵树上
+    // （菜单高亮与外壳模式都会跟着不对）。
+    { key: '/admin/about', icon: <InfoCircleOutlined />, label: t('nav.about') }
   ]
 
   const menuItems = mode === 'admin' ? adminMenuItems : appMenuItems
@@ -404,14 +402,8 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
                 selectedKeys={[selectedKey]}
                 items={menuItems}
                 style={{ borderInlineEnd: 'none' }}
-                onClick={({ key }) => {
-                  // 「关于」是弹窗不是页面：拦下导航（key 也不进 selectedKeys，点了不会留高亮）。
-                  if (key === 'about') {
-                    setAboutOpen(true)
-                    return
-                  }
-                  navigate(key)
-                }}
+                // 每一项都是路由（包括「关于」）：不再有"点了开弹窗、不留高亮"的特例。
+                onClick={({ key }) => navigate(key)}
               />
             </div>
             {mode === 'admin' ? (
@@ -573,9 +565,6 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
           </div>
         </Layout>
       </Layout>
-
-      {/* 「关于」：版本、协议版本与开源许可集中在这里（入口在右上角用户菜单）。 */}
-      <AboutDialog open={aboutOpen} clientVersion={CLIENT_VERSION} onClose={() => setAboutOpen(false)} />
     </LayoutModeProvider>
   )
 }

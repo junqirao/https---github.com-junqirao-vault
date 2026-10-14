@@ -479,7 +479,7 @@ function createTray(): void {
       Menu.buildFromTemplate([
         { label: '显示窗口', click: () => showWindow() },
         // 版本与开源许可不再打在托盘上：它们是"偶尔核对一次"的信息，已集中进客户端侧边栏的
-        // 「关于」（见 packages/ui 的 AboutDialog），托盘只留最常用的动作。
+        // 「关于」（见 packages/ui 的 AboutPage），托盘只留最常用的动作。
         { type: 'separator' },
         {
           label: '退出',

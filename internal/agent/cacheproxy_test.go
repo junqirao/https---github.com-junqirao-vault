@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -207,6 +210,62 @@ func TestCacheStatusWithoutPortal(t *testing.T) {
 	// ReleaseTarget 在门户未打开时必须是安全空操作（卸载路径会无条件调它）。
 	if err := m.ReleaseTarget("alloc-1"); err != nil {
 		t.Fatalf("未打开门户时 ReleaseTarget 应为空操作，实际 %v", err)
+	}
+}
+
+// TestClearTargetWithoutPortal 门户没打开时清缓存必须是安全空操作并如实回 false：
+// 界面据此提示"当前没有缓存可清"，而不是报一句"已清空"。
+func TestClearTargetWithoutPortal(t *testing.T) {
+	store := newCacheTestStore(t)
+	m := newCacheManager(store, testLogger())
+	if m.ClearTarget("alloc-1") {
+		t.Fatal("门户未打开时不应报告已清空")
+	}
+	if m.ClearTarget("   ") {
+		t.Fatal("空分配 ID 不应报告已清空")
+	}
+	// 未初始化（单测里直接构造 Agent）时同样不能 panic。
+	var zero *cacheManager
+	if zero.ClearTarget("alloc-1") {
+		t.Fatal("零值管理器不应报告已清空")
+	}
+}
+
+// TestHandleCacheClear 锁定清空缓存的入参与"没有目标可清"的语义。
+//
+// 缓存目标按分配注册，界面手里只有库 ID：这里覆盖库没挂载（没有目标，如实回
+// cleared=false，不是错误）与两个 ID 都不给（请求本身不合法）两种情形。
+func TestHandleCacheClear(t *testing.T) {
+	a := newServerConnectTestAgent(t)
+
+	bare := httptest.NewRecorder()
+	a.handleCacheClear(bare, httptest.NewRequest(http.MethodPost, "/agent/cache/clear", strings.NewReader(`{}`)))
+	if bare.Code != http.StatusBadRequest {
+		t.Fatalf("两个 ID 都不给应 400，实际 %d：%s", bare.Code, bare.Body.String())
+	}
+
+	// 库有挂载记录，但缓存管理器未初始化（等于门户没起来）：没有目标可清。
+	a.store.PutMount(&MountState{RepoID: "repo-1", AllocationID: "alloc-1"}, &mountRuntime{})
+	rec := httptest.NewRecorder()
+	a.handleCacheClear(rec, httptest.NewRequest(http.MethodPost, "/agent/cache/clear",
+		strings.NewReader(`{"repo_id":"repo-1"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("没有目标可清不该报错，实际 %d：%s", rec.Code, rec.Body.String())
+	}
+	var got cacheClearResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("响应不是 JSON：%v（%s）", err, rec.Body.String())
+	}
+	if got.Cleared || len(got.AllocationIDs) != 0 {
+		t.Fatalf("没有目标可清时必须如实回 false，实际 %+v", got)
+	}
+
+	// 未知库同理：没有挂载记录 = 没有目标。
+	rec = httptest.NewRecorder()
+	a.handleCacheClear(rec, httptest.NewRequest(http.MethodPost, "/agent/cache/clear",
+		strings.NewReader(`{"repo_id":"repo-unknown"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("未知库不该报错，实际 %d：%s", rec.Code, rec.Body.String())
 	}
 }
 

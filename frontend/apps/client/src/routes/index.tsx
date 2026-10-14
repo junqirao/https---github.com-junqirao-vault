@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
 
 import {
+  AboutPage,
   AuditList,
   ClientSettings,
   EmptyState,
@@ -23,6 +24,8 @@ import {
 } from '@vault/ui'
 
 import { AppLayout } from '../layouts/AppLayout'
+// 客户端版本由宿主注入（真源是 apps/client/package.json，构建期 define 进 CLIENT_VERSION）。
+import { CLIENT_VERSION } from '../config'
 import { useAppStore } from '../store/appStore'
 import type { AutoMountProgress } from '../flow/useStartupFlow'
 
@@ -126,6 +129,9 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
         <Route path="logs" element={<LogViewer />} />
         <Route path="repos/:repoId" element={<RepoDetailRoute />} />
         <Route path="settings" element={<ClientSettingsRoute />} />
+        {/* 「关于」是页面而不是弹窗：链接能分享、刷新能回来、前进后退也对得上
+            （弹窗关掉就等于没去过，被问"你那边什么版本"时没法把它留在那儿对着念）。 */}
+        <Route path="about" element={<AboutPage clientVersion={CLIENT_VERSION} />} />
         <Route path="*" element={<NotFoundRoute />} />
       </Route>
 
@@ -188,6 +194,8 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
             客户端自己的代理日志在应用端 /logs，两者不是一回事。 */}
         <Route path="logs" element={<LogViewer source="server" />} />
         <Route path="system" element={<SystemSettings isSuperAdmin={isSuperAdmin} />} />
+        {/* 管理端同一份内容、同一个页面组件：版本/许可与登录角色无关（见 AppLayout 管理端菜单）。 */}
+        <Route path="about" element={<AboutPage clientVersion={CLIENT_VERSION} />} />
       </Route>
     </Routes>
   )

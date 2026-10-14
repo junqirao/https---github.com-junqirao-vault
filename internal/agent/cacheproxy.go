@@ -363,6 +363,28 @@ func (m *cacheManager) runningPortal() *iscsiproxy.Portal {
 	return m.portal
 }
 
+// ClearTarget 丢弃某个库的本地读缓存内容（L1 与 L2 两级），门户目标与正在进行的会话
+// 都保留：读缓存可以在挂载期间清空，不必让客户机重新登录。
+//
+// 返回 false 表示这个库当前没有缓存目标——没挂载、这次走了直连，或该库注册的是纯透传
+// 目标——调用方据此如实告诉用户"没有可清的缓存"，而不是假装清掉了。
+func (m *cacheManager) ClearTarget(allocationID string) bool {
+	// 零值 cacheManager（单测里直接构造的 Agent，见 TestUsageSnapshotWithoutCache）没有
+	// 门户可查：当作没有目标可清，而不是 panic。
+	if m == nil {
+		return false
+	}
+	allocationID = strings.TrimSpace(allocationID)
+	if allocationID == "" {
+		return false
+	}
+	p := m.runningPortal()
+	if p == nil {
+		return false
+	}
+	return p.DropCache(allocationID)
+}
+
 // EnsureTarget 为该库注册/复用代理目标。幂等：key 已在门户中时直接返回。
 //
 // 开缓存的库注册带缓存的代理目标；**未开缓存的库也走这里**，只是注册成纯透传目标
