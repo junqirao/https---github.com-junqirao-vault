@@ -327,6 +327,85 @@ func TestScanDetectionDisabled(t *testing.T) {
 	}
 }
 
+func TestFillAdmitStreamSpan(t *testing.T) {
+	// A 64 KiB block and a one MiB budget is sixteen blocks, which is the span a
+	// stream may cover before nothing it installs can survive until it comes
+	// round again.
+	const (
+		blockSize = 64 << 10
+		l1Bytes   = 1 << 20
+	)
+	newCache := func(scan bool) *Cache {
+		return newTestCache(t, testOpts{blockSize: blockSize, l1Bytes: l1Bytes, shards: 4, scan: scan})
+	}
+
+	t.Run("stream inside L1 keeps installing", func(t *testing.T) {
+		c := newCache(true)
+		for i := int64(0); i < 16; i++ {
+			if !c.FillAdmit(i*blockSize, blockSize) {
+				t.Fatalf("read at %d refused while the stream still fits in L1", i*blockSize)
+			}
+		}
+	})
+
+	t.Run("stream past L1 stops installing", func(t *testing.T) {
+		c := newCache(true)
+		var admitted int
+		for i := int64(0); i < 48; i++ {
+			if c.FillAdmit(i*blockSize, blockSize) {
+				admitted++
+			}
+		}
+		// The first sixteen blocks are the ones the L1 can hold. Past that the span
+		// is wider than the cache, and every further install pays a copy and an
+		// eviction for data no read can come back for: the refusal holds for the
+		// rest of the pass, which is also what keeps the resident blocks resident
+		// instead of letting the stream evict its own beginning.
+		if admitted != 16 {
+			t.Fatalf("admitted %d of 48 reads, want 16 (what the L1 can hold)", admitted)
+		}
+		if got := c.Stats().FillSkips; got != 32 {
+			t.Fatalf("fill skips = %d, want 32", got)
+		}
+	})
+
+	t.Run("read behind the span starts its own", func(t *testing.T) {
+		c := newCache(true)
+		for i := int64(64); i < 112; i++ { // a stream that starts four MiB in
+			c.FillAdmit(i*blockSize, blockSize)
+		}
+		// A read that lands before everything covered is a different region, and is
+		// judged on its own instead of inheriting this span's width.
+		if !c.FillAdmit(0, blockSize) {
+			t.Fatal("read before the span was refused")
+		}
+	})
+
+	t.Run("distant read is its own stream", func(t *testing.T) {
+		c := newCache(true)
+		if !c.FillAdmit(0, blockSize) {
+			t.Fatal("first read refused")
+		}
+		// Large random reads land far apart. Each has to be judged on its own
+		// rather than widening one span until the cache refuses to fill for a
+		// device it merely happens to be spread across.
+		for _, off := range []int64{1 << 40, 2 << 40, 3 << 40} {
+			if !c.FillAdmit(off, blockSize) {
+				t.Fatalf("distant read at %d refused", off)
+			}
+		}
+	})
+
+	t.Run("admission off admits everything", func(t *testing.T) {
+		c := newCache(false)
+		for i := int64(0); i < 128; i++ {
+			if !c.FillAdmit(i*blockSize, blockSize) {
+				t.Fatalf("read at %d refused with scan admission disabled", i*blockSize)
+			}
+		}
+	})
+}
+
 func TestDropEmptiesL1(t *testing.T) {
 	const bs, ss = 16 << 10, 4 << 10
 	src := newFakeSource(ss, 4<<20)

@@ -163,6 +163,10 @@ type Stats struct {
 	// (no backend read at all). It is the counter a hit rate can be computed
 	// from: the other hit counters are per block segment or per sector run.
 	RequestHits atomic.Int64
+	// FillSkips counts streamed reads that were forwarded without being
+	// installed because the stream had already covered more ground than L1 can
+	// hold. See Cache.FillAdmit.
+	FillSkips atomic.Int64
 }
 
 // Snapshot is a plain copy of the counters, for logging.
@@ -173,6 +177,7 @@ type Stats struct {
 type Snapshot struct {
 	Reads, L1Hits, PartialHits, L2Hits, BackendReads, Fills, Evictions, Invalidations, ScanBypass int64
 	RequestHits                                                                                   int64
+	FillSkips                                                                                     int64
 	L1UsedBytes                                                                                   int64
 	L1LimitBytes                                                                                  int64
 }
@@ -182,7 +187,7 @@ func (s *Stats) snapshot() Snapshot {
 		Reads: s.Reads.Load(), L1Hits: s.L1Hits.Load(), PartialHits: s.PartialHits.Load(),
 		L2Hits: s.L2Hits.Load(), BackendReads: s.BackendReads.Load(), Fills: s.Fills.Load(),
 		Evictions: s.Evictions.Load(), Invalidations: s.Invalidations.Load(), ScanBypass: s.ScanBypass.Load(),
-		RequestHits: s.RequestHits.Load(),
+		RequestHits: s.RequestHits.Load(), FillSkips: s.FillSkips.Load(),
 	}
 }
 
@@ -806,6 +811,28 @@ type StreamFill struct {
 	epochs   []uint64
 }
 
+// FillAdmit reports whether a streamed read of length bytes at off is worth
+// installing into L1 as it passes.
+//
+// It is the streaming path's half of the sequential-scan admission rule. That
+// path forwards a long read block by block and never consults the run detector,
+// so without this a sequential run over a region larger than L1 installs every
+// block it reads and evicts every one of them unused: the copy, the eviction and
+// the allocation are all paid on the client's path for data no later read can
+// come back for, which is the run that loses to running uncached.
+//
+// The budget compared against is the whole L1, not a shard: a stream's blocks
+// are spread over the shards by block number, so what decides whether a block
+// survives until the stream comes round again is how far the stream has
+// travelled against all of L1.
+func (c *Cache) FillAdmit(off, length int64) bool {
+	if c.scan.admitStream(off, length, int64(c.totalBlocks)*int64(c.blockSize)) {
+		return true
+	}
+	c.stats.FillSkips.Add(1)
+	return false
+}
+
 // BeginFill prepares an L1 fill for [off, off+length), capturing the covered
 // shards' epochs before any data is read. It returns nil when the range cannot
 // be installed block by block (empty, misaligned, or the cache is closing), in
@@ -1415,6 +1442,15 @@ type scanDetector struct {
 	enabled   bool
 	threshold int
 	buckets   []scanBucket
+
+	// streamMu guards the span of the stream currently being forwarded, the
+	// state admitStream decides on. It is one span rather than one per bucket:
+	// the question is about the L1 as a whole, and it is asked once per large
+	// read rather than once per sector run, so there is nothing to fan out.
+	streamMu    sync.Mutex
+	streamStart int64
+	streamEnd   int64
+	streamLive  bool
 }
 
 type scanBucket struct {
@@ -1445,4 +1481,48 @@ func (d *scanDetector) observe(off, length int64) bool {
 	}
 	b.lastEnd = off + length
 	return b.run >= d.threshold
+}
+
+// admitStream reports whether a read of length bytes at off, large enough to be
+// forwarded as a stream, is worth installing into L1 on the way past.
+//
+// The rule is geometry rather than pattern matching, because a block the stream
+// installs is only read back when the stream comes round again, and it is only
+// still there if everything installed after it fits in L1 as well. So the
+// detector follows how far the current stream has already travelled: once its
+// span is wider than the whole L1, the blocks at the front of it have been
+// evicted by the ones behind, and every further install pays a block-sized copy,
+// an eviction and a slice allocation for data no read can come back for.
+//
+// A stream that stays inside the L1 span keeps installing, so a working set that
+// fits behaves as before, and a read that jumps further than the span covered so
+// far starts a new span instead of extending this one - which is what keeps
+// large random reads, scattered over a device far wider than L1, from being
+// mistaken for one long sequential run.
+//
+// The state is a consequence of the reads this detector is shown, so it only
+// ever sees reads the caller considered streamable: a workload whose reads are
+// all small never moves the span, and never reaches this decision.
+func (d *scanDetector) admitStream(off, length, limit int64) bool {
+	if !d.enabled {
+		return true
+	}
+	end := off + length
+	d.streamMu.Lock()
+	span := d.streamEnd - d.streamStart
+	switch {
+	case !d.streamLive || end <= d.streamStart:
+		// The first streamed read, or one that lands behind everything the
+		// current stream has covered: a new stream, or this one come round.
+		d.streamStart, d.streamEnd, d.streamLive = off, end, true
+	case off > d.streamEnd && off-d.streamEnd > span:
+		// A jump wider than the stream has travelled is unrelated to what came
+		// before it, so it starts its own span rather than widening this one.
+		d.streamStart, d.streamEnd = off, end
+	case end > d.streamEnd:
+		d.streamEnd = end
+	}
+	span = d.streamEnd - d.streamStart
+	d.streamMu.Unlock()
+	return span <= limit
 }

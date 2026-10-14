@@ -875,7 +875,6 @@ func (s *session) writeDataInBatch(itt uint32, data []byte, off uint32, dataSN u
 	hdrs := make([]byte, n*len(bhs))
 	bufs := make(net.Buffers, 0, n*3)
 	var pad [3]byte
-	expCmdSN := s.expCmdSN.Load()
 
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
@@ -883,6 +882,15 @@ func (s *session) writeDataInBatch(itt uint32, data []byte, off uint32, dataSN u
 	if last {
 		statSN = s.statSN
 	}
+	// ExpCmdSN is read under sendMu, like statSN and like every other writer of a
+	// PDU. It only ever grows (noteCommand raises it as commands arrive), so
+	// reading it at the moment the batch is written is what keeps the value the
+	// client sees non-decreasing: read before the lock, a batch that reaches the
+	// connection later can carry a smaller ExpCmdSN than one already sent, and the
+	// command window appears to go backwards on a connection with several
+	// commands in flight. One command at a time cannot reorder, which is why this
+	// only shows up with queue depth.
+	expCmdSN := s.expCmdSN.Load()
 	for i := 0; i < n; i++ {
 		seg := data[i*chunk:]
 		if len(seg) > chunk {

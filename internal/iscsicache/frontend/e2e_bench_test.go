@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -164,7 +165,10 @@ func e2eLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, 
 type e2eEndpoint struct {
 	addr string
 	iqn  string
-	stop func()
+	// cache is the middle proxy's L1, when it has one, so a benchmark can report
+	// what the fills actually bought.
+	cache *cache.Cache
+	stop  func()
 }
 
 // e2eStartStorage brings up the backing target the product would talk to: the
@@ -197,6 +201,26 @@ func e2eStartStorage(b *testing.B, ctx context.Context, link *e2eLink) *e2eEndpo
 // hop is not pinned to one core.
 func e2eStartProxy(b *testing.B, ctx context.Context, cached bool, link *e2eLink) *e2eEndpoint {
 	b.Helper()
+	l1 := int64(0)
+	if cached {
+		l1 = 16 << 20
+	}
+	return e2eStartProxySize(b, ctx, l1, 0, link)
+}
+
+// e2eStartProxySize builds the middle proxy with an explicit L1 budget and shard
+// count; l1 == 0 leaves the cache off. The size is a knob because the cache's
+// usefulness is a question of geometry: a sequential stream revisits a shard
+// only every `shards` blocks, so at 64 KiB blocks over a 64 MiB region a
+// small-shard L1 is refilled with blocks that are evicted before anything reads
+// them again, while a large enough L1 turns the same fills into hits.
+//
+// Sizing L1 downwards is not free: New floors a shard at eight blocks, so the
+// smallest L1 the defaults allow is 256 shards * 8 blocks * 64 KiB = 128 MiB of
+// shards of capacity no matter what budget is asked for. Fewer shards is what
+// actually shrinks the cache.
+func e2eStartProxySize(b *testing.B, ctx context.Context, l1 int64, shards int, link *e2eLink) *e2eEndpoint {
+	b.Helper()
 	storage := e2eStartStorage(b, ctx, link)
 
 	be, err := backend.DialPool(ctx, backend.Config{
@@ -208,9 +232,18 @@ func e2eStartProxy(b *testing.B, ctx context.Context, cached bool, link *e2eLink
 	}
 
 	pxCfg := proxy.Config{Backend: be, TargetIQN: "iqn.e2e:proxy", Logger: e2eLogger()}
-	if cached {
-		c, err := cache.New(cache.Config{
-			BlockSize: cache.DefaultBlockSize, SectorSize: 4096, L1Bytes: 16 << 20,
+	var c *cache.Cache
+	if l1 > 0 {
+		// ScanEnabled is off by default so these numbers stay comparable with the
+		// ones recorded before the knob existed. The service turns scan admission
+		// on (CacheConfig.applyDefaults), so VAULT_BENCH_SCAN=1 measures what a
+		// deployment actually runs and is also how the stream admission rule is
+		// A/B'd: the large reads below are streamed, which never consults the run
+		// detector, so with it on the only admission that differs is the stream
+		// span rule.
+		c, err = cache.New(cache.Config{
+			BlockSize: cache.DefaultBlockSize, SectorSize: 4096, L1Bytes: l1, Shards: shards,
+			ScanEnabled: os.Getenv("VAULT_BENCH_SCAN") != "",
 		})
 		if err != nil {
 			b.Fatalf("cache: %v", err)
@@ -229,15 +262,35 @@ func e2eStartProxy(b *testing.B, ctx context.Context, cached bool, link *e2eLink
 	}
 	go func() { _ = target.Serve(ctx) }()
 	return &e2eEndpoint{
-		addr: target.Addr().String(), iqn: "iqn.e2e:proxy",
+		addr: target.Addr().String(), iqn: "iqn.e2e:proxy", cache: c,
 		stop: func() { _ = target.Close(); _ = be.Close(); storage.stop() },
 	}
 }
 
+// e2eReport fills logs what the cache did during the timed run, so a throughput
+// number can be read against the fills that produced it.
+func e2eReportFills(b *testing.B, ep *e2eEndpoint) {
+	b.Helper()
+	if ep.cache == nil {
+		return
+	}
+	s := ep.cache.Stats()
+	b.Logf("cache: reads=%d l1hits=%d requesthits=%d fills=%d evictions=%d scanbypass=%d fillskips=%d l1used=%d/%d",
+		s.Reads, s.L1Hits, s.RequestHits, s.Fills, s.Evictions, s.ScanBypass, s.FillSkips, s.L1UsedBytes, s.L1LimitBytes)
+}
+
 func e2eDial(b *testing.B, ctx context.Context, addr, iqn string) *backend.Initiator {
 	b.Helper()
+	return e2eDialWith(b, ctx, addr, iqn, 0)
+}
+
+// e2eDialWith dials with an explicit MaxRecvDataSegmentLength, so a run can
+// announce the 64 KiB segments a Windows initiator announces instead of this
+// initiator's 256 KiB default.
+func e2eDialWith(b *testing.B, ctx context.Context, addr, iqn string, mrdsl int) *backend.Initiator {
+	b.Helper()
 	it, err := backend.Dial(ctx, backend.Config{
-		Address: addr, TargetIQN: iqn,
+		Address: addr, TargetIQN: iqn, MaxRecvDataSegmentLength: mrdsl,
 		IOTimeout: 10 * time.Second, DialTimeout: 5 * time.Second, Logger: e2eLogger(),
 	})
 	if err != nil {
@@ -280,6 +333,20 @@ func e2eSizeName(n int64) string {
 	default:
 		return fmt.Sprintf("%dB", n)
 	}
+}
+
+// e2eNextStart hands out the next 1 MiB-aligned offset of a stream that cycles
+// the whole device. The position has to be reduced modulo the device on every
+// call: an earlier version reset the offset to zero once the counter ran past
+// the device, which left every later read pinned at offset zero, so a "stream"
+// benchmark quietly became a hot-read benchmark that the cache served from L1
+// without ever filling or evicting.
+func e2eNextStart(seq *atomic.Uint64, blocks, devBlocks uint64) uint64 {
+	span := devBlocks / blocks * blocks
+	if span == 0 {
+		return 0
+	}
+	return (seq.Add(blocks) - blocks) % span
 }
 
 func e2eRunReads(b *testing.B, s *e2eStack, size int64, stream bool) {
@@ -385,10 +452,7 @@ func e2eRunReadsParallel(b *testing.B, ctx context.Context, ep *e2eEndpoint, siz
 			for i := 0; i < n; i++ {
 				var start uint64
 				if stream {
-					start = seq.Add(uint64(blocks)) - uint64(blocks)
-					if start+uint64(blocks) > devBlocks {
-						start = 0
-					}
+					start = e2eNextStart(&seq, uint64(blocks), devBlocks)
 				}
 				res, err := client.ExecInto(ctx, e2eReadCDB(start, blocks), nil, buf)
 				if err != nil {
@@ -429,6 +493,111 @@ func BenchmarkEndToEndReadConcurrent(b *testing.B) {
 			defer ep.stop()
 			e2eRunReadsParallel(b, ctx, ep, size, true, workers)
 		})
+	}
+}
+
+// e2eRunReadsOneSession drives one client session with depth commands
+// outstanding, which is the shape a real initiator presents: a Windows mount
+// puts its whole queue depth on the one connection it has. The per-worker
+// benchmark above buys depth with extra sessions, so it cannot show what a deep
+// queue on one connection does to the proxy, and that is exactly the case a
+// CrystalDiskMark sequential run exercises.
+func e2eRunReadsOneSession(b *testing.B, ctx context.Context, ep *e2eEndpoint, size int64, mrdsl int, depth int, stream bool) {
+	b.Helper()
+	if depth < 1 {
+		depth = 1
+	}
+	if depth > b.N {
+		depth = b.N
+	}
+	blocks := uint32(size / e2eBlockSize)
+	devBlocks := uint64(e2eDeviceMB<<20) / e2eBlockSize
+
+	client := e2eDialWith(b, ctx, ep.addr, ep.iqn, mrdsl)
+	defer client.Close()
+
+	per, extra := b.N/depth, b.N%depth
+	var seq atomic.Uint64
+
+	b.SetBytes(size)
+	b.ResetTimer()
+	var wg sync.WaitGroup
+	for w := 0; w < depth; w++ {
+		n := per
+		if w < extra {
+			n++
+		}
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			buf := make([]byte, size)
+			for i := 0; i < n; i++ {
+				var start uint64
+				if stream {
+					start = e2eNextStart(&seq, uint64(blocks), devBlocks)
+				}
+				res, err := client.ExecInto(ctx, e2eReadCDB(start, blocks), nil, buf)
+				if err != nil {
+					b.Errorf("read: %v", err)
+					return
+				}
+				if len(res.Data) != int(size) {
+					b.Errorf("read returned %d of %d bytes", len(res.Data), size)
+					return
+				}
+			}
+		}(n)
+	}
+	wg.Wait()
+	b.StopTimer()
+}
+
+// BenchmarkEndToEndReadQueueDepth is the CrystalDiskMark sequential profile on
+// the connection shape a real mount has: one session, one MiB reads, QD1 against
+// QD8. QD8 must not be slower than QD1 — the client is offering the proxy more
+// work to overlap, and the only thing the extra depth may cost is bookkeeping.
+//
+// The mrdsl sub-benchmarks split the client segment size, because that is the
+// granularity at which the frontend interleaves several commands' Data-In on the
+// one connection: 64 KiB is what the Microsoft initiator announces, 256 KiB is
+// this initiator's default. The streams are kept cold: the region cycles the
+// whole device, which is four times the 16 MiB L1 the harness builds.
+func BenchmarkEndToEndReadQueueDepth(b *testing.B) {
+	const size = 1 << 20
+	caches := []struct {
+		name   string
+		l1     int64
+		shards int
+	}{
+		{"nocache", 0, 0},
+		// 4 shards * 4 blocks floors the L1 at 1 MiB against a 64 MiB region, so
+		// every block a fill installs has been evicted by the time the stream comes
+		// round again: the fills are pure overhead. This is the shape a 256 MiB L1
+		// under a 1 GiB sequential region has.
+		{"l1-thrash-1m", 1 << 20, 4},
+		// The whole region fits, so the same fills are read back.
+		{"l1-fits-16m", 16 << 20, 0},
+	}
+	for _, client := range []struct {
+		name  string
+		mrdsl int
+	}{
+		{"win64k", 64 << 10},
+		{"dsl256k", 256 << 10},
+	} {
+		for _, cc := range caches {
+			for _, depth := range []int{1, 8} {
+				qd := fmt.Sprintf("qd%d", depth)
+				b.Run(cc.name+"/"+client.name+"/"+qd, func(b *testing.B) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					ep := e2eStartProxySize(b, ctx, cc.l1, cc.shards, nil)
+					defer ep.stop()
+					e2eRunReadsOneSession(b, ctx, ep, size, client.mrdsl, depth, true)
+					e2eReportFills(b, ep)
+				})
+			}
+		}
 	}
 }
 

@@ -271,8 +271,8 @@ func (p *Proxy) cacheableStream(cdb []byte) bool {
 
 // readStreamFilled serves a large cached read by streaming. A range that is
 // already entirely in L1 is answered from memory; anything else is read from the
-// backing target once, forwarded segment by segment, and installed into L1 as it
-// passes through.
+// backing target once and forwarded segment by segment, installing it into L1 as
+// it passes through unless the stream has already outrun L1 (Cache.FillAdmit).
 func (p *Proxy) readStreamFilled(ctx context.Context, cdb []byte, inLen int, st backend.Streamer, sink frontend.DataInSink) (frontend.Result, error) {
 	params, err := iscsi.ParseReadWrite(cdb)
 	if err != nil {
@@ -302,8 +302,14 @@ func (p *Proxy) readStreamFilled(ctx context.Context, cdb []byte, inLen int, st 
 	}
 	putReadBuf(buf)
 
-	// Cold: stream the payload and fill from the segments on the way past.
-	fill := p.c.BeginFill(off, length)
+	// Cold: stream the payload and fill from the segments on the way past, as long
+	// as the fill can still be read back before the stream evicts it. A stream
+	// wider than L1 cannot, and the payload has to reach the client either way, so
+	// skipping the install only drops work from the path.
+	var fill *cache.StreamFill
+	if p.c.FillAdmit(off, length) {
+		fill = p.c.BeginFill(off, length)
+	}
 	p.stats.Reads.Add(1)
 	res, err := st.ExecStream(ctx, cdb, int(length), fillSink{dst: sink, fill: fill})
 	if err != nil {
