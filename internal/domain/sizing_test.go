@@ -5,9 +5,9 @@ import "testing"
 // TestCalculateVHDXSizeUsesMBGranularity 锁定"按 MB 取整"的容量推导。
 //
 // 背景（真实反馈："我一点空间都没用就占了 1G"）：旧参数是 1GB 粒度 + 512MB 预留下限 +
-// 1GB 空目录兜底，于是**空目录/小目录**也会推导出 1GB 级的 VHDX 标称容量。而分配时是
-// **按母盘标称容量预留用量**的（差异盘建完后才按实测物理占用校正），于是每个分配一上来
-// 就占 1GB 配额。VHDX 是动态盘，标称容量只是上限 —— 按 MB 取整才符合实际占用。
+// 1GB 空目录兜底，于是**空目录/小目录**也会推导出 1GB 级的 VHDX 标称容量。而配额口径是
+// **已用 = 已分配磁盘总量**（分配那一刻起就按母盘标称容量计费），于是每个分配一上来
+// 就吃掉 1GB 配额。VHDX 是动态盘，标称容量只是上限 —— 按 MB 取整才符合实际占用。
 func TestCalculateVHDXSizeUsesMBGranularity(t *testing.T) {
 	const (
 		mib = int64(1) << 20

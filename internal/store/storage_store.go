@@ -135,12 +135,18 @@ func (s *Store) CountStorages(ctx context.Context) (int, error) {
 type StorageDiskStat struct {
 	// DiskCount 磁盘记录数。
 	DiskCount int
-	// UsedBytes 占用：按 diskAccountedBytes 的统一口径（与配额口径一致）。
+	// UsedBytes 宿主实际占用：按 diskAccountedBytes 的口径（见该函数注释）。
 	UsedBytes int64
 }
 
-// diskAccountedBytes 是"这块盘占了多少"的统一口径，必须与 accountedUsageSQL 保持一致
-// （改一处就要改另一处，两处都是给用户看的同一个数）：
+// diskAccountedBytes 是"这块盘在宿主上实际占了多少"的口径，给**存储页**用。
+//
+// ⚠️ 它**不是**配额口径：配额口径是"已用 = 已分配磁盘总量"（见 accountedUsageSQL），
+// 按盘的标称容量计费，与这里算出来的宿主物理占用是两回事，不要试图把两者对齐 ——
+// 配额要的是"分出去多少"，存储页要的是"卷上真实占了多大"（动态盘 / thin 差异盘通常
+// 远小于标称容量，两者本来就不该相等）。
+//
+// 单盘口径：
 //
 //	1. 有实测物理占用 → 用它；
 //	2. 建盘失败（error）→ 0，盘根本不存在；

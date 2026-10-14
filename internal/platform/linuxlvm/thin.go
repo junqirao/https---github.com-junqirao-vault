@@ -359,7 +359,9 @@ func (m *Manager) Delete(ctx context.Context, ref string) error {
 // 数值偏大，只能用于展示，不能用于配额精算。
 //
 // ⚠️ 返回 0 是**合法实测值**（差异盘刚派生时独占块就是 0，全部与母盘共享），
-// 不代表"没测到"：调用方与配额口径都必须按实测值处理（见 store.accountedUsageSQL）。
+// 不代表"没测到"：展示侧（存储页）必须按实测值处理，不能当成"尚未采样"退回标称容量
+// （否则新建的库一上线就"已用 100%"，见 store.diskAccountedBytes）。配额口径不看这个数：
+// 已用 = 已分配磁盘总量，按标称容量计费（见 store.accountedUsageSQL）。
 func (m *Manager) PhysicalSize(ref string) (int64, error) {
 	vg, lv, err := parseRef(ref)
 	if err != nil {

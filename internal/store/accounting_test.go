@@ -6,7 +6,8 @@ import (
 	"vault/internal/domain"
 )
 
-// TestDiskAccountedBytes 锁定"这块盘占了多少"的统一口径（与 accountedUsageSQL 同义）。
+// TestDiskAccountedBytes 锁定存储页的"宿主实际占用"口径（**不是**配额口径：
+// 配额按标称容量计费，见 accountedUsageSQL）。
 //
 // 重点是 ready + physical=0：thin 差异盘刚派生时独占块本来就是 0（全部与母盘共享），
 // 这是**实测值**而不是"没测到"。早先把它当成未采样、退回标称容量，导致新建的库

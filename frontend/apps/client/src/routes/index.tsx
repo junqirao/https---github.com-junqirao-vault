@@ -1,4 +1,4 @@
-import { Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
+import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 
 import {
   AboutPage,
@@ -51,20 +51,31 @@ function RequireSuperAdmin({ children }: { children: JSX.Element }): JSX.Element
   return children
 }
 
+/** 详情页的来源（写进 `location.state.from`），决定「返回」回到哪一份存储库列表。 */
+interface RepoDetailState {
+  from?: string
+}
+
 function RepoDetailRoute(): JSX.Element {
   const { repoId } = useParams<{ repoId: string }>()
   const navigate = useNavigate()
+  const location = useLocation()
   const { isSuperAdmin, user } = useAuth()
   if (!repoId) return <Navigate to="/my-repos" replace />
+  // 详情是两条外壳**共用**的一个页面（/repos/:repoId 只挂在应用外壳下），所以"返回去哪"不能按
+  // 角色猜：超管从用户端「我的存储库」点进来，角色上仍是超管，猜出来的管理端列表是错的。
+  // 来源在跳转时写进 location.state（见下面各处的 onOpen），直接打开/刷新链接时没有来源，
+  // 才退回按角色判断。
+  const backTo = (location.state as RepoDetailState | null)?.from ?? (isSuperAdmin ? '/admin/repos' : '/my-repos')
   return (
     <RepoDetail
       repoId={repoId}
       isSuperAdmin={isSuperAdmin}
       currentUserId={user?.id ?? ''}
       currentUserName={user?.username ?? ''}
-      // 详情的「返回」一律回到存储库列表，不做 navigate(-1)：从新建页跳进详情时，
+      // 详情的「返回」回到进来时的那份列表，不做 navigate(-1)：从新建页跳进详情时，
       // 历史里那张已经提交过的表单还在，后退会把用户送回去（表单已重置，看着像白填了）。
-      onBack={() => navigate(isSuperAdmin ? '/admin/repos' : '/my-repos', { replace: true })}
+      onBack={() => navigate(backTo, { replace: true })}
     />
   )
 }
@@ -109,7 +120,8 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
           element={
             <MyRepos
               onCreate={() => navigate('/my-repos/new')}
-              onOpen={(repoId) => navigate(`/repos/${repoId}`)}
+              // 详情「返回」靠这个来源回到应用端列表（见 RepoDetailRoute）。
+              onOpen={(repoId) => navigate(`/repos/${repoId}`, { state: { from: '/my-repos' } })}
             />
           }
         />
@@ -120,8 +132,8 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
               isSuperAdmin={false}
               // 建库成功即离开新建页：用 replace 把新建页从历史里顶掉，
               // 否则以后在任何地方按浏览器后退都会回到那张已提交过的空表单。
-              onCreated={(repo) => navigate(`/repos/${repo.id}`, { replace: true })}
-              onOpenRepo={(repoId) => navigate(`/repos/${repoId}`, { replace: true })}
+              onCreated={(repo) => navigate(`/repos/${repo.id}`, { replace: true, state: { from: '/my-repos' } })}
+              onOpenRepo={(repoId) => navigate(`/repos/${repoId}`, { replace: true, state: { from: '/my-repos' } })}
               onCancel={() => navigate('/my-repos')}
             />
           }
@@ -158,7 +170,8 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
             <RepoList
               isSuperAdmin
               onCreate={() => navigate('/admin/repos/new')}
-              onOpen={(repoId) => navigate(`/repos/${repoId}`)}
+              // 详情「返回」靠这个来源回到管理端列表（见 RepoDetailRoute）。
+              onOpen={(repoId) => navigate(`/repos/${repoId}`, { state: { from: '/admin/repos' } })}
             />
           }
         />
@@ -168,8 +181,8 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
             <RepoCreateForm
               isSuperAdmin
               // 同应用端：建库成功后新建页不再留在历史里，详情页返回只回存储库列表。
-              onCreated={(repo) => navigate(`/repos/${repo.id}`, { replace: true })}
-              onOpenRepo={(repoId) => navigate(`/repos/${repoId}`, { replace: true })}
+              onCreated={(repo) => navigate(`/repos/${repo.id}`, { replace: true, state: { from: '/admin/repos' } })}
+              onOpenRepo={(repoId) => navigate(`/repos/${repoId}`, { replace: true, state: { from: '/admin/repos' } })}
               onCancel={() => navigate('/admin/repos')}
             />
           }

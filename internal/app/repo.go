@@ -738,6 +738,10 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			if repo.ParentDiskID == nil {
 				return apperr.New("repo.disk_missing", 500)
 			}
+			mainDisk, err := tx.GetDisk(ctx, *repo.ParentDiskID)
+			if err != nil {
+				return err
+			}
 			a := &domain.Allocation{
 				RepoID: repo.ID,
 				DiskID: *repo.ParentDiskID,
@@ -745,6 +749,17 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 				State:  domain.AllocationStateAllocated,
 			}
 			if err := tx.CreateAllocation(ctx, a); err != nil {
+				return err
+			}
+			// 用量口径：独享库把**整块盘**分给这个用户，按它的标称容量计费
+			// （已用 = 已分配磁盘总量，见 store.accountedUsageSQL）。
+			//
+			// 不会重复计费：uk_allocations_disk 保证一块盘只有一行分配，
+			// 而"复用已有分配"在上面的循环里已经提前返回了。
+			if _, err := tx.AddRepoUsedBytes(ctx, repo.ID, mainDisk.SizeBytes); err != nil {
+				return err
+			}
+			if _, err := tx.AddUserUsedBytes(ctx, userID, mainDisk.SizeBytes); err != nil {
 				return err
 			}
 			alloc = a
@@ -789,7 +804,8 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 				if err := tx.CreateAllocation(ctx, a); err != nil {
 					return err
 				}
-				// 用量预留口径与派生路径完全一致（按母盘容量预留，随后由对账按实际占用校正）。
+				// 用量口径：池位盘一旦被分出去就按它的标称容量（= 母盘容量）计费，
+				// 与派生路径完全一致，也正是对账算出来的值（见 store.accountedUsageSQL）。
 				if _, err := tx.AddRepoUsedBytes(ctx, repo.ID, need); err != nil {
 					return err
 				}
@@ -822,7 +838,8 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			return err
 		}
 
-		// 配额：母盘容量按逻辑大小预留，任务完成后按实际物理占用校正。
+		// 配额：按差异盘的标称容量（= 母盘容量）计费，建盘期间就已经计上，
+		// 防止并发分配在同一瞬间超卖。
 		need := parent.SizeBytes
 		if err := checkQuota(repo.QuotaBytes, repo.UsedBytes, need); err != nil {
 			return err
@@ -874,7 +891,7 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			return err
 		}
 
-		// 预留用量，防止并发分配超卖。
+		// 计费用量（口径：已用 = 已分配磁盘总量），同时防止并发分配超卖。
 		if _, err := tx.AddRepoUsedBytes(ctx, repo.ID, need); err != nil {
 			return err
 		}
@@ -930,8 +947,8 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 
 	if staleDiskID != "" {
 		// 作废旧差异盘（连带删除它的 iSCSI 目标）：这是"母盘版本对不上才释放"的唯一路径。
-		// 配额上，新盘已按母盘容量预留，旧占用要等删除任务完成后才退回，中间短暂多占一份；
-		// 对账（reclaim/reconcile）随后会按实际占用校正。
+		// 配额上，新盘已按母盘容量计费，旧盘要等删除任务真正删掉记录后才退出账目，
+		// 中间会短暂多占一份；对账（reclaim/reconcile）随后按已分配盘重算收敛。
 		stalePayload := deleteDiskPayload{DiskID: staleDiskID}
 		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobDeleteDisk, staleDiskID,
 			"delete_disk:"+staleDiskID, lock.DiskKey(staleDiskID), stalePayload); err != nil {

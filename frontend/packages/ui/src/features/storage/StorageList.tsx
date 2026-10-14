@@ -192,7 +192,9 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
       key: 'capacity',
       width: 190,
       render: (_value, storage) =>
-        // 有底层卷时展示"已用 ÷ 分配"（配额口径）；纯目录模式退化为所在卷可用空间。
+        // 有底层卷时展示"已用 ÷ 分配"：这里是**宿主实际占用**口径（卷上真占了多大），
+        // 不是库/用户的配额口径（那个是"已用 = 已分配磁盘总量"，按盘标称容量计费）；
+        // 纯目录模式退化为所在卷可用空间。
         storage.size_bytes > 0
           ? `${formatBytes(storage.used_bytes)} / ${formatBytes(storage.size_bytes)}`
           : `${formatBytes(storage.free_bytes)} / ${formatBytes(storage.total_bytes)}`

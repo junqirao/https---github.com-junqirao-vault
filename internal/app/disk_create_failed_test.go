@@ -36,11 +36,11 @@ func createPendingDiffDisk(t *testing.T, st *store.Store, repoID, userID string,
 	return disk
 }
 
-// TestMarkCreateFailedReleasesReservedUsage 覆盖"建盘终态失败必须回退预留用量"。
+// TestMarkCreateFailedReleasesReservedUsage 覆盖"建盘终态失败必须回退计费用量"。
 //
-// 真实反馈："我一点空间都没用就占了 1G" —— 分配时按**母盘标称容量**预留用量，差异盘
-// 建完后才按实测物理占用校正（见 runCreateDiff）。建盘彻底失败时校正永远不会发生，
-// 那份预留就成了永久挂账（每个失败的分配 1GB 起），而用户在界面上什么都没用。
+// 真实反馈："我一点空间都没用就占了 1G" —— 配额口径是**已用 = 已分配磁盘总量**，
+// 分配那一刻就按标称容量计费（见 repo.Allocate）。建盘彻底失败时这块盘根本不存在，
+// 不能被它永远占着配额（每个失败的分配 1GB 起），而用户在界面上什么都没拿到。
 //
 // 幂等是硬要求：对账会反复调用 MarkCreateFailed（兜住历史数据与崩溃场景），
 // 重复回退会把用量退成负数（历史工单：-7.98 GB）。
@@ -49,20 +49,20 @@ func TestMarkCreateFailedReleasesReservedUsage(t *testing.T) {
 	st := openAppTestStore(t)
 	repoID, userID := seedRepoWithOwner(t, st)
 
-	const reserved int64 = 1 << 30 // 预留 1GiB（母盘标称容量）
+	const reserved int64 = 1 << 30 // 计费 1GiB（母盘标称容量）
 	disk := createPendingDiffDisk(t, st, repoID, userID, reserved)
 
-	// 1) 分配：按母盘标称容量预留。
+	// 1) 分配：按标称容量计费。
 	if _, err := st.AddRepoUsedBytes(ctx, repoID, reserved); err != nil {
-		t.Fatalf("预留存储库用量失败：%v", err)
+		t.Fatalf("计费存储库用量失败：%v", err)
 	}
 	if _, err := st.AddUserUsedBytes(ctx, userID, reserved); err != nil {
-		t.Fatalf("预留用户用量失败：%v", err)
+		t.Fatalf("计费用户用量失败：%v", err)
 	}
 
 	svc := &DiskService{Deps: Deps{Store: st, Log: testLogger()}}
 
-	// 2) 建盘彻底失败 → 预留必须回退，磁盘进入 error（不再永远停在 creating）。
+	// 2) 建盘彻底失败 → 这笔用量必须回退，磁盘进入 error（不再永远停在 creating）。
 	if err := svc.MarkCreateFailed(ctx, disk.ID, errors.New("create diff failed")); err != nil {
 		t.Fatalf("MarkCreateFailed 失败：%v", err)
 	}

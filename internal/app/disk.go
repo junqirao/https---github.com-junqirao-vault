@@ -172,11 +172,11 @@ func (s *DiskService) MarkCreateFailed(ctx context.Context, diskID string, cause
 	// 回退分配时预留的用量（**幂等**：只有从 creating 首次转入 error 才会走到这里，
 	// 对账会重复调用本函数，重复回退会把用量退成负数 —— 历史工单：-7.98 GB）。
 	//
-	// 为什么必须回退（真实反馈："我一点空间都没用就占了 1G"）：分配时按母盘标称容量
-	// 预留用量，差异盘建完后才按实测物理占用校正（见 runCreateDiff）。建盘彻底失败时
-	// 校正永远不会发生，那份预留就成了**永久挂账** —— 每个失败的分配 1GB 起。
+	// 为什么要回退（真实反馈："我一点空间都没用就占了 1G"）：配额口径是
+	// **已用 = 已分配磁盘总量**（见 store.accountedUsageSQL），盘一旦建出来就按标称容量
+	// 计费，直到它被删除；而建盘彻底失败时这份盘根本不存在，不能被它一直占着配额。
 	//
-	// 先落库状态再重算：计费口径里"error 且没测到物理占用"计 0，正是这条预留的出口。
+	// 先落库状态再重算：计费口径对 state=error 的盘计 0，正是这条预留的出口。
 	userID := s.allocatedUserID(ctx, disk.ID)
 	disk.State = domain.DiskStateError
 	if err := s.Store.UpdateDisk(ctx, disk); err != nil {
@@ -322,8 +322,8 @@ func (s *DiskService) SamplePhysicalUsage(ctx context.Context) error {
 			}
 		}
 	}
-	// 采样刚把 physical_bytes 改成了**当前**实际占用，账目必须跟着走：
-	// 否则账停在建盘那一刻的金额，删除时就会退掉从未计入过的增量（见 resyncUsage）。
+	// 配额口径（已用 = 已分配磁盘总量）与 physical_bytes 无关，采样只影响展示；
+	// 这里顺手做一次全量对账，纯属兜底收敛历史脏数据（正常情况下是空操作）。
 	if drift, err := s.Store.RecomputeUsage(ctx); err != nil {
 		s.Log.Warn("按实际占用重算已用量失败", "error", err)
 	} else if drift.Repos > 0 || drift.Users > 0 {
@@ -572,7 +572,7 @@ func (s *DiskService) ensureDiffDisk(ctx context.Context, disk, parent *domain.D
 	if err := s.Store.UpdateDisk(ctx, disk); err != nil {
 		return err
 	}
-	// 实测物理占用落库后，按实际占用重算用量（分配时是按逻辑大小预留的）。
+	// 盘建好了：账目本该就是标称容量（分配时已计费），这里重算一次只为收敛历史脏数据。
 	userID := s.allocatedUserID(ctx, disk.ID)
 	s.resyncUsage(ctx, disk.RepoID, userID)
 	rep.Progress(100)
@@ -1015,16 +1015,16 @@ func (s *DiskService) deleteDiskArtifacts(ctx context.Context, diskID, allocatio
 	return nil
 }
 
-// resyncUsage 把"该盘所在存储库 / 所属用户"的已用量**按 disks 表的实际占用重算**。
+// resyncUsage 把"该盘所在存储库 / 所属用户"的已用量**按 disks 表的分配情况重算**。
 //
 // ⚠️ 不要再改回"删除时按记忆的金额做减法"。真实工单：删掉一个差异盘后存储库已用
-// 变成 **-100M** —— 账上记的是**建盘那一刻**的实测物理占用，而差异盘会随写入持续
-// 变大（physical_bytes 由采样更新，账目并不跟着变），于是删除时拿**删除那一刻**的
-// 物理占用去减，就减掉了从未计入过的增量。
+// 变成 **-100M** —— 账上记的金额与删除那一刻算出来的金额对不上（当时的口径是物理占用，
+// 差异盘会长大、母盘容量也可能被改），差额就沉淀成了负数。
 //
 // 以 disks 表（唯一真源）重算是幂等的：多算一次、少算一次都能自愈。
 //
-// 计费口径见 store.accountedUsageSQL（物理优先 → error 且无占用计 0 → 否则退回逻辑大小）。
+// 计费口径见 store.accountedUsageSQL（已用 = 已分配磁盘总量：有未释放的分配行就按
+// 标称容量计费，建盘终态失败的盘计 0）。
 func (s *DiskService) resyncUsage(ctx context.Context, repoID, userID string) {
 	if strings.TrimSpace(repoID) != "" {
 		if _, err := s.Store.RecomputeRepoUsage(ctx, repoID); err != nil {

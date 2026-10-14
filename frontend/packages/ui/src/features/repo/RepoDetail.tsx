@@ -127,7 +127,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       : isSuperAdmin || repo.owner_id === currentUserId
     : isSuperAdmin
   // 用量口径与卡片一致（分母 = 库容量，见 repoUsage）。本机挂着这个库时用本机**实测**的
-  // 卷用量：服务端的 used_bytes 是宿主侧物理占用（写过的最高水位，删了也不回落）。
+  // 卷用量：服务端的 used_bytes 是已分配磁盘总量（按盘标称容量计费，等于库容量）。
   const mountUsage = pickMountUsage(agent.usage, repo?.id)
   const {
     percent: usagePercent,
@@ -136,8 +136,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     measured: usageMeasured
   } = repoUsage(repo, mountUsage, !isSuperAdmin)
   // 未挂载时客户端不报用量、条置灰（见 RepoCards 的 RepoUsage）：那一刻服务端回退值是
-  // "删了也不回落的最高水位"，用量写 `-`；上限照报，仍是"已用 / 上限"那一行文案。
-  // 管理端是例外：运维看的正是宿主侧占用，那个绝对数在这里是有效信息（与表格同口径）。
+  // 等于库容量的"已分配容量"，用量写 `-`；上限照报，仍是"已用 / 上限"那一行文案。
+  // 管理端是例外：运维看的正是"这个库分配出去多大"，那个绝对数在这里是有效信息（与表格同口径）。
   const usageMuted = !isSuperAdmin && !usageMeasured
   // 刚挂上、实测用量还在取数：把 `-` 与条都换成转圈（见 useAgent 的 repoUsageLoading）。
   // 只在客户端那条路上成立 —— 管理端显示的是服务端口径，本机实测值到位后只是换个口径，

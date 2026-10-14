@@ -83,28 +83,31 @@ func assertUsage(t *testing.T, st *store.Store, repoID, userID string, want int6
 }
 
 // TestUsageReserveCorrectReleaseBalances 覆盖一次完整生命周期的账目闭环：
-// 分配预留（逻辑大小）→ 建盘校正（实测物理）→ 采样（盘长大了）→ 删除（归零）。
+// 分配（按标称容量计费）→ 建盘完成 → 采样（物理占用长大了）→ 删除（归零）。
+//
+// 口径是"已用 = 已分配磁盘总量"：从分配那一刻起到盘被删除为止，账上都该是**标称容量**，
+// 采样只改 physical_bytes 的展示值，不动账。
 //
 // 关键回归（真实工单）：**删掉一个差异盘后存储库已用变成 -100M**。
-// 根因是删除时按"记忆的金额"做减法，而账上记的是建盘那一刻的物理占用，
-// 差异盘之后被写入撑大（采样只改 physical_bytes，不动账），于是减掉了从未计入的增量。
-// 因此这里要求：账目在每一步都等于 disks 表的派生值，并且删除后必须是 0 而不是负数。
+// 根因是删除时按"记忆的金额"做减法，而账上的金额与删除那一刻算出来的金额对不上，
+// 差额就沉淀成了负数。因此这里要求：账目在每一步都等于 disks 表的派生值，
+// 并且删除后必须是 0 而不是负数。
 func TestUsageReserveCorrectReleaseBalances(t *testing.T) {
 	ctx := context.Background()
 	st := openAppTestStore(t)
 	repoID, userID := seedRepoWithOwner(t, st)
 
-	const size int64 = 2 << 30      // 逻辑 2GB（分配时的预留）
+	const size int64 = 2 << 30      // 标称容量 2GB（计费金额）
 	const atCreate int64 = 20 << 20 // 建盘那一刻的物理占用
 	const grown int64 = 100 << 20   // 之后被写入撑到 100M（正是 -100M 的来路）
 
-	// 1) 分配：按逻辑大小预留（对应 repo.go 的 Allocate）。
+	// 1) 分配：按标称容量计费（对应 repo.go 的 Allocate）。
 	disk := createPendingDiffDisk(t, st, repoID, userID, size)
 	if _, err := st.AddRepoUsedBytes(ctx, repoID, size); err != nil {
-		t.Fatalf("预留存储库用量失败：%v", err)
+		t.Fatalf("计费存储库用量失败：%v", err)
 	}
 	if _, err := st.AddUserUsedBytes(ctx, userID, size); err != nil {
-		t.Fatalf("预留用户用量失败：%v", err)
+		t.Fatalf("计费用户用量失败：%v", err)
 	}
 
 	svc := &DiskService{Deps: Deps{
@@ -113,20 +116,20 @@ func TestUsageReserveCorrectReleaseBalances(t *testing.T) {
 		Disk:  fakeDiskBackend{exists: true, physicalSize: grown},
 	}}
 
-	// 2) 建盘完成：实测物理占用落库 → 账目校正为实测值（对应 runCreateDiff）。
+	// 2) 建盘完成：物理占用落库，但账目仍是标称容量（对应 runCreateDiff）。
 	disk.PhysicalBytes = atCreate
 	disk.State = domain.DiskStateReady
 	if err := st.UpdateDisk(ctx, disk); err != nil {
 		t.Fatalf("写回磁盘失败：%v", err)
 	}
 	svc.resyncUsage(ctx, repoID, userID)
-	assertUsage(t, st, repoID, userID, atCreate)
+	assertUsage(t, st, repoID, userID, size)
 
-	// 3) 差异盘随写入变大：采样把 physical_bytes 改成 100M，账目必须跟着走到实际占用。
+	// 3) 差异盘随写入变大：采样把 physical_bytes 改成 100M，账目不受影响。
 	if err := svc.SamplePhysicalUsage(ctx); err != nil {
 		t.Fatalf("采样失败：%v", err)
 	}
-	assertUsage(t, st, repoID, userID, grown)
+	assertUsage(t, st, repoID, userID, size)
 
 	// 4) 删除该差异盘：账目必须归零，不得出现 -100M。
 	if err := svc.deleteDiskArtifacts(ctx, disk.ID, "alloc-"+disk.ID); err != nil {
@@ -141,22 +144,24 @@ func TestRecomputeRepoUsageIsIdempotent(t *testing.T) {
 	st := openAppTestStore(t)
 	repoID, userID := seedRepoWithOwner(t, st)
 
+	const size int64 = 2 << 30
 	const physical int64 = 5 << 20
-	disk := createDiffDisk(t, st, repoID, userID, 2<<30, physical)
+	disk := createDiffDisk(t, st, repoID, userID, size, physical)
 
 	used, err := st.RecomputeRepoUsage(ctx, repoID)
 	if err != nil {
 		t.Fatalf("重算存储库用量失败：%v", err)
 	}
-	if used != physical {
-		t.Fatalf("重算结果 = %d，期望实际占用 %d", used, physical)
+	// 计费口径是标称容量，physical 只用于展示，不能影响账目。
+	if used != size {
+		t.Fatalf("重算结果 = %d，期望已分配磁盘总量 %d", used, size)
 	}
 	used, err = st.RecomputeRepoUsage(ctx, repoID)
 	if err != nil {
 		t.Fatalf("二次重算失败：%v", err)
 	}
-	if used != physical {
-		t.Fatalf("二次重算结果 = %d，期望 %d（重算必须幂等）", used, physical)
+	if used != size {
+		t.Fatalf("二次重算结果 = %d，期望 %d（重算必须幂等）", used, size)
 	}
 
 	// 盘记录消失后重算必须归零 —— 删除路径正是靠这一点把占用退干净。
@@ -172,7 +177,7 @@ func TestRecomputeRepoUsageIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestRecomputeUsageRepairsNegative 覆盖"以磁盘实际占用为唯一真源"的用量重算：
+// TestRecomputeUsageRepairsNegative 覆盖"以 disks 表为唯一真源"的用量重算：
 // 历史脏数据（负数）必须被修回正确值，且重复执行是空操作。
 func TestRecomputeUsageRepairsNegative(t *testing.T) {
 	ctx := context.Background()
@@ -183,7 +188,7 @@ func TestRecomputeUsageRepairsNegative(t *testing.T) {
 	const physical int64 = 6 << 20
 	createDiffDisk(t, st, repoID, userID, size, physical)
 
-	// 母盘不计入用量（只按差异盘计费）：即便存在也不该被算进去。
+	// 没被分配出去的盘不计入用量：母盘没有分配行，即便存在也不该被算进去。
 	if err := st.CreateDisk(ctx, &domain.Disk{
 		RepoID:    repoID,
 		Kind:      domain.DiskKindParent,
@@ -214,15 +219,15 @@ func TestRecomputeUsageRepairsNegative(t *testing.T) {
 	if err != nil {
 		t.Fatalf("回查用户失败：%v", err)
 	}
-	if user.UsedBytes != physical {
-		t.Fatalf("用户用量应为物理占用 %d，实际=%d", physical, user.UsedBytes)
+	if user.UsedBytes != size {
+		t.Fatalf("用户用量应为已分配磁盘总量 %d，实际=%d", size, user.UsedBytes)
 	}
 	repo, err := st.GetRepository(ctx, repoID)
 	if err != nil {
 		t.Fatalf("回查存储库失败：%v", err)
 	}
-	if repo.UsedBytes != physical {
-		t.Fatalf("存储库用量应为物理占用 %d，实际=%d", physical, repo.UsedBytes)
+	if repo.UsedBytes != size {
+		t.Fatalf("存储库用量应为已分配磁盘总量 %d，实际=%d", size, repo.UsedBytes)
 	}
 
 	// 幂等：账目已一致时不得再改动任何行。
@@ -235,9 +240,9 @@ func TestRecomputeUsageRepairsNegative(t *testing.T) {
 	}
 }
 
-// TestRecomputeUsageFallsBackToLogicalSize 尚未建好的盘（creating）按逻辑大小预留计费，
-// 与"分配时按逻辑预留"的口径保持一致（否则会在建盘完成前把用量算成 0，并发分配直接超卖）。
-func TestRecomputeUsageFallsBackToLogicalSize(t *testing.T) {
+// TestRecomputeUsageChargesDuringCreate 尚未建好的盘（creating）就已经按标称容量计费，
+// 与"分配时即计费"的口径保持一致（否则会在建盘完成前把用量算成 0，并发分配直接超卖）。
+func TestRecomputeUsageChargesDuringCreate(t *testing.T) {
 	ctx := context.Background()
 	st := openAppTestStore(t)
 	repoID, userID := seedRepoWithOwner(t, st)
@@ -253,30 +258,109 @@ func TestRecomputeUsageFallsBackToLogicalSize(t *testing.T) {
 		t.Fatalf("回查用户失败：%v", err)
 	}
 	if user.UsedBytes != size {
-		t.Fatalf("尚未建好时应按逻辑大小 %d 预留计费，实际=%d", size, user.UsedBytes)
+		t.Fatalf("尚未建好时应按标称容量 %d 计费，实际=%d", size, user.UsedBytes)
 	}
 }
 
-// TestUsageMeasuredZeroIsNotUnknown 已建好的盘实测物理占用为 0 时按 0 计费。
+// TestUsageCountsAllocatedDisksByNominalSize 锁定配额口径：**已用 = 已分配磁盘总量**。
 //
-// 关键回归（真实反馈）：新建的库一上线就"已用 100%"。thin 差异盘刚派生出来时独占块
-// 本来就是 0（所有块都与母盘共享），而旧口径把 physical_bytes == 0 一律当成"尚未采样"
-// 退回标称容量 —— 库容量恰好等于那块盘的容量，进度条于是直接拉满。
-func TestUsageMeasuredZeroIsNotUnknown(t *testing.T) {
+// 三个易错点一起守住：
+//  1. 已分配的盘按**标称容量**计费，与实测物理占用无关 —— thin 差异盘刚派生时独占块
+//     就是 0，按实测记账会让"已分配 2TB 的库"显示成"用了 5MB"，配额形同虚设；
+//  2. 建库时预创建、还没分给任何人的池位盘不计费 —— 否则一个共享数量 5、容量 1TB 的
+//     池化库刚建好就显示"已用 5TB"；
+//  3. 建盘终态失败（error）的盘计 0 —— 不让失败的分配永久挂账。
+func TestUsageCountsAllocatedDisksByNominalSize(t *testing.T) {
 	ctx := context.Background()
 	st := openAppTestStore(t)
 	repoID, userID := seedRepoWithOwner(t, st)
 
 	const size int64 = 3 << 30
-	disk := createDiffDisk(t, st, repoID, userID, size, 0) // 建好了，实测独占占用就是 0
+
+	// 1) 已分配的盘：实测物理占用为 0 也照样按标称容量计费。
+	disk := createDiffDisk(t, st, repoID, userID, size, 0)
 	if disk.State != domain.DiskStateReady {
 		t.Fatalf("前置条件：该盘应是 ready，实际=%s", disk.State)
+	}
+	if _, err := st.RecomputeUsage(ctx); err != nil {
+		t.Fatalf("重算失败：%v", err)
+	}
+	assertUsage(t, st, repoID, userID, size)
+
+	// 2) 池位盘：同为建好的差异盘，但没有分配行 → 不进账目。
+	if err := st.CreateDisk(ctx, &domain.Disk{
+		RepoID:    repoID,
+		Kind:      domain.DiskKindDiff,
+		VHDXPath:  filepath.Join("C:", "vault", "disks", "diffs", "idle-pool.vhdx"),
+		SizeBytes: 4 << 30,
+		State:     domain.DiskStatePublished,
+	}); err != nil {
+		t.Fatalf("建池位盘记录失败：%v", err)
+	}
+	if _, err := st.RecomputeUsage(ctx); err != nil {
+		t.Fatalf("重算失败：%v", err)
+	}
+	assertUsage(t, st, repoID, userID, size)
+
+	// 3) 建盘终态失败：分配行还在，但盘不存在 → 计 0。
+	broken := &domain.Disk{
+		RepoID:    repoID,
+		Kind:      domain.DiskKindDiff,
+		VHDXPath:  filepath.Join("C:", "vault", "disks", "diffs", "broken.vhdx"),
+		SizeBytes: 5 << 30,
+		State:     domain.DiskStateError,
+	}
+	if err := st.CreateDisk(ctx, broken); err != nil {
+		t.Fatalf("建失败盘记录失败：%v", err)
+	}
+	if err := st.CreateAllocation(ctx, &domain.Allocation{
+		ID:     "alloc-" + broken.ID,
+		RepoID: repoID,
+		DiskID: broken.ID,
+		UserID: userID,
+		State:  domain.AllocationStateAllocated,
+	}); err != nil {
+		t.Fatalf("建分配记录失败：%v", err)
+	}
+	if _, err := st.RecomputeUsage(ctx); err != nil {
+		t.Fatalf("重算失败：%v", err)
+	}
+	assertUsage(t, st, repoID, userID, size)
+}
+
+// TestUsageCountsExclusiveRepoDisk 独享库把整块独立盘分给用户，容量同样计入已用 ——
+// "已分配磁盘总量"不区分盘的形态（差异盘 / 独立盘），有分配行就算。
+func TestUsageCountsExclusiveRepoDisk(t *testing.T) {
+	ctx := context.Background()
+	st := openAppTestStore(t)
+	repoID, userID := seedRepoWithOwner(t, st)
+
+	const size int64 = 10 << 30
+	disk := &domain.Disk{
+		RepoID:    repoID,
+		Kind:      domain.DiskKindStandalone,
+		VHDXPath:  filepath.Join("C:", "vault", "disks", "standalone", "s.vhdx"),
+		SizeBytes: size,
+		State:     domain.DiskStateReady,
+	}
+	if err := st.CreateDisk(ctx, disk); err != nil {
+		t.Fatalf("建独立盘记录失败：%v", err)
+	}
+	// 独享库的分配行就挂在这块独立盘上（见 repo.Allocate 的独享分支）。
+	if err := st.CreateAllocation(ctx, &domain.Allocation{
+		ID:     "alloc-" + disk.ID,
+		RepoID: repoID,
+		DiskID: disk.ID,
+		UserID: userID,
+		State:  domain.AllocationStateAllocated,
+	}); err != nil {
+		t.Fatalf("建分配记录失败：%v", err)
 	}
 
 	if _, err := st.RecomputeUsage(ctx); err != nil {
 		t.Fatalf("重算失败：%v", err)
 	}
-	assertUsage(t, st, repoID, userID, 0)
+	assertUsage(t, st, repoID, userID, size)
 }
 
 // TestRepoCapacityDerivedFromStartDisk 守住存储库卡片进度条的**分母**（库容量）。

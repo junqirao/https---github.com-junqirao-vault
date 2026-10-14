@@ -369,8 +369,8 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
       { title: t('field.mode'), dataIndex: 'mode', key: 'mode', width: 200, render: (value: string) => repoModeLabel(value) },
       { title: t('field.group'), dataIndex: 'group', key: 'group', render: (value?: string) => value || '-' },
       {
-        // 管理端表格看的是**服务端口径**（宿主侧物理占用，分母 = 库容量，见 repoUsage）：
-        // 运维要的是"这块盘在存储上占了多大"，与客户端卡片的本机实测值是两回事。
+        // 管理端表格看的是**服务端口径**（已分配磁盘总量，分母 = 库容量，见 repoUsage）：
+        // 运维要的是"这块库分配出去多大"，与客户端卡片的本机实测值是两回事。
         title: t('repo.used'),
         key: 'size',
         render: (_value, repo) => repoUsage(repo).text

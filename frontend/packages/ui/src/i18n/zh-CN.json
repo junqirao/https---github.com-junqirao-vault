@@ -326,7 +326,7 @@
   "repo.parentCondition": "母盘状态",
   "repo.parentVersion": "母盘版本",
   "repo.used": "已用",
-  "repo.usedLocalHint": "本机挂载盘的实测占用，也就是这块盘里实际有多少数据。服务端显示的是宿主侧物理占用，客户机里删掉的数据在回收前不会减少，所以两边数字可能不一样。",
+  "repo.usedLocalHint": "本机挂载盘的实测占用，也就是这块盘里实际有多少数据。服务端显示的是「已分配磁盘总量」（按盘的容量计费），所以两边数字本来就不一样。",
   "repo.group.owned": "我拥有的",
   "repo.group.joined": "我参与的",
   "repo.view.card": "卡片",

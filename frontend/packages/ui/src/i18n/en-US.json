@@ -326,7 +326,7 @@
   "repo.parentCondition": "Parent condition",
   "repo.parentVersion": "Parent version",
   "repo.used": "Used",
-  "repo.usedLocalHint": "Measured usage of the volume mounted on this machine — how much data is actually on the disk. The server reports host-side physical allocation, which does not shrink until deleted data is reclaimed, so the two numbers can differ.",
+  "repo.usedLocalHint": "Measured usage of the volume mounted on this machine — how much data is actually on the disk. The server reports the total allocated disk size (charged by disk capacity), so the two numbers are expected to differ.",
   "repo.group.owned": "Owned by me",
   "repo.group.joined": "Shared with me",
   "repo.view.card": "Cards",

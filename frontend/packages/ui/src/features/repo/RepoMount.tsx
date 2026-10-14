@@ -22,7 +22,7 @@ export interface RepoMountController {
   /**
    * 本机挂载卷的**实测**用量（挂载点所在卷的容量/可用/已用）。
    *
-   * 服务端的 used_bytes 是宿主侧物理占用（写过的最高水位，客户机里删掉数据也不回落），
+   * 服务端的 used_bytes 是已分配磁盘总量（按盘标称容量计费，等于库容量），
    * 卡片上的「已用」用它才是用户眼里的用量（见 repoUsage）。未挂载 / 代理不可用 /
    * 取数失败时为 undefined，此时客户端不报用量（写 `-`）、只报上限，进度条置灰
    * （见 RepoCards 的 RepoUsage）。

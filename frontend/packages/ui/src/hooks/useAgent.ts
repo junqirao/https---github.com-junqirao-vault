@@ -63,7 +63,7 @@ export interface UseAgentResult {
   /**
    * 本机**挂载卷的真实用量**（来自 GET /agent/usage）；没有本机挂载/代理不可用时为空。
    *
-   * 服务端的「已用」是宿主侧物理占用（写过的最高水位，客户机里删掉数据也不回落），
+   * 服务端的「已用」是已分配磁盘总量（按盘标称容量计费，等于库容量），
    * 卡片要显示"用户眼里的用了多少"只能靠这个本机实测值（见 pickMountUsage）。
    */
   usage: AgentMountVolumeUsage[]
