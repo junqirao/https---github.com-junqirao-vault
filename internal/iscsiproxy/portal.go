@@ -26,7 +26,7 @@ type PortalConfig struct {
 type Portal struct {
 	log *slog.Logger
 
-	opsMu sync.Mutex
+	opsMu   sync.Mutex
 	mu      sync.Mutex
 	targets map[string]*target
 	closed  bool
@@ -90,7 +90,7 @@ func (p *Portal) Add(ctx context.Context, tc TargetConfig) error {
 	p.targets[key] = t
 	p.mu.Unlock()
 
-	go t.serve()
+	t.start()
 	p.log.Info("iscsiproxy: 缓存目标已注册",
 		"engine", Version, "key", key, "target_iqn", t.iqn,
 		"listen", t.addr.String(), "backend", t.backend)

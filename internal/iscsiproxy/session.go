@@ -75,6 +75,11 @@ type session struct {
 	pending   map[uint32]*pending
 	pendingN  atomic.Int32 // collectTI 的快速路径：为 0 时跳过锁与 map 查找
 	closeOnce sync.Once
+
+	// unmapPending 收集 UNMAP 命令的参数列表：被解除映射的范围不在 CDB 里，而在
+	// 紧随其后的 Data-Out 载荷里。命令与载荷都只在 I→T 泵（pumpIT）里出现，所以
+	// 这张表不需要锁，也不能被其他 goroutine 碰。
+	unmapPending map[uint32]*unmapPending
 }
 
 func newSession(t *target, it, bt net.Conn) *session {
@@ -167,6 +172,7 @@ func (s *session) pumpIT() {
 			fr.splice(s.bt)
 			return
 		}
+		s.observeDataOut(f)
 		if s.handleCommandIT(f) {
 			continue // answered locally, never reaches the backend
 		}
@@ -258,9 +264,11 @@ func (s *session) handleCommandIT(f *frame) bool {
 	case iscsi.SCSIWrite10, iscsi.SCSIWrite16:
 		s.invalidateWrite(cdb)
 	case iscsi.SCSIUnmap:
-		s.dropAll()
-	case 0x41, 0x93: // WRITE SAME(10) / WRITE SAME(16)
-		s.dropAll()
+		// UNMAP 的范围不在 CDB 里：它作为数据段随命令一起来（immediate data），
+		// 或者跟在后面的 Data-Out 载荷里。两种形态都要认。
+		s.watchUnmap(f, cdb)
+	case iscsi.SCSIWriteSame10, iscsi.SCSIWriteSame16:
+		s.invalidateWriteSame(cdb)
 	}
 	return false
 }
@@ -423,13 +431,205 @@ func (s *session) invalidateWrite(cdb []byte) {
 	t.stats.invalidations.Add(1)
 }
 
-func (s *session) dropAll() {
+const (
+	// maxUnmapParamBytes bounds the parameter list the proxy will hold for one
+	// UNMAP. The CDB's length field is 16 bits, so this is a defensive limit.
+	maxUnmapParamBytes = 1 << 16
+	// maxUnmapPending bounds the per-session table of UNMAP commands whose list
+	// has not arrived yet. A full table drops the whole device instead: keeping
+	// data the initiator just released is the one mistake that cannot be paid
+	// for with a cache miss.
+	maxUnmapPending = 64
+)
+
+// unmapPending is one UNMAP command whose parameter list is still arriving.
+type unmapPending struct {
+	want int
+	buf  []byte
+}
+
+// invalidateWriteSame 只失效 WRITE SAME(10/16) 覆盖的那段范围。
+//
+// WRITE SAME 把 CDB 携带的一块数据重复写满指定 LBA 范围（清零、格式化、初始化
+// 磁盘就是它），UNMAP 位置 1 时等价于对这范围做 UNMAP。两种形态都只说明"这段
+// 范围的原内容作废"，所以只需要失效这段范围。以前这里整盘 Drop：Windows 的
+// "优化驱动器"（TRIM）发一次命令，整个 L1/L2 就没了，那正是"用着用着缓存归零"。
+func (s *session) invalidateWriteSame(cdb []byte) {
 	t := s.tgt
 	t.stats.writes.Add(1)
-	if c := t.getCache(); c != nil {
-		c.Drop()
-		t.stats.invalidations.Add(1)
+	bs := t.lunBlockSize()
+	if bs == 0 {
+		return
 	}
+	p, err := iscsi.ParseWriteSame(cdb)
+	if err != nil {
+		s.dropAll("write-same-unparsable")
+		return
+	}
+	bc := t.lunBlockCount()
+	blocks := p.Blocks
+	if blocks == 0 {
+		// SBC-3：块数为 0 表示"一直到设备的最后一个块"。容量还没观测到（bc == 0）
+		// 就无法把它换算成范围，只能整盘失效 —— 这条日志正好能指出 READ CAPACITY
+		// 没被我们看见，而不是"缓存自己坏了"。
+		if bc == 0 || p.LBA >= bc {
+			s.dropAll("write-same-open-ended-range")
+			return
+		}
+		blocks = bc - p.LBA
+	}
+	if bc > 0 && (p.LBA >= bc || blocks > bc-p.LBA) {
+		// 超出设备范围说明这条命令的形态我们没看懂，整盘失效更安全。
+		s.dropAll("write-same-range-out-of-bounds")
+		return
+	}
+	s.invalidateRange(int64(p.LBA)*int64(bs), int64(blocks)*int64(bs))
+}
+
+// invalidateRange 失效 [off, off+length) 这段字节范围，统一走写路径的失效通道
+// （L1 同步、L2 异步，见 invalidateWrite 的说明）。
+func (s *session) invalidateRange(off, length int64) {
+	if length <= 0 {
+		return
+	}
+	t := s.tgt
+	c := t.getCache()
+	if c == nil {
+		return
+	}
+	c.InvalidateAsync(off, length)
+	t.stats.invalidations.Add(1)
+}
+
+// watchUnmap 处理一条 UNMAP 命令的参数列表。
+//
+// UNMAP 的 CDB 里没有范围，只有列表长度：范围在参数列表里（8 字节参数头加每段
+// 16 字节的 LBA/块数）。
+//
+// 参数列表有两种送达方式，代理必须都认：
+//
+//   - immediate data：列表作为命令 PDU 的数据段直接跟来（登录协商 InitialR2T=No
+//     且 ImmediateData=Yes 时 Windows 会这么做）。此时不会有 Data-Out 帧。
+//   - 单独的 Data-Out PDU：先只拿到 CDB，列表随后到达，见 observeDataOut。
+//
+// 只认后者会让前者的每个 ITT 在 unmapPending 里留下一个永远等不到载荷的条目，
+// 攒够 maxUnmapPending 之后每条 UNMAP 都走整盘失效：用户看到的就是缓存突然
+// 归零，而且此后一直是几 KB。
+func (s *session) watchUnmap(f *frame, cdb []byte) {
+	t := s.tgt
+	t.stats.writes.Add(1)
+	if t.lunBlockSize() == 0 {
+		return
+	}
+	p, err := iscsi.ParseUnmap(cdb)
+	if err != nil || p.ListLength <= 0 {
+		// 空列表的 UNMAP 不解除任何范围，缓存不必动。
+		return
+	}
+	if p.ListLength > maxUnmapParamBytes {
+		s.dropAll("unmap-list-too-large")
+		return
+	}
+	// immediate data：列表已经在命令帧的数据段里，不会再有 Data-Out。
+	if d := f.data(); len(d) > 0 {
+		if len(d) < p.ListLength {
+			// 数据段比 CDB 声称的短：形态没看懂，保守整盘失效。
+			s.dropAll("unmap-immediate-short")
+			return
+		}
+		s.applyUnmapRanges(d[:p.ListLength])
+		return
+	}
+	if len(s.unmapPending) >= maxUnmapPending {
+		// 表满说明有一批命令的列表始终没等到（形态不认识）。整盘失效是必要的，但必须
+		// 顺手把表清空：不清就会一直满着，此后每条 UNMAP 都再清一次缓存，永远暖不起来。
+		s.unmapPending = nil
+		s.dropAll("unmap-pending-full")
+		return
+	}
+	if s.unmapPending == nil {
+		s.unmapPending = make(map[uint32]*unmapPending)
+	}
+	s.unmapPending[f.hdr.ITT()] = &unmapPending{want: p.ListLength}
+}
+
+// observeDataOut 把 Data-Out 的载荷收进它所属的 UNMAP 参数列表，凑齐后失效其中
+// 的范围。它跑在 I→T 泵里，与 watchUnmap 同一个 goroutine：表不需要锁。
+//
+// 普通写命令的 Data-Out 也会经过这里，表为空时只是一次 map 长度检查。
+func (s *session) observeDataOut(f *frame) {
+	if len(s.unmapPending) == 0 || f.hdr.Opcode() != iscsi.OpDataOut {
+		return
+	}
+	itt := f.hdr.ITT()
+	u := s.unmapPending[itt]
+	if u == nil {
+		return
+	}
+	data := f.data()
+	if len(data) == 0 {
+		return
+	}
+	if len(u.buf)+len(data) > u.want+16 {
+		// 载荷比 CDB 声称的还长：这条命令的形态不认识，退回整盘失效。
+		delete(s.unmapPending, itt)
+		s.dropAll("unmap-dataout-overflow")
+		return
+	}
+	// frame 的缓冲只活到下一帧，所以必须复制出来。
+	u.buf = append(u.buf, data...)
+	if len(u.buf) < u.want {
+		return
+	}
+	delete(s.unmapPending, itt)
+	s.applyUnmapRanges(u.buf[:u.want])
+}
+
+// applyUnmapRanges 按参数列表里的各段范围失效。只有解析不出范围时才退化成整盘
+// 失效，这样一次 TRIM 不会把没被碰过的缓存也清掉。
+func (s *session) applyUnmapRanges(list []byte) {
+	t := s.tgt
+	bs := t.lunBlockSize()
+	if bs == 0 || t.getCache() == nil {
+		return
+	}
+	bc := t.lunBlockCount()
+	ranges := iscsi.UnmapRanges(list)
+	if len(ranges) == 0 {
+		// 载荷声称有描述符却一段都没解析出来：形态不认识，整盘失效更安全。
+		if len(list) >= 8 && binary.BigEndian.Uint16(list[0:2]) > 0 {
+			s.dropAll("unmap-no-descriptors")
+		}
+		return
+	}
+	for _, r := range ranges {
+		if bc > 0 && (r.LBA >= bc || r.Blocks > bc-r.LBA) {
+			// 描述符越界：要么容量观测不对，要么这不是我们以为的那块盘，整盘失效。
+			s.dropAll("unmap-range-out-of-bounds")
+			return
+		}
+		s.invalidateRange(int64(r.LBA)*int64(bs), int64(r.Blocks)*int64(bs))
+	}
+}
+
+// dropAll 是"看不懂命令形态"时的安全兜底：把整库读缓存一次清掉。
+//
+// 它必须留下 reason 和计数：用户看到的"缓存突然从几百 MB 掉到几 KB"就是这条
+// 路径，而 invalidations 计数器区分不出"按范围失效"（便宜，热数据还在）和
+// "整盘失效"（缓存全没了）。没有 reason，事后只能靠猜。
+func (s *session) dropAll(reason string) {
+	t := s.tgt
+	t.stats.writes.Add(1)
+	c := t.getCache()
+	if c == nil {
+		return
+	}
+	t.stats.wholeDrops.Add(1)
+	t.log.Warn("iscsiproxy: 整盘失效读缓存（命令形态未识别，兜底全清）",
+		"engine", Version, "key", t.key, "reason", reason,
+		"l1_used_bytes", c.Stats().L1UsedBytes)
+	c.Drop()
+	t.stats.invalidations.Add(1)
 }
 
 // injectBufCap is the largest assembled injection: maxTeeBytes of data plus one

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -42,9 +43,14 @@ type L2Config struct {
 // CacheConfig describes the per-target read cache. Unset geometry takes the
 // cache package's defaults.
 type CacheConfig struct {
-	BlockSize      int
-	SectorSize     int
-	L1Bytes        int64
+	BlockSize  int
+	SectorSize int
+	L1Bytes    int64
+	// L1Snapshot is the file L1 is written to on a clean stop and loaded from on
+	// the next start. Empty disables it, which leaves L1 cold after every
+	// restart. It is independent of L2: a client that turned L2 off still gets
+	// its memory cache back.
+	L1Snapshot     string
 	L2             L2Config
 	ScanEnabled    bool
 	ScanThreshold  int
@@ -86,6 +92,14 @@ type counters struct {
 	localCmds     atomic.Int64
 	passthrough   atomic.Int64
 	degraded      atomic.Int64
+	// l1Restored counts the blocks the L1 snapshot brought back at bind time.
+	l1Restored atomic.Int64
+	// wholeDrops counts the times a command the proxy could not parse made it
+	// throw away the *entire* read cache instead of the range the command
+	// covered. It is separate from invalidations because that counter cannot
+	// tell a range invalidation (cheap, keeps the cache warm) from a whole-cache
+	// drop (wipes it), and "缓存突然从几百 MB 掉到几 KB" is exactly the latter.
+	wholeDrops atomic.Int64
 }
 
 // target serves one allocation: a listener the initiator connects to, a backend
@@ -112,10 +126,19 @@ type target struct {
 	serial      string
 	wwid        string
 	bindStarted bool
+	// l1Path 是 L1 内存快照的落盘位置；l1Binding 是写快照时绑定的后端命名空间，
+	// 快照只有落在同一块盘（同一 namespace）上才可信。
+	l1Path    string
+	l1Binding string
 
+	// serveWG 覆盖 Accept 循环：它退出了才不会再登记新会话（见 close）。
+	serveWG  sync.WaitGroup
 	sessMu   sync.Mutex
 	sessions map[*session]struct{}
-	scan     scanDetector
+	// sessWG 覆盖每条会话：close 必须等它们全部收摊才给 L1 落盘，否则快照会漏掉
+	// 收尾那一刻发生的一次写失效，下次启动就会读到被写过的旧扇区。
+	sessWG sync.WaitGroup
+	scan   scanDetector
 
 	stats counters
 }
@@ -135,6 +158,7 @@ func newTarget(log *slog.Logger, tc TargetConfig) (*target, error) {
 		dial:     defaultDialTimeout,
 		cc:       tc.Cache,
 		noCache:  tc.NoCache,
+		l1Path:   strings.TrimSpace(tc.Cache.L1Snapshot),
 		log:      log,
 		ln:       ln,
 		addr:     ln.Addr(),
@@ -145,6 +169,17 @@ func newTarget(log *slog.Logger, tc TargetConfig) (*target, error) {
 		t.dial = d
 	}
 	return t, nil
+}
+
+// start runs the Accept loop under serveWG. close waits for it, because only
+// once the loop has returned is it a fact that no further session can be
+// registered — which is what makes waiting for the sessions meaningful.
+func (t *target) start() {
+	t.serveWG.Add(1)
+	go func() {
+		defer t.serveWG.Done()
+		t.serve()
+	}()
 }
 
 // serve accepts initiator connections until the listener is closed.
@@ -162,6 +197,9 @@ func (t *target) serve() {
 		if err != nil {
 			return
 		}
+		// 在启动 goroutine 之前登记：否则"已 accept、还没登记"的窗口会让 close
+		// 误判没有会话在跑（快照就会在一次收尾写失效之前落下）。
+		t.sessWG.Add(1)
 		go t.guardedHandle(c)
 	}
 }
@@ -169,6 +207,7 @@ func (t *target) serve() {
 // guardedHandle 处理一条发起端连接并兜住 panic：单条连接的异常只影响它自己，
 // 不允许升级为整个代理进程的崩溃（理由见 session.guardedPump）。
 func (t *target) guardedHandle(ic net.Conn) {
+	defer t.sessWG.Done()
 	defer func() {
 		if r := recover(); r != nil {
 			t.log.Error("iscsiproxy: 处理发起端连接 panic，已隔离该连接（代理继续运行）",
@@ -247,7 +286,15 @@ func (t *target) dropCache() bool {
 	if c == nil {
 		return false
 	}
+	// 这条路径是**用户主动**清缓存（界面按钮 / ClearTarget）。留一条日志：否则事后看到
+	// "缓存归零"无法区分是人点的还是命令兜底清掉的（见 wholeDrops）。
+	t.log.Info("iscsiproxy: 按要求清空读缓存（用户操作）",
+		"engine", Version, "key", t.key, "l1_used_bytes", c.Stats().L1UsedBytes)
 	c.Drop()
+	// 落盘的 L1 快照要一起作废：否则下次启动会把它装回来，"清空缓存"就清了个假的。
+	if t.l1Path != "" {
+		_ = os.Remove(t.l1Path)
+	}
 	return true
 }
 
@@ -257,6 +304,15 @@ func (t *target) lunBlockSize() uint32 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.blockSize
+}
+
+// lunBlockCount returns the backing LUN's logical block count, or 0 until a
+// READ CAPACITY response has been observed. It bounds the ranges a WRITE SAME
+// or an UNMAP may name.
+func (t *target) lunBlockCount() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.blockCount
 }
 
 // identitySeen reports whether the LUN has been described well enough to bind a
@@ -336,17 +392,80 @@ func (t *target) maybeBind() {
 		return
 	}
 	t.cache, t.l2 = c, l2f
+	t.l1Binding = ns
 	t.mu.Unlock()
 	// L2 可能是关着的（未启用或本平台不可用），此时恢复数无意义，如实记 0。
 	l2Restored, l2Unverified := 0, 0
 	if l2f != nil {
 		l2Restored, l2Unverified = l2f.Restored(), l2f.Unverified()
 	}
+	// 把上次收尾时落盘的 L1 装回内存：这是"停止代理/重挂库之后缓存不归零"的那一步。
+	l1Restored := t.loadL1Snapshot(c, ns)
 	t.log.Info("iscsiproxy: 缓存已绑定后端盘指纹",
 		"engine", Version, "key", t.key, "namespace", ns[:16],
 		"serial", desc.Serial, "wwid", desc.WWID,
 		"block_size", desc.BlockSize, "blocks", desc.BlockCount,
-		"l2_restored", l2Restored, "l2_unverified", l2Unverified)
+		"l2_restored", l2Restored, "l2_unverified", l2Unverified,
+		"l1_restored", l1Restored)
+}
+
+// loadL1Snapshot 把上次收尾时落盘的 L1 装回内存，返回装回的块数。
+//
+// 它只信任"干净"的快照（见 cache.LoadSnapshot）：不干净、属于另一块盘、或者
+// 几何变了都当作没有快照。不可用的文件顺手删掉，免得每次启动都白读一遍才发
+// 现它没用。
+func (t *target) loadL1Snapshot(c *cache.Cache, ns string) int {
+	if t.l1Path == "" || c == nil {
+		return 0
+	}
+	n, err := c.LoadSnapshot(t.l1Path, ns)
+	switch {
+	case err == nil:
+	case errors.Is(err, cache.ErrSnapshotStale):
+		t.log.Info("iscsiproxy: L1 快照不可用，已丢弃，本次 L1 从空开始",
+			"engine", Version, "key", t.key, "l1_snapshot", t.l1Path, "reason", err)
+		_ = os.Remove(t.l1Path)
+		return 0
+	default:
+		t.log.Warn("iscsiproxy: 读取 L1 快照失败，本次 L1 从空开始",
+			"engine", Version, "key", t.key, "error", err)
+		return 0
+	}
+	if n > 0 {
+		t.stats.l1Restored.Add(int64(n))
+	}
+	return n
+}
+
+// saveL1Snapshot 把 L1 落到磁盘，让下一次启动能装回来。
+//
+// 必须在所有会话退出之后调用（见 close）：保存期间若来一次写失效，快照里就会
+// 留下"其实已经被写掉"的扇区，下次启动直接读到旧数据。
+func (t *target) saveL1Snapshot(c *cache.Cache) error {
+	if t.l1Path == "" || c == nil {
+		return nil
+	}
+	blocks, size, err := c.SaveSnapshot(t.l1Path, t.snapshotBinding())
+	if err != nil {
+		t.log.Warn("iscsiproxy: L1 快照落盘失败", "engine", Version, "key", t.key,
+			"l1_snapshot", t.l1Path, "error", err)
+		return err
+	}
+	if blocks == 0 {
+		// 空快照没有价值：留着只会让下次启动白读一遍。
+		_ = os.Remove(t.l1Path)
+		return nil
+	}
+	t.log.Info("iscsiproxy: L1 快照已落盘", "engine", Version, "key", t.key,
+		"blocks", blocks, "bytes", size, "l1_snapshot", t.l1Path)
+	return nil
+}
+
+// snapshotBinding returns the namespace the L1 snapshot is written under.
+func (t *target) snapshotBinding() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.l1Binding
 }
 
 // close stops the listener, drops every session and releases the cache.
@@ -364,6 +483,8 @@ func (t *target) close() error {
 	if t.ln != nil {
 		_ = t.ln.Close()
 	}
+	// Accept 循环退出之后才不会再登记新会话，这时候等会话才有确定的意义。
+	t.serveWG.Wait()
 	t.sessMu.Lock()
 	ss := make([]*session, 0, len(t.sessions))
 	for s := range t.sessions {
@@ -373,18 +494,25 @@ func (t *target) close() error {
 	for _, s := range ss {
 		s.close()
 	}
-	return closeCache(c, l2f)
+	// 会话全部收摊后 L1 才静止：先落盘再让 cache 收摊，快照就不会漏掉收尾时的写失效。
+	t.sessWG.Wait()
+	saveErr := t.saveL1Snapshot(c)
+	return errors.Join(closeCache(c, l2f), saveErr)
 }
 
 func (t *target) statsSnapshot() Stats {
-	st := Stats{Proxy: StatsSnapshot{
-		Reads:         t.stats.reads.Load(),
-		Writes:        t.stats.writes.Load(),
-		Invalidations: t.stats.invalidations.Load(),
-		LocalCmds:     t.stats.localCmds.Load(),
-		Passthrough:   t.stats.passthrough.Load(),
-		Degraded:      t.stats.degraded.Load(),
-	}}
+	st := Stats{
+		Proxy: StatsSnapshot{
+			Reads:         t.stats.reads.Load(),
+			Writes:        t.stats.writes.Load(),
+			Invalidations: t.stats.invalidations.Load(),
+			LocalCmds:     t.stats.localCmds.Load(),
+			Passthrough:   t.stats.passthrough.Load(),
+			Degraded:      t.stats.degraded.Load(),
+		},
+		L1Restored: int(t.stats.l1Restored.Load()),
+		WholeDrops: int(t.stats.wholeDrops.Load()),
+	}
 	if c := t.getCache(); c != nil {
 		st.Cache = c.Stats()
 		st.BlockSize = c.BlockSize()

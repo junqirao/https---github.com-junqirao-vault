@@ -412,6 +412,9 @@ func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest)
 		}
 		cc = iscsiproxy.CacheConfig{
 			L1Bytes: l1,
+			// L1 是内存缓存，收尾时落盘、下次启动装回内存：停止代理或重新挂载之后
+			// 热数据不必从零预热。它和 L2 独立，关掉 L2 也照样恢复。
+			L1Snapshot: cacheL1Path(m.cfg.Get().CacheL2Dir, allocationID),
 			// 与 v1 一致：默认开启顺序扫描准入，连续大顺序读不冲掉热点。
 			ScanEnabled:   true,
 			ScanThreshold: 32,
@@ -735,6 +738,13 @@ type CacheTargetStatus struct {
 	// L2UsedBytes/L2LimitBytes 是 L2 文件占用与配额（未启用 L2 时为 0）。
 	L2UsedBytes  int64 `json:"l2_used_bytes"`
 	L2LimitBytes int64 `json:"l2_limit_bytes"`
+	// L1Restored 是本次绑定缓存时从 L1 内存快照装回的块数；为 0 表示 L1 从空开始
+	// （没有快照，或快照属于另一块盘/几何不符而不被信任）。这就是"停止代理或重挂库
+	// 之后缓存不归零"的直接读数，与 L2 是否开启无关。
+	L1Restored int `json:"l1_restored"`
+	// WholeDrops 是"命令形态没看懂"导致整盘清空读缓存的次数。它和失效计数分开：
+	// 缓存从几百 MB 掉到几 KB 只可能是这个计数在涨，日志里每条都带 reason。
+	WholeDrops int `json:"whole_drops"`
 	// L2Restored 是本次打开 L2 文件时从快照恢复的槽数；干净关闭后重开也走这条路。
 	// L2Unverified 是其中**还没核实**的槽数：这些槽的索引来自上一次未正常关闭的会话，
 	// 要读到它时用槽上的 stamp 核对过才敢用，因此会随读取逐步归零。
@@ -810,6 +820,8 @@ func (m *cacheManager) Status() CacheStatus {
 			L2Hits:       cs.L2Hits,
 			BackendReads: cs.BackendReads,
 			Writes:       stats.Proxy.Writes,
+			L1Restored:   stats.L1Restored,
+			WholeDrops:   stats.WholeDrops,
 			L2Restored:   stats.L2Restored,
 			L2Unverified: stats.L2Unverified,
 			L2Dropped:    stats.L2Dropped,
@@ -832,13 +844,23 @@ func cacheTargetIQN(allocationID string) string {
 	return cacheIQNPrefix + sanitizeIQNSuffix(allocationID)
 }
 
-// cacheL2Path 返回某个分配的 L2 数据文件路径。dir 为空时落在默认目录
+// cacheStorageDir 解析缓存文件的目录。dir 为空时落在默认目录
 // `<DataDir>\iscsi-cache`（用户可在客户端设置里改到别的盘）。
-func cacheL2Path(dir, allocationID string) string {
+func cacheStorageDir(dir string) string {
 	if strings.TrimSpace(dir) == "" {
-		dir = filepath.Join(DataDir(), "iscsi-cache")
+		return filepath.Join(DataDir(), "iscsi-cache")
 	}
-	return filepath.Join(dir, "l2-"+sanitizeIQNSuffix(allocationID)+".bin")
+	return dir
+}
+
+// cacheL2Path 返回某个分配的 L2 数据文件路径。
+func cacheL2Path(dir, allocationID string) string {
+	return filepath.Join(cacheStorageDir(dir), "l2-"+sanitizeIQNSuffix(allocationID)+".bin")
+}
+
+// cacheL1Path 返回某个分配的 L1 内存快照路径，与 L2 同目录。
+func cacheL1Path(dir, allocationID string) string {
+	return filepath.Join(cacheStorageDir(dir), "l1-"+sanitizeIQNSuffix(allocationID)+".bin")
 }
 
 // cacheBackendPort 返回后端目标的有效端口（服务端未下发时取 iSCSI 默认端口）。

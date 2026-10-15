@@ -19,11 +19,13 @@ const (
 	SCSIRead10             uint8 = 0x28
 	SCSIWrite10            uint8 = 0x2a
 	SCSISynchronizeCache10 uint8 = 0x35
+	SCSIWriteSame10        uint8 = 0x41
 	SCSIUnmap              uint8 = 0x42
 	SCSIModeSelect10       uint8 = 0x55
 	SCSIModeSense10        uint8 = 0x5a
 	SCSIRead16             uint8 = 0x88
 	SCSIWrite16            uint8 = 0x8a
+	SCSIWriteSame16        uint8 = 0x93
 	SCSIServiceActionIn16  uint8 = 0x9e
 	SCSIReportLuns         uint8 = 0xa0
 )
@@ -289,6 +291,100 @@ func ParseSynchronizeCache(cdb []byte) (SynchronizeCacheParams, error) {
 		return p, fmt.Errorf("iscsi: not a SYNCHRONIZE CACHE CDB")
 	}
 	return p, nil
+}
+
+// Cache invalidation commands ---------------------------------------------------------
+
+// WriteSameParams describes a WRITE SAME(10/16) CDB.
+type WriteSameParams struct {
+	LBA uint64
+	// Blocks is the number of logical blocks the command covers. SBC-3 defines
+	// zero as "through the last logical block of the device".
+	Blocks uint64
+	// Unmap reports the UNMAP bit: the device deallocates the range instead of
+	// filling it with the block the CDB carries. The effect on cached data is
+	// the same one an UNMAP command has.
+	Unmap bool
+	// CDBLen is 10 or 16.
+	CDBLen int
+}
+
+// ParseWriteSame decodes WRITE SAME(10/16).
+func ParseWriteSame(cdb []byte) (WriteSameParams, error) {
+	var p WriteSameParams
+	switch {
+	case len(cdb) >= 10 && cdb[0] == SCSIWriteSame10:
+		p.Unmap = cdb[1]&0x08 != 0
+		p.LBA = uint64(binary.BigEndian.Uint32(cdb[2:6]))
+		p.Blocks = uint64(binary.BigEndian.Uint16(cdb[7:9]))
+		p.CDBLen = 10
+	case len(cdb) >= 16 && cdb[0] == SCSIWriteSame16:
+		p.Unmap = cdb[1]&0x08 != 0
+		p.LBA = binary.BigEndian.Uint64(cdb[2:10])
+		p.Blocks = uint64(binary.BigEndian.Uint32(cdb[10:14]))
+		p.CDBLen = 16
+	default:
+		return p, fmt.Errorf("iscsi: not a WRITE SAME CDB")
+	}
+	return p, nil
+}
+
+// UnmapParams describes an UNMAP CDB. The ranges the command releases are not
+// in the CDB: they arrive in the Data-Out payload that follows it.
+type UnmapParams struct {
+	// ListLength is the size in bytes of the UNMAP parameter list the initiator
+	// sends in the command's Data-Out payload.
+	ListLength int
+}
+
+// ParseUnmap decodes an UNMAP(10) CDB.
+func ParseUnmap(cdb []byte) (UnmapParams, error) {
+	var p UnmapParams
+	if len(cdb) < 10 || cdb[0] != SCSIUnmap {
+		return p, fmt.Errorf("iscsi: not an UNMAP CDB")
+	}
+	p.ListLength = int(binary.BigEndian.Uint16(cdb[7:9]))
+	return p, nil
+}
+
+// LbaRange is one logical block range a command covers.
+type LbaRange struct {
+	LBA    uint64
+	Blocks uint64
+}
+
+// UnmapRanges decodes an UNMAP parameter list:
+//
+//	bytes 0..1  UNMAP data length, the bytes of descriptors that follow
+//	bytes 2..3  block descriptor data length (UNMAP does not use it)
+//	bytes 4..7  reserved
+//	then one 16-byte descriptor per range: LBA(8) + blocks(4) + reserved(4)
+//
+// A payload that is shorter than the length its header announces is decoded as
+// far as it goes; callers compare the decoded list against what the CDB asked
+// for and fall back to dropping the device when the two disagree.
+func UnmapRanges(data []byte) []LbaRange {
+	if len(data) < 8 {
+		return nil
+	}
+	n := int(binary.BigEndian.Uint16(data[0:2]))
+	if n > len(data)-8 {
+		n = len(data) - 8
+	}
+	n -= n % 16
+	if n <= 0 {
+		return nil
+	}
+	out := make([]LbaRange, 0, n/16)
+	for i := 0; i+16 <= n; i += 16 {
+		d := data[8+i:]
+		blocks := uint64(binary.BigEndian.Uint32(d[8:12]))
+		if blocks == 0 {
+			continue
+		}
+		out = append(out, LbaRange{LBA: binary.BigEndian.Uint64(d[0:8]), Blocks: blocks})
+	}
+	return out
 }
 
 // Text negotiation ------------------------------------------------------------------

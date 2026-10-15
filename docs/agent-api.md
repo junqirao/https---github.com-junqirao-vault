@@ -446,6 +446,8 @@ CacheTargetStatus = {
   target_iqn,                   # 本地门户为该库公示的 IQN（挂载链路上实际连接的）
   l1_used_bytes, l1_limit_bytes,   # 内存缓存占用与配额
   l2_used_bytes, l2_limit_bytes,   # L2 文件占用与配额（未启用 L2 时均为 0）
+  l1_restored,                  # 绑定缓存时从 L1 内存快照装回的块数（0 = 没快照或快照不可信）
+  whole_drops,                  # 因命令形态未识别而整盘清空读缓存的次数（>0 即"缓存突然归零"的原因）
   l2_restored, l2_unverified,      # 打开 L2 时从快照恢复的槽数 / 其中还没用槽上的 stamp 核实的槽数
   # l2_unverified 随读取逐步归零；正常关闭后重开不会被核实过就是 0（干净关闭的快照直接可信）
   l2_dropped,                   # 核实失败的槽数（索引指向的槽已被改作他用，本次按未命中处理）

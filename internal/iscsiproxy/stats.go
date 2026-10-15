@@ -45,4 +45,13 @@ type Stats struct {
 	// have been answered from a slot another write had taken over. A value that
 	// keeps growing means the index is not flushed often enough.
 	L2Dropped int
+	// L1Restored counts the blocks the L1 snapshot brought back into memory when
+	// the target bound its cache. Zero means L1 started empty (no snapshot, or
+	// the snapshot was not trusted).
+	L1Restored int
+	// WholeDrops counts the commands the proxy could not decode and answered by
+	// dropping the entire read cache instead of just the range they covered.
+	// Any non-zero value explains a cache that fell from hundreds of MB to a few
+	// KB: the log line that goes with each one names the reason.
+	WholeDrops int
 }

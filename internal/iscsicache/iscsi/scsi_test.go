@@ -180,6 +180,77 @@ func TestTextEncodeParseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestParseWriteSame(t *testing.T) {
+	cdb := make([]byte, 10)
+	cdb[0] = SCSIWriteSame10
+	cdb[1] = 0x08 // UNMAP bit
+	binary.BigEndian.PutUint32(cdb[2:6], 0x2000)
+	binary.BigEndian.PutUint16(cdb[7:9], 32)
+
+	p, err := ParseWriteSame(cdb)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p.LBA != 0x2000 || p.Blocks != 32 || !p.Unmap || p.CDBLen != 10 {
+		t.Fatalf("decoded %+v", p)
+	}
+
+	// WRITE SAME(16): the UNMAP bit defaults to clear and a zero block count
+	// means "through the last logical block of the device".
+	cdb16 := make([]byte, 16)
+	cdb16[0] = SCSIWriteSame16
+	binary.BigEndian.PutUint64(cdb16[2:10], 0x1_0000_0000)
+	p, err = ParseWriteSame(cdb16)
+	if err != nil {
+		t.Fatalf("parse 16: %v", err)
+	}
+	if p.LBA != 0x1_0000_0000 || p.Blocks != 0 || p.Unmap || p.CDBLen != 16 {
+		t.Fatalf("decoded %+v", p)
+	}
+
+	if _, err := ParseWriteSame([]byte{SCSIRead10}); err == nil {
+		t.Fatal("expected a non WRITE SAME CDB to be rejected")
+	}
+}
+
+func TestParseUnmapAndRanges(t *testing.T) {
+	cdb := make([]byte, 10)
+	cdb[0] = SCSIUnmap
+	// 8-byte parameter header plus two 16-byte descriptors.
+	binary.BigEndian.PutUint16(cdb[7:9], 40)
+
+	p, err := ParseUnmap(cdb)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p.ListLength != 40 {
+		t.Fatalf("list length = %d, want 40", p.ListLength)
+	}
+	if _, err := ParseUnmap([]byte{SCSIRead10}); err == nil {
+		t.Fatal("expected a non UNMAP CDB to be rejected")
+	}
+
+	list := make([]byte, 8+2*16)
+	binary.BigEndian.PutUint16(list[0:2], 32) // descriptor bytes that follow
+	binary.BigEndian.PutUint64(list[8:16], 100)
+	binary.BigEndian.PutUint32(list[16:20], 5)
+	binary.BigEndian.PutUint64(list[24:32], 4096)
+	binary.BigEndian.PutUint32(list[32:36], 0) // an empty range is not a range
+
+	ranges := UnmapRanges(list)
+	if len(ranges) != 1 || ranges[0].LBA != 100 || ranges[0].Blocks != 5 {
+		t.Fatalf("decoded %+v", ranges)
+	}
+
+	// A payload cut short decodes only the descriptors it actually holds.
+	if got := UnmapRanges(list[:16]); len(got) != 0 {
+		t.Fatalf("truncated list decoded to %+v", got)
+	}
+	if got := UnmapRanges(nil); got != nil {
+		t.Fatalf("nil list decoded to %+v", got)
+	}
+}
+
 func TestParseSynchronizeCache(t *testing.T) {
 	cdb := make([]byte, 10)
 	cdb[0] = SCSISynchronizeCache10
