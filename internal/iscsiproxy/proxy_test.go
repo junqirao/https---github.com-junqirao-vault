@@ -447,3 +447,45 @@ func TestReadBufPoolRoundTrip(t *testing.T) {
 		readBufPut(again)
 	}
 }
+
+// TestInjectBufPoolRoundTrip 锁定注入缓冲池的尺寸分类与归还语义：取出的缓冲
+// cap 等于其尺寸类、归还后同尺寸类的请求必须复用它 —— 一次 4KiB 命中不该占用
+// 为最大读准备的缓冲。
+func TestInjectBufPoolRoundTrip(t *testing.T) {
+	for _, n := range []int{0, 48, 4096, 64 << 10, 200 << 10, 1 << 20, maxTeeBytes} {
+		b := injectBufGet(n)
+		if len(b) != n {
+			t.Fatalf("injectBufGet(%d) 长度 = %d", n, len(b))
+		}
+		cl := injectBufClass(n)
+		if cap(b) != injectBufClasses[cl] {
+			t.Fatalf("injectBufGet(%d) 容量 %d 不属于尺寸类 %d", n, cap(b), injectBufClasses[cl])
+		}
+		injectBufPut(b)
+		again := injectBufGet(n)
+		if cap(again) != cap(b) {
+			t.Fatalf("归还后同尺寸类应复用：cap %d -> %d", cap(b), cap(again))
+		}
+		injectBufPut(again)
+	}
+}
+
+// TestInjectBufNeedFitsTheBound 锁定容量上界的推算前提：只要 MRDSL 不低于
+// RFC 7143 的下限 512，任何一次注入的组装长度都不会超过 injectBufCap，分档后
+// 的最大尺寸类也就装得下，组装循环不会越界写。
+func TestInjectBufNeedFitsTheBound(t *testing.T) {
+	for _, mrdsl := range []int{512, 4096, 64 << 10, 256 << 10, 1 << 20} {
+		for _, n := range []int{0, 512, 4096, 64 << 10, 1 << 20, maxTeeBytes} {
+			need := injectBufNeed(n, mrdsl)
+			if need > injectBufCap {
+				t.Fatalf("MRDSL %d 下 %d 字节的组装需要 %d，超过上界 %d", mrdsl, n, need, injectBufCap)
+			}
+			if need < n {
+				t.Fatalf("MRDSL %d 下 %d 字节的组装长度算成 %d", mrdsl, n, need)
+			}
+		}
+	}
+	if last := injectBufClasses[len(injectBufClasses)-1]; last < injectBufCap {
+		t.Fatalf("最大尺寸类 %d 小于上界 %d", last, injectBufCap)
+	}
+}

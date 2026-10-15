@@ -284,6 +284,11 @@ func (h *BHS) SetLoginTSIH(v uint16) { put16(h[14:16], v) }
 type PDU struct {
 	Header BHS
 	Data   []byte
+	// InPlace marks a PDU whose data segment ReadSegment was handed straight:
+	// Data is a slice of the buffer that owns the bytes, not a segment of its
+	// own. A consumer must account for Data without copying it again — the copy
+	// has already happened, into the only place the bytes live.
+	InPlace bool
 }
 
 // NewPDU builds a PDU with the given opcode and data segment.

@@ -684,6 +684,8 @@ func (s source) ReadAt(ctx context.Context, off int64, dst []byte) error {
 	lba := uint64(off / bs)
 	blocks := uint64(len(dst)) / uint64(bs)
 
+	// A stack array is not an option here: the command is handed to the backend
+	// as a slice, so whichever way it is built the compiler moves it to the heap.
 	cdb := make([]byte, 16)
 	var res *backend.Result
 	var err error

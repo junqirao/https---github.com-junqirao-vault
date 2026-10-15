@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
@@ -438,5 +439,464 @@ func TestLiveWriteThroughput(t *testing.T) {
 		cacheLoss := (1 - c.cached.mbps/c.direct.mbps) * 100
 		t.Logf("  %s: 转发开销损失 %.1f%%，写失效再损失 %.1f%%（合计 %.1f%%）",
 			wb.name, passLoss, cacheLoss-passLoss, cacheLoss)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// CrystalDiskMark 口径的三链路对比：裸连 / 代理(纯透传) / 代理+L1+L2
+// ---------------------------------------------------------------------------
+
+// 口径取自 CrystalDiskMark 9 的 Default profile（与那份 CrystalDiskMark_*.txt 一致）：
+// SEQ1M Q8T1、SEQ1M Q1T1、RND4K Q32T16、RND4K Q1T1 读写各四项，测试区 512 MiB，
+// 每个负载测 3 次（报告取 3 次的平均），负载之间静 5 秒。
+//
+// 三条链路就是客户端 agent 的三种真实形态（见 internal/agent/cacheproxy.go）：
+//
+//	裸连      发起端直连后端目标，没有代理，基线
+//	代理      走本机代理，但该库没开缓存（NoCache 纯透传）
+//	代理+缓存 走本机代理且开了缓存（L1/L2 + 顺序扫描准入，agent 的默认配额）
+//
+// ⚠️ 写测试是破坏性的：测试区取 LUN **末尾**的 512 MiB（与 vault-iscsi-bench
+// -allow-write 写的是同一侧，不碰盘首）。默认不跑，要跑就显式指定：
+//
+//	$env:VAULT_ISCSI_TEST_ADDR="172.18.28.200:3260"
+//	$env:VAULT_ISCSI_TEST_IQN="iqn.1991-05.com.microsoft:win-0e595h11jss-test-target"
+//	go test ./internal/iscsiproxy -run TestLiveCDMProfile -v -count=1 -timeout 90m
+//
+// VAULT_CDM_MB / VAULT_CDM_ITERS 可覆盖测试区与次数（调试时缩小用；日志会写明实际口径），
+// VAULT_CDM_L1_MB / VAULT_CDM_L2_MB 覆盖"开缓存那一列"的缓存预算。L1 必须大于测试区，
+// 否则缓存列量的是后端而不是缓存（见下面的注释）。
+const (
+	cdmDefaultMB    = 512
+	cdmDefaultIters = 3
+	// cdmInterval 对应 CDM 的 "Interval 5 sec"：负载之间静 5 秒，顺带把后端在上一相末尾
+	// 吞下的写缓存消化掉，前一个负载的尾流不算进下一个负载。
+	cdmInterval = 5 * time.Second
+	// cdmL1Bytes/cdmL2Bytes 是"开缓存那一列"两级缓存的预算。⚠️ L1 必须显著大于测试区：
+	// CDM 每一轮都把整个测试区重新读一遍，工作集就是测试区本身，L1 只要不大于它，第二轮
+	// 仍然要回到后端（或落到 L2），缓存列就永远等于裸连，量的是后端的脸而不是缓存的。
+	// 所以默认给 2 GiB（agent 推荐值的上限），而不是 agent 的总预算默认值 512 MiB —— 后者
+	// 配上 CDM 默认的 512 MiB 测试区刚好相等，是"缓存列没有意义"的配置。
+	// VAULT_CDM_L1_MB / VAULT_CDM_L2_MB 可覆盖；L2 生产默认 4 GiB，默认照样给 4 GiB，
+	// 但 L1 一旦装得下工作集，L2 就只是兜底，跑不出差别。
+	cdmDefaultL1MB = 2048
+	cdmDefaultL2MB = 4096
+)
+
+// cdmWorkload 是一个 CDM 负载。depth 是同时在飞的命令数（CDM 标题里的 Q=），threads 是
+// CDM 自己的线程数（T=）——两者只决定它内部的划分，在飞的命令条数都是 Q，所以这里按
+// depth 起 worker，threads 只用来打印与 CDM 报告一致的标题。
+type cdmWorkload struct {
+	size    int64
+	depth   int
+	threads int
+	random  bool
+	write   bool
+}
+
+func (w cdmWorkload) label() string {
+	kind, size := "SEQ", "1MiB"
+	if w.random {
+		kind = "RND"
+	}
+	if w.size < 1<<20 {
+		size = "4KiB"
+	}
+	return fmt.Sprintf("%s %5s (Q=%3d, T=%2d)", kind, size, w.depth, w.threads)
+}
+
+func (w cdmWorkload) phase() string {
+	if w.write {
+		return "写"
+	}
+	return "读"
+}
+
+// cdmWorkloads 按 CDM 报告的顺序给出八个负载：先四个读，再四个写。
+func cdmWorkloads() []cdmWorkload {
+	base := []cdmWorkload{
+		{size: 1 << 20, depth: 8, threads: 1},
+		{size: 1 << 20, depth: 1, threads: 1},
+		{size: 4 << 10, depth: 32, threads: 16, random: true},
+		{size: 4 << 10, depth: 1, threads: 1, random: true},
+	}
+	out := make([]cdmWorkload, 0, len(base)*2)
+	out = append(out, base...)
+	for _, w := range base {
+		w.write = true
+		out = append(out, w)
+	}
+	return out
+}
+
+// cdmResult 是一个负载一轮的结果。mbps 用 CDM 的十进制口径（1 MB = 1e6 字节），lat 是
+// 平均单命令时延——即 CDM 那个 <> 里的数字（总时长 / 命令数）。
+type cdmResult struct {
+	mbps float64
+	iops float64
+	lat  time.Duration
+}
+
+func cdmAvg(rs []cdmResult) cdmResult {
+	if len(rs) == 0 {
+		return cdmResult{}
+	}
+	var mbps, iops float64
+	var lat time.Duration
+	for _, r := range rs {
+		mbps += r.mbps
+		iops += r.iops
+		lat += r.lat
+	}
+	n := float64(len(rs))
+	return cdmResult{mbps: mbps / n, iops: iops / n, lat: lat / time.Duration(len(rs))}
+}
+
+// cdmPass 跑一轮完整的测试区：把 span 按 size 切成连续的（顺序）或打乱的（随机）偏移，
+// 用 depth 个 worker 发出去。返回这一轮的耗时与命令数。
+func cdmPass(ctx context.Context, it *backend.Initiator, w cdmWorkload, start, span int64, blockSize int, seed int64) (time.Duration, int, error) {
+	steps := int(span / w.size)
+	offs := make([]int64, steps)
+	for i := range offs {
+		offs[i] = start + int64(i)*w.size
+	}
+	if w.random {
+		// CDM 的随机测试是"每个块恰好碰一次"的乱序，不是带重复的随机采样：这样一轮走过
+		// 的字节数正好等于测试区，各负载之间才可比。
+		rand.New(rand.NewSource(seed)).Shuffle(steps, func(i, j int) { offs[i], offs[j] = offs[j], offs[i] })
+	}
+
+	depth := w.depth
+	if depth < 1 {
+		depth = 1
+	}
+	shards := make([][]int64, depth)
+	for i, off := range offs {
+		shards[i%depth] = append(shards[i%depth], off)
+	}
+
+	blocks := uint32(w.size / int64(blockSize))
+	var (
+		mu       sync.Mutex
+		firstErr error
+	)
+	record := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
+		}
+		mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	t0 := time.Now()
+	for _, shard := range shards {
+		if len(shard) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(shard []int64) {
+			defer wg.Done()
+			buf := make([]byte, w.size)
+			cdb := make([]byte, 10)
+			if w.write {
+				cdb[0] = iscsi.SCSIWrite10
+				for i := range buf {
+					buf[i] = byte(i*31 + 7)
+				}
+			} else {
+				cdb[0] = iscsi.SCSIRead10
+			}
+			for _, off := range shard {
+				binary.BigEndian.PutUint32(cdb[2:6], uint32(off/int64(blockSize)))
+				binary.BigEndian.PutUint16(cdb[7:9], uint16(blocks))
+				var (
+					res *backend.Result
+					err error
+				)
+				if w.write {
+					res, err = it.Exec(ctx, cdb, buf, 0)
+				} else {
+					res, err = it.ExecInto(ctx, cdb, nil, buf)
+				}
+				if err != nil {
+					record(err)
+					return
+				}
+				if !res.OK() {
+					record(res.Error())
+					return
+				}
+				if !w.write && len(res.Data) != len(buf) {
+					record(fmt.Errorf("短读：%d 字节，期望 %d", len(res.Data), len(buf)))
+					return
+				}
+			}
+		}(shard)
+	}
+	wg.Wait()
+	dur := time.Since(t0)
+	mu.Lock()
+	err := firstErr
+	mu.Unlock()
+	if err != nil {
+		return dur, 0, err
+	}
+	return dur, steps, nil
+}
+
+// cdmMeasure 按 CDM 的口径把一个负载重复 iters 轮，并把每轮的数字打进日志。
+func cdmMeasure(ctx context.Context, t *testing.T, it *backend.Initiator, w cdmWorkload, start, span int64, blockSize, iters int) ([]cdmResult, error) {
+	out := make([]cdmResult, 0, iters)
+	for k := 0; k < iters; k++ {
+		time.Sleep(cdmInterval)
+		dur, ops, err := cdmPass(ctx, it, w, start, span, blockSize, int64(k)+1)
+		if err != nil {
+			return out, fmt.Errorf("第 %d 轮: %w", k+1, err)
+		}
+		r := cdmResult{
+			mbps: float64(ops) * float64(w.size) / dur.Seconds() / 1e6,
+			iops: float64(ops) / dur.Seconds(),
+			lat:  dur / time.Duration(ops),
+		}
+		out = append(out, r)
+		t.Logf("    %s %s 第%d轮: %9.3f MB/s [%9.1f IOPS] < %8.2f us>",
+			w.phase(), w.label(), k+1, r.mbps, r.iops, float64(r.lat.Nanoseconds())/1e3)
+	}
+	return out, nil
+}
+
+// cdmLink 是一条被对比的链路：一个名字、一个发起端会话的工厂、清理与统计。
+type cdmLink struct {
+	name  string
+	dial  func(t *testing.T) *backend.Initiator
+	close func()
+	stats func() (iscsiproxy.Stats, bool)
+	// bindWait 表示这条链路的缓存是异步绑定的，跑负载之前要等它绑上。
+	bindWait bool
+}
+
+func cdmEnvInt(name string, def int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+func TestLiveCDMProfile(t *testing.T) {
+	addr := strings.TrimSpace(os.Getenv("VAULT_ISCSI_TEST_ADDR"))
+	iqn := strings.TrimSpace(os.Getenv("VAULT_ISCSI_TEST_IQN"))
+	if addr == "" || iqn == "" {
+		t.Skip("live target not configured (VAULT_ISCSI_TEST_ADDR / VAULT_ISCSI_TEST_IQN)")
+	}
+	spanMB := cdmEnvInt("VAULT_CDM_MB", cdmDefaultMB)
+	iters := cdmEnvInt("VAULT_CDM_ITERS", cdmDefaultIters)
+	l1Bytes := int64(cdmEnvInt("VAULT_CDM_L1_MB", cdmDefaultL1MB)) << 20
+	l2Bytes := int64(cdmEnvInt("VAULT_CDM_L2_MB", cdmDefaultL2MB)) << 20
+
+	// 4K 随机写在这块盘上只有一千多 IOPS，八个负载 × 三轮 × 三条链路要跑二三十分钟，
+	// 超时给足（-timeout 也要跟上，Go 默认的 10 分钟会把它掐了）。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Hour)
+	defer cancel()
+
+	probe, err := backend.Dial(ctx, backend.Config{Address: addr, TargetIQN: iqn, IOTimeout: 60 * time.Second})
+	if err != nil {
+		t.Fatalf("直连后端失败: %v", err)
+	}
+	info := probe.Info()
+	_ = probe.Close()
+
+	blockSize := int(info.BlockSize)
+	devBytes := int64(info.BlockCount) * int64(blockSize)
+	span := int64(spanMB) << 20
+	if span > devBytes/2 {
+		span = devBytes / 2
+	}
+	span -= span % (1 << 20) // 1MiB 的负载要能整除整块测试区
+	start := devBytes - span
+
+	t.Logf("目标: %s %s（%s %s，%d 字节/块，%.2f GiB）",
+		addr, iqn, info.Vendor, info.Product, blockSize, float64(devBytes)/(1<<30))
+	t.Logf("口径: CrystalDiskMark 9 Default profile（SEQ1M Q8T1/Q1T1、RND4K Q32T16/Q1T1，读+写）")
+	t.Logf("测试区: LUN 末尾 %d MiB（偏移 %d 起）× %d 轮，负载之间静 %s", span>>20, start, iters, cdmInterval)
+	t.Logf("开缓存那一列: L1=%d MiB、L2=%d MiB、顺序扫描准入开", l1Bytes>>20, l2Bytes>>20)
+	if l1Bytes <= span {
+		t.Logf("⚠️ L1(%d MiB) 不大于测试区(%d MiB)：缓存列的工作集装不进 L1，这一列会接近裸连，"+
+			"量的是后端而不是缓存。要看缓存的增益请把 VAULT_CDM_L1_MB 抬到测试区的 2 倍以上，"+
+			"或把 VAULT_CDM_MB 缩到 L1 之内。", l1Bytes>>20, spanMB)
+	}
+	t.Logf("⚠️ 写相会覆盖测试区所在的 %d MiB", span>>20)
+
+	dialBackend := func(t *testing.T, address string) *backend.Initiator {
+		it, err := backend.Dial(context.Background(), backend.Config{
+			Address: address, TargetIQN: iqn, IOTimeout: 60 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("直连后端失败（%s）: %v", address, err)
+		}
+		return it
+	}
+
+	// startProxyLink 起一个代理链路：cacheOn=false 时该库用 NoCache 纯透传，也就是
+	// 客户端 agent 里"用户没给这个卷开缓存"的形态。
+	startProxyLink := func(name, key string, cacheOn bool) cdmLink {
+		var logs strings.Builder
+		log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		p, err := iscsiproxy.NewPortal(iscsiproxy.PortalConfig{Logger: log})
+		if err != nil {
+			t.Fatalf("NewPortal: %v", err)
+		}
+		cc := iscsiproxy.CacheConfig{}
+		if cacheOn {
+			cc = iscsiproxy.CacheConfig{
+				L1Bytes: l1Bytes,
+				L2: iscsiproxy.L2Config{
+					Enabled:   true,
+					Path:      t.TempDir() + "\\l2.bin",
+					SizeBytes: l2Bytes,
+				},
+				ScanEnabled: true, ScanThreshold: 32,
+			}
+		}
+		if err := p.Add(context.Background(), iscsiproxy.TargetConfig{
+			Key:     key,
+			Backend: iscsiproxy.BackendConfig{Address: addr, TargetIQN: iqn},
+			Cache:   cc,
+			NoCache: !cacheOn,
+		}); err != nil {
+			t.Fatalf("Add(%s): %v", key, err)
+		}
+		host, port, ok := p.TargetAddr(key)
+		if !ok {
+			t.Fatal("TargetAddr: 未返回代理地址")
+		}
+		l := cdmLink{name: name, bindWait: cacheOn}
+		l.close = func() { _ = p.Close() }
+		l.stats = func() (iscsiproxy.Stats, bool) { return p.Stats(key) }
+		l.dial = func(t *testing.T) *backend.Initiator {
+			it, err := backend.Dial(context.Background(), backend.Config{
+				Address:   net.JoinHostPort(host, strconv.Itoa(port)),
+				TargetIQN: iqn,
+				IOTimeout: 60 * time.Second,
+			})
+			if err != nil {
+				t.Fatalf("连代理失败（%s）: %v\n代理日志：%s", key, err, logs.String())
+			}
+			return it
+		}
+		return l
+	}
+
+	links := []cdmLink{
+		{name: "裸连（直连后端）"},
+		startProxyLink("代理（纯透传）", "cdm-nocache", false),
+		startProxyLink("代理+缓存（L1+L2）", "cdm-cached", true),
+	}
+	links[0].dial = func(t *testing.T) *backend.Initiator { return dialBackend(t, addr) }
+	links[0].close = func() {}
+	links[0].stats = func() (iscsiproxy.Stats, bool) { return iscsiproxy.Stats{}, false }
+	workloads := cdmWorkloads()
+	results := make([][]cdmResult, len(links))
+	snaps := make([]iscsiproxy.Stats, len(links))
+	haveSnap := make([]bool, len(links))
+
+	for li := range links {
+		t.Logf("=== 链路 %d/%d：%s ===", li+1, len(links), links[li].name)
+		it := links[li].dial(t)
+		if links[li].bindWait {
+			// 缓存是在泵里观测到 LUN 身份之后异步绑定的，等它绑上再测。
+			bound := false
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+				if st, ok := links[li].stats(); ok && st.BlockSize != 0 {
+					bound = true
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if !bound {
+				_ = it.Close()
+				links[li].close()
+				t.Fatalf("链路 %s 的缓存没绑上（BlockSize 恒为 0），这一列的数没有意义", links[li].name)
+			}
+		}
+		results[li] = make([]cdmResult, len(workloads))
+		for wi, w := range workloads {
+			rs, err := cdmMeasure(ctx, t, it, w, start, span, blockSize, iters)
+			if err != nil {
+				_ = it.Close()
+				links[li].close()
+				t.Fatalf("链路 %s 的%s %s: %v", links[li].name, w.phase(), w.label(), err)
+			}
+			results[li][wi] = cdmAvg(rs)
+		}
+		_ = it.Close()
+		if st, ok := links[li].stats(); ok {
+			snaps[li], haveSnap[li] = st, true
+		}
+		links[li].close()
+	}
+
+	// 按 CDM 报告的样式，一条链路一块。
+	for li := range links {
+		t.Logf("[%s]", links[li].name)
+		for _, phase := range []string{"读", "写"} {
+			t.Logf("  [%s]", map[string]string{"读": "Read", "写": "Write"}[phase])
+			for wi, w := range workloads {
+				if w.phase() != phase {
+					continue
+				}
+				r := results[li][wi]
+				t.Logf("    %s: %9.3f MB/s [%9.1f IOPS] < %8.2f us>",
+					w.label(), r.mbps, r.iops, float64(r.lat.Nanoseconds())/1e3)
+			}
+		}
+		if haveSnap[li] {
+			st := snaps[li]
+			t.Logf("    统计: 观测读=%d 写=%d 缓存代答=%d 透传=%d 降级=%d | 后端读=%d L1命中=%d L2命中=%d 填充=%d 失效=%d 扫描跳过=%d",
+				st.Proxy.Reads, st.Proxy.Writes, st.Proxy.LocalCmds, st.Proxy.Passthrough, st.Proxy.Degraded,
+				st.Cache.BackendReads, st.Cache.L1Hits, st.Cache.L2Hits,
+				st.Cache.Fills, st.Cache.Invalidations, st.Cache.ScanBypass)
+		}
+	}
+
+	if len(links) != 3 {
+		t.Fatalf("对比表按三条链路排版，实际 %d 条", len(links))
+	}
+	t.Logf("=== 汇总（MB/s，%d 轮平均；CDM 口径 1MB=1e6 字节）===", iters)
+	t.Logf("%-24s %11s %11s %13s %10s", "负载", "裸连", "代理", "代理+缓存", "缓存/裸连")
+	for _, phase := range []string{"读", "写"} {
+		for wi, w := range workloads {
+			if w.phase() != phase {
+				continue
+			}
+			d, p, c := results[0][wi].mbps, results[1][wi].mbps, results[2][wi].mbps
+			t.Logf("%-24s %11.3f %11.3f %13.3f %9.2fx", w.label(), d, p, c, c/d)
+		}
+	}
+
+	// 代理链路一旦降级成纯字节转发，缓存就根本没参与，这一列的数没有意义。
+	for li := 1; li < len(links); li++ {
+		if haveSnap[li] && snaps[li].Proxy.Degraded > 0 {
+			t.Fatalf("链路 %s 的会话降级为纯透传（degraded=%d），对比无效", links[li].name, snaps[li].Proxy.Degraded)
+		}
+	}
+	// 松口径兜底：任何一列都不该掉到直连的 20% 以下。真掉下去说明链路坏了，而不是
+	// "慢"——每条链路的损失看上面的汇总。
+	for wi, w := range workloads {
+		d := results[0][wi].mbps
+		if d <= 0 {
+			t.Fatalf("%s %s 的直连基线是 0，设备可能没在干活", w.phase(), w.label())
+		}
+		for li := 1; li < len(links); li++ {
+			if r := results[li][wi].mbps; r < d*0.2 {
+				t.Errorf("%s 的%s %s 掉到直连的 %.1f%%（%.3f vs %.3f MB/s），链路可能坏了",
+					links[li].name, w.phase(), w.label(), r/d*100, r, d)
+			}
+		}
 	}
 }

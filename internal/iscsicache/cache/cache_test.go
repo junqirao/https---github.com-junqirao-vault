@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1013,5 +1014,104 @@ func TestFillObservedInstallsAlignedInterior(t *testing.T) {
 	}
 	if c.ReadCached(ss, make([]byte, ss)) {
 		t.Fatal("起点未对齐的部分扇区不应被填充")
+	}
+}
+
+// TestFillObservedReleaseOwnership pins the ownership contract the tee path
+// relies on: a caller that stages a read in a pooled buffer and hands it to
+// FillObservedRelease gets it back exactly once, and never before the bytes it
+// carries have been installed. Without that the proxy cannot recycle the buffer
+// a forwarded read was staged in, and every miss allocates a fresh one.
+func TestFillObservedReleaseOwnership(t *testing.T) {
+	const bs, ss = 16 << 10, 4 << 10
+	c := newTestCache(t, testOpts{})
+
+	// A run that starts in block 0 and ends in block 2, so the release has to
+	// wait for the last of the three runs it feeds.
+	off := int64(bs) - ss
+	run := make([]byte, bs+2*ss)
+	for i := range run {
+		run[i] = byte((off + int64(i)) / ss)
+	}
+	var calls, hits, wanted atomic.Int64
+	c.FillObservedRelease(off, run, func() {
+		calls.Add(1)
+		// Whatever the release sees must already be servable: a buffer recycled
+		// before its bytes were installed would corrupt the block it was copied
+		// into, or hand the next reader the wrong bytes.
+		buf := make([]byte, ss)
+		for cur := off; cur+ss <= off+int64(len(run)); cur += ss {
+			wanted.Add(1)
+			if c.ReadCached(cur, buf) {
+				hits.Add(1)
+			}
+		}
+	})
+	c.Wait()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("release 调用 %d 次，应为 1 次", got)
+	}
+	if h, w := hits.Load(), wanted.Load(); h != w {
+		t.Fatalf("release 时仍有未安装的扇区：命中 %d/%d", h, w)
+	} else if w != 6 {
+		t.Fatalf("测试前提有误：应覆盖 6 个扇区，实际 %d", w)
+	}
+
+	// A run whose sector aligned interior is empty installs nothing, but the
+	// buffer still comes back.
+	calls.Store(0)
+	c.FillObservedRelease(int64(ss)+1000, make([]byte, 100), func() { calls.Add(1) })
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("无对齐内区时 release 调用 %d 次，应为 1 次", got)
+	}
+
+	// So does a run offered to a closed cache.
+	c.Close()
+	calls.Store(0)
+	c.FillObservedRelease(0, make([]byte, ss), func() { calls.Add(1) })
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("缓存关闭后 release 调用 %d 次，应为 1 次", got)
+	}
+
+	// And a run the queue refuses is released by the enqueue itself.
+	calls.Store(0)
+	c.enqueueFill(0, 0, make([]byte, ss), 0, false, newFillRelease(func() { calls.Add(1) }))
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("入队被拒时 release 调用 %d 次，应为 1 次", got)
+	}
+}
+
+// TestInstallValidatedDropsWhatItCannotPlace pins the two ways a run is refused
+// before it is published: a stale epoch, and an offset that does not sit on a
+// sector boundary. Both must leave the entry untouched — the second one is also
+// the reason the guard exists, since addressing whole sectors from a misaligned
+// offset used to index off the front of the run.
+func TestInstallValidatedDropsWhatItCannotPlace(t *testing.T) {
+	const ss = 4 << 10
+	c := newTestCache(t, testOpts{})
+	epoch := c.shard(0).epoch.Load()
+
+	var calls atomic.Int64
+	rel := newFillRelease(func() { calls.Add(1) })
+	c.installValidated(0, 0, make([]byte, ss), epoch+1, false, rel)
+	// What the worker does with a run that was not handed to an L2 write.
+	rel.done()
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("被丢弃的填充应释放缓冲，release 调用 %d 次", got)
+	}
+	if c.ReadCached(0, make([]byte, ss)) {
+		t.Fatal("epoch 不匹配的填充不应被安装")
+	}
+
+	// An offset that does not sit on a sector boundary used to index off the
+	// front of the run; it must simply be refused.
+	c.installValidated(0, 1, make([]byte, ss), epoch, false, nil)
+	if c.ReadCached(0, make([]byte, ss)) {
+		t.Fatal("未对齐的填充不应写入任何扇区")
+	}
+
+	c.installValidated(0, 0, make([]byte, ss), epoch, false, nil)
+	if !c.ReadCached(0, make([]byte, ss)) {
+		t.Fatal("对齐的填充应被安装")
 	}
 }

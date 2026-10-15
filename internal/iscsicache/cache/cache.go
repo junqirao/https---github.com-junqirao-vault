@@ -498,7 +498,7 @@ func (c *Cache) serveMiss(ctx context.Context, blk uint64, blkStart, off int64, 
 	n := s1 - s0 + 1
 	sec := int64(c.sectorSize)
 	start := blkStart + int64(s0)*sec
-	buf := make([]byte, int64(n)*sec)
+	buf := fillBufGet(int(int64(n) * sec))
 
 	// The epoch is captured before the data is read, never after: an invalidation
 	// always follows the write it belongs to, so a fill whose epoch was captured
@@ -525,8 +525,11 @@ func (c *Cache) serveMiss(ctx context.Context, blk uint64, blkStart, off int64, 
 	}
 	copy(dst, buf[off-start:])
 	// Data that came out of L2 is already there: only a backing read needs to
-	// populate it.
-	c.enqueueFill(blk, int(start-blkStart), buf, epoch, !fromL2)
+	// populate it. The staging buffer travels with the fill: the release returns
+	// it to the pool once the worker has consumed the run, so the request pays
+	// neither an allocation nor a zeroing for it.
+	c.enqueueFill(blk, int(start-blkStart), buf, epoch, !fromL2,
+		newFillRelease(func() { fillBufPut(buf) }))
 	return nil
 }
 
@@ -565,7 +568,15 @@ func (c *Cache) fillRun(ctx context.Context, start, end int64, dst []byte, src S
 	// Every covered shard's epoch is captured before the read, so a write that
 	// invalidates any of them while the backing store is being read drops the
 	// whole install instead of publishing data the write has made stale.
-	epochs := make([]uint64, lastBlk-firstBlk+1)
+	// The epochs stay on the stack for the spans that dominate this path (a
+	// 1MiB run is 16 blocks); a longer one falls back to the heap.
+	nBlocks := int(lastBlk - firstBlk + 1)
+	var stackEpochs [16]uint64
+	epochs := stackEpochs[:]
+	if nBlocks > len(epochs) {
+		epochs = make([]uint64, nBlocks)
+	}
+	epochs = epochs[:nBlocks]
 	for i := range epochs {
 		epochs[i] = c.shard(firstBlk + uint64(i)).epoch.Load()
 	}
@@ -581,7 +592,7 @@ func (c *Cache) fillRun(ctx context.Context, start, end int64, dst []byte, src S
 		if segEnd > readEnd {
 			segEnd = readEnd
 		}
-		c.installValidated(blk, int(off-blkStart), buf[off-readStart:segEnd-readStart], epochs[blk-firstBlk], false)
+		c.installValidated(blk, int(off-blkStart), buf[off-readStart:segEnd-readStart], epochs[blk-firstBlk], false, nil)
 		off = segEnd
 	}
 	c.stats.Fills.Add(1)
@@ -724,9 +735,13 @@ func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
 		}
 		n := s1 - s0 + 1
 		start := blkStart + int64(s0)*ss
-		buf := make([]byte, int64(n)*ss)
+		buf := fillBufGet(int(int64(n) * ss))
 		ok, err := c.l2.ReadSectors(blk, s0, n, buf)
 		if err != nil {
+			// Nothing has been queued yet, so this buffer and the runs taken out
+			// of L2 before this block are the caller's to recycle.
+			fillBufPut(buf)
+			dropPromoteBufs(promotes)
 			c.log.Warn("cache: l2 read failed", "block", blk, "err", err)
 			return false
 		}
@@ -734,6 +749,8 @@ func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
 			// Neither level holds the whole segment: report a plain miss. Nothing
 			// has been committed to the counters, and the caller re-reads the
 			// range from the backing store.
+			fillBufPut(buf)
+			dropPromoteBufs(promotes)
 			return false
 		}
 		copy(dst[cur-off:segEnd-off], buf[cur-start:])
@@ -744,11 +761,22 @@ func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
 	c.stats.L1Hits.Add(l1Hits)
 	c.stats.L2Hits.Add(int64(len(promotes)))
 	c.stats.RequestHits.Add(1)
-	// writeL2 is false: the data came out of L2, so only L1 needs it.
+	// writeL2 is false: the data came out of L2, so only L1 needs it. Each
+	// promote carries its staging buffer into the fill that consumes it.
 	for _, p := range promotes {
-		c.enqueueFill(p.blk, p.blockOff, p.data, p.epoch, false)
+		buf := p.data
+		c.enqueueFill(p.blk, p.blockOff, buf, p.epoch, false,
+			newFillRelease(func() { fillBufPut(buf) }))
 	}
 	return true
+}
+
+// dropPromoteBufs recycles the staging buffers of promotes a read abandoned
+// before they were handed to a fill worker.
+func dropPromoteBufs(ps []l2Promote) {
+	for _, p := range ps {
+		fillBufPut(p.data)
+	}
 }
 
 // FillObserved installs bytes teed from a read the caller forwarded to the
@@ -763,7 +791,22 @@ func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
 // that bumps a covered shard before the install drops it rather than publishing
 // data the write has made stale.
 func (c *Cache) FillObserved(off int64, data []byte) {
+	c.FillObservedRelease(off, data, nil)
+}
+
+// FillObservedRelease is FillObserved for a caller that owns data: release runs
+// once the last byte of the range has been installed or dropped, so a caller
+// that staged the observed read in a pooled buffer can recycle it.
+//
+// The release is called exactly once, on every path out of the function —
+// including the ones that install nothing (a range that cannot be cut on a
+// sector boundary, a closing cache). A caller therefore has a single place to
+// account for the buffer it handed over.
+func (c *Cache) FillObservedRelease(off int64, data []byte, release func()) {
 	if len(data) == 0 || off < 0 || c.closed.Load() {
+		if release != nil {
+			release()
+		}
 		return
 	}
 	ss := int64(c.sectorSize)
@@ -774,11 +817,21 @@ func (c *Cache) FillObserved(off int64, data []byte) {
 	end := off + int64(len(data))
 	end -= end % ss
 	if end <= start {
+		if release != nil {
+			release()
+		}
 		return
 	}
 	c.stats.BackendReads.Add(1)
 	bs := int64(c.blockSize)
 	writeL2 := c.l2 != nil
+	// The buffer is shared by every block the range covers, so its release holds
+	// one reference of its own (dropped at the end of the loop) plus one per
+	// queued run.
+	var rel *fillRelease
+	if release != nil {
+		rel = newFillRelease(release)
+	}
 	for cur := start; cur < end; {
 		blk := uint64(cur / bs)
 		blkStart := int64(blk) * bs
@@ -788,9 +841,11 @@ func (c *Cache) FillObserved(off int64, data []byte) {
 		}
 		from := int(cur - off)
 		epoch := c.shard(blk).epoch.Load()
-		c.enqueueFill(blk, int(cur-blkStart), data[from:from+int(segEnd-cur)], epoch, writeL2)
+		rel.add()
+		c.enqueueFill(blk, int(cur-blkStart), data[from:from+int(segEnd-cur)], epoch, writeL2, rel)
 		cur = segEnd
 	}
+	rel.done()
 }
 
 // StreamFill installs a read's payload into L1 while the read is being
@@ -809,6 +864,9 @@ type StreamFill struct {
 	start    int64
 	firstBlk uint64
 	epochs   []uint64
+	// inline backs epochs for the spans this path usually covers (up to 16
+	// blocks, a 1MiB read), so preparing a fill costs one allocation, not two.
+	inline [16]uint64
 }
 
 // FillAdmit reports whether a streamed read of length bytes at off is worth
@@ -849,11 +907,17 @@ func (c *Cache) BeginFill(off, length int64) *StreamFill {
 	}
 	first := uint64(off / bs)
 	last := uint64(off/bs + length/bs - 1)
-	epochs := make([]uint64, last-first+1)
-	for i := range epochs {
-		epochs[i] = c.shard(first + uint64(i)).epoch.Load()
+	f := &StreamFill{c: c, sec: c.sectorSize, start: off, firstBlk: first}
+	nBlocks := int(last - first + 1)
+	epochs := f.inline[:]
+	if nBlocks > len(epochs) {
+		epochs = make([]uint64, nBlocks)
 	}
-	return &StreamFill{c: c, sec: c.sectorSize, start: off, firstBlk: first, epochs: epochs}
+	f.epochs = epochs[:nBlocks]
+	for i := range f.epochs {
+		f.epochs[i] = c.shard(first + uint64(i)).epoch.Load()
+	}
+	return f
 }
 
 // Write installs the bytes delivered at off, a byte offset within the transfer,
@@ -874,7 +938,7 @@ func (f *StreamFill) Write(off int64, data []byte) {
 		if blockOff%f.sec == 0 && n%f.sec == 0 {
 			blk := uint64((f.start + off) / bs)
 			if i := blk - f.firstBlk; i < uint64(len(f.epochs)) {
-				f.c.installValidated(blk, blockOff, data[:n], f.epochs[i], false)
+				f.c.installValidated(blk, blockOff, data[:n], f.epochs[i], false, nil)
 			}
 		}
 		data = data[n:]
@@ -900,6 +964,85 @@ func (f *StreamFill) Rollback() {
 	f.c.Invalidate(f.start, int64(len(f.epochs))*int64(f.c.blockSize))
 }
 
+// fillBufPools recycle the staging buffers a read stages L1's data in: the
+// sector run serveMiss reads out of L2 or the backing store, and the one
+// readCachedL1L2 takes out of L2. Both are handed to a fill worker, so they are
+// recycled by the fill's release rather than at the call site.
+//
+// The classes are the sizes a run inside one block can have: a 4KiB random read
+// covers one sector and the largest run is a whole 64KiB block. A block larger
+// than the largest class is allocated and left to the collector on the way back.
+var fillBufPools [4]sync.Pool
+
+var fillBufSizes = [...]int{4 << 10, 16 << 10, 64 << 10, 256 << 10}
+
+// fillBufGet returns a buffer of n bytes whose capacity is its size class.
+func fillBufGet(n int) []byte {
+	for i, sz := range fillBufSizes {
+		if n <= sz {
+			if v := fillBufPools[i].Get(); v != nil {
+				if b, ok := v.([]byte); ok && cap(b) >= n {
+					return b[:n]
+				}
+			}
+			return make([]byte, sz)[:n]
+		}
+	}
+	return make([]byte, n)
+}
+
+// fillBufPut recycles a buffer handed out by fillBufGet.
+func fillBufPut(b []byte) {
+	if b == nil {
+		return
+	}
+	for i, sz := range fillBufSizes {
+		if cap(b) == sz {
+			fillBufPools[i].Put(b[:sz])
+			return
+		}
+	}
+}
+
+// fillRelease is the ownership handover for the staging buffer of a fill. It
+// exists because one buffer can feed several runs: FillObserved cuts what it was
+// handed into one run per cache block it covers, so the buffer can only be
+// recycled once the last of those runs has been consumed — installed, or dropped
+// for a stale epoch, a full queue or a closing cache.
+//
+// References are counted: the caller holds one and every queued run holds one.
+// The callback runs on the drop of the last reference, on whichever goroutine
+// drops it, and must not touch the fill's data.
+type fillRelease struct {
+	n  int32
+	fn func()
+}
+
+// newFillRelease returns a release holding the caller's own reference; the
+// caller must drop it with done once it has handed the buffer over.
+func newFillRelease(fn func()) *fillRelease {
+	return &fillRelease{n: 1, fn: fn}
+}
+
+// add takes one more reference, for a run about to be queued. It must happen
+// before the run is queued: a worker that consumed it could otherwise drop the
+// last reference before this one exists.
+func (r *fillRelease) add() {
+	if r != nil {
+		atomic.AddInt32(&r.n, 1)
+	}
+}
+
+// done drops one reference, running the release when the last one goes.
+func (r *fillRelease) done() {
+	if r == nil {
+		return
+	}
+	if atomic.AddInt32(&r.n, -1) == 0 {
+		r.fn()
+	}
+}
+
 // fillReq is one sector run a worker installs into L1, optionally populating L2.
 type fillReq struct {
 	blk      uint64
@@ -907,6 +1050,7 @@ type fillReq struct {
 	data     []byte
 	epoch    uint64
 	writeL2  bool
+	release  *fillRelease
 }
 
 // enqueueFill hands a just read sector run to the fill workers.
@@ -916,17 +1060,22 @@ type fillReq struct {
 // That is also why the enqueue never blocks — a cold random workload enqueues
 // one fill per read, and making the read wait for queue space would put the
 // queue's backpressure back on the client.
-func (c *Cache) enqueueFill(blk uint64, blockOff int, data []byte, epoch uint64, writeL2 bool) {
+//
+// rel is consumed exactly once: by the worker that installs the run, or here
+// when the run is dropped.
+func (c *Cache) enqueueFill(blk uint64, blockOff int, data []byte, epoch uint64, writeL2 bool, rel *fillRelease) {
 	if c.closed.Load() {
+		rel.done()
 		return
 	}
 	// Counted before the send so a concurrent waitFills that observes zero cannot
 	// miss this fill: the worker only decrements after installing it.
 	c.fillPending.Add(1)
 	select {
-	case c.fillCh <- fillReq{blk: blk, blockOff: blockOff, data: data, epoch: epoch, writeL2: writeL2}:
+	case c.fillCh <- fillReq{blk: blk, blockOff: blockOff, data: data, epoch: epoch, writeL2: writeL2, release: rel}:
 	default:
 		c.fillPending.Add(-1)
+		rel.done()
 	}
 }
 
@@ -938,7 +1087,11 @@ func (c *Cache) fillWorker() {
 			return
 		case req := <-c.fillCh:
 			c.stats.Fills.Add(1)
-			c.installValidated(req.blk, req.blockOff, req.data, req.epoch, req.writeL2)
+			// A run the install handed to an L2 write is released by that write:
+			// the data is not reusable before it has been written out.
+			if !c.installValidated(req.blk, req.blockOff, req.data, req.epoch, req.writeL2, req.release) {
+				req.release.done()
+			}
 			c.fillDone()
 		}
 	}
@@ -963,11 +1116,17 @@ func (c *Cache) fillDone() {
 // is dropped — or runs after the run installed, and clears what it installed. It
 // can never clear the bits and then have the run mark them valid with pre-write
 // data.
-func (c *Cache) installValidated(blk uint64, blockOff int, data []byte, epoch uint64, writeL2 bool) {
-	if len(data) == 0 {
-		return
-	}
+// The returned bool reports whether the run was handed to an L2 write
+// goroutine, which then owns rel: the caller must not release it.
+//
+// blockOff must sit on a sector boundary; a run that does not is dropped rather
+// than published, because installValidated addresses whole sectors and cannot
+// place a partial one.
+func (c *Cache) installValidated(blk uint64, blockOff int, data []byte, epoch uint64, writeL2 bool, rel *fillRelease) bool {
 	ss := c.sectorSize
+	if len(data) == 0 || blockOff%ss != 0 {
+		return false
+	}
 	first := blockOff / ss
 	last := (blockOff + len(data)) / ss
 
@@ -975,7 +1134,7 @@ func (c *Cache) installValidated(blk uint64, blockOff int, data []byte, epoch ui
 	sh.mu.Lock()
 	if sh.epoch.Load() != epoch {
 		sh.mu.Unlock()
-		return
+		return false
 	}
 	e := sh.blocks[blk]
 	if e == nil {
@@ -1005,17 +1164,21 @@ func (c *Cache) installValidated(blk uint64, blockOff int, data []byte, epoch ui
 			// population that carries pre-write data.
 			c.fence.enqueue()
 			sh.mu.Unlock()
-			go c.writeL2(blk, first, data)
-			return
+			go c.writeL2(blk, first, data, rel)
+			return true
 		default:
 		}
 	}
 	sh.mu.Unlock()
+	return false
 }
 
 // writeL2 populates L2 with a sector run and releases its slot in the fence, so
-// an invalidation waits for the populations that carry pre-write data.
-func (c *Cache) writeL2(blk uint64, firstSector int, data []byte) {
+// an invalidation waits for the populations that carry pre-write data. rel is
+// dropped at the end: the run's staging buffer cannot be recycled before it has
+// been written out.
+func (c *Cache) writeL2(blk uint64, firstSector int, data []byte, rel *fillRelease) {
+	defer rel.done()
 	defer func() { <-c.l2Sem }()
 	defer c.fence.complete()
 	if err := c.l2.WriteSectors(blk, firstSector, len(data)/c.sectorSize, data); err != nil {
@@ -1192,7 +1355,10 @@ func (c *Cache) readAligned(ctx context.Context, off int64, dst []byte, src Sour
 	if start == off && (s1-s0+1)*sector == int64(len(dst)) {
 		return src.ReadAt(ctx, off, dst)
 	}
-	buf := make([]byte, (s1-s0+1)*sector)
+	// Nothing is queued for this one — it is the bypass the scan detector sends a
+	// streamed read down — so the staging buffer is recycled here.
+	buf := fillBufGet(int((s1 - s0 + 1) * sector))
+	defer fillBufPut(buf)
 	if err := src.ReadAt(ctx, start, buf); err != nil {
 		return err
 	}

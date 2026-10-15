@@ -242,6 +242,37 @@ type File struct {
 	recovered  int
 	unverified int
 	dropped    int
+
+	// stampBuf and pageBuf are the scratch sectors the metadata is built in and
+	// read into. Every user of them holds the write lock, so one buffer of each
+	// serves all of them and neither a stamp nor an index page rewrite costs an
+	// allocation. pageBuf is cleared before it is filled, because a record for a
+	// slot that is not live has to read as zeros.
+	stampBuf []byte
+	pageBuf  []byte
+}
+
+// stampBufLocked returns the sector a stamp is built in or read into. The caller
+// holds the write lock.
+//
+// Everything a stamp is compared or checksummed on — the magic and the block,
+// generation, version and checksum fields — is written before the sector is used
+// or written out, so the tail beyond them never has to be cleared: it can only
+// ever hold bytes read out of this file's own stamp sectors.
+func (f *File) stampBufLocked() []byte {
+	if f.stampBuf == nil {
+		f.stampBuf = make([]byte, stampSize)
+	}
+	return f.stampBuf
+}
+
+// pageBufLocked returns the index page buffer. The caller holds the write lock
+// and clears it before filling it in.
+func (f *File) pageBufLocked() []byte {
+	if f.pageBuf == nil {
+		f.pageBuf = make([]byte, indexPageSize)
+	}
+	return f.pageBuf
 }
 
 // Open opens (and if needed creates) the L2 file. When the file was closed
@@ -556,7 +587,12 @@ func (f *File) insertLocked(num int, blk uint64, valid uint32, version uint64) {
 // that are not live get a zeroed record, which is what makes a page rewrite
 // drop the entries that were invalidated since the last flush.
 func (f *File) writeIndexPage(page int) error {
-	buf := make([]byte, indexPageSize)
+	buf := f.pageBufLocked()
+	// Zeroed first: a slot that is not live keeps its record untouched below, and
+	// a record that reads as zeros is what tells a later load there is no entry
+	// there. A recycled buffer would otherwise rewrite the previous page's
+	// records into this one, and the page checksum would bless them.
+	clear(buf)
 	copy(buf[:4], indexPageMag)
 	put64(buf[4:], f.generation)
 	for i := 0; i < recsPerPage; i++ {
@@ -644,7 +680,7 @@ func (f *File) confirmEntry(blk uint64) {
 // counted, so a caller can tell a recovery that worked from one that is paying
 // for a snapshot the session never got to flush.
 func (f *File) verifyLocked(sl *slot) (bool, error) {
-	st := make([]byte, stampSize)
+	st := f.stampBufLocked()
 	if err := f.store.ReadAt(st, f.stampOffset(sl.num)); err != nil {
 		return false, err
 	}
@@ -695,7 +731,7 @@ func (f *File) forgetSlotLocked(blk uint64, sl *slot) {
 // data, so a slot whose data write was torn keeps the previous stamp and fails
 // verification instead of being taken for the block it used to describe.
 func (f *File) writeStampLocked(sl *slot) error {
-	st := make([]byte, stampSize)
+	st := f.stampBufLocked()
 	copy(st[:8], stampMag)
 	put64(st[stampOffBlk:], sl.blk)
 	put64(st[stampOffGen:], f.generation)
@@ -914,7 +950,7 @@ func (f *File) ensureVerifiedLocked(sl *slot) bool {
 // slot handed to a new block can pick one the disk cannot confuse with what it
 // still holds.
 func (f *File) readStampVersionLocked(num int) (uint64, bool) {
-	st := make([]byte, stampSize)
+	st := f.stampBufLocked()
 	if err := f.store.ReadAt(st, f.stampOffset(num)); err != nil {
 		return 0, false
 	}

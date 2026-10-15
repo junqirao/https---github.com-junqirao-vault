@@ -343,7 +343,9 @@ func (s *session) handleRead(f *frame) bool {
 	}
 	// Miss: register the read so its Data-In sequence is teed into the cache.
 	// buf 的所有权移交给 pending：它的子切片会被 FillObserved 挂进 fill 队列
-	// 由 worker 异步消费，此处绝不能归还池中。
+	// 由 worker 异步消费，此处绝不能归还池中。归还点在 fill 侧：install 完成后由
+	// FillObservedRelease 的 release 回调放回池子，没有回填成功的路径（表满、
+	// 状态失败、响应不全、无缓存绑定）也各自归还一次。
 	s.watchRead(f.hdr.ITT(), off, buf)
 	return false
 }
@@ -352,7 +354,11 @@ func (s *session) handleRead(f *frame) bool {
 // it completes. buf is handed to the pending and filled from the response's
 // BufOffset-tagged segments.
 func (s *session) watchRead(itt uint32, off int64, buf []byte) {
-	s.registerPending(itt, &pending{kind: pendRead, off: off, length: len(buf), buf: buf})
+	if !s.registerPending(itt, &pending{kind: pendRead, off: off, length: len(buf), buf: buf}) {
+		// The observation was dropped, so nothing will tee into the buffer: it
+		// goes straight back to the pool and the read is simply forwarded.
+		readBufPut(buf)
+	}
 }
 
 func (s *session) handleInquiry(f *frame) {
@@ -431,11 +437,75 @@ func (s *session) dropAll() {
 // 512 (RFC 7143), so the segment count is bounded by maxTeeBytes/512.
 const injectBufCap = maxTeeBytes + (maxTeeBytes/512+2)*51
 
-// injectBufPool holds the assembly buffers for injectLocked. The whole Data-In
+// injectBufClasses are the capacities of injectBufPools: the sizes a cached read
+// is assembled in, from a single 64KiB segment up to the worst case
+// injectBufCap. The class of a request is the smallest size that fits it, and
+// each class is a multiple of the largest page the allocator rounds to, so the
+// capacity of a class's buffer is the class itself — which is what lets the put
+// side recover the class from cap.
+//
+// The whole point of splitting them is the same as on the read side: a 4KiB hit
+// must not pin a buffer sized for the largest read a session can serve.
+var injectBufClasses = [4]int{64 << 10, 256 << 10, 1 << 20, (injectBufCap + 8191) &^ 8191}
+
+// injectBufPools holds the assembly buffers for injectLocked. The whole Data-In
 // sequence is flattened and sent with a single Write: a 1MiB hit at 64KiB MRDSL
 // otherwise costs 32 socket sends (header+body per segment), which dominates
 // the hit path's CPU once the cache is warm.
-var injectBufPool = sync.Pool{New: func() any { return make([]byte, injectBufCap) }}
+var injectBufPools [len(injectBufClasses)]sync.Pool
+
+// injectBufNeed is the assembly a Data-In sequence of n bytes needs when it is
+// sent in mrdsl segments: a 48-byte BHS plus at most 3 bytes of padding each.
+// An empty payload still makes one segment, as the loop in injectLocked does.
+func injectBufNeed(n, mrdsl int) int {
+	segs := 1
+	if mrdsl > 0 {
+		if s := (n + mrdsl - 1) / mrdsl; s > 1 {
+			segs = s
+		}
+	}
+	return n + segs*51
+}
+
+// injectBufClass is the smallest class that fits n.
+func injectBufClass(n int) int {
+	for i, sz := range injectBufClasses {
+		if n <= sz {
+			return i
+		}
+	}
+	return len(injectBufClasses) - 1
+}
+
+func injectBufGet(n int) []byte {
+	cl := injectBufClass(n)
+	if n > injectBufClasses[cl] {
+		// Larger than any class the pool holds: the session's segment size is
+		// below the 512-byte floor these are sized for, so it gets its own buffer.
+		return make([]byte, n)
+	}
+	if v := injectBufPools[cl].Get(); v != nil {
+		if b, ok := v.([]byte); ok && cap(b) >= n {
+			return b[:n]
+		}
+	}
+	return make([]byte, injectBufClasses[cl])[:n]
+}
+
+// injectBufPut recycles a buffer from injectBufGet; the caller must not touch it
+// afterwards. Anything larger than the biggest class — a session whose MRDSL is
+// small enough to need more assembly than the bound assumes — is left to the
+// collector.
+func injectBufPut(b []byte) {
+	if b == nil {
+		return
+	}
+	cl := injectBufClass(cap(b))
+	if cap(b) != injectBufClasses[cl] {
+		return
+	}
+	injectBufPools[cl].Put(b[:injectBufClasses[cl]])
+}
 
 var zeroPad [3]byte
 
@@ -454,8 +524,8 @@ func (s *session) injectLocked(cmd *iscsi.BHS, data []byte) error {
 	mrdsl := s.maxSendSegment()
 	itt, lun := cmd.ITT(), cmd.LUN()
 
-	out := injectBufPool.Get().([]byte)
-	defer injectBufPool.Put(out)
+	out := injectBufGet(injectBufNeed(len(data), mrdsl))
+	defer injectBufPut(out)
 	pos := 0
 	seg, dataSN, bufOffset := 0, uint32(0), uint32(0)
 	n := len(data)
@@ -508,14 +578,26 @@ func (s *session) maxSendSegment() int {
 	return m
 }
 
-// registerPending adds a watched command, dropping it when the table is full.
-func (s *session) registerPending(itt uint32, p *pending) {
+// registerPending adds a watched command, reporting whether it was stored: a
+// full table drops the observation, never the command.
+func (s *session) registerPending(itt uint32, p *pending) bool {
 	s.ittMu.Lock()
-	if len(s.pending) < maxPending {
+	ok := len(s.pending) < maxPending
+	if ok {
 		s.pending[itt] = p
 		s.pendingN.Store(int32(len(s.pending)))
 	}
 	s.ittMu.Unlock()
+	return ok
+}
+
+// releasePending recycles the pooled buffer of a pending the proxy is done with
+// without consuming it. Only a read stages its response in a pooled buffer; the
+// identity probes allocate their own.
+func releasePending(p *pending) {
+	if p.kind == pendRead {
+		readBufPut(p.buf)
+	}
 }
 
 // collectTI tees a Data-In segment into the buffer of the command it belongs to
@@ -552,6 +634,9 @@ func (s *session) collectTI(f *frame) {
 	s.pendingN.Store(int32(len(s.pending)))
 	s.ittMu.Unlock()
 	if f.hdr[3] != iscsi.StatusGood {
+		// The command failed, so there is nothing to observe and nothing read the
+		// staged buffer.
+		releasePending(p)
 		return
 	}
 	s.finishPending(p)
@@ -562,11 +647,21 @@ func (s *session) finishPending(p *pending) {
 	switch p.kind {
 	case pendRead:
 		if p.got < p.length {
+			// A response that did not cover the whole read leaves the buffer half
+			// filled: it is not worth caching and it is ours to recycle.
+			releasePending(p)
 			return
 		}
-		if c := t.getCache(); c != nil {
-			c.FillObserved(p.off, p.buf)
+		c := t.getCache()
+		if c == nil {
+			releasePending(p)
+			return
 		}
+		// The staged buffer goes with the observation: the cache recycles it once
+		// the last run it feeds has been installed, so a miss costs no allocation
+		// and no copy of the data into a second buffer.
+		buf := p.buf
+		c.FillObservedRelease(p.off, buf, func() { readBufPut(buf) })
 	case pendInquirySerial, pendInquiryWWID:
 		if p.got < 4 {
 			return

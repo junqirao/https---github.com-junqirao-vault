@@ -134,11 +134,71 @@ func (s *session) readPDU() (*iscsi.PDU, error) {
 	refreshDeadline(&s.readSetAt, s.t.cfg.IdleTimeout, func(t time.Time) {
 		_ = s.conn.SetReadDeadline(t)
 	})
-	p, err := iscsi.ReadPDU(s.conn)
-	if err == nil {
-		s.logPDU("recv", p)
+	h, err := iscsi.ReadBHS(s.conn)
+	if err != nil {
+		return nil, err
 	}
-	return p, err
+	p := &iscsi.PDU{Header: h}
+	// A Data-Out burst is read straight into the buffer that is going to hold it.
+	// The alternative — a segment of its own, routed to the transfer afterwards —
+	// costs an allocation and a full-length copy for every burst of every write,
+	// and the header alone already says where the bytes belong.
+	if h.Opcode() == iscsi.OpDataOut {
+		if dst := s.dataOutWindow(&h); dst != nil {
+			if err := iscsi.ReadSegment(s.conn, &h, dst); err != nil {
+				return nil, err
+			}
+			p.Data, p.InPlace = dst, true
+			s.logPDU("recv", p)
+			return p, nil
+		}
+	}
+	if dsl := h.DataSegmentLength(); dsl > 0 {
+		p.Data = make([]byte, dsl)
+	}
+	if err := iscsi.ReadSegment(s.conn, &h, p.Data); err != nil {
+		return nil, err
+	}
+	s.logPDU("recv", p)
+	return p, nil
+}
+
+// dataOutWindow returns the part of the write the next Data-Out segment belongs
+// in, or nil when it cannot be placed from the header alone: a transfer that is
+// not registered, or a segment that does not fit the window it claims. Such a
+// PDU falls back to a segment of its own and handleDataOut reports it exactly as
+// it always did, so a placement miss is only ever a lost optimisation.
+func (s *session) dataOutWindow(h *iscsi.BHS) []byte {
+	dsl := h.DataSegmentLength()
+	if dsl <= 0 {
+		return nil
+	}
+	if h.TTT() == iscsi.ReservedTag {
+		w := s.takeWrite(h.ITT())
+		if w == nil {
+			return nil
+		}
+		off := int(h.BufOffset())
+		if !fits(off, dsl, len(w.buf)) {
+			return nil
+		}
+		return w.buf[off : off+dsl]
+	}
+	tx := s.takePending(h.TTT())
+	if tx == nil {
+		return nil
+	}
+	off := int(h.BufOffset()) - tx.base
+	if !fits(off, dsl, tx.want) {
+		return nil
+	}
+	return tx.buf[tx.base+off : tx.base+off+dsl]
+}
+
+// fits reports whether n bytes at off stay inside a window of size, without the
+// wrap that off+n can take for a field an initiator controls.
+func fits(off, n, size int) bool {
+	return off >= 0 && n >= 0 && off <= size-n
 }
 
 func (s *session) writePDU(p *iscsi.PDU) error {
@@ -675,6 +735,12 @@ func (s *session) handleDataOut(pdu *iscsi.PDU) {
 			s.log.Warn("frontend: unsolicited Data-Out for unknown task", "itt", h.ITT())
 			return
 		}
+		if pdu.InPlace {
+			// The reader deposited the burst where it belongs, so only the
+			// contiguous fill the command waits on has to advance.
+			w.arrived(int(h.BufOffset()), len(pdu.Data))
+			return
+		}
 		w.push(int(h.BufOffset()), pdu.Data)
 		return
 	}
@@ -685,10 +751,10 @@ func (s *session) handleDataOut(pdu *iscsi.PDU) {
 		return
 	}
 	off := int(h.BufOffset()) - tx.base
-	if off < 0 || off+len(pdu.Data) > tx.want {
+	if !fits(off, len(pdu.Data), tx.want) {
 		tx.err = fmt.Errorf("frontend: Data-Out offset %d out of range (burst of %d at %d)",
 			int(h.BufOffset()), tx.want, tx.base)
-	} else {
+	} else if !pdu.InPlace {
 		copy(tx.buf[tx.base+off:], pdu.Data)
 	}
 	tx.got += len(pdu.Data)
@@ -719,15 +785,47 @@ func newWriteTransfer(size int) *writeTransfer {
 // initiator cannot overflow; a broken one sets err and the command fails.
 func (w *writeTransfer) push(off int, data []byte) {
 	w.mu.Lock()
-	if off+len(data) > len(w.buf) {
-		w.err = fmt.Errorf("frontend: write data at %d beyond the %d byte transfer", off+len(data), len(w.buf))
-	} else {
+	if fits(off, len(data), len(w.buf)) {
 		copy(w.buf[off:], data)
-		if end := off + len(data); end > w.fill {
-			w.fill = end
-		}
+		w.advanceLocked(off, len(data))
+	} else {
+		w.err = w.outOfRange(off + len(data))
 	}
 	w.mu.Unlock()
+	w.signal()
+}
+
+// arrived accounts for a burst the connection reader deposited straight into the
+// buffer (see readPDU): the bytes are already in place, so only the contiguous
+// fill the command waits on has to advance. It reports the same error push would
+// for a burst that does not fit, which the reader's placement check — the very
+// same predicate — makes unreachable.
+func (w *writeTransfer) arrived(off, n int) {
+	w.mu.Lock()
+	if fits(off, n, len(w.buf)) {
+		w.advanceLocked(off, n)
+	} else {
+		w.err = w.outOfRange(off + n)
+	}
+	w.mu.Unlock()
+	w.signal()
+}
+
+// advanceLocked moves the contiguous fill up to the end of the bytes just
+// deposited at off. The caller holds the mutex.
+func (w *writeTransfer) advanceLocked(off, n int) {
+	if end := off + n; end > w.fill {
+		w.fill = end
+	}
+}
+
+func (w *writeTransfer) outOfRange(end int) error {
+	return fmt.Errorf("frontend: write data at %d beyond the %d byte transfer", end, len(w.buf))
+}
+
+// signal wakes a command waiting on the transfer. It never blocks: the reader
+// must not be held up by a command that is not reading yet.
+func (w *writeTransfer) signal() {
 	select {
 	case w.notify <- struct{}{}:
 	default:
