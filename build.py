@@ -661,23 +661,34 @@ def clean_stale_dist_artifacts(keep_version: str) -> None:
 def _frontend_deps_ready() -> bool:
     """判断前端依赖是否**真的可用**（不只是"目录存在"）。
 
-    只判断 `frontend/node_modules` 是否存在远远不够：pnpm 用连接点把
-    `node_modules/<pkg>` 指向虚拟仓库 `.pnpm/...`，一旦安装被中断、虚拟仓库被清理、
-    或 store 在另一个盘/另一个账号下，这些目录会退化成"存在但打不开"的空壳——
-    目录列得出来，`tsc` / `vite` 二进制却根本不在，构建会在 typecheck 处报
-    `Cannot find module ...\typescript\bin\tsc` 才失败，很难联想到依赖问题。
+    只判断 `frontend/node_modules` 是否存在远远不够：pnpm 默认的 isolated 布局把
+    `node_modules/<pkg>` 做成指向虚拟仓库 `.pnpm/...` 的连接点，一旦安装被中断、
+    虚拟仓库被清理、store 在另一个盘/另一个账号下，或者**系统禁止遍历连接点**
+    （Windows 报 WinError 448「无法遍历该路径，因为它包含不受信任的装入点」），
+    这些目录就会退化成"存在但打不开"的空壳：`tsc` 二进制读不到，构建最终倒在
+    typecheck 处报 `Cannot find module ...\typescript\bin\tsc`，很难联想到依赖问题。
 
-    因此直接探测真正要用到的二进制是否可读；stat 抛错一律按"不可用"处理。
+    这里既不猜路径，也不看 `node_modules/.bin/tsc` —— 那只是 pnpm 生成的 shim
+    脚本，连接点全坏时它照样存在；而且根 `node_modules` 里还可能有 public hoist
+    出来的真实副本，包级连接点坏了它却是好的。两者都会让检查假通过、install 被
+    跳过。所以判据改为在每个要跑 typecheck 的包里真正执行一次 `tsc --version`：
+    走的就是 pnpm 解析 bin 的那条路，布局怎么变都不会误判。
     """
-    for rel in ("node_modules/.bin/tsc", "node_modules/.bin/tsc.cmd",
-                "packages/ui/node_modules/typescript/bin/tsc",
-                "packages/ui/node_modules/typescript/bin/tsc.cmd"):
-        try:
-            if (FRONTEND_DIR / rel).is_file():
-                return True
-        except OSError:
+    pnpm = which("pnpm") or which("pnpm.cmd")
+    if not pnpm:
+        return False
+    for pkg in ("packages/ui", "apps/client"):
+        cwd = FRONTEND_DIR / pkg
+        if not (cwd / "package.json").is_file():
             continue
-    return False
+        try:
+            proc = subprocess.run([pnpm, "exec", "tsc", "--version"], cwd=str(cwd),
+                                  capture_output=True, text=True, **_NO_WINDOW)
+        except OSError:
+            return False
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return False
+    return True
 
 
 def build_frontend(args) -> None:
@@ -695,8 +706,13 @@ def build_frontend(args) -> None:
             install_cmd += ["--registry", args.registry]
         run(install_cmd, cwd=FRONTEND_DIR, capture=False)
         if not _frontend_deps_ready():
-            die("pnpm install 之后仍未找到可用的 typescript（tsc）；"
-                "请删除 frontend/node_modules 与 frontend/*/node_modules 后重试")
+            die("pnpm install 之后 tsc 仍然跑不起来。若 node_modules 里已有依赖，"
+                "多半是 pnpm 的连接点在这台机器上不可遍历（Windows 报「无法遍历该路径，"
+                "因为它包含不受信任的装入点」，WinError 448）：pnpm 默认的 isolated 布局把"
+                "每个包都做成连接点，系统一旦禁止遍历，全部依赖都会变成「看得见、打不开」，"
+                "而 pnpm install 看到目录还在就什么也不做。解法是改用 npm 风格的扁平布局："
+                "在 frontend/.npmrc 写入 node-linker=hoisted，然后删除 frontend/node_modules、"
+                "frontend/packages/ui/node_modules、frontend/apps/client/node_modules 后重跑")
 
     run([pnpm, "-r", "typecheck"], cwd=FRONTEND_DIR, capture=False)
     run([pnpm, "--filter", "@vault/client", "build"], cwd=FRONTEND_DIR, capture=False)

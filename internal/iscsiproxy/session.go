@@ -64,11 +64,16 @@ type session struct {
 	expCmd   uint32 // latest ExpCmdSN the initiator was told
 	maxCmd   uint32 // latest MaxCmdSN the initiator was told
 
+	// tiBatch 是 initiator 方向唯一的写出口：T→I 泵转发的帧与本地代答的 Data-In
+	// 都先并入它再写出。两者都在 outMu 下追加，所以来源不同的字节永远不会交错，
+	// 而 StatSN 的顺序恰好取决于这个先后。
+	tiBatch *frameBatch
+
 	negMu         sync.Mutex
 	degraded      atomic.Bool // 每帧都要读，走原子位而不是锁
 	degradeReason string      // 仅在 negMu 下于置位前写一次
 	loginDone     bool
-	initMRDSL     int
+	initMRDSL     atomic.Int32 // 命中注入每帧都要读，走原子量而不是 negMu
 	tgtMRDSL      int
 
 	ittMu     sync.Mutex
@@ -83,16 +88,18 @@ type session struct {
 }
 
 func newSession(t *target, it, bt net.Conn) *session {
-	return &session{
-		tgt:       t,
-		it:        it,
-		bt:        bt,
-		log:       t.log,
-		expCmd:    1,
-		initMRDSL: defaultMRDSL,
-		tgtMRDSL:  defaultMRDSL,
-		pending:   make(map[uint32]*pending),
+	s := &session{
+		tgt:      t,
+		it:       it,
+		bt:       bt,
+		log:      t.log,
+		expCmd:   1,
+		tgtMRDSL: defaultMRDSL,
+		pending:  make(map[uint32]*pending),
 	}
+	s.initMRDSL.Store(defaultMRDSL)
+	s.tiBatch = newFrameBatch(it)
+	return s
 }
 
 // run pumps both directions until either side closes, then tears the session
@@ -152,12 +159,15 @@ func (s *session) degrade(reason string) {
 }
 
 // pumpIT forwards initiator→backend. It observes commands to invalidate on
-// writes and to answer reads from the cache; everything else is spliced after
-// the sequence numbers are pulled back.
+// writes and to answer reads from the cache; everything else is batched into one
+// Write per burst of consecutive frames (see frameBatch).
 func (s *session) pumpIT() {
 	defer s.close()
 	fr := newFrameReader(s.it, &s.digests)
-	scratch := make([]byte, writeCoalesce+8)
+	batch := newFrameBatch(s.bt)
+	// 会话退出时批里可能还留着已解析成功的帧：先发出去再关连接，与逐帧写
+	// 相比不丢字节。这里连 s.bt 只有本泵写，不需要 outMu。
+	defer func() { _ = batch.flush() }()
 	for {
 		f, err := fr.read()
 		if err != nil {
@@ -165,32 +175,55 @@ func (s *session) pumpIT() {
 		}
 		s.observeLoginIT(f)
 		if s.isDegraded() {
-			// 降级会话的余下流量不再逐帧解析：当前帧发走后直接裸拷贝。
-			if err := writeFrame(s.bt, f, scratch); err != nil {
+			// 降级会话的余下流量不再逐帧解析：先把攒下的帧发完（顺序不能乱），
+			// 当前帧发走后直接裸拷贝。
+			if err := batch.flush(); err != nil {
+				return
+			}
+			if err := writeFrame(s.bt, f); err != nil {
 				return
 			}
 			fr.splice(s.bt)
 			return
 		}
 		s.observeDataOut(f)
-		if s.handleCommandIT(f) {
-			continue // answered locally, never reaches the backend
+		if !s.handleCommandIT(f) {
+			rewriteIT(&f.hdr, s.offset)
+			s.tgt.stats.passthrough.Add(1)
+			if err := batch.append(f); err != nil {
+				return
+			}
 		}
-		rewriteIT(&f.hdr, s.offset)
-		s.tgt.stats.passthrough.Add(1)
-		if err := writeFrame(s.bt, f, scratch); err != nil {
-			return
+		// 只有在读者手里再没有下一个字节时才写出：此时继续读就要等 socket，
+		// 已攒的帧本来就该发出去了，因此攒批不引入任何额外延迟。
+		//
+		// 本地代答之后也要走这一步：代答只是让当前帧不进批，批里可能还压着之前
+		// 攒下的透传命令，漏掉这次 flush 就会把它们一直压到下一帧到达为止。
+		if fr.r.Buffered() == 0 {
+			if err := batch.flush(); err != nil {
+				return
+			}
 		}
 	}
 }
 
 // pumpTI forwards backend→initiator. It rewrites the target's sequence numbers,
-// watches responses for the tee and the LUN identity, and serialises writes with
-// the injection path.
+// watches responses for the tee and the LUN identity, and feeds the frames it
+// forwards into the same batch the injected cache hits use (s.tiBatch).
+//
+// 攒批与放锁的配合是这个方向唯一的难点：注入的 Data-In 与转发帧写的是同一条
+// 连接，而 StatSN 必须严格递增。所以 initiator 方向的每一次写入 —— 不管是转发
+// 还是代答 —— 都走 tiBatch，并且都在 outMu 里追加，这样"谁先谁后"由追加顺序
+// 决定，与 flush 发生在哪一刻无关。若让注入直接写连接，它就会插到批的前面，
+// 序号立刻倒退（这正是真机上断链那一类故障）。
 func (s *session) pumpTI() {
 	defer s.close()
 	fr := newFrameReader(s.bt, &s.digests)
-	scratch := make([]byte, writeCoalesce+8)
+	defer func() {
+		s.outMu.Lock()
+		_ = s.tiBatch.flush()
+		s.outMu.Unlock()
+	}()
 	for {
 		f, err := fr.read()
 		if err != nil {
@@ -198,7 +231,13 @@ func (s *session) pumpTI() {
 		}
 		s.observeLoginTI(f)
 		if s.isDegraded() {
-			if err := writeFrame(s.it, f, scratch); err != nil {
+			s.outMu.Lock()
+			err = s.tiBatch.flush()
+			if err == nil {
+				err = writeFrame(s.it, f)
+			}
+			s.outMu.Unlock()
+			if err != nil {
 				return
 			}
 			fr.splice(s.it)
@@ -208,7 +247,10 @@ func (s *session) pumpTI() {
 		s.outMu.Lock()
 		rewriteTI(&f.hdr, s.offset)
 		s.captureTargetSeq(&f.hdr)
-		err = writeFrame(s.it, f, scratch)
+		err = s.tiBatch.append(f)
+		if err == nil && fr.r.Buffered() == 0 {
+			err = s.tiBatch.flush()
+		}
 		s.outMu.Unlock()
 		if err != nil {
 			return
@@ -757,7 +799,13 @@ func (s *session) injectLocked(cmd *iscsi.BHS, data []byte) error {
 			break
 		}
 	}
-	if _, err := s.it.Write(out[:pos]); err != nil {
+	if err := s.tiBatch.write(out[:pos]); err != nil {
+		return err
+	}
+	// 注入的响应必须立刻发出去：它回答的是一条正在等待的命令，不能等下一次
+	// 攒批。此刻 tiBatch 里若还压着 T→I 泵刚转发的帧，它们会先于注入写出，
+	// 顺序正是 StatSN 递增所需要的那样。
+	if err := s.tiBatch.flush(); err != nil {
 		return err
 	}
 	s.lastStat = statSN
@@ -766,9 +814,7 @@ func (s *session) injectLocked(cmd *iscsi.BHS, data []byte) error {
 }
 
 func (s *session) maxSendSegment() int {
-	s.negMu.Lock()
-	m := s.initMRDSL
-	s.negMu.Unlock()
+	m := int(s.initMRDSL.Load())
 	if m <= 0 {
 		m = defaultMRDSL
 	}
@@ -930,7 +976,7 @@ func (s *session) applyLogin(keys map[string]string, resp bool) {
 			if resp {
 				s.tgtMRDSL = n
 			} else {
-				s.initMRDSL = n
+				s.initMRDSL.Store(int32(n))
 			}
 		}
 	}
@@ -977,7 +1023,7 @@ func (s *session) finishLogin() {
 	degraded, reason := s.degraded.Load(), s.degradeReason
 	mrdsl := s.tgtMRDSL
 	if mrdsl == 0 {
-		mrdsl = s.initMRDSL
+		mrdsl = int(s.initMRDSL.Load())
 	}
 	s.negMu.Unlock()
 	if degraded {

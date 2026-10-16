@@ -27,6 +27,8 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/health", a.handleHealth)
 	mux.HandleFunc("GET /agent/state", a.handleState)
 	mux.HandleFunc("GET /agent/log", a.handleLog)
+	// 进程内存与 GC 运行时读数，并与缓存自己的账本放在一起对账（见 memory.go）。
+	mux.HandleFunc("GET /agent/memstats", a.handleMemStats)
 
 	// 会话推送/清除：**按台**操作（多服务端下每台各自一份会话，见 docs/agent-api.md）。
 	// POST 可带 server_key / primary；DELETE 可带 ?server_key=（省略 = 清全部会话）。
@@ -548,6 +550,9 @@ func (a *Agent) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, err)
 		return
 	}
+	// L1 预算可能变了，软内存上限跟着走：否则用户把预算调大之后，GC 会一直按旧上限
+	// 收紧（抖动），把缓存的好处吃掉。
+	applyMemoryLimit(cfg, a.logger)
 	a.writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
 }
 

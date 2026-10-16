@@ -732,9 +732,15 @@ type CacheTargetStatus struct {
 	AllocationID string `json:"allocation_id"`
 	// TargetIQN 是挂载链路上实际登录的 IQN。v2 透传代理用它对应的后端目标真实 IQN。
 	TargetIQN string `json:"target_iqn"`
-	// L1UsedBytes/L1LimitBytes 是内存缓存占用与配额。
-	L1UsedBytes  int64 `json:"l1_used_bytes"`
-	L1LimitBytes int64 `json:"l1_limit_bytes"`
+	// L1UsedBytes/L1LimitBytes 是内存缓存占用与配额。占用只算块数据
+	// （blocks × blockSize），配额口径与它一致。
+	//
+	// L1ResidentBytes 是这份索引**实际**占的堆：块数据之外还有 entry 头、map 桶和
+	// 三个 FIFO 队列的槽位。它是估算值（见 cache.ResidentBytes），用来跟
+	// GET /agent/memstats 的 heap_alloc 对账：两者之差就是账外部分。
+	L1UsedBytes     int64 `json:"l1_used_bytes"`
+	L1LimitBytes    int64 `json:"l1_limit_bytes"`
+	L1ResidentBytes int64 `json:"l1_resident_bytes"`
 	// L2UsedBytes/L2LimitBytes 是 L2 文件占用与配额（未启用 L2 时为 0）。
 	L2UsedBytes  int64 `json:"l2_used_bytes"`
 	L2LimitBytes int64 `json:"l2_limit_bytes"`
@@ -809,22 +815,23 @@ func (m *cacheManager) Status() CacheStatus {
 		// 这样在缓存尚未绑定或首读未命中时读 IOPS 也如实非 0。
 		reads := stats.Proxy.Reads
 		ts := CacheTargetStatus{
-			AllocationID: key,
-			TargetIQN:    iqn,
-			L1UsedBytes:  cs.L1UsedBytes,
-			L1LimitBytes: cs.L1LimitBytes,
-			Reads:        reads,
-			RequestHits:  cs.RequestHits,
-			L1Hits:       cs.L1Hits,
-			PartialHits:  cs.PartialHits,
-			L2Hits:       cs.L2Hits,
-			BackendReads: cs.BackendReads,
-			Writes:       stats.Proxy.Writes,
-			L1Restored:   stats.L1Restored,
-			WholeDrops:   stats.WholeDrops,
-			L2Restored:   stats.L2Restored,
-			L2Unverified: stats.L2Unverified,
-			L2Dropped:    stats.L2Dropped,
+			AllocationID:    key,
+			TargetIQN:       iqn,
+			L1UsedBytes:     cs.L1UsedBytes,
+			L1LimitBytes:    cs.L1LimitBytes,
+			L1ResidentBytes: cs.L1ResidentBytes,
+			Reads:           reads,
+			RequestHits:     cs.RequestHits,
+			L1Hits:          cs.L1Hits,
+			PartialHits:     cs.PartialHits,
+			L2Hits:          cs.L2Hits,
+			BackendReads:    cs.BackendReads,
+			Writes:          stats.Proxy.Writes,
+			L1Restored:      stats.L1Restored,
+			WholeDrops:      stats.WholeDrops,
+			L2Restored:      stats.L2Restored,
+			L2Unverified:    stats.L2Unverified,
+			L2Dropped:       stats.L2Dropped,
 		}
 		if stats.BlockSize > 0 && stats.L2Slots > 0 {
 			slot := int64(stats.BlockSize)

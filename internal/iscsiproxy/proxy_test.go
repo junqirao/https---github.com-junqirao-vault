@@ -246,7 +246,7 @@ func TestFrameRoundTrip(t *testing.T) {
 	f.padLen = (4 - len(pdu.Data)%4) % 4
 
 	var buf bytes.Buffer
-	if err := writeFrame(&buf, &f, nil); err != nil {
+	if err := writeFrame(&buf, &f); err != nil {
 		t.Fatalf("writeFrame 失败：%v", err)
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
@@ -287,7 +287,7 @@ func TestFrameReaderDigestAndAHS(t *testing.T) {
 	f.padLen = (4 - len(data)%4) % 4
 
 	var buf bytes.Buffer
-	if err := writeFrame(&buf, &f, nil); err != nil {
+	if err := writeFrame(&buf, &f); err != nil {
 		t.Fatalf("writeFrame 失败：%v", err)
 	}
 	// 手工拼出期望的字节序，逐段落位校验。
@@ -487,5 +487,194 @@ func TestInjectBufNeedFitsTheBound(t *testing.T) {
 	}
 	if last := injectBufClasses[len(injectBufClasses)-1]; last < injectBufCap {
 		t.Fatalf("最大尺寸类 %d 小于上界 %d", last, injectBufCap)
+	}
+}
+
+// batchTestWriter 记录 Write 调用次数，用来验证攒批确实把多次写并成了一次。
+type batchTestWriter struct {
+	buf    bytes.Buffer
+	writes int
+}
+
+func (w *batchTestWriter) Write(p []byte) (int, error) {
+	w.writes++
+	return w.buf.Write(p)
+}
+
+// batchTestFrame 造一帧 Data-In。payload 不同则字节内容不同，于是逐字节比较
+// 既能证明内容一致，也能证明顺序没乱。
+func batchTestFrame(payload int, withAHS, withHD, withDD bool) *frame {
+	data := make([]byte, payload)
+	for i := range data {
+		data[i] = byte(i*7 + payload)
+	}
+	var f frame
+	f.hdr.SetOpcode(iscsi.OpDataIn)
+	f.hdr.SetDataSegmentLength(payload)
+	if withAHS {
+		ahs := []byte{0xde, 0xad, 0xbe, 0xef}
+		f.ahsLen = len(ahs)
+		f.hdr[4] = uint8(len(ahs) / 4)
+		f.body = append(append([]byte{}, ahs...), data...)
+	} else {
+		f.body = data
+	}
+	if withHD {
+		f.hasHD = true
+		f.hd = [4]byte{0xa1, 0xa2, 0xa3, 0xa4}
+	}
+	if withDD {
+		f.hasDD = true
+		f.dd = [4]byte{0xb1, 0xb2, 0xb3, 0xb4}
+	}
+	f.padLen = (4 - payload%4) % 4
+	for i := 0; i < f.padLen; i++ {
+		f.pad[i] = 0xcc
+	}
+	return &f
+}
+
+// TestFrameBatchMatchesWriteFrame 是攒批的正确性底线：一帧无论走批还是直发，
+// 写出的字节必须与逐帧写完全一致 —— 攒批只该改变系统调用的次数。
+func TestFrameBatchMatchesWriteFrame(t *testing.T) {
+	cases := []struct {
+		name                    string
+		payload                 int
+		withAHS, withHD, withDD bool
+	}{
+		{"empty", 0, false, false, false},
+		{"small-pad", 7, false, false, false},
+		{"4k", 4096, false, false, false},
+		{"over-copy-limit", frameCopyLimit + 512, false, false, false},
+		{"at-batch-cap", frameBatchCap - 48, false, false, false},
+		{"over-batch-cap", frameBatchCap + 4096, false, false, false},
+		{"ahs", 100, true, false, false},
+		{"digests", 100, true, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := batchTestFrame(tc.payload, tc.withAHS, tc.withHD, tc.withDD)
+
+			var want batchTestWriter
+			if err := writeFrame(&want, f); err != nil {
+				t.Fatalf("writeFrame 失败：%v", err)
+			}
+			// 这里不校验 Write 次数：writeFrame 的"一次系统调用"来自
+			// net.Buffers.WriteTo 命中 TCP 连接的 writeBuffers 接口，而
+			// bytes.Buffer 不在其列，会退化成逐 slice 写。攒批的 Write 次数
+			// 由 frameBatch.flush 保证，与目标类型无关（见下一个测试）。
+
+			var got batchTestWriter
+			b := newFrameBatch(&got)
+			if err := b.append(f); err != nil {
+				t.Fatalf("append 失败：%v", err)
+			}
+			if err := b.flush(); err != nil {
+				t.Fatalf("flush 失败：%v", err)
+			}
+			if !bytes.Equal(got.buf.Bytes(), want.buf.Bytes()) {
+				t.Fatalf("攒批写出的字节与逐帧写不一致:\n got %x\nwant %x", got.buf.Bytes(), want.buf.Bytes())
+			}
+		})
+	}
+}
+
+// TestFrameBatchCoalescesWrites 验证收益本身：同一窗口里的多个小帧并成一次 Write，
+// 且字节顺序不变。
+func TestFrameBatchCoalescesWrites(t *testing.T) {
+	const frames = 8
+
+	var want batchTestWriter
+	for i := 0; i < frames; i++ {
+		if err := writeFrame(&want, batchTestFrame(1024+i*512, false, false, false)); err != nil {
+			t.Fatalf("writeFrame 失败：%v", err)
+		}
+	}
+
+	var got batchTestWriter
+	b := newFrameBatch(&got)
+	for i := 0; i < frames; i++ {
+		if err := b.append(batchTestFrame(1024+i*512, false, false, false)); err != nil {
+			t.Fatalf("append 失败：%v", err)
+		}
+	}
+	if err := b.flush(); err != nil {
+		t.Fatalf("flush 失败：%v", err)
+	}
+
+	// bytes.Buffer 不实现 net 的 writeBuffers，所以 writeFrame 在这里退化成
+	// "一帧两个 slice 两次 Write"；真实连接是 *net.TCPConn，同一帧只发一次
+	// WSASend。无论哪种目标类型，攒批都把那 2×frames 次写并成了 1 次。
+	if want.writes != frames*2 {
+		t.Fatalf("逐帧写应触发 %d 次 Write，实际 %d 次", frames*2, want.writes)
+	}
+	if got.writes != 1 {
+		t.Fatalf("%d 个小帧应合并为 1 次 Write，实际 %d 次", frames, got.writes)
+	}
+	if !bytes.Equal(got.buf.Bytes(), want.buf.Bytes()) {
+		t.Fatalf("攒批后的字节流与逐帧写不一致:\n got %x\nwant %x", got.buf.Bytes(), want.buf.Bytes())
+	}
+}
+
+// countingConn 只把 Write 转给计数器：被测路径在测试里只写不读，其余 net.Conn
+// 方法碰不到，一旦真的碰到就 panic，不会静默放过。
+type countingConn struct {
+	net.Conn
+	w *batchTestWriter
+}
+
+func (c *countingConn) Write(p []byte) (int, error) { return c.w.Write(p) }
+
+// TestInjectedHitQueuesBehindForwardedFrames 钉住 initiator 方向"唯一写出口"这条
+// 不变量：本地代答必须排在**已经攒下、但还没写出**的透传帧之后。
+//
+// 真机上这就是 StatSN 倒退导致 RST 断链的那一类故障：代答若直接写连接，就会插到
+// 攒批的前面，序号先大后小。同时代答必须立刻把自己的响应送出去 —— 它回答的是
+// 一条正在等待的命令，不能等下一次攒批。
+func TestInjectedHitQueuesBehindForwardedFrames(t *testing.T) {
+	w := &batchTestWriter{}
+	it := &countingConn{w: w}
+	s := newSession(&target{}, it, it)
+
+	// T→I 泵攒下一帧后端响应，但读者手里还有数据，flush 被推迟 —— 这正是批里
+	// 压着未写出字节的那个窗口。
+	// 零载荷：一个 48 字节的头，第二个 PDU 的头紧跟其后，无需跳过数据段。
+	forwarded := batchTestFrame(0, false, false, false)
+	forwarded.hdr.SetOpcode(iscsi.OpSCSIResponse)
+	forwarded.hdr.SetStatSN(41)
+	if err := s.tiBatch.append(forwarded); err != nil {
+		t.Fatalf("append 失败：%v", err)
+	}
+
+	// 紧接着一条可以在本地代答的命中读。
+	var cmd iscsi.BHS
+	cmd.SetITT(7)
+	cmd.SetCmdSN(9)
+	s.lastStat = 41
+	if err := s.injectLocked(&cmd, []byte("cached-hit")); err != nil {
+		t.Fatalf("注入失败：%v", err)
+	}
+
+	if w.writes != 1 {
+		t.Fatalf("透传帧与注入应在一次 Write 里按序写出，实际写了 %d 次", w.writes)
+	}
+	r := bytes.NewReader(w.buf.Bytes())
+	first, err := iscsi.ReadBHS(r)
+	if err != nil {
+		t.Fatalf("读第一个 PDU 头失败：%v", err)
+	}
+	if first.Opcode() != iscsi.OpSCSIResponse || first.StatSN() != 41 {
+		t.Fatalf("第一个 PDU 应是排在注入之前的透传响应，实际 opcode=%#x statSN=%d",
+			first.Opcode(), first.StatSN())
+	}
+	second, err := iscsi.ReadBHS(r)
+	if err != nil {
+		t.Fatalf("读第二个 PDU 头失败：%v", err)
+	}
+	if second.Opcode() != iscsi.OpDataIn {
+		t.Fatalf("第二个 PDU 应是注入的 Data-In，实际 opcode=%#x", second.Opcode())
+	}
+	if got, want := second.StatSN(), uint32(42); got != want {
+		t.Fatalf("注入的 StatSN 应接着透传序号走，实际 %d，期望 %d", got, want)
 	}
 }

@@ -156,38 +156,23 @@ func (fr *frameReader) readTail(h *frame, dataLen int) error {
 	return nil
 }
 
-// writeCoalesce caps the frame size flattened into a single Write. Go's
-// net.Buffers has no scatter-gather write on Windows, so a multi-slice frame
-// costs one syscall per slice; below this size a memcpy into the pump's scratch
-// buffer is cheaper than the extra syscalls. Larger frames (bulk data segments)
-// take the two-Write path instead: a syscall is far cheaper than copying MiBs.
-const writeCoalesce = 16 << 10
-
 // writeFrame writes a PDU, preserving the field order of RFC 7143 (BHS, AHS,
-// header digest, data, padding, data digest). scratch is a per-pump buffer used
-// to flatten small digest-free frames into a single Write; nil is allowed.
-func writeFrame(w io.Writer, f *frame, scratch []byte) error {
-	data := f.data()
-	if !f.hasHD && !f.hasDD {
-		total := 48 + len(f.body) + f.padLen
-		if total <= writeCoalesce && len(scratch) >= total {
-			b := scratch[:total]
-			copy(b, f.hdr[:])
-			copy(b[48:], f.body)
-			copy(b[48+len(f.body):], f.pad[:f.padLen])
-			_, err := w.Write(b)
-			return err
-		}
-		if f.ahsLen == 0 && f.padLen == 0 {
-			if _, err := w.Write(f.hdr[:]); err != nil {
-				return err
-			}
-			if len(data) > 0 {
-				_, err := w.Write(data)
-				return err
-			}
-			return nil
-		}
+// header digest, data, padding, data digest).
+//
+// It always hands the whole PDU to net.Buffers, which is **one** send syscall no
+// matter how many slices the frame is made of: internal/poll.(*FD).Writev packs
+// every slice into a single WSABuf array and issues one WSASend on Windows
+// (writev on Unix). An earlier version instead flattened small frames through a
+// memcpy into a per-pump scratch buffer and wrote bulk frames with two separate
+// Writes, on the theory that net.Buffers had no scatter-gather on Windows; both
+// only added work. Batching several frames into a single Write is a different
+// trade and still a win — that is what frameBatch does.
+func writeFrame(w io.Writer, f *frame) error {
+	// 纯头帧（响应、命令、无载荷的 Data-In）占 4K 随机负载的一半，直接写省掉
+	// net.Buffers 的接口断言与 WSABuf 构造，依然是一次 Write。
+	if !f.hasHD && !f.hasDD && f.ahsLen == 0 && f.padLen == 0 && len(f.body) == 0 {
+		_, err := w.Write(f.hdr[:])
+		return err
 	}
 	var segs [6][]byte
 	bufs := net.Buffers(segs[:0])
@@ -198,7 +183,7 @@ func writeFrame(w io.Writer, f *frame, scratch []byte) error {
 	if f.hasHD {
 		bufs = append(bufs, f.hd[:])
 	}
-	if len(data) > 0 {
+	if data := f.data(); len(data) > 0 {
 		bufs = append(bufs, data)
 	}
 	if f.padLen > 0 {
@@ -209,4 +194,108 @@ func writeFrame(w io.Writer, f *frame, scratch []byte) error {
 	}
 	_, err := bufs.WriteTo(w)
 	return err
+}
+
+const (
+	// frameBatchCap 是一个方向上的写批大小。取一个读窗口的大小：读满一窗
+	// （frameReadBuffer 字节，通常已含多个完整 PDU）正好一次 Write 送走。
+	frameBatchCap = frameReadBuffer
+	// frameCopyLimit 是"空批时愿意为合并而拷贝"的帧大小上限。比它大的帧在批
+	// 为空时直接写（writeFrame 本身就是一次 gather 写，不拷也只是一次 syscall），
+	// 拷贝它只有在下一帧恰好已在读缓冲里时才回本，不值得赌。
+	frameCopyLimit = 16 << 10
+)
+
+// frameBatch 把同一方向上连续到达的若干帧攒进一个缓冲，凑成一次 Write。
+//
+// 为什么要攒：每个 PDU 至少一次发送系统调用，而系统调用就是代理的每 PDU
+// 大头 —— 写路径的 CPU profile 里 61% 的样本落在 WSASend 上。QD≥2 时读者
+// 的窗口里本来就躺着好几个完整 PDU，把它们拼进一个缓冲再一次写出，可把 N
+// 次系统调用降成 1 次。
+//
+// 延迟不会增加：只有读者手里**已经**没有下一个字节时才 flush（见两个泵），
+// 绝不为了凑批去等还没到的数据。攒批期间帧内容一个字节都不变，只是发送时机
+// 推迟到本批末尾。
+type frameBatch struct {
+	w   io.Writer
+	out []byte
+	n   int
+}
+
+func newFrameBatch(w io.Writer) *frameBatch {
+	return &frameBatch{w: w, out: make([]byte, frameBatchCap)}
+}
+
+// append 把一帧并入批。放不下（或帧太大不宜拷）时先 flush。
+//
+// 帧指向读者的缓冲，下一帧就会覆盖它，所以这里必须把字节拷走；不拷贝的大帧
+// 只有"批为空且帧本身不小"这一种情况，那时直接写出去同样是零拷贝一次系统调用。
+func (b *frameBatch) append(f *frame) error {
+	if f.hasHD || f.hasDD {
+		// 协商到摘要的会话本来就降级为纯透传，收不到这里；真收到也不值得为它
+		// 破例：flush 之后按原样写一帧。
+		if err := b.flush(); err != nil {
+			return err
+		}
+		return writeFrame(b.w, f)
+	}
+	total := 48 + len(f.body) + f.padLen
+	if total > len(b.out) {
+		// 比整个批还大的帧（透传帧的数据段不受注入上限约束）。
+		if err := b.flush(); err != nil {
+			return err
+		}
+		return writeFrame(b.w, f)
+	}
+	if b.n == 0 && total > frameCopyLimit {
+		return writeFrame(b.w, f)
+	}
+	if b.n+total > len(b.out) {
+		if err := b.flush(); err != nil {
+			return err
+		}
+	}
+	dst := b.out[b.n : b.n+total]
+	copy(dst, f.hdr[:])
+	copy(dst[48:], f.body)
+	copy(dst[48+len(f.body):], f.pad[:f.padLen])
+	b.n += total
+	return nil
+}
+
+// flush 把已攒的字节一次写出。n 先清零再写：写失败时调用方都会终止会话，而
+// 重试一批已经部分写出的字节会重复发送。
+func (b *frameBatch) flush() error {
+	if b.n == 0 {
+		return nil
+	}
+	buf := b.out[:b.n]
+	b.n = 0
+	_, err := b.w.Write(buf)
+	return err
+}
+
+// write 把一段已经装配好的连续字节（本地代答的一整串 Data-In）并入批，从而与
+// 同方向攒下的透传帧保持先后次序 —— 注入直接写连接就会插到批的前面，StatSN 立刻
+// 倒退。调用方负责在注入后 flush：注入的响应不能等下次攒批才发出去。
+//
+// 大块不拷贝：比整个批还大的注入先 flush 掉已攒的帧，再零拷贝写出去。
+func (b *frameBatch) write(p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+	if len(p) > len(b.out) {
+		if err := b.flush(); err != nil {
+			return err
+		}
+		_, err := b.w.Write(p)
+		return err
+	}
+	if b.n+len(p) > len(b.out) {
+		if err := b.flush(); err != nil {
+			return err
+		}
+	}
+	b.n += copy(b.out[b.n:], p)
+	return nil
 }

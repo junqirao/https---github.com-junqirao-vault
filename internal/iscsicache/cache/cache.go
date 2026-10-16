@@ -173,13 +173,15 @@ type Stats struct {
 //
 // L1UsedBytes/L1LimitBytes report how much of the L1 memory budget currently
 // holds cached blocks and what the budget is, so a caller can show occupancy
-// next to the hit counters.
+// next to the hit counters. L1ResidentBytes is the estimate of what the L1
+// index really costs the collector; see Cache.ResidentBytes.
 type Snapshot struct {
 	Reads, L1Hits, PartialHits, L2Hits, BackendReads, Fills, Evictions, Invalidations, ScanBypass int64
 	RequestHits                                                                                   int64
 	FillSkips                                                                                     int64
 	L1UsedBytes                                                                                   int64
 	L1LimitBytes                                                                                  int64
+	L1ResidentBytes                                                                               int64
 }
 
 func (s *Stats) snapshot() Snapshot {
@@ -369,7 +371,46 @@ func (c *Cache) SectorSize() int { return c.sectorSize }
 func (c *Cache) Stats() Snapshot {
 	s := c.stats.snapshot()
 	s.L1UsedBytes, s.L1LimitBytes = c.Usage()
+	s.L1ResidentBytes = c.ResidentBytes()
 	return s
+}
+
+// Per-entry overhead outside the payload, used by ResidentBytes.
+const (
+	// entryHeaderBytes is sizeof(entry): block number, data slice header, two
+	// atomic counters and the queue tag, padded to 8-byte alignment. Kept in
+	// step with the struct by entryHeaderBytesMatchesStruct.
+	entryHeaderBytes = 48
+	// mapSlotBytes is the per-entry share of map[uint64]*entry: key, pointer and
+	// tophash across a bucket at Go's load factor, plus slack for overflow.
+	mapSlotBytes = 24
+	// ptrBytes is one FIFO queue slot.
+	ptrBytes = 8
+)
+
+// ResidentBytes estimates what the L1 index costs the collector: the block data
+// Usage() counts, plus the entry headers, map buckets and FIFO slots it does
+// not. Usage() stays the logical number the budget is expressed in; this is the
+// one to compare against MemStats.HeapAlloc (the agent reports both).
+//
+// It is an estimate, not a measurement: the map share is a flat per-entry
+// constant rather than the real bucket layout, and the queue slices are counted
+// at capacity because that is the memory the array is holding.
+func (c *Cache) ResidentBytes() int64 {
+	var total int64
+	for _, s := range c.shards {
+		total += s.residentBytes()
+	}
+	return total
+}
+
+func (s *shard) residentBytes() int64 {
+	s.mu.Lock()
+	n := int64(len(s.blocks))
+	slots := int64(cap(s.newQ) + cap(s.midQ) + cap(s.oldQ))
+	s.mu.Unlock()
+	perEntry := int64(s.c.blockSize) + entryHeaderBytes + mapSlotBytes
+	return n*perEntry + slots*ptrBytes
 }
 
 // Usage reports the L1 memory currently holding cached blocks and the L1
@@ -1511,7 +1552,16 @@ func (s *shard) removeFromQueueLocked(e *entry) {
 	}
 	for i, x := range *q {
 		if x == e {
-			*q = append((*q)[:i], (*q)[i+1:]...)
+			// Shift manually rather than append((*q)[:i], (*q)[i+1:]...): that
+			// form leaves the old last element duplicated in a slot past len,
+			// where the backing array keeps it alive. Because the duplicate is
+			// whatever happened to be last, a later removal of that element
+			// would leave it pinned after it left the queue. Same contents,
+			// no stale pointer.
+			old := len(*q)
+			copy((*q)[i:], (*q)[i+1:])
+			(*q)[old-1] = nil
+			*q = (*q)[:old-1]
 			return
 		}
 	}
@@ -1519,9 +1569,18 @@ func (s *shard) removeFromQueueLocked(e *entry) {
 
 // maintainLocked keeps the three FIFO queues inside their quotas, evicting from
 // the old queue down to the low watermark once the shard exceeds the high one.
+//
+// Every dequeue clears the vacated slot before reslicing. q = q[1:] on its own
+// only moves the window: the backing array still holds the *entry, and for an
+// evicted entry (already deleted from the map) that reference is enough to keep
+// the entry and its whole block allocation alive until append happens to
+// reallocate. Those slots are invisible to Usage(), which counts blocks.
+// Measured on the shipped geometry (512 MiB budget, 256 shards, skewed access)
+// they held ~200 MiB — the bulk of the gap between Usage() and MemStats.
 func (s *shard) maintainLocked() {
 	for len(s.newQ) > s.newQuota {
 		e := s.newQ[0]
+		s.newQ[0] = nil
 		s.newQ = s.newQ[1:]
 		if e.freq.Load() >= 1 {
 			e.q = queueMid
@@ -1533,12 +1592,14 @@ func (s *shard) maintainLocked() {
 	}
 	for len(s.midQ) > s.midQuota {
 		e := s.midQ[0]
+		s.midQ[0] = nil
 		s.midQ = s.midQ[1:]
 		e.q = queueOld
 		s.oldQ = append(s.oldQ, e)
 	}
 	for len(s.blocks) > s.high && len(s.oldQ) > 0 {
 		e := s.oldQ[0]
+		s.oldQ[0] = nil
 		s.oldQ = s.oldQ[1:]
 		delete(s.blocks, e.blk)
 		s.c.stats.Evictions.Add(1)

@@ -428,6 +428,12 @@ export interface AgentCacheTargetStatus {
   target_iqn: string
   l1_used_bytes: number
   l1_limit_bytes: number
+  /**
+   * 这份索引**实际**占的堆（估算，含 entry 头/map 桶/FIFO 队列槽位）。`l1_used_bytes`
+   * 只算块数据（配额口径），两者之差是账外开销；用来跟 GET /agent/memstats 的
+   * `heap_alloc` 对账，解释"上限 512MiB 为什么进程占 2GB"。
+   */
+  l1_resident_bytes: number
   /** L2 未启用时为 0。 */
   l2_used_bytes: number
   l2_limit_bytes: number

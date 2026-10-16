@@ -177,6 +177,8 @@ func New(opt Options) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 软内存上限要尽早设：它决定 GC 的堆目标，之后缓存与上传缓冲才开始占用堆。
+	applyMemoryLimit(cfg.Get(), logger)
 	state, err := NewStateStore(opt.StatePath, logger)
 	if err != nil {
 		return nil, err

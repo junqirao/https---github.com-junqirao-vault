@@ -188,6 +188,19 @@ GET /agent/log?day=<日期>&tail=<字节数>
   ↑ {day:<本次返回的日期>, days:[<可查询日期(升序)>],
      path:<该日期日志文件路径>, text:<原始文本(JSON Lines)>, error?}
 
+# 诊断模块：进程内存与 GC 运行时读数，用来解释"缓存上限设了 512MiB、进程却占 2GB"
+# 这类问题。**不要轮询**：ReadMemStats 会短暂停顿所有 goroutine，仅供排查时用。
+GET /agent/memstats
+  ↑ {heap_alloc, heap_inuse, heap_sys, heap_idle, heap_released,   # 字节；heap_sys-heap_alloc 是清扫滞后与闲置碎片
+     next_gc,                  # 下次 GC 的目标堆大小：默认 GOGC=100 时等于存活堆的两倍，RSS"看着会涨"就是它
+     gc_cpu_fraction,          # GC 占用 CPU 的比例（进程启动至今）：判断毛刺是不是 GC 造成的
+     num_gc, num_goroutine, gomaxprocs,
+     gomemlimit_bytes,         # 当前生效的软内存上限：代理按 cache_l1_bytes + 512MiB 自动设；GOMEMLIMIT 环境变量优先
+     gogc_env,                 # GOGC 环境变量原值，空串 = 用默认的 100
+     l1_used_bytes_total,      # 所有库的 L1 账本合计（只算块数据，与 targets[].l1_used_bytes 同口径）
+     l1_resident_bytes_total}  # 这些索引实际占的堆（估算）：与 heap_alloc 的差就是账外部分
+}
+
 HostState = {
   iscsi_available:bool,              # 找得到 IscsiInitiator 模块/cmdlet
   iscsi_service:"running"|"stopped"|"unknown",
@@ -444,7 +457,8 @@ CacheRecommend = {              # 逐库分到多少没有单一数字，看 tar
 CacheTargetStatus = {
   allocation_id,                # 与挂载记录、存储库卡片一一对应
   target_iqn,                   # 本地门户为该库公示的 IQN（挂载链路上实际连接的）
-  l1_used_bytes, l1_limit_bytes,   # 内存缓存占用与配额
+  l1_used_bytes, l1_limit_bytes,   # 内存缓存占用与配额（占用只算块数据 blocks×blockSize）
+  l1_resident_bytes,            # 上面这份索引**实际**占的堆（估算，含 entry 头/map 桶/队列槽位）
   l2_used_bytes, l2_limit_bytes,   # L2 文件占用与配额（未启用 L2 时均为 0）
   l1_restored,                  # 绑定缓存时从 L1 内存快照装回的块数（0 = 没快照或快照不可信）
   whole_drops,                  # 因命令形态未识别而整盘清空读缓存的次数（>0 即"缓存突然归零"的原因）
@@ -744,6 +758,14 @@ POST  /agent/repo-mounts/{repo_id}
 - **取值范围**：L1 必须落在 `[64MiB, 64GiB]`；L2 允许 **0（= 关闭 L2，只做内存缓存）**，
   非 0 时必须落在 `[256MiB, 1TiB]`。越界时 PATCH 返回 `system.invalid_param`
   （args.field=`cache_l1_bytes` / `cache_l2_bytes`），界面在提交前就按同一口径拦下。
+
+**进程 RSS 与这个上限的关系**：存活堆实测是 L1 账本的 1.3~1.8 倍（块数据之外还有每个 entry
+的头、map 桶、FIFO 队列槽位，以及读缓冲/上传缓冲等 `sync.Pool` 的高水位），而 Go 默认
+`GOGC=100` 会把 GC 的堆目标定在**存活堆的两倍**上 —— 于是"上限 512MiB"对应的 RSS 约 2GB，
+而且因为目标是跟着存活堆浮动的，看起来会一直涨。代理启动时、以及每次 PATCH 改到 L1 预算时，
+都会按 `cache_l1_bytes + 512MiB` 设 `runtime/debug.SetMemoryLimit` 把这个浮动封顶；它是
+**软**上限，只在逼近时才加紧 GC，不改变平时的行为。要自己接管就设 `GOMEMLIMIT` 环境变量
+（代理检测到就完全不碰）。当前生效值与 GC 实况见 `GET /agent/memstats`。
 - **0 与"没配"必须区分**：L2 的 0 是合法取值（关闭），配置里显式写过 0 之后不再被归一回
   默认值（见 `cacheL2Set`）；只有从未配过 L2 时才取默认 4GiB。
 - 改这项**不影响已有挂载**的既有配额（新配额在下一次挂载时生效）。
