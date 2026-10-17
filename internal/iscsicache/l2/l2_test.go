@@ -10,19 +10,31 @@ import (
 const (
 	testBlock  = 16 << 10
 	testSector = 4 << 10
-	// Three slots, one index page and the super block.
-	testSize = SuperBlockSize + indexPageSize + 3*(testBlock+stampSize)
+	// testSlots is what layout makes of the test budget.
+	testSlots = 3
+	// Three slots, their stamps, one index page and the super block. The stamps
+	// are one region of their own after the slots rather than a sector wedged
+	// between them, so the three slots are three contiguous blocks of bytes.
+	testSize = SuperBlockSize + testSlots*(testBlock+stampSize) + indexPageSize
+	// testStampBase is where that region starts.
+	testStampBase = SuperBlockSize + testSlots*testBlock
+	// testRegionBlocks is the region size the helpers below open with. It is a
+	// whole file's worth of slots at testSize, so blocks 0..2 are one region in
+	// one home, and it stays the same across a budget change — which is what the
+	// region size has to do for a resize to keep the slots it already has.
+	testRegionBlocks = testSlots
 )
 
 func openTestL2(t *testing.T, store Store, namespace string) *File {
 	t.Helper()
 	f, err := Open(Config{
-		Path:       "test.bin",
-		SizeBytes:  testSize,
-		BlockSize:  testBlock,
-		SectorSize: testSector,
-		Namespace:  namespace,
-		Store:      store,
+		Path:         "test.bin",
+		SizeBytes:    testSize,
+		BlockSize:    testBlock,
+		SectorSize:   testSector,
+		RegionBlocks: testRegionBlocks,
+		Namespace:    namespace,
+		Store:        store,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -35,12 +47,13 @@ func openTestL2(t *testing.T, store Store, namespace string) *File {
 func openSizedL2(t *testing.T, store Store, size int64) *File {
 	t.Helper()
 	f, err := Open(Config{
-		Path:       "test.bin",
-		SizeBytes:  size,
-		BlockSize:  testBlock,
-		SectorSize: testSector,
-		Namespace:  "ns",
-		Store:      store,
+		Path:         "test.bin",
+		SizeBytes:    size,
+		BlockSize:    testBlock,
+		SectorSize:   testSector,
+		RegionBlocks: testRegionBlocks,
+		Namespace:    "ns",
+		Store:        store,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -48,15 +61,34 @@ func openSizedL2(t *testing.T, store Store, size int64) *File {
 	return f
 }
 
+// testStampOffset is where the stamp of a slot sits in the test file.
+func testStampOffset(num int) int64 {
+	return testStampBase + int64(num)*int64(stampSize)
+}
+
 // stampOf reads the stamp sector of a slot straight from the store, the way a
-// crashed session would have left it. Slots start right after the super block.
+// crashed session would have left it. The stamps follow the slot area in one
+// region of their own, so a slot's stamp is not at its own offset.
 func stampOf(t *testing.T, store Store, num int) []byte {
 	t.Helper()
 	b := make([]byte, stampSize)
-	if err := store.ReadAt(b, SuperBlockSize+int64(num)*int64(testBlock+stampSize)); err != nil {
+	if err := store.ReadAt(b, testStampOffset(num)); err != nil {
 		t.Fatalf("read stamp %d: %v", num, err)
 	}
 	return b
+}
+
+// slotNumOf is the slot a block is cached in, or -1. It reads the index the way
+// the file does, so a test can check where a block was homed.
+func slotNumOf(t *testing.T, f *File, blk uint64) int {
+	t.Helper()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	sl := f.index[blk]
+	if sl == nil {
+		return -1
+	}
+	return sl.num
 }
 
 func pattern(n int, tag byte) []byte {
@@ -162,32 +194,36 @@ func TestInvalidateSectors(t *testing.T) {
 	}
 }
 
-// TestRingRecyclesOldestSlot checks the FIFO slot allocation: the fourth
-// distinct block must evict the first one.
-func TestRingRecyclesOldestSlot(t *testing.T) {
+// TestRegionReplacesTheResidentOne checks what a full cache costs when a new
+// region arrives: it takes a home over, and the region that held it loses every
+// block at once. At this size the whole file is one region, so the second one
+// touched is already one too many.
+func TestRegionReplacesTheResidentOne(t *testing.T) {
 	f := openTestL2(t, NewMemoryStore(testSize), "ns")
-	for blk := uint64(1); blk <= 3; blk++ {
+	for blk := uint64(1); blk <= 2; blk++ {
 		if err := f.WriteSectors(blk, 0, 1, pattern(testSector, byte(blk))); err != nil {
 			t.Fatalf("write block %d: %v", blk, err)
 		}
 	}
-	if f.UsedSlots() != 3 {
-		t.Fatalf("used slots = %d, want 3", f.UsedSlots())
-	}
-	if err := f.WriteSectors(4, 0, 1, pattern(testSector, 4)); err != nil {
-		t.Fatalf("write block 4: %v", err)
+	if f.UsedSlots() != 2 {
+		t.Fatalf("used slots = %d, want 2", f.UsedSlots())
 	}
 
-	ok, _ := f.ReadSectors(1, 0, 1, make([]byte, testSector))
-	if ok {
-		t.Fatal("block 1 should have been recycled")
+	// Block 3 is the first block of the next region. The only home is taken, so
+	// it is recycled and takes the two blocks in it with it.
+	if err := f.WriteSectors(3, 0, 1, pattern(testSector, 3)); err != nil {
+		t.Fatalf("write block 3: %v", err)
 	}
-	ok, _ = f.ReadSectors(4, 0, 1, make([]byte, testSector))
-	if !ok {
-		t.Fatal("block 4 was not stored")
+	for blk := uint64(1); blk <= 2; blk++ {
+		if ok, _ := f.ReadSectors(blk, 0, 1, make([]byte, testSector)); ok {
+			t.Fatalf("block %d survived the recycling of its home", blk)
+		}
 	}
-	if f.UsedSlots() != 3 {
-		t.Fatalf("used slots = %d, want 3", f.UsedSlots())
+	if ok, _ := f.ReadSectors(3, 0, 1, make([]byte, testSector)); !ok {
+		t.Fatal("block 3 was not stored")
+	}
+	if f.UsedSlots() != 1 {
+		t.Fatalf("used slots = %d, want 1", f.UsedSlots())
 	}
 }
 
@@ -234,6 +270,96 @@ func TestNamespaceChangeRewritesSuperBlock(t *testing.T) {
 	}
 	if !bytes.Equal(nsB, header[32:64]) {
 		t.Fatal("super block was rewritten for an unchanged namespace")
+	}
+}
+
+// TestLayoutPutsStampsInTheirOwnRegion pins the shape the merged read rests on:
+// the slots are contiguous bytes right after the super block, every stamp is in
+// one region after them, and the index region follows that.
+//
+// The point of the shape is that a run of neighbouring blocks is a run of
+// neighbouring bytes, so ReadBlocks serves it with one transfer straight into
+// the caller's buffer, with no metadata wedged in between to read around.
+func TestLayoutPutsStampsInTheirOwnRegion(t *testing.T) {
+	f := openTestL2(t, NewMemoryStore(testSize), "ns-a")
+	defer f.Close()
+
+	if got := f.slotDataOffset(0); got != SuperBlockSize {
+		t.Fatalf("slot 0 data at %d, want %d", got, SuperBlockSize)
+	}
+	for num := 1; num < f.slotCount; num++ {
+		if got, want := f.slotDataOffset(num), SuperBlockSize+int64(num)*int64(f.slotSize); got != want {
+			t.Fatalf("slot %d data at %d, want %d", num, got, want)
+		}
+		if gap := f.slotDataOffset(num) - f.slotDataOffset(num-1) - int64(f.slotSize); gap != 0 {
+			t.Fatalf("gap of %d bytes before slot %d: slot data has to be contiguous", gap, num)
+		}
+	}
+	// The stamps begin where the whole slot area ends, so no stamp can sit
+	// between two slots.
+	after := f.slotDataOffset(f.slotCount-1) + int64(f.slotSize)
+	if got := f.stampOffset(0); got != after {
+		t.Fatalf("stamp region at %d, want %d", got, after)
+	}
+	for num := 1; num < f.slotCount; num++ {
+		if got, want := f.stampOffset(num), f.stampOffset(0)+int64(num)*int64(stampSize); got != want {
+			t.Fatalf("stamp %d at %d, want %d", num, got, want)
+		}
+	}
+	// And the index region starts after both, so nothing overlaps.
+	if got, want := f.indexOffset(f.slotCount, 0), f.stampOffset(f.slotCount-1)+int64(stampSize); got != want {
+		t.Fatalf("index region at %d, want %d", got, want)
+	}
+
+	// Every one of those offsets is handed to a store that may refuse a transfer
+	// which is not a whole number of sectors, so every one of them has to be one.
+	for _, off := range []int64{
+		SuperBlockSize,
+		f.slotDataOffset(0),
+		f.slotDataOffset(f.slotCount - 1),
+		f.stampOffset(0),
+		f.stampOffset(f.slotCount - 1),
+		f.indexOffset(f.slotCount, 0),
+	} {
+		if off%testSector != 0 {
+			t.Fatalf("offset %d is not a multiple of the sector size", off)
+		}
+	}
+	if f.slotSize%testSector != 0 {
+		t.Fatalf("slot size %d is not a multiple of the sector size", f.slotSize)
+	}
+}
+
+// TestPreviousLayoutIsDiscarded is the cost of moving the stamps: an older file
+// keeps them between the slots, so its slots cannot be addressed under the
+// current offsets. It is rebuilt from empty rather than migrated, which is what
+// the format version is for.
+func TestPreviousLayoutIsDiscarded(t *testing.T) {
+	store := NewMemoryStore(testSize)
+	f := openTestL2(t, store, "ns")
+	for blk := uint64(0); blk < 3; blk++ {
+		writeFullBlock(t, f, blk)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Rewrite the header as the session that wrote those slots had it.
+	header := make([]byte, SuperBlockSize)
+	if err := store.ReadAt(header, 0); err != nil {
+		t.Fatalf("read superblock: %v", err)
+	}
+	header[8] = 3
+	put32(header[sbOffCRC:], checksum(header, sbOffCRC))
+	if err := store.WriteAt(header, 0); err != nil {
+		t.Fatalf("write superblock: %v", err)
+	}
+
+	again := openTestL2(t, store, "ns")
+	if n := again.UsedSlots(); n != 0 {
+		t.Fatalf("used slots = %d after a format change, want 0", n)
+	}
+	if ok, _ := again.ReadSectors(0, 0, 1, make([]byte, testSector)); ok {
+		t.Fatal("a slot written under the previous layout was served")
 	}
 }
 
@@ -519,10 +645,11 @@ func TestCrashRecoveryDropsForeignStamp(t *testing.T) {
 			if err := f.Sync(); err != nil {
 				t.Fatalf("sync: %v", err)
 			}
-			st := stampOf(t, store, 0)
+			num := slotNumOf(t, f, 7)
+			st := stampOf(t, store, num)
 			tc.edit(st, f.generation)
 			put32(st[stampOffCRC:], checksum(st, stampOffCRC))
-			if err := store.WriteAt(st, SuperBlockSize); err != nil {
+			if err := store.WriteAt(st, testStampOffset(num)); err != nil {
 				t.Fatalf("write stamp: %v", err)
 			}
 

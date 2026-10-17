@@ -804,19 +804,17 @@ func (m *cacheManager) Status() CacheStatus {
 	if a := p.Addr(); a != nil {
 		st.Addr = a.String()
 	}
-	for _, key := range p.Keys() {
-		stats, ok := p.Stats(key)
-		if !ok {
-			continue
-		}
-		iqn, _ := p.TargetIQN(key)
+	// 一次遍历门户表取回全部（计数 + IQN）：每个 key 分别查两次表会把门户锁拿两遍，
+	// 而库数正是这条路径上唯一会增长的量（见 Portal.Snapshots）。
+	for key, snap := range p.Snapshots() {
+		stats := snap.Stats
 		cs := stats.Cache
 		// Reads 取代理观测到的读命令数（而非缓存的命中计数）：命中率 = 整条命中 / 读命令，
 		// 这样在缓存尚未绑定或首读未命中时读 IOPS 也如实非 0。
 		reads := stats.Proxy.Reads
 		ts := CacheTargetStatus{
 			AllocationID:    key,
-			TargetIQN:       iqn,
+			TargetIQN:       snap.IQN,
 			L1UsedBytes:     cs.L1UsedBytes,
 			L1LimitBytes:    cs.L1LimitBytes,
 			L1ResidentBytes: cs.L1ResidentBytes,

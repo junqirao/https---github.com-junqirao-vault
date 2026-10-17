@@ -59,6 +59,16 @@ type L2 interface {
 	// ok is false when any of the requested sectors is absent, in which case
 	// dst content is unspecified.
 	ReadSectors(blk uint64, sec, n int, dst []byte) (ok bool, err error)
+	// ReadBlocks fills dst, which holds nblk blocks, with consecutive blocks
+	// starting at blk0 and returns how many it served. The count is a prefix of
+	// the request, and a short count is not an error: the block it stopped on
+	// may be absent or may still be waiting to be confirmed, so the caller
+	// carries on with ReadSectors for it — which is also what settles it.
+	//
+	// It exists because the block granularity and the transfer granularity are
+	// not the same question: what a run of neighbouring blocks costs depends on
+	// how the file laid them out, and only the file can answer that.
+	ReadBlocks(blk0 uint64, nblk int, dst []byte) (served int, err error)
 	// WriteSectors stores n sectors starting at sector sec of block blk.
 	WriteSectors(blk uint64, sec, n int, src []byte) error
 	// InvalidateSectors drops n sectors starting at sector sec of block blk.
@@ -201,9 +211,16 @@ type Cache struct {
 	totalBlocks int
 
 	shards []*shard
-	scan   *scanDetector
-	l2     L2
-	log    *slog.Logger
+	// shardMask/shardsPow2 pick how shard() indexes shards: a mask when the count
+	// is a power of two (the default geometry, and the one the agent builds) and a
+	// modulo otherwise. Every block lookup goes through shard(), and the mask keeps
+	// a 64-bit division off that path. Both are written once in New, before the
+	// cache is reachable from another goroutine, and are never mutated after.
+	shardMask  uint64
+	shardsPow2 bool
+	scan       *scanDetector
+	l2         L2
+	log        *slog.Logger
 
 	// l2Sem bounds how many L2 populations may be in flight and the fence orders
 	// them against an invalidation, which must wait for the populations already
@@ -305,6 +322,8 @@ func New(cfg Config) (*Cache, error) {
 	for i := range c.shards {
 		c.shards[i] = newShard(c, per, cfg.NewQuotaPct, cfg.HighWatermark, cfg.LowWatermark)
 	}
+	c.shardsPow2 = cfg.Shards&(cfg.Shards-1) == 0
+	c.shardMask = uint64(cfg.Shards) - 1
 	if c.l2 != nil {
 		c.l2Sem = make(chan struct{}, l2WriteConcurrency)
 		c.l2InvCh = make(chan l2InvReq, defaultL2InvQueueDepth)
@@ -370,16 +389,44 @@ func (c *Cache) SectorSize() int { return c.sectorSize }
 // Stats returns a snapshot of the counters, including L1 occupancy.
 func (c *Cache) Stats() Snapshot {
 	s := c.stats.snapshot()
-	s.L1UsedBytes, s.L1LimitBytes = c.Usage()
-	s.L1ResidentBytes = c.ResidentBytes()
+	blocks, slots := c.census()
+	s.L1UsedBytes = blocks * int64(c.blockSize)
+	s.L1LimitBytes = int64(c.totalBlocks) * int64(c.blockSize)
+	s.L1ResidentBytes = c.residentBytes(blocks, slots)
 	return s
+}
+
+// census walks the shards once and returns how many blocks L1 holds and how many
+// FIFO slots its queues are holding.
+//
+// Usage, ResidentBytes and Stats need both numbers, so they take them in one
+// pass: each used to walk the shards on its own, which made one status poll cost
+// two lock acquisitions per shard (512 at the default geometry) and made the
+// agent's 5-second sampler a periodic spike proportional to the number of
+// mounted libraries. Sampling both under one hold per shard halves that and
+// changes no number: the two counts are read from the same instant, where they
+// were previously read one shard-walk apart.
+func (c *Cache) census() (blocks, slots int64) {
+	for _, s := range c.shards {
+		b, n := s.census()
+		blocks += b
+		slots += n
+	}
+	return blocks, slots
+}
+
+// residentBytes applies ResidentBytes' per-block and per-slot constants to a
+// census, so Stats and ResidentBytes cannot drift apart.
+func (c *Cache) residentBytes(blocks, slots int64) int64 {
+	perEntry := int64(c.blockSize) + entryHeaderBytes + mapSlotBytes
+	return blocks*perEntry + slots*ptrBytes
 }
 
 // Per-entry overhead outside the payload, used by ResidentBytes.
 const (
-	// entryHeaderBytes is sizeof(entry): block number, data slice header, two
-	// atomic counters and the queue tag, padded to 8-byte alignment. Kept in
-	// step with the struct by entryHeaderBytesMatchesStruct.
+	// entryHeaderBytes is sizeof(entry): block number, data slice header, three
+	// atomic words (valid bits, reuse count, queue tag) and the padding to 8-byte
+	// alignment. Kept in step with the struct by entryHeaderBytesMatchesStruct.
 	entryHeaderBytes = 48
 	// mapSlotBytes is the per-entry share of map[uint64]*entry: key, pointer and
 	// tophash across a bucket at Go's load factor, plus slack for overflow.
@@ -397,20 +444,8 @@ const (
 // constant rather than the real bucket layout, and the queue slices are counted
 // at capacity because that is the memory the array is holding.
 func (c *Cache) ResidentBytes() int64 {
-	var total int64
-	for _, s := range c.shards {
-		total += s.residentBytes()
-	}
-	return total
-}
-
-func (s *shard) residentBytes() int64 {
-	s.mu.Lock()
-	n := int64(len(s.blocks))
-	slots := int64(cap(s.newQ) + cap(s.midQ) + cap(s.oldQ))
-	s.mu.Unlock()
-	perEntry := int64(s.c.blockSize) + entryHeaderBytes + mapSlotBytes
-	return n*perEntry + slots*ptrBytes
+	blocks, slots := c.census()
+	return c.residentBytes(blocks, slots)
 }
 
 // Usage reports the L1 memory currently holding cached blocks and the L1
@@ -419,10 +454,7 @@ func (s *shard) residentBytes() int64 {
 // It walks the shards, so it is meant for periodic reporting (the agent polls
 // it for the storage page), not for the read path.
 func (c *Cache) Usage() (used, limit int64) {
-	var blocks int64
-	for _, s := range c.shards {
-		blocks += int64(s.liveBlocks())
-	}
+	blocks, _ := c.census()
 	return blocks * int64(c.blockSize), int64(c.totalBlocks) * int64(c.blockSize)
 }
 
@@ -766,7 +798,6 @@ func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
 		if segEnd > end {
 			segEnd = end
 		}
-		s0, s1 := c.sectorRange(blkStart, cur, segEnd-cur)
 		sh := c.shard(blk)
 		if e := sh.lookup(blk); e != nil && e.copyIfValid(blkStart, cur, dst[cur-off:segEnd-off], c.sectorSize) {
 			sh.touch(e)
@@ -774,6 +805,46 @@ func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
 			cur = segEnd
 			continue
 		}
+		// The block missed L1. When the request spans it whole and L1 holds
+		// none of the blocks behind it either, hand L2 the range instead of the
+		// block: how many transfers that range costs is the file's business,
+		// and its layout is what decides.
+		if run := c.l2Run(blk, cur, blkStart, segEnd, end); run > 1 {
+			out := dst[cur-off : cur-off+int64(run)*bs]
+			served, err := c.l2.ReadBlocks(blk, run, out)
+			if err != nil {
+				dropPromoteBufs(promotes)
+				c.log.Warn("cache: l2 read failed", "block", blk, "blocks", run, "err", err)
+				return false
+			}
+			for i := 0; i < served; i++ {
+				// The run was read straight into dst, so promotion copies each
+				// block out of it. That copy is what the staging buffer of the
+				// per block path was for, minus the transfer it used to cost.
+				b := blk + uint64(i)
+				buf := fillBufGet(int(bs))
+				copy(buf, out[i*int(bs):(i+1)*int(bs)])
+				promotes = append(promotes, l2Promote{blk: b, blockOff: 0, data: buf, epoch: c.shard(b).epoch.Load()})
+			}
+			if served == run {
+				cur += int64(run) * bs
+				continue
+			}
+			// The run stopped short. The block it stopped on is served one at a
+			// time below, which is also what confirms an entry a crash left
+			// unverified; whatever was served keeps its place in dst.
+			if served > 0 {
+				cur += int64(served) * bs
+				blk = uint64(cur / bs)
+				blkStart = int64(blk) * bs
+				segEnd = blkStart + bs
+				if segEnd > end {
+					segEnd = end
+				}
+				sh = c.shard(blk)
+			}
+		}
+		s0, s1 := c.sectorRange(blkStart, cur, segEnd-cur)
 		n := s1 - s0 + 1
 		start := blkStart + int64(s0)*ss
 		buf := fillBufGet(int(int64(n) * ss))
@@ -810,6 +881,38 @@ func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
 			newFillRelease(func() { fillBufPut(buf) }))
 	}
 	return true
+}
+
+// l2Run is how many whole blocks one L2 range request may cover, or 1 when the
+// range is not worth asking for.
+//
+// The range has to start on the block boundary and the block has to be covered
+// whole, because a run is answered with whole blocks and a block the request
+// only partly covers could only be stitched together from two sources. L1 has
+// to hold none of the blocks behind it either: a block L1 can answer never
+// reaches L2 at all, so a run through one would read more than the request
+// needs and then throw the block away.
+//
+// Only the blocks behind the first one are asked about. The caller has just
+// looked up the first one and found it missing, and looking again would be a
+// second traversal of the same shard.
+func (c *Cache) l2Run(blk uint64, cur, blkStart, segEnd, end int64) int {
+	bs := int64(c.blockSize)
+	if cur != blkStart || segEnd != blkStart+bs {
+		return 1
+	}
+	run := 1
+	for {
+		b := blk + uint64(run)
+		if start := int64(b) * bs; start+bs > end {
+			// The request stops inside b, so b is not ours to read whole.
+			return run
+		}
+		if e := c.shard(b).lookup(b); e != nil && e.rangeValid(0, c.sectorsPer-1) {
+			return run
+		}
+		run++
+	}
 }
 
 // dropPromoteBufs recycles the staging buffers of promotes a read abandoned
@@ -1181,7 +1284,7 @@ func (c *Cache) installValidated(blk uint64, blockOff int, data []byte, epoch ui
 	if e == nil {
 		e = &entry{blk: blk, data: make([]byte, c.blockSize)}
 		sh.blocks[blk] = e
-		e.q = queueNew
+		e.q.Store(queueNew)
 		sh.newQ = append(sh.newQ, e)
 		sh.maintainLocked()
 	}
@@ -1377,7 +1480,17 @@ func (c *Cache) l2InvWorker() {
 	}
 }
 
-func (c *Cache) shard(blk uint64) *shard { return c.shards[blk%uint64(len(c.shards))] }
+// shard returns the shard owning blk.
+//
+// The shard count is a power of two for every geometry the agent builds, so the
+// index is a mask; the modulo is kept for a configured count that is not, which
+// a mask would index wrongly.
+func (c *Cache) shard(blk uint64) *shard {
+	if c.shardsPow2 {
+		return c.shards[blk&c.shardMask]
+	}
+	return c.shards[blk%uint64(len(c.shards))]
+}
 
 func (c *Cache) sectorRange(blkStart, off, length int64) (int, int) {
 	return int((off - blkStart) / int64(c.sectorSize)), int((off - blkStart + length - 1) / int64(c.sectorSize))
@@ -1416,17 +1529,44 @@ type entry struct {
 	data  []byte
 	valid atomic.Uint32
 	freq  atomic.Uint32
-	q     uint8 // guarded by the owning shard mutex
+	// q is the S3-FIFO queue the entry sits in. Its writers all hold the owning
+	// shard mutex; it is atomic because touch reads it before taking that mutex to
+	// skip a promotion that cannot happen. A plain field would make that read a
+	// data race. It still fits the header's padding, so sizeof(entry) is unchanged.
+	q atomic.Uint32 // guarded by the owning shard mutex
 }
 
 func (e *entry) setValid(i int)   { e.valid.Or(1 << uint(i)) }
 func (e *entry) clearValid(i int) { e.valid.And(^(uint32(1) << uint(i))) }
 
-func (e *entry) rangeValid(s0, s1 int) bool {
-	mask := uint32(0)
-	for i := s0; i <= s1; i++ {
-		mask |= 1 << uint(i)
+// sectorMask[n] has its low n bits set: n consecutive sectors' worth of valid
+// bits. rangeValid needs that mask shifted up to the run's first sector, and it
+// is called twice per block, so the mask is looked up rather than assembled one
+// bit at a time.
+//
+// It is a table rather than (1<<(s1+1))-(1<<s0) because that form shifts a
+// uint32 by 32 when the run covers all of them, which Go turns into zero — the
+// run would be reported invalid with no error anywhere. The table has no such
+// case.
+var sectorMask = func() [33]uint32 {
+	var m [33]uint32
+	for n := range m {
+		if n == 32 {
+			m[n] = ^uint32(0)
+			continue
+		}
+		m[n] = 1<<uint(n) - 1
 	}
+	return m
+}()
+
+func (e *entry) rangeValid(s0, s1 int) bool {
+	if s1 < s0 {
+		// An empty run is vacuously valid. The loop this replaced answered the
+		// same, and the table has no entry for a non-positive sector count.
+		return true
+	}
+	mask := sectorMask[s1-s0+1] << uint(s0)
 	return e.valid.Load()&mask == mask
 }
 
@@ -1446,7 +1586,7 @@ func (e *entry) copyIfValid(blkStart, off int64, dst []byte, sectorSize int) boo
 // shard -------------------------------------------------------------------------
 
 const (
-	queueNew uint8 = iota
+	queueNew uint32 = iota
 	queueMid
 	queueOld
 )
@@ -1503,25 +1643,39 @@ func (s *shard) lookup(blk uint64) *entry {
 	return e
 }
 
-// liveBlocks reports how many blocks the shard currently holds, for occupancy
-// reporting.
-func (s *shard) liveBlocks() int {
+// census reports how many blocks the shard currently holds and how many slots
+// its FIFO queues are holding, for occupancy reporting. One lock covers both,
+// so a caller that wants the two numbers does not pay for two passes.
+func (s *shard) census() (blocks, slots int64) {
 	s.mu.Lock()
-	n := len(s.blocks)
+	blocks = int64(len(s.blocks))
+	slots = int64(cap(s.newQ) + cap(s.midQ) + cap(s.oldQ))
 	s.mu.Unlock()
-	return n
+	return blocks, slots
 }
 
 // touch records a hit: S3-FIFO promotes an entry that was reused while sitting
 // in the old queue back into the middle queue.
+//
+// A promotion only ever moves an entry out of the old queue, and a hit almost
+// always finds its entry in the new or middle queue, where touch changes nothing
+// — so the queue tag is tested before the lock is taken. The tag is owned by the
+// shard mutex, so that test can see a value a concurrent dequeue has already
+// moved past: a stale "old" tag only costs the locked re-test below, and a stale
+// "new"/"mid" tag costs one promotion that the next hit repeats. Neither is a
+// correctness problem, S3-FIFO being a heuristic, and the common case stops
+// paying a mutex round trip per block.
 func (s *shard) touch(e *entry) {
 	if e.freq.Load() < 3 {
 		e.freq.Add(1)
 	}
+	if e.q.Load() != queueOld {
+		return
+	}
 	s.mu.Lock()
-	if e.q == queueOld && e.freq.Load() >= 2 && s.blocks[e.blk] == e {
+	if e.q.Load() == queueOld && e.freq.Load() >= 2 && s.blocks[e.blk] == e {
 		s.removeFromQueueLocked(e)
-		e.q = queueMid
+		e.q.Store(queueMid)
 		s.midQ = append(s.midQ, e)
 	}
 	s.mu.Unlock()
@@ -1544,7 +1698,7 @@ func (s *shard) removeLocked(e *entry) {
 
 func (s *shard) removeFromQueueLocked(e *entry) {
 	q := &s.newQ
-	switch e.q {
+	switch e.q.Load() {
 	case queueMid:
 		q = &s.midQ
 	case queueOld:
@@ -1583,10 +1737,10 @@ func (s *shard) maintainLocked() {
 		s.newQ[0] = nil
 		s.newQ = s.newQ[1:]
 		if e.freq.Load() >= 1 {
-			e.q = queueMid
+			e.q.Store(queueMid)
 			s.midQ = append(s.midQ, e)
 		} else {
-			e.q = queueOld
+			e.q.Store(queueOld)
 			s.oldQ = append(s.oldQ, e)
 		}
 	}
@@ -1594,7 +1748,7 @@ func (s *shard) maintainLocked() {
 		e := s.midQ[0]
 		s.midQ[0] = nil
 		s.midQ = s.midQ[1:]
-		e.q = queueOld
+		e.q.Store(queueOld)
 		s.oldQ = append(s.oldQ, e)
 	}
 	for len(s.blocks) > s.high && len(s.oldQ) > 0 {

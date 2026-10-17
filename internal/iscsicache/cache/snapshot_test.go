@@ -8,12 +8,12 @@ import (
 )
 
 // blockQueues maps every live block to the S3-FIFO queue it sits in.
-func blockQueues(c *Cache) map[uint64]uint8 {
-	out := make(map[uint64]uint8)
+func blockQueues(c *Cache) map[uint64]uint32 {
+	out := make(map[uint64]uint32)
 	for _, sh := range c.shards {
 		sh.mu.Lock()
 		for blk, e := range sh.blocks {
-			out[blk] = e.q
+			out[blk] = e.q.Load()
 		}
 		sh.mu.Unlock()
 	}

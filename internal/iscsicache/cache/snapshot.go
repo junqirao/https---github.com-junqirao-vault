@@ -120,7 +120,7 @@ func (c *Cache) SaveSnapshot(path, binding string) (blocks int, bytes int64, err
 			binary.LittleEndian.PutUint64(rec[0:8], e.blk)
 			binary.LittleEndian.PutUint32(rec[8:12], mask)
 			binary.LittleEndian.PutUint32(rec[12:16], e.freq.Load())
-			binary.LittleEndian.PutUint32(rec[16:20], uint32(e.q))
+			binary.LittleEndian.PutUint32(rec[16:20], e.q.Load())
 			binary.LittleEndian.PutUint32(rec[20:24], uint32(nsec))
 			if _, err = bw.Write(rec); err != nil {
 				sh.mu.Unlock()
@@ -224,7 +224,7 @@ func (c *Cache) LoadSnapshot(path, binding string) (int, error) {
 		blk := binary.LittleEndian.Uint64(rec[0:8])
 		mask := binary.LittleEndian.Uint32(rec[8:12])
 		freq := binary.LittleEndian.Uint32(rec[12:16])
-		q := uint8(binary.LittleEndian.Uint32(rec[16:20]))
+		q := binary.LittleEndian.Uint32(rec[16:20])
 		nsec := int(binary.LittleEndian.Uint32(rec[20:24]))
 		// 快照比当前 L1 预算大（用户调小了缓存）：装到满为止，余下的丢掉。
 		if loaded >= c.totalBlocks {
@@ -258,16 +258,17 @@ func (c *Cache) LoadSnapshot(path, binding string) (int, error) {
 // installSnapshotBlock puts a restored block back into its shard, in the queue
 // it sat in when it was saved: where a block sits in S3-FIFO is the whole value
 // of a warm start, so a restored block must not be forced back to the new queue.
-func (c *Cache) installSnapshotBlock(blk uint64, mask, freq uint32, q uint8, data []byte) bool {
+func (c *Cache) installSnapshotBlock(blk uint64, mask, freq, q uint32, data []byte) bool {
 	sh := c.shard(blk)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	if _, ok := sh.blocks[blk]; ok {
 		return false
 	}
-	e := &entry{blk: blk, data: data, q: q}
+	e := &entry{blk: blk, data: data}
 	e.valid.Store(mask)
 	e.freq.Store(freq)
+	e.q.Store(q)
 	sh.blocks[blk] = e
 	switch q {
 	case queueMid:
@@ -275,7 +276,7 @@ func (c *Cache) installSnapshotBlock(blk uint64, mask, freq uint32, q uint8, dat
 	case queueOld:
 		sh.oldQ = append(sh.oldQ, e)
 	default:
-		e.q = queueNew
+		e.q.Store(queueNew)
 		sh.newQ = append(sh.newQ, e)
 	}
 	// 队列配额（尤其是 new 队列）必须立刻收回来，否则恢复一个满载的 L1 会让

@@ -45,6 +45,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,15 +54,23 @@ const (
 	SuperBlockSize = 4096
 	superBlockMag  = "VLTISCL2"
 	// superBlockVer 2 added the persisted index region and the snapshot marker;
-	// 3 adds the per-slot stamp sector and the statically reserved index.
-	superBlockVer = 3
+	// 3 added the per-slot stamp sector and the statically reserved index;
+	// 4 moved every stamp out of the slot area into one of its own, which is
+	// what makes the data of neighbouring slots neighbouring bytes. An older
+	// file has its stamps wedged between the slots, so it is discarded and
+	// rebuilt rather than migrated: see initSuperBlock.
+	superBlockVer = 4
 )
 
-// Slot stamp. Every slot begins with one reserved sector describing the data
-// that follows it, so a slot can be validated without trusting the index that
-// points at it. The version is what makes an invalidation visible to the next
-// open: dropping sectors only changes the version, and a snapshot that predates
-// the drop then fails to match the entry it would otherwise resurrect.
+// Slot stamp. Every slot has one reserved sector describing the data it holds,
+// so a slot can be validated without trusting the index that points at it. All
+// of them live in one region after the slots, not between them: a run of
+// neighbouring slots is then a run of neighbouring bytes on disk, which is what
+// lets a range read be served in one transfer straight into the caller's buffer.
+//
+// The version is what makes an invalidation visible to the next open: dropping
+// sectors only changes the version, and a snapshot that predates the drop then
+// fails to match the entry it would otherwise resurrect.
 const (
 	stampSize = indexPageSize
 	stampMag  = "VLTSTAMP"
@@ -97,9 +106,13 @@ const (
 	sbOffSlotCount  = 20
 	sbOffGeneration = 24
 	sbOffNamespace  = 32
-	sbOffNext       = 64
-	sbOffState      = 72
-	sbOffCRC        = 76
+	// sbOffRegion holds the region size the slots were laid out with. It takes
+	// part in the geometry check because it decides which slot a block belongs
+	// in: a file written with another one cannot be homed under this session's
+	// mapping.
+	sbOffRegion = 64
+	sbOffState  = 72
+	sbOffCRC    = 76
 )
 
 // Snapshot states. Open marks the file open; only Close marks it clean, and
@@ -115,6 +128,18 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 const (
 	DefaultBlockSize  = 64 * 1024
 	DefaultSectorSize = 4096
+	// DefaultMaxIOBytes is how many bytes one transfer against the store may
+	// cover. It is one mebibyte because that is what a run of neighbouring
+	// blocks adds up to under the region layout, and because the store pays for
+	// the cap once per shard rather than once per transfer: four shards of
+	// scratch, not one buffer per read. Config.MaxIOBytes overrides it.
+	DefaultMaxIOBytes = 1 << 20
+	// DefaultRegionBlocks is how many consecutive blocks of the LUN one slot
+	// home holds: the granularity at which neighbouring blocks are kept
+	// physically adjacent, and so the length of the runs a range read turns
+	// into. A home is recycled as a unit, so this is also how much of the cache
+	// one newly touched region can cost.
+	DefaultRegionBlocks = 128
 )
 
 // ErrUnsupported reports that no L2 store exists for the running platform.
@@ -138,6 +163,16 @@ type Config struct {
 	SizeBytes  int64
 	BlockSize  int
 	SectorSize int
+	// MaxIOBytes caps one transfer against the store, in bytes. It is what lets
+	// a run of neighbouring blocks be read in a single transfer, so it has to
+	// cover at least one block; Open clamps it to the size of the file. Zero
+	// takes DefaultMaxIOBytes.
+	MaxIOBytes int
+	// RegionBlocks is how many consecutive blocks of the LUN one slot home
+	// holds. Zero takes DefaultRegionBlocks; Open lowers it to the slot count
+	// when the budget holds fewer slots than that, because a home needs at
+	// least one slot and a file needs at least one home.
+	RegionBlocks int
 	// Namespace binds the file to a backing LUN identity. A mismatch is
 	// reported and the in-memory index simply starts empty.
 	Namespace string
@@ -156,8 +191,8 @@ func (c *Config) normalize() error {
 	if c.BlockSize%c.SectorSize != 0 {
 		return fmt.Errorf("l2: block size %d is not a multiple of sector size %d", c.BlockSize, c.SectorSize)
 	}
-	if n := c.BlockSize / c.SectorSize; n < 1 || n > 32 {
-		return fmt.Errorf("l2: %d sectors per slot is out of range (1..32)", n)
+	if n := c.BlockSize / c.SectorSize; n < 1 || n > secPerSlotMax {
+		return fmt.Errorf("l2: %d sectors per slot is out of range (1..%d)", n, secPerSlotMax)
 	}
 	// Every IO is issued on a sector boundary, so the index page size has to stay
 	// a whole number of sectors.
@@ -166,6 +201,20 @@ func (c *Config) normalize() error {
 	}
 	if c.SizeBytes <= SuperBlockSize+int64(c.slotBytes()) {
 		return fmt.Errorf("l2: size %d is too small", c.SizeBytes)
+	}
+	if c.RegionBlocks < 0 {
+		return fmt.Errorf("l2: region blocks %d is negative", c.RegionBlocks)
+	}
+	if c.RegionBlocks == 0 {
+		c.RegionBlocks = DefaultRegionBlocks
+	}
+	if c.MaxIOBytes <= 0 {
+		c.MaxIOBytes = DefaultMaxIOBytes
+	}
+	// A cap below one slot would make a single block unreadable, and the
+	// superblock is read through the same scratch on open.
+	if min := maxInt(c.slotBytes(), SuperBlockSize); c.MaxIOBytes < min {
+		c.MaxIOBytes = min
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -197,22 +246,30 @@ type slot struct {
 	stamped bool
 }
 
-// File is a fixed slot L2 cache held in a single file. Slots are handed out in
-// a ring, so a slot is recycled FIFO and never needs explicit eviction.
+// File is a fixed slot L2 cache held in a single file. A block is handed the
+// slot its LBA region owns rather than the next one free, so the blocks of a
+// region are always neighbours on disk and a range read of them is a streaming
+// read rather than one transfer per block.
 //
-// Layout: superblock, then the slots, then the index region. Slots start at a
-// fixed offset, so a session that gets a different budget addresses the slots
-// it already has in exactly the same place; only the index region moves, and it
-// is rewritten from memory when it does. The superblock records the slot count
-// its index region belongs to, which is what lets a later session find it.
+// Layout: superblock, then the slots, then the slot stamps, then the index
+// region. Slots start at a fixed offset, so a session that gets a different
+// budget addresses the slots it already has in exactly the same place; the stamp
+// and index regions move with the slot count and are rewritten when they do. The
+// superblock records the slot count its index region belongs to, which is what
+// lets a later session find it, and the region size, because that decides which
+// slot a block belongs in.
 type File struct {
 	store      Store
 	slotSize   int
 	sectorSize int
 	secPerSlot int
 	slotCount  int
-	namespace  string
-	log        *slog.Logger
+	// maxIO is Config.MaxIOBytes clamped to the file. One transfer may cover
+	// this many bytes, which is what sets how long a run of neighbouring slots
+	// ReadBlocks can serve per IO.
+	maxIO     int
+	namespace string
+	log       *slog.Logger
 
 	indexPages int
 	// snapshotSlots is the slot count the index region on disk belongs to. It
@@ -229,7 +286,48 @@ type File struct {
 	mu         sync.RWMutex
 	index      map[uint64]*slot
 	slotsByNum []*slot
-	next       int
+
+	// Region homing. A block belongs in the slot its LBA region owns:
+	// num = home*regionBlocks + blk%regionBlocks. The blocks of one region are
+	// therefore always a run of neighbouring slots, which is what makes a range
+	// read of a region one streaming transfer instead of one transfer per block.
+	//
+	// homeOf says which home each region owns, freeHomes holds the ones no
+	// region owns, homeLive marks the owned ones and hand sweeps them when a
+	// new region needs a home — giving the second chance a home's reference bit
+	// earns it. A home is recycled whole: homing a region over one that is
+	// already there gives up every block that home held.
+	regionBlocks int
+	homes        int
+	homeOf       map[uint64]int
+	freeHomes    []int
+	homeLive     []bool
+	// homeUsed is how many slots each home holds. It is a hint for picking a
+	// victim and for reporting the fill, never something a read or a write is
+	// addressed by: a count that drifted would send an eviction to a home that
+	// is not empty, which costs those blocks and nothing else.
+	homeUsed []int
+	// homeRef is the second chance a home gets: it is set by a read that was
+	// actually served out of it and cleared by the eviction hand as it sweeps.
+	// A home therefore survives one sweep after its last read, and the one
+	// whose turn comes up with nothing having read it since the previous sweep
+	// is the one given away — which is what keeps a region that is being read
+	// resident instead of recycling it because its number came up.
+	//
+	// It is atomic and lives outside the lock because reads hold the index for
+	// read: they run in parallel with each other, so the bit has to be set
+	// without excluding them. That is still safe against the sweep, which runs
+	// under the write lock: a writer cannot start while a reader holds the
+	// index, so no read can set a bit between the sweep's first clear and its
+	// last — every bit it has already cleared stays clear for that whole pass,
+	// which is what makes the pass terminate.
+	homeRef []atomic.Bool
+	// hand is where the next sweep starts, and evictions counts how many homes
+	// it has taken away: a number that keeps climbing says the cache is too
+	// small for the working set, and one that settles says the working set fits
+	// and the layout is stable.
+	hand      int
+	evictions atomic.Int64
 	// dirty holds the index pages that changed since the last flush; dirtyAll
 	// means every page has to be rewritten (Drop).
 	dirty    map[int]struct{}
@@ -289,6 +387,22 @@ func Open(cfg Config) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A home needs at least one slot and a file needs at least one home, so a
+	// budget too small for the configured region size is given a smaller one
+	// rather than no homing at all.
+	regionBlocks := cfg.RegionBlocks
+	if regionBlocks > slotCount {
+		regionBlocks = slotCount
+	}
+	// The store sizes its scratch once and reads through it, so the cap is
+	// clamped to the file it can never read past.
+	maxIO := cfg.MaxIOBytes
+	if int64(maxIO) > fileSize {
+		maxIO = int(fileSize)
+	}
+	if maxIO < maxInt(slotSize, SuperBlockSize) {
+		maxIO = maxInt(slotSize, SuperBlockSize)
+	}
 
 	store := cfg.Store
 	if store == nil {
@@ -300,12 +414,17 @@ func Open(cfg Config) (*File, error) {
 				return nil, fmt.Errorf("l2: create cache directory %s: %w", dir, err)
 			}
 		}
-		s, err := openStore(cfg.Path, fileSize, maxInt(slotSize, SuperBlockSize))
+		s, err := openStore(cfg.Path, fileSize, maxIO)
 		if err != nil {
 			return nil, err
 		}
 		store = s
 	}
+	// Counting from here on means every transfer the file issues goes through
+	// the wrapper, including the superblock read below, so the counters describe
+	// what the file really did rather than a list of paths someone remembered to
+	// instrument.
+	store = newStatStore(store)
 
 	f := &File{
 		store:      store,
@@ -313,14 +432,19 @@ func Open(cfg Config) (*File, error) {
 		sectorSize: cfg.SectorSize,
 		secPerSlot: slotSize / cfg.SectorSize,
 		slotCount:  slotCount,
+		maxIO:      maxIO,
 		namespace:  cfg.Namespace,
 		log:        cfg.Logger,
 		indexPages: indexPages,
 		index:      make(map[uint64]*slot),
 		slotsByNum: make([]*slot, slotCount),
 		dirty:      make(map[int]struct{}),
+
+		regionBlocks: regionBlocks,
+		homes:        slotCount / regionBlocks,
 	}
 	f.fullMask = sectorMask(0, f.secPerSlot)
+	f.initHomes()
 	if err := f.initSuperBlock(); err != nil {
 		store.Close()
 		return nil, err
@@ -334,7 +458,8 @@ func Open(cfg Config) (*File, error) {
 		return nil, fmt.Errorf("l2: size store: %w", err)
 	}
 	cfg.Logger.Info("l2 opened", "path", cfg.Path, "slots", slotCount,
-		"slot_size", slotSize, "namespace", shortHash(cfg.Namespace),
+		"slot_size", slotSize, "max_io", maxIO, "namespace", shortHash(cfg.Namespace),
+		"homes", f.homes, "region_blocks", f.regionBlocks,
 		"recovered", f.recovered, "unverified", f.unverified)
 	return f, nil
 }
@@ -392,6 +517,44 @@ func (f *File) UsedSlots() int {
 	return len(f.index)
 }
 
+// RegionBlocks returns how many consecutive blocks of the LUN one home holds.
+func (f *File) RegionBlocks() int { return f.regionBlocks }
+
+// Homes returns how many regions the file can hold at once. It is Slots()
+// divided by RegionBlocks(), and any slots left over cannot be used at all:
+// a region takes a whole run or none of it.
+func (f *File) Homes() int { return f.homes }
+
+// Evictions returns how many regions have had their home taken away since the
+// file was opened, counting only the ones that still held blocks: a home handed
+// over empty gives up nothing and is not reported here.
+//
+// Together with Slots it is the number that says whether the cache fits the
+// working set. A cache whose regions fit stops recycling them entirely — the
+// layout reaches a steady state and stays there — so a count that climbs for as
+// long as the workload runs means the regions in use do not fit, and the size
+// (or the region granularity) is what has to change rather than the read path.
+func (f *File) Evictions() int64 { return f.evictions.Load() }
+
+// RegionFill returns how many of the slots each region in the cache is using,
+// one entry per region held.
+//
+// It exists because the region size is the one parameter of the layout that
+// cannot be settled by reading the code: a region that is only ever partly
+// filled pays for slots no other block may have, and how often that happens is
+// a property of the workload, not of the file. Measuring the fill is what
+// decides whether the size is right, and it is why the number is returned
+// rather than summarised.
+func (f *File) RegionFill() []int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	fill := make([]int, 0, len(f.homeOf))
+	for _, h := range f.homeOf {
+		fill = append(fill, f.homeUsed[h])
+	}
+	return fill
+}
+
 // Restored returns how many slots the last Open found in the snapshot, whether
 // it was closed cleanly or not.
 func (f *File) Restored() int {
@@ -422,6 +585,18 @@ func (f *File) Dropped() int {
 	return f.dropped
 }
 
+// IOStats reports the physical IO this file has issued since it was opened. It
+// is what tells a merged read of a run from the per block reads it replaced:
+// see the type's own comment for why the counters are read without a lock.
+func (f *File) IOStats() IOStats {
+	if st, ok := f.store.(*statStore); ok {
+		return st.stats()
+	}
+	// A caller that replaced the store (the concurrency tests do) is not
+	// counting, and reporting zeroes is honest about that.
+	return IOStats{}
+}
+
 // initSuperBlock validates the header, restores a cleanly closed index, and
 // finally marks the file open so that a crash from here on cannot bring back
 // the mapping this session is about to change.
@@ -445,6 +620,12 @@ func (f *File) initSuperBlock() error {
 	case int(le32(buf[sbOffSlotSize:])) != f.slotSize ||
 		int(le32(buf[sbOffSectorSize:])) != f.sectorSize:
 		f.log.Warn("l2: geometry changed, starting with an empty index")
+		f.reset()
+	case int(le32(buf[sbOffRegion:])) != f.regionBlocks:
+		// The region size decides which slot a block belongs in, so records
+		// written under another one are not places this session can serve from.
+		f.log.Warn("l2: region size changed, discarding previous contents",
+			"old", le32(buf[sbOffRegion:]), "new", f.regionBlocks)
 		f.reset()
 	case string(buf[sbOffNamespace:sbOffNamespace+32]) != string(ns[:]):
 		f.log.Warn("l2: cache namespace changed, discarding previous contents",
@@ -471,9 +652,10 @@ func (f *File) initSuperBlock() error {
 		if err := f.loadIndex(); err != nil {
 			return err
 		}
-		if n := le64(buf[sbOffNext:]); n < uint64(f.slotCount) {
-			f.next = int(n)
-		}
+		// The directory is derived from the slots rather than persisted, so it
+		// is rebuilt here — after the records, because an entry the mapping
+		// cannot home is dropped from the index.
+		f.rebuildHomesLocked()
 		f.recovered = len(f.index)
 		if clean {
 			for _, sl := range f.index {
@@ -496,7 +678,7 @@ func (f *File) reset() {
 	f.generation = newGeneration()
 	f.index = make(map[uint64]*slot)
 	f.slotsByNum = make([]*slot, f.slotCount)
-	f.next = 0
+	f.initHomes()
 	f.dirty = make(map[int]struct{})
 	f.dirtyAll = false
 	f.recovered = 0
@@ -517,7 +699,7 @@ func (f *File) writeSuperBlock(state uint32) error {
 	put64(buf[sbOffGeneration:], f.generation)
 	ns := sha256.Sum256([]byte(f.namespace))
 	copy(buf[sbOffNamespace:sbOffNamespace+32], ns[:])
-	put64(buf[sbOffNext:], uint64(f.next))
+	put32(buf[sbOffRegion:], uint32(f.regionBlocks))
 	put32(buf[sbOffState:], state)
 	put32(buf[sbOffCRC:], checksum(buf, sbOffCRC))
 	if err := f.store.WriteAt(buf, 0); err != nil {
@@ -644,6 +826,14 @@ func (f *File) ReadSectors(blk uint64, sec, n int, dst []byte) (bool, error) {
 		}
 		if sl.verified {
 			err := f.store.ReadAt(dst[:n*f.sectorSize], f.slotOffset(sl.num, sec))
+			if err == nil {
+				// A read that was served is the only thing that tells the
+				// eviction hand a region is being used rather than merely
+				// resident, so it is marked here and nowhere else: a miss, a
+				// partial entry or one that had to be confirmed first is not
+				// evidence that anyone wants this home kept.
+				f.homeRef[sl.num/f.regionBlocks].Store(true)
+			}
 			f.mu.RUnlock()
 			if err != nil {
 				return false, err
@@ -656,6 +846,97 @@ func (f *File) ReadSectors(blk uint64, sec, n int, dst []byte) (bool, error) {
 	// Still unverified after confirming it: the entry is gone, so the read is a
 	// plain miss rather than a guess.
 	return false, nil
+}
+
+// ReadBlocks reads consecutive blocks starting at blk0 into dst, which has to
+// hold at least nblk blocks, and returns how many blocks it served.
+//
+// The count is always a prefix of the request: a block that is absent, only
+// partly valid, or still waiting to be confirmed against its stamp ends the
+// run. A short count is not an error, because the caller is expected to carry
+// on with ReadSectors — which is also what confirms the entry that stopped it.
+//
+// Neighbouring blocks whose slots are physically adjacent are covered by one
+// transfer, up to maxIO bytes of it, and the whole range is served under a
+// single read lock: a run that used to cost one lock acquisition, one lookup
+// and one transfer per block costs one of each per run instead. Under the
+// region layout that adjacency is by construction, so a read of a region is a
+// streaming read; under the ring it holds for runs that were filled in order
+// and have not been recycled yet.
+func (f *File) ReadBlocks(blk0 uint64, nblk int, dst []byte) (int, error) {
+	if nblk <= 0 {
+		return 0, nil
+	}
+	if len(dst) < nblk*f.slotSize {
+		return 0, io.ErrShortBuffer
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	served := f.readyRunLocked(blk0, nblk)
+	perIO := f.slotsPerIO()
+	for i := 0; i < served; {
+		first := f.index[blk0+uint64(i)]
+		run := 1
+		for run < served-i && run < perIO {
+			// Compared against the first slot of the run rather than the one
+			// before it, because adjacency is exactly a step in slot numbers.
+			if f.index[blk0+uint64(i+run)].num != first.num+run {
+				break
+			}
+			run++
+		}
+		out := dst[i*f.slotSize : (i+run)*f.slotSize]
+		if err := f.readRunLocked(out, first.num, run); err != nil {
+			// What was already read stays served: the count is a prefix, so
+			// the caller can keep those blocks and re-read only the rest.
+			return i, err
+		}
+		// Serving the run is what keeps the region it came from resident. A run
+		// can straddle two homes — the last slot of one followed by the first
+		// slot of the next — so every home it covers is marked, not just the
+		// one it started in.
+		for n := 0; n < run; n++ {
+			f.homeRef[(first.num+n)/f.regionBlocks].Store(true)
+		}
+		i += run
+	}
+	return served, nil
+}
+
+// readRunLocked serves run adjacent slots whose data areas follow each other at
+// the slot stride. Since stamps live in their own region, nothing sits between
+// the slots and the run is one transfer straight into out — no staging buffer,
+// no copy.
+func (f *File) readRunLocked(out []byte, first, run int) error {
+	return f.store.ReadAt(out, f.slotDataOffset(first))
+}
+
+// readyRunLocked returns how many blocks from blk0 are present in full and may
+// be served without changing any state. An entry that still has to prove itself
+// against its stamp stops the run rather than being skipped over, because
+// confirming it takes the write lock — the caller's per block fallback does it.
+func (f *File) readyRunLocked(blk0 uint64, nblk int) int {
+	n := 0
+	for n < nblk {
+		sl := f.index[blk0+uint64(n)]
+		if sl == nil || sl.valid != f.fullMask || !sl.verified {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+// slotsPerIO is how many adjacent slots one transfer may cover. Neighbouring
+// slots are neighbouring bytes, so it is the transfer cap divided by the slot
+// size, and never less than one: a cap below one slot would make a block
+// unreadable, and Open does not allow one.
+func (f *File) slotsPerIO() int {
+	if n := f.maxIO / f.slotSize; n > 1 {
+		return n
+	}
+	return 1
 }
 
 // confirmEntry settles the entry for blk when it came back from a snapshot that
@@ -721,6 +1002,7 @@ func (f *File) forgetSlotLocked(blk uint64, sl *slot) {
 	}
 	if f.slotsByNum[sl.num] == sl {
 		f.slotsByNum[sl.num] = nil
+		f.homeUsed[sl.num/f.regionBlocks]--
 	}
 	// The next index page rewrite has to drop the record too.
 	f.markDirtyLocked(sl.num)
@@ -804,11 +1086,13 @@ func (f *File) InvalidateSectors(blk uint64, sec, n int) {
 	if err := f.writeStampLocked(sl); err != nil {
 		f.log.Warn("l2: stamp an invalidated slot", "block", blk, "slot", sl.num, "err", err)
 	}
-	f.markDirtyLocked(sl.num)
 	if sl.valid == 0 {
-		delete(f.index, blk)
-		f.slotsByNum[sl.num] = nil
+		// Every sector is gone, so the slot is free again. It goes through the
+		// same path as any other release, so the home it belongs to is told.
+		f.forgetSlotLocked(blk, sl)
+		return
 	}
+	f.markDirtyLocked(sl.num)
 }
 
 // Drop forgets every slot without touching the slot contents, by moving to a
@@ -821,7 +1105,7 @@ func (f *File) Drop() {
 	defer f.mu.Unlock()
 	f.index = make(map[uint64]*slot)
 	f.slotsByNum = make([]*slot, f.slotCount)
-	f.next = 0
+	f.initHomes()
 	f.dirty = make(map[int]struct{})
 	f.dirtyAll = false
 	f.recovered = 0
@@ -901,11 +1185,19 @@ func (f *File) flushLocked(clean bool) error {
 	return f.writeSuperBlock(stateClean)
 }
 
+// allocSlotLocked hands a block the slot its region owns, claiming a home for
+// that region first if it does not have one. Because the slot is derived from
+// the block, it never steers a block into a slot the region's own neighbours are
+// not already in: the blocks of a region fill their home in order, and a run of
+// them stays a run on disk until the home is recycled.
 func (f *File) allocSlotLocked(blk uint64) *slot {
-	num := f.next
-	f.next = (f.next + 1) % f.slotCount
+	num := f.homeSlotLocked(blk)
 	version := uint64(1)
 	if old := f.slotsByNum[num]; old != nil {
+		// The slot still holds another block. Homing makes this rare — a home
+		// belongs to one region, so the slot is either free or holds the block
+		// that belongs in it — but a record restored from a layout this session
+		// cannot place can leave one behind.
 		delete(f.index, old.blk)
 		version = old.version + 1
 		if !old.verified {
@@ -919,11 +1211,166 @@ func (f *File) allocSlotLocked(blk uint64) *slot {
 		// there. Starting above it keeps this block's record from matching it.
 		version = v + 1
 	}
+	if f.slotsByNum[num] == nil {
+		f.homeUsed[num/f.regionBlocks]++
+	}
 	sl := &slot{num: num, blk: blk, version: version}
 	f.slotsByNum[num] = sl
 	f.index[blk] = sl
 	f.markDirtyLocked(num)
 	return sl
+}
+
+// homeSlotLocked is the slot a block belongs in: its region's home plus the
+// block's own place in that region.
+func (f *File) homeSlotLocked(blk uint64) int {
+	reg := blk / uint64(f.regionBlocks)
+	h, ok := f.homeOf[reg]
+	if !ok {
+		h = f.claimHomeLocked()
+		f.homeOf[reg] = h
+	}
+	return h*f.regionBlocks + int(blk%uint64(f.regionBlocks))
+}
+
+// claimHomeLocked returns a home for a region that does not have one, preferring
+// one that was never used over recycling a region that is in the cache. The free
+// ones are handed out in order, which is also the order the eviction hand sweeps
+// them: a sequential walk over the LUN then fills the cache in one pass and
+// gives up its oldest region first.
+func (f *File) claimHomeLocked() int {
+	if len(f.freeHomes) > 0 {
+		h := f.freeHomes[0]
+		f.freeHomes = f.freeHomes[1:]
+		f.homeLive[h] = true
+		return h
+	}
+	return f.evictHomeLocked()
+}
+
+// evictHomeLocked takes a home away from the region that holds it, giving up
+// whatever was in it.
+//
+// A home with nothing left in it goes first, because it costs nothing: a region
+// whose blocks were all invalidated still owns its home, and taking a full one
+// ahead of it would throw away data to no purpose.
+//
+// Only when they are all holding something does the hand decide, and it decides
+// like a clock: every home it passes whose reference bit is set is cleared and
+// left alone for this round, and the first one it finds with the bit clear is
+// the one given away. The bit is set by the reads a home serves, so what the
+// hand gives away is a home nothing has read since the previous sweep — under a
+// workload whose hot regions keep being read, those are the ones that are not
+// hot, which is the whole of the steady state the layout is after: the regions
+// being read stay put and stop being recycled at all.
+//
+// A pass always terminates: it runs under the write lock, so no read can set a
+// bit while it sweeps, and every bit it has cleared for this pass is still clear
+// when it comes back around to it.
+func (f *File) evictHomeLocked() int {
+	for i := 0; i < f.homes; i++ {
+		h := (f.hand + i) % f.homes
+		if f.homeUsed[h] != 0 {
+			continue
+		}
+		f.giveHomeLocked(h)
+		return h
+	}
+	for {
+		h := f.hand
+		f.hand = (h + 1) % f.homes
+		if f.homeRef[h].Swap(false) {
+			continue
+		}
+		f.giveHomeLocked(h)
+		return h
+	}
+}
+
+// giveHomeLocked hands one home to the region that has just claimed it. The
+// reference bit is cleared rather than inherited: the home is about to hold
+// another region, and the reads that set it were reads of the region leaving.
+//
+// Only a home that still holds blocks counts as an eviction. Handing over one
+// that is already empty gives up nothing, and counting it would make the number
+// climb for a cache that is only ever reclaiming the room a region left behind.
+func (f *File) giveHomeLocked(h int) {
+	if f.homeUsed[h] != 0 {
+		f.evictions.Add(1)
+	}
+	f.releaseHomeLocked(h)
+	f.homeRef[h].Store(false)
+	f.homeLive[h] = true
+}
+
+// releaseHomeLocked drops every block the home holds, so it can be handed to
+// another region. The blocks are detached from the index rather than deleted
+// blindly, and the version their slot carries is left where it is: the next
+// write into the slot reads it back and starts above it, so a record this
+// session flushed can never be matched by a stamp an earlier one left.
+func (f *File) releaseHomeLocked(h int) {
+	base := h * f.regionBlocks
+	for i := 0; i < f.regionBlocks; i++ {
+		sl := f.slotsByNum[base+i]
+		if sl == nil {
+			continue
+		}
+		if reg := sl.blk / uint64(f.regionBlocks); f.homeOf[reg] == h {
+			delete(f.homeOf, reg)
+		}
+		if !sl.verified {
+			f.settleUnverifiedLocked(false)
+		}
+		f.forgetSlotLocked(sl.blk, sl)
+	}
+	f.homeLive[h] = false
+}
+
+// initHomes starts with an empty directory: no region owns anything and every
+// home is free.
+func (f *File) initHomes() {
+	f.homeOf = make(map[uint64]int, f.homes)
+	f.freeHomes = make([]int, 0, f.homes)
+	f.homeLive = make([]bool, f.homes)
+	f.homeUsed = make([]int, f.homes)
+	f.homeRef = make([]atomic.Bool, f.homes)
+	f.hand = 0
+	for h := 0; h < f.homes; h++ {
+		f.freeHomes = append(f.freeHomes, h)
+	}
+}
+
+// rebuildHomesLocked reads the directory back out of the slots a snapshot
+// restored, which is the only thing that outlives a crash: a slot's number says
+// which home and which region it belongs to, so nothing about homing has to be
+// persisted.
+//
+// An entry whose slot does not sit where its block says it should cannot be
+// homed, and serving it would break the one invariant the read path rests on. It
+// is dropped instead: an older region size, or a slot a crash left behind from
+// one, costs those entries rather than the mapping.
+func (f *File) rebuildHomesLocked() {
+	f.initHomes()
+	R := uint64(f.regionBlocks)
+	for num, sl := range f.slotsByNum {
+		if sl == nil {
+			continue
+		}
+		if uint64(num%f.regionBlocks) != sl.blk%R {
+			f.forgetSlotLocked(sl.blk, sl)
+			continue
+		}
+		h := num / f.regionBlocks
+		f.homeLive[h] = true
+		f.homeUsed[h]++
+		f.homeOf[sl.blk/R] = h
+	}
+	f.freeHomes = f.freeHomes[:0]
+	for h := 0; h < f.homes; h++ {
+		if !f.homeLive[h] {
+			f.freeHomes = append(f.freeHomes, h)
+		}
+	}
 }
 
 // ensureVerifiedLocked prepares an entry for a state change. An entry restored
@@ -967,23 +1414,58 @@ func (f *File) markDirtyLocked(num int) {
 	f.dirty[num/recsPerPage] = struct{}{}
 }
 
-// stampOffset is the start of a slot, where its stamp sector lives. Slots start
-// right after the super block, whatever the budget is.
+// slotDataOffset is the first byte of a slot's data. The slots start right after
+// the super block and follow each other at the slot size, so two slots with
+// consecutive numbers hold two adjacent runs of bytes, with no metadata between
+// them — which is what lets ReadBlocks serve a run in one transfer.
+//
+// It does not depend on the budget, so a session that changes the budget keeps
+// the slots the previous one wrote, at the same offsets.
+func (f *File) slotDataOffset(num int) int64 {
+	return SuperBlockSize + int64(num)*int64(f.slotSize)
+}
+
+// stampOffset is where a slot's stamp lives. Every stamp is in one region after
+// the slot area, so a slot's data is not interrupted by its metadata and the
+// whole region can be walked in order.
+//
+// It is addressed through this session's slot count rather than the snapshot's.
+// A budget change therefore moves the region, and entries restored from the
+// previous budget fail to match the stamp read for them: that costs the restored
+// entries, the same way a relocated index region already costs the pages that no
+// longer fit, and the next flush writes every stamp at its new place.
 func (f *File) stampOffset(num int) int64 {
-	return SuperBlockSize + int64(num)*int64(f.slotSize+stampSize)
+	return SuperBlockSize + int64(f.slotCount)*int64(f.slotSize) + int64(num)*stampSize
 }
 
 // slotOffset is the start of the sector run inside a slot's data area.
 func (f *File) slotOffset(num, sec int) int64 {
-	return f.stampOffset(num) + stampSize + int64(sec*f.sectorSize)
+	return f.slotDataOffset(num) + int64(sec*f.sectorSize)
+}
+
+// secPerSlotMax bounds the valid mask: one bit per sector of a slot, held in a
+// uint32, is how the index records which parts of a slot hold data.
+const secPerSlotMax = 32
+
+// sectorMasks[n] is the mask of n consecutive sectors starting at sector zero,
+// so a range starting at sec is that pattern shifted up. Every read, write and
+// invalidation builds one of these, which makes it a lookup instead of a loop
+// over the sectors of the range.
+var sectorMasks = buildSectorMasks()
+
+func buildSectorMasks() [secPerSlotMax + 1]uint32 {
+	var m [secPerSlotMax + 1]uint32
+	for i := 1; i <= secPerSlotMax; i++ {
+		m[i] = m[i-1] | 1<<uint(i-1)
+	}
+	return m
 }
 
 func sectorMask(sec, n int) uint32 {
-	var m uint32
-	for i := 0; i < n; i++ {
-		m |= 1 << uint(sec+i)
+	if sec < 0 || n <= 0 || sec+n > secPerSlotMax {
+		return 0
 	}
-	return m
+	return sectorMasks[n] << uint(sec)
 }
 
 func shortHash(s string) string {

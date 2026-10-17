@@ -189,6 +189,46 @@ func (p *Portal) Stats(key string) (Stats, bool) {
 	return t.statsSnapshot(), true
 }
 
+// TargetSnapshot is one registered target's counters together with the identity
+// a status page shows next to them.
+type TargetSnapshot struct {
+	Stats Stats
+	// IQN is the target's IQN, the same value TargetIQN reports for its key.
+	IQN string
+}
+
+// Snapshots returns every registered target's counters, keyed the way the portal
+// is, in no particular order.
+//
+// It exists for a caller that reports them all at once (the agent's cache status
+// endpoint): asking per key costs the portal table lock once for the counters and
+// once for the IQN, and the counters themselves walk the target's cache index, so
+// one pass over the table is the cheap half of that to halve — but it is the half
+// that scales with the number of mounted libraries.
+//
+// The table is copied under the lock and the counters are sampled outside it:
+// statsSnapshot takes the target's own locks, and sampling it while holding the
+// portal lock would order the two.
+func (p *Portal) Snapshots() map[string]TargetSnapshot {
+	type registered struct {
+		key string
+		t   *target
+		iqn string
+	}
+	p.mu.Lock()
+	list := make([]registered, 0, len(p.targets))
+	for k, t := range p.targets {
+		list = append(list, registered{key: k, t: t, iqn: t.iqn})
+	}
+	p.mu.Unlock()
+
+	out := make(map[string]TargetSnapshot, len(list))
+	for _, r := range list {
+		out[r.key] = TargetSnapshot{Stats: r.t.statsSnapshot(), IQN: r.iqn}
+	}
+	return out
+}
+
 // Addr returns the address of the first registered target, or nil when there is
 // none. Per target ports mean there is no single portal address.
 func (p *Portal) Addr() net.Addr {

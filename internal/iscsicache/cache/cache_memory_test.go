@@ -11,11 +11,11 @@ import (
 // 这一点是关键：出队之后 shard 里的切片头指向数组的后半段，出队处那些槽位在正常
 // 操作下根本看不到（这正是这类泄漏藏得住的原因）。测试留着数组的切片头，出队之后
 // 还能回头检查它们。
-func installQueue(sh *shard, q *[]*entry, tag uint8, n int) []*entry {
+func installQueue(sh *shard, q *[]*entry, tag uint32, n int) []*entry {
 	backing := make([]*entry, 0, n)
 	for i := 0; i < n; i++ {
 		e := &entry{blk: uint64(tag)*1000 + uint64(i)}
-		e.q = tag
+		e.q.Store(tag)
 		sh.blocks[e.blk] = e
 		backing = append(backing, e)
 	}

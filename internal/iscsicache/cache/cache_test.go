@@ -56,6 +56,11 @@ func expectPattern(t *testing.T, sectorSize int, off int64, got []byte) {
 	}
 }
 
+// testBlkSecs is the sectors per block newTestCache builds when a test does not
+// ask for another geometry, so a fake L2 agrees with the cache about where one
+// block ends and the next begins.
+const testBlkSecs = (16 << 10) / (4 << 10)
+
 type testOpts struct {
 	blockSize  int
 	sectorSize int
@@ -535,7 +540,14 @@ func TestReadEmptyBuffer(t *testing.T) {
 type fakeL2 struct {
 	mu      sync.Mutex
 	secSize int
-	sects   map[uint64]map[int][]byte
+	// blkSecs is how many of those sectors make up one cache block, which is
+	// what turns a range request into a run of blocks.
+	blkSecs int
+	// rangeCalls and rangeBlocks count the range reads, which is how a test
+	// tells one merged read from the per block reads it replaced.
+	rangeCalls  int
+	rangeBlocks int
+	sects       map[uint64]map[int][]byte
 	// gate, when set, blocks every WriteSectors until it is closed.
 	gate chan struct{}
 	// entered, when set, receives once as WriteSectors is entered (before the
@@ -544,8 +556,8 @@ type fakeL2 struct {
 	entered chan struct{}
 }
 
-func newFakeL2(secSize int) *fakeL2 {
-	return &fakeL2{secSize: secSize, sects: map[uint64]map[int][]byte{}}
+func newFakeL2(secSize, blkSecs int) *fakeL2 {
+	return &fakeL2{secSize: secSize, blkSecs: blkSecs, sects: map[uint64]map[int][]byte{}}
 }
 
 func (f *fakeL2) ReadSectors(blk uint64, sec, n int, dst []byte) (bool, error) {
@@ -561,6 +573,44 @@ func (f *fakeL2) ReadSectors(blk uint64, sec, n int, dst []byte) (bool, error) {
 		copy(dst[i*f.secSize:], m[sec+i])
 	}
 	return true, nil
+}
+
+// ReadBlocks serves whole blocks out of consecutive cache blocks, which is the
+// part of the contract the merged read path leans on: the count is a prefix, so
+// a block that is not wholly present ends the run and sends the caller back to
+// the per block path.
+func (f *fakeL2) ReadBlocks(blk0 uint64, nblk int, dst []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rangeCalls++
+	served := 0
+	for ; served < nblk; served++ {
+		m := f.sects[blk0+uint64(served)]
+		whole := true
+		for s := 0; s < f.blkSecs; s++ {
+			if m[s] == nil {
+				whole = false
+				break
+			}
+		}
+		if !whole {
+			break
+		}
+		for s := 0; s < f.blkSecs; s++ {
+			off := (served*f.blkSecs + s) * f.secSize
+			copy(dst[off:off+f.secSize], m[s])
+		}
+	}
+	f.rangeBlocks += served
+	return served, nil
+}
+
+// rangeReads reports how many range reads were asked for and how many blocks
+// they served between them.
+func (f *fakeL2) rangeReads() (calls, blocks int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rangeCalls, f.rangeBlocks
 }
 
 func (f *fakeL2) WriteSectors(blk uint64, sec, n int, src []byte) error {
@@ -627,7 +677,7 @@ func srcPattern(sectorSize int, off int64, n int) []byte {
 // out of L2 are promoted into L1.
 func TestReadCachedBothServesFromL2(t *testing.T) {
 	const ss = 4 << 10
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	if err := l2.WriteSectors(0, 0, 1, srcPattern(ss, 0, ss)); err != nil {
 		t.Fatalf("seed L2: %v", err)
 	}
@@ -653,7 +703,7 @@ func TestReadCachedBothServesFromL2(t *testing.T) {
 // is a plain miss and does not inflate the hit counters.
 func TestReadCachedBothPartialMiss(t *testing.T) {
 	const ss = 4 << 10
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	if err := l2.WriteSectors(0, 0, 1, srcPattern(ss, 0, ss)); err != nil {
 		t.Fatalf("seed L2: %v", err)
 	}
@@ -672,7 +722,7 @@ func TestReadCachedBothPartialMiss(t *testing.T) {
 // sectors it is about to discard, so reads must skip it.
 func TestReadCachedBothSkipsL2WhileInvalidationPending(t *testing.T) {
 	const ss = 4 << 10
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	if err := l2.WriteSectors(0, 0, 1, srcPattern(ss, 0, ss)); err != nil {
 		t.Fatalf("seed L2: %v", err)
 	}
@@ -698,7 +748,7 @@ func TestReadCachedBothMissesStaleL2DuringInvalidateAsync(t *testing.T) {
 	src := newFakeSource(ss, 4<<20)
 	gate := make(chan struct{})
 	entered := make(chan struct{}, 1)
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	l2.gate = gate
 	l2.entered = entered
 	c := newTestCache(t, testOpts{l2: l2})
@@ -740,7 +790,7 @@ func TestReadCachedBothMissesStaleL2DuringInvalidateAsync(t *testing.T) {
 func TestDropClearsL2(t *testing.T) {
 	const ss = 4 << 10
 	src := newFakeSource(ss, 4<<20)
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	c := newTestCache(t, testOpts{l2: l2})
 
 	if err := c.Read(context.Background(), 0, make([]byte, ss), src); err != nil {
@@ -765,7 +815,7 @@ func TestDropClearsL2(t *testing.T) {
 func TestReadPopulatesL2InBackground(t *testing.T) {
 	const ss = 4 << 10
 	src := newFakeSource(ss, 4<<20)
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	c := newTestCache(t, testOpts{l2: l2})
 
 	buf := make([]byte, ss)
@@ -786,7 +836,7 @@ func TestInvalidateWaitsForBackgroundL2Write(t *testing.T) {
 	const ss = 4 << 10
 	src := newFakeSource(ss, 4<<20)
 	gated := make(chan struct{})
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	l2.gate = gated
 	l2.entered = make(chan struct{}, 1)
 	c := newTestCache(t, testOpts{l2: l2})
@@ -835,7 +885,7 @@ func TestInvalidateAsyncDoesNotWaitForL2Population(t *testing.T) {
 	const ss = 4 << 10
 	src := newFakeSource(ss, 4<<20)
 	gated := make(chan struct{})
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	l2.gate = gated
 	l2.entered = make(chan struct{}, 1)
 	c := newTestCache(t, testOpts{l2: l2})
@@ -918,7 +968,7 @@ func TestAsyncFillDropsOnInvalidate(t *testing.T) {
 // invalidation has dropped the range.
 func TestInvalidatedFillDoesNotResurrectInL2(t *testing.T) {
 	const ss = 4 << 10
-	l2 := newFakeL2(ss)
+	l2 := newFakeL2(ss, testBlkSecs)
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
 	src := &blockingSource{fake: newFakeSource(ss, 4<<20), release: release, entered: entered}
