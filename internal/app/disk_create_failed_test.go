@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"vault/internal/domain"
+	"vault/internal/job"
 	"vault/internal/store"
 )
 
@@ -96,6 +98,33 @@ func TestMarkCreateFailedReleasesReservedUsage(t *testing.T) {
 	user, _ = st.GetUserByID(ctx, userID)
 	if repo.UsedBytes != 0 || user.UsedBytes != 0 {
 		t.Fatalf("重复回滚不得再退用量：repo=%d user=%d", repo.UsedBytes, user.UsedBytes)
+	}
+}
+
+// TestCopyProgressReporter 覆盖"写入母盘"的进度映射（消费方见 buildVHDXFromSource）。
+//
+// 拷入是建盘里唯一的长活：源目录多大就要写多大的盘（30G 的库 = 30G 的读 + 30G 的写），
+// 此前任务进度只上报 15 与 85 两个端点，中间几十分钟条纹丝不动 ——
+// 用户看到的正是"100% 卡在建库中"（真实反馈：30G 等了半小时，以为是校验卡住了）。
+func TestCopyProgressReporter(t *testing.T) {
+	var got []int
+	rep := copyProgressReporter(job.ReporterFunc(func(p int) { got = append(got, p) }), 15, 85)
+
+	rep(0, 100)   // 起步：落在区间起点
+	rep(50, 100)  // 一半：15 + 70*0.5
+	rep(50, 100)  // 采样重复（卷上可用空间没再变）→ 不得重复上报
+	rep(100, 100) // 拷完：落在区间终点
+	rep(100, 100)
+	if want := []int{15, 50, 85}; !slices.Equal(got, want) {
+		t.Fatalf("进度上报序列 = %v，期望 %v", got, want)
+	}
+
+	// 总量未知（源目录为空、统计失败）时不报：编不出百分比就不要去动进度条。
+	var unknownCount int
+	unknown := copyProgressReporter(job.ReporterFunc(func(int) { unknownCount++ }), 15, 85)
+	unknown(1024, 0)
+	if unknownCount != 0 {
+		t.Fatalf("总量未知时不应上报，实际上报 %d 次", unknownCount)
 	}
 }
 

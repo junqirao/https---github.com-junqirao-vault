@@ -320,6 +320,16 @@ func SysDepsInstallFailed() *Error {
 func RepoNotFound() *Error  { return New("repo.not_found", http.StatusNotFound) }
 func RepoNameTaken() *Error { return New("repo.name_taken", http.StatusConflict) }
 
+// RepoUploadConflict 同名存储库正在被使用，本次上传无法接管（覆盖）它。
+//
+// 与 RepoNameTaken 的区别：name_taken 是"名字被占"，这个是"名字被占且**不能**自动接管"
+// （库主不是你、有人正挂着、已经分配过盘）。上传侧会先清理同名残骸，只有这里说的
+// 情况才拒绝，所以用户看到的应当是明确的"改个名或先删库"，而不是含糊的"名字已存在"。
+func RepoUploadConflict(reason string) *Error {
+	return New("repo.upload_conflict", http.StatusConflict).
+		WithArg("reason", reason)
+}
+
 // RepoParentConditionViolation 母盘状态不满足操作前提（见 4.3 状态机）。
 func RepoParentConditionViolation(current, expected string) *Error {
 	return New("repo.parent_condition_violation", http.StatusConflict).

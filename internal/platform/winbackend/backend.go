@@ -177,7 +177,8 @@ func (b *Backend) EnsureFormatted(ctx context.Context, ref, fileSystem, label st
 //
 // 卸载放在 defer 中并用 context.WithoutCancel 执行：即使中途失败或 ctx 取消，
 // 也必须把盘分离，避免留下"已挂载但无句柄管理"的脏状态（与 buildVHDXFromSource 一致）。
-func (b *Backend) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string) (int, int64, error) {
+// onCopy 透传给 CopyTree，用于上报拷入过程的字节进度（可为 nil）。
+func (b *Backend) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string, onCopy platform.CopyProgressFunc) (int, int64, error) {
 	if !strings.EqualFold(strings.TrimSpace(fileSystem), "ntfs") {
 		b.log.Warn("Windows 服务端只能建 NTFS 盘，拒绝其它文件系统", "file_system", fileSystem)
 		return 0, 0, platform.ErrUnsupported
@@ -210,7 +211,7 @@ func (b *Backend) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, 
 			WithArg("reason", "no_drive_letter")
 	}
 
-	files, bytes, err := b.VHD.CopyTree(ctx, sourceDir, info.DriveLetter+`:\\`)
+	files, bytes, err := b.VHD.CopyTree(ctx, sourceDir, info.DriveLetter+`:\\`, onCopy)
 	if err != nil {
 		return 0, 0, err
 	}

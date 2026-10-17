@@ -709,16 +709,53 @@ export interface UploadState {
   repo_name: string
   local_dir: string
   state: UploadStatus
+  /**
+   * 用户是否暂停了这个上传（代理侧的闸门，见 internal/agent/upload.go 的 uploadTask.pause）。
+   *
+   * `state` 不变（仍是 uploading）：暂停停的是"继续往下传"，阶段并没有变 —— 界面据此把
+   * 按钮翻成「继续」，也就知道那个百分比为什么不动了。
+   */
+  paused?: boolean
   total_files: number
   total_bytes: number
   uploaded_bytes: number
   chunk_total: number
   chunk_done: number
+  /**
+   * 会进入校验的文件总数（非空文件；分母 M）与已逐个校验通过的文件数（分子 N）。
+   *
+   * 与「分块」的区别：分块数只说明字节搬了多少，这一对才说明"哪些文件真的成了" ——
+   * 服务端每收满一个文件覆盖的全部分块就回报一次，客户端累加（见 internal/agent/upload.go）。
+   */
+  files_total: number
+  files_done: number
+  /** 此刻正在读取/上传的文件（相对源目录的路径）；空/缺失 = 尚不可知。 */
+  current_file?: string
+  /**
+   * 一条"值得知道、但不是失败"的提示码（当前只有 repo_overwritten）。
+   *
+   * 上传开始时服务端会清掉同名残留、或接管一个同名库去重建（见 app.UploadService.prepareUploadName）：
+   * 这些动作改变了服务端已有的东西，不能静默做完。文案由 uploadNoticeText 按码取，
+   * 未知码一律不渲染 —— 把内部码直接甩到界面上比不显示更糟。
+   */
+  notice?: string
+  /**
+   * 服务端建库任务的进度（0~100），只在 state === 'completing' 时有意义。
+   *
+   * 为什么要单独一个字段：提交建库的那一刻字节进度就满了（进度条 100%），但建库是另一件活 ——
+   * 把刚上传的整棵树再写一份进新建的虚拟盘，30G 的库就是 30G 的读 + 30G 的写，几十分钟起步。
+   * 以前这里没有任何数字，界面只能"100% + 校验中"地钉着，看起来就是卡死。
+   */
+  build_progress?: number
   job_id?: string
   repo_id?: string
   error?: string
   started_at: number
   finished_at?: number
+  /** 客户端平滑后的传输速率（字节/秒）；0/缺失 = 尚不可估算。 */
+  speed_bytes_per_sec?: number
+  /** 预计剩余秒数；0/缺失 = 不可估算或已传完（界面显示 "--"）。 */
+  eta_seconds?: number
 }
 
 /** POST /agent/fs/scan 的响应。 */
@@ -736,6 +773,13 @@ export interface StartUploadInput {
   repo_mode: 'shared' | 'exclusive'
   storage_id?: string
   quota_bytes?: number
+  /**
+   * 共享磁盘限制：建出来的库每块差异盘允许的容量（字节）；省略/0 表示不限制。
+   *
+   * 服务端会把它随上传会话的清单一起存下来（见 uploadManifestRecord），上传结束建库时生效 ——
+   * 所以上传建库这条路径也能带上它，不必等服务端建完库再进详情页改。
+   */
+  diff_disk_limit_bytes?: number
   source_mode: 'copy' | 'move'
   /**
    * 把库建到**哪台**服务端（二选一即可）。

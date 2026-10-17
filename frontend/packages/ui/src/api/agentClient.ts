@@ -364,7 +364,7 @@ async function httpRequest<T>(target: AgentEndpoint, options: RequestOptions): P
 /**
  * 挂载/卸载涉及 iSCSI 会话与磁盘上线，超时放宽到 5 分钟。
  *
- * 预算：服务端同步发布 iSCSI 目标最多 2 分钟（代理侧 mountRequestTimeout），
+ * 预算：服务端同步做"等差异盘 + 全量发布目标 + 读回"最多 3 分钟（代理侧 longRequestTimeout），
  * 之后还有门户登记、会话建立（最多 60s）、磁盘上线与后置脚本。
  * 代理会通过 mount 事件持续上报阶段，界面不是"卡住不动"。
  */
@@ -625,6 +625,20 @@ export const agentApi = {
   /** 取消上传（保留已传分块，可续传）。 */
   cancelUpload(uploadId: string): Promise<{ ok: true }> {
     return request({ method: 'DELETE', path: `/agent/uploads/${encodeURIComponent(uploadId)}` })
+  },
+
+  /**
+   * 暂停上传：只停住"继续传下一块"，服务端会话与已传分块原样保留。
+   *
+   * 用 POST 而不是 PUT：请求由 Electron 主进程代发，而它按方法放行（PUT 会被挡下）。
+   */
+  pauseUpload(uploadId: string): Promise<{ ok: true }> {
+    return request({ method: 'POST', path: `/agent/uploads/${encodeURIComponent(uploadId)}/pause` })
+  },
+
+  /** 恢复已暂停的上传，从停住的地方接着传。 */
+  resumeUpload(uploadId: string): Promise<{ ok: true }> {
+    return request({ method: 'POST', path: `/agent/uploads/${encodeURIComponent(uploadId)}/resume` })
   },
 
   /**

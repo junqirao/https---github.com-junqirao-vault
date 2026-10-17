@@ -23,8 +23,13 @@ import (
 //	6 → disks 新增 file_system：记录这块盘**分区**上的文件系统（ntfs/ext4）。
 //	    建盘时按"使用该盘的客户端操作系统"决定（Windows→NTFS，Linux→ext4），
 //	    分区表与格式化都写进盘里、事后改不了，所以要把这个标记持久化下来
-//	    （见 docs/implementation.md 5.16 磁盘布局与文件系统）。
-const currentSchemaVersion = 6
+//	    （见 docs/implementation.md 5.16 磁盘布局与文件系统）；
+//	7 → repositories 新增 diff_disk_limit_bytes（共享磁盘限制：每块差异盘允许的容量，
+//	    0=不限制，即沿用"等于母盘容量"）、disks 新增 accounted_bytes（该盘计入配额的容量，
+//	    0=按 size_bytes 计）。差异盘只装差异数据、实际写入很少，按母盘容量整份记账会把
+//	    用户配额吃光，因此记账口径独立于 size_bytes —— size_bytes 仍必须等于母盘容量，
+//	    客户端要靠它按容量匹配本地 iSCSI 盘（见 docs/implementation.md 5.17 共享磁盘限制）。
+const currentSchemaVersion = 7
 
 // Migrate 建表并记录 schema 版本。
 //
@@ -115,6 +120,12 @@ func addColumns(ctx context.Context, q queryer, dialect Dialect) error {
 		{"disks", "file_system",
 			`ALTER TABLE disks ADD COLUMN file_system TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE disks ADD COLUMN file_system VARCHAR(16) NOT NULL DEFAULT ''`},
+		{"repositories", "diff_disk_limit_bytes",
+			`ALTER TABLE repositories ADD COLUMN diff_disk_limit_bytes INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE repositories ADD COLUMN diff_disk_limit_bytes BIGINT NOT NULL DEFAULT 0`},
+		{"disks", "accounted_bytes",
+			`ALTER TABLE disks ADD COLUMN accounted_bytes INTEGER NOT NULL DEFAULT 0`,
+			`ALTER TABLE disks ADD COLUMN accounted_bytes BIGINT NOT NULL DEFAULT 0`},
 	}
 	for _, c := range columns {
 		exists, err := columnExists(ctx, q, dialect, c.table, c.column)

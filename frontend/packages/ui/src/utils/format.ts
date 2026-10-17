@@ -19,6 +19,19 @@ export function formatBytes(bytes: number | undefined | null): string {
 }
 
 /**
+ * 传输速率文案（如 `12.3 MB/s`）。
+ *
+ * 量级换算复用 formatBytes，只补一个 `/s` 后缀：速率与容量必须是同一套进位，
+ * 否则一屏里会同时出现"已传 1.2 GB"和"速度 1150 MB/s"这种自相矛盾的组合。
+ * 速率未知（0 / 缺失 / 负数）返回 `-` —— 与"速度为 0"（卡住不动）不是一回事。
+ */
+export function formatSpeed(bytesPerSecond: number | undefined | null): string {
+  if (bytesPerSecond === undefined || bytesPerSecond === null || Number.isNaN(bytesPerSecond)) return '-'
+  if (bytesPerSecond <= 0) return '-'
+  return `${formatBytes(bytesPerSecond)}/s`
+}
+
+/**
  * 存储库用量：进度条百分比 + 「已用 / 上限」文案。
  *
  * 卡片、详情页概览共用一个口径（同一台机器上这两处必须显示同一个数）；管理端表格走服务端

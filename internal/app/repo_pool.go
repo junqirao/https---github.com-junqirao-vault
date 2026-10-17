@@ -197,8 +197,12 @@ func (s *DiskService) ensurePoolDiffDisk(ctx context.Context, repo *domain.Repos
 		ParentID:      &parentID,
 		ParentVersion: repo.ParentVersion,
 		SizeBytes:     parent.SizeBytes,
-		VHDType:       domain.VHDTypeDifferencing,
-		State:         domain.DiskStateCreating,
+		// 池位盘在**建库时**就把记账容量按共享磁盘限制定好：盘一旦被分出去就按这个值计费
+		// （见 RepoService.Allocate 与 store.accountedUsageSQL），所以它必须跟着限制走，
+		// 不能等分配时再补。size_bytes 仍是母盘容量（客户端按容量匹配盘）。
+		AccountedBytes: diffDiskAccountedBytes(repo, parent.SizeBytes),
+		VHDType:        domain.VHDTypeDifferencing,
+		State:          domain.DiskStateCreating,
 		// 池位差异盘同样是母盘快照，格式标记继承母盘。
 		FileSystem: parent.FileSystemOrDefault(),
 	}

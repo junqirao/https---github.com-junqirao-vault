@@ -150,10 +150,20 @@ func headLines(s string, n int) string {
 	return strings.Join(lines, " | ")
 }
 
+// uploadChunkRoute 是分块上传的路由模板。
+//
+// 它是**纯字节搬运**的高频路由：每 8MiB 一块、一块一次 PUT，一个几百 GB 的库轻松上万次
+// （限流都单独给了一条，见 middlewareUploadRateLimit）。访问日志与审计都为它开例外：
+// 逐块留痕会把日志页与审计表刷成"某一次上传的流水账"，真正要看的行全被冲走
+// （真实反馈："上传时不要那么多日志，会刷屏的"）。
+//
+// 上传这件事本身仍有完整留痕：创建会话、完成建库、中止各一条（见 app.UploadService 的 audit）。
+const uploadChunkRoute = "/v1/uploads/{id}/chunks/{index}"
+
 // middlewareAccessLog 记录 method / path / status / duration / request_id。
 //
 // 例外：极简探针（systemPingPath）不进日志 —— 界面每 10 秒打一次，而它匿名、空响应、
-// 没有任何可审计的内容，记进来只会把有用的行冲走。
+// 没有任何可审计的内容，记进来只会把有用的行冲走。分块上传见 isQuietTransfer。
 func (r *Router) middlewareAccessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == systemPingPath {
@@ -166,6 +176,9 @@ func (r *Router) middlewareAccessLog(next http.Handler) http.Handler {
 		if rec.status == 0 {
 			rec.status = http.StatusOK
 		}
+		if isQuietTransfer(req, rec.status) {
+			return
+		}
 		r.deps.Log.Info("http",
 			"request_id", requestIDFrom(req.Context()),
 			"method", req.Method,
@@ -176,6 +189,14 @@ func (r *Router) middlewareAccessLog(next http.Handler) http.Handler {
 			"ip", clientIP(req),
 		)
 	})
+}
+
+// isQuietTransfer 判断这次请求是否属于"成功也不必记"的高频字节搬运（目前只有分块上传）。
+//
+// **失败照记**：搬运出错（磁盘写不进去、校验不过、被限流、会话已中止）正是要留证据的现场；
+// 而一次成功的分块没有任何信息量 —— 它的结果已经体现在"上传任务"的进度与状态里了。
+func isQuietTransfer(req *http.Request, status int) bool {
+	return status < http.StatusBadRequest && routePattern(req) == uploadChunkRoute
 }
 
 // middlewareAudit 对所有写操作落审计（调用 store.AppendAudit）。
@@ -201,6 +222,12 @@ func (r *Router) middlewareAudit(next http.Handler) http.Handler {
 			userID = p.UserID
 		}
 		pattern := routePattern(req)
+		// 分块上传不落审计（见 uploadChunkRoute）：一块一条会把审计页变成"某一次上传的
+		// 流水账"，把真正的写操作（建库、删除、授权）埋掉；而上传会话的创建、完成与中止
+		// 各有审计，链路上并不缺证据。
+		if pattern == uploadChunkRoute {
+			return
+		}
 		r.deps.App.AuditWithIP(req.Context(), userID, "http."+strings.ToLower(req.Method), pattern,
 			"status="+itoa(rec.status), clientIP(req), result)
 	})

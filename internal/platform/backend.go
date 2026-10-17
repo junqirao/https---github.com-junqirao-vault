@@ -124,6 +124,16 @@ type DiskBackend interface {
 	Deactivate(ctx context.Context, ref string) error
 }
 
+// CopyProgressFunc 上报"把源目录拷进虚拟盘"的进度（已写入字节 / 总字节）。
+//
+// 为什么需要它：从源目录建盘不是把源目录"挂上去"，而是把整棵源目录**再写一份**进
+// 新建的虚拟盘 —— 30G 的库就是 30G 的读 + 30G 的写，纯粹由磁盘速度决定，没有捷径。
+// 在此之前这一段没有任何中间状态可观察（进度条从 15% 一直钉到 85%），用户看到的
+// 就是"卡住了"（真实反馈：上传 30G，"校验中"等了半小时）。
+//
+// nil 表示调用方不需要进度上报；实现方必须容忍 nil（一次都不调用）。
+type CopyProgressFunc func(copied, total int64)
+
 // VolumeBackend 是卷（文件系统）后端。
 type VolumeBackend interface {
 	// EnsureFormatted 幂等地初始化 + 分区 + 格式化，返回卷信息。
@@ -140,7 +150,8 @@ type VolumeBackend interface {
 	// 返回拷入的文件数与总字节数。
 	//
 	// 该方法是"从源目录建盘"的完整流水线，调用方不需要关心中间的挂载细节。
-	MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string) (files int, bytes int64, err error)
+	// onCopy 用于上报拷入过程的字节进度（可为 nil，见 CopyProgressFunc）。
+	MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string, onCopy CopyProgressFunc) (files int, bytes int64, err error)
 
 	// SpaceUsageOf 返回路径所在卷的标识、文件系统与可用/总空间。
 	SpaceUsageOf(ctx context.Context, path string) (*domain.VolumeSpace, error)

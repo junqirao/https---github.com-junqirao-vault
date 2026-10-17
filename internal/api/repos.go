@@ -32,9 +32,17 @@ type createRepoRequest struct {
 	//
 	// 用指针是为了区分"显式传 0"和"没传"：老客户端不传时按 ShareCount 处理，
 	// 显式传 0 表示明确不要预创建。
-	MaxDiffDisks *int  `json:"max_diff_disks"`
-	QuotaBytes   int64 `json:"quota_bytes"`
-	Group        string `json:"group"`
+	MaxDiffDisks *int `json:"max_diff_disks"`
+	// DiffDiskLimitBytes 共享磁盘限制：本库每块差异盘（即每个共享者手里那块盘）
+	// **允许**的容量，也是它计入配额的量。填 0（或留空）表示不限制，沿用
+	// "等于母盘容量"的老口径。
+	//
+	// 差异盘只装差异数据、实际写入往往只有几十兆，按母盘容量整份记账会把共享者的
+	// 配额一次吃光（30G 的库分给 5 个人 = 每人扣 30G），所以共享库通常会给一个够用的
+	// 小值。它不是物理限额：盘挂出去仍然是母盘那么大的卷（见 domain.Disk.AccountedBytes）。
+	DiffDiskLimitBytes int64  `json:"diff_disk_limit_bytes"`
+	QuotaBytes         int64  `json:"quota_bytes"`
+	Group              string `json:"group"`
 	// StorageID 可选的目标存储 ID（留空则在所有启用存储中自动选根）。
 	StorageID string `json:"storage_id"`
 	// ClientOS 可选：将使用该库的客户端操作系统（windows | linux，留空按 windows）。
@@ -49,7 +57,10 @@ type updateRepoRequest struct {
 	Name         *string `json:"name"`
 	QuotaBytes   *int64  `json:"quota_bytes"`
 	MaxDiffDisks *int    `json:"max_diff_disks"`
-	Group        *string `json:"group"`
+	// DiffDiskLimitBytes 共享磁盘限制（0 = 不限制）；改了它，库里已有的差异盘
+	// 会一起按新值重新记账（见 RepoService.Update）。
+	DiffDiskLimitBytes *int64  `json:"diff_disk_limit_bytes"`
+	Group              *string `json:"group"`
 }
 
 // handleListRepos 列出存储库。
@@ -113,16 +124,17 @@ func (r *Router) handleCreateRepo(w http.ResponseWriter, req *http.Request) {
 	}
 
 	repo, disk, err := r.deps.App.Repos().Create(req.Context(), app.CreateRepoInput{
-		Name:         in.Name,
-		Mode:         domain.RepoMode(in.Mode),
-		OwnerID:      owner,
-		SourceDir:    in.SourceDir,
-		SizeBytes:    in.SizeBytes,
-		MaxDiffDisks: share,
-		QuotaBytes:   in.QuotaBytes,
-		Group:        in.Group,
-		StorageID:    in.StorageID,
-		ClientOS:     in.ClientOS,
+		Name:               in.Name,
+		Mode:               domain.RepoMode(in.Mode),
+		OwnerID:            owner,
+		SourceDir:          in.SourceDir,
+		SizeBytes:          in.SizeBytes,
+		MaxDiffDisks:       share,
+		DiffDiskLimitBytes: in.DiffDiskLimitBytes,
+		QuotaBytes:         in.QuotaBytes,
+		Group:              in.Group,
+		StorageID:          in.StorageID,
+		ClientOS:           in.ClientOS,
 	})
 	if err != nil {
 		r.writeError(w, req, err)
@@ -166,10 +178,11 @@ func (r *Router) handleUpdateRepo(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	repo, err := r.deps.App.Repos().Update(req.Context(), id, app.UpdateRepoInput{
-		Name:         in.Name,
-		QuotaBytes:   in.QuotaBytes,
-		MaxDiffDisks: in.MaxDiffDisks,
-		Group:        in.Group,
+		Name:               in.Name,
+		QuotaBytes:         in.QuotaBytes,
+		MaxDiffDisks:       in.MaxDiffDisks,
+		DiffDiskLimitBytes: in.DiffDiskLimitBytes,
+		Group:              in.Group,
 	})
 	if err != nil {
 		r.writeError(w, req, err)

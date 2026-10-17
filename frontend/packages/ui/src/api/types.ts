@@ -13,7 +13,8 @@ export interface ListResponse<T> {
 export type Role = 'super_admin' | 'user'
 export type Permission = 'read' | 'mount' | 'manage'
 export type RepoMode = 'shared' | 'exclusive'
-export type RepoState = 'creating' | 'active' | 'sealing' | 'deleting' | 'error'
+// importing：本地目录上传建库还没结束（数据在传/母盘在建），与 creating 一样不可挂载。
+export type RepoState = 'creating' | 'importing' | 'active' | 'sealing' | 'deleting' | 'error'
 export type ParentCondition = 'idle' | 'derived' | 'temp_shared' | 'maintenance'
 export type DiskKind = 'parent' | 'diff' | 'standalone'
 export type DiskState = 'creating' | 'ready' | 'published' | 'deleting' | 'error'
@@ -91,6 +92,15 @@ export interface RepoDTO {
    */
   share_count: number
   max_diff_disks: number
+  /**
+   * 共享磁盘限制：本库每块差异盘（也就是每个共享者手里那块盘）**允许**的容量，
+   * 也是它计入配额的量；0 表示不限制（按母盘容量整份记账）。
+   *
+   * 注意它不是"这块盘有多大"：盘挂出去仍然是母盘容量（客户端按容量匹配本地盘），
+   * 这个值管的是"按多少计费"—— 差异盘只装差异数据，按母盘容量整份扣会把共享者的
+   * 配额一次吃光（30G 的库分给 5 个人 = 每人扣 30G）。
+   */
+  diff_disk_limit_bytes: number
   quota_bytes: number
   /** 库容量：建库时设定的容量（那块盘的 VHDX 标称容量），服务端读时派生。 */
   capacity_bytes: number
@@ -593,12 +603,6 @@ export interface BootstrapResponse {
   user: Pick<UserDTO, 'id' | 'username' | 'role'>
 }
 
-export interface EnrollmentTokenResponse {
-  token: string
-  expires_at: number
-  server_instance_id: string
-}
-
 /** POST /v1/users 的响应：用户字段 + 自动签发的一次性证书（签发失败时缺省）。 */
 export interface CreateUserResponse extends UserDTO {
   certificate?: IssuedCertificateDTO
@@ -722,6 +726,8 @@ export interface CreateRepoRequest {
   source_dir?: string
   size_bytes?: number
   max_diff_disks?: number
+  /** 共享磁盘限制：每块差异盘允许的容量（单位字节，表单按 M 录入）；0/缺省表示不限制。 */
+  diff_disk_limit_bytes?: number
   quota_bytes?: number
   group?: string
 }
@@ -730,6 +736,8 @@ export interface UpdateRepoRequest {
   name?: string
   quota_bytes?: number
   max_diff_disks?: number
+  /** 共享磁盘限制；0 表示不限制。改了它，库里已有的差异盘会一起按新值重新记账。 */
+  diff_disk_limit_bytes?: number
   group?: string
 }
 

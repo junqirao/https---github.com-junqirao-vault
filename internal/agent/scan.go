@@ -164,7 +164,10 @@ func relSlash(root, p string) string {
 
 // uploadPlanFile 描述某个文件在拼接流中的全局偏移。
 type uploadPlanFile struct {
-	Abs    string
+	Abs string
+	// Rel 是相对源目录的斜杠路径；仅用于界面展示"当前正在处理中的文件"
+	// （见 uploadFileAt），不参与任何读写定位。
+	Rel    string
 	Offset int64
 	Size   int64
 }
@@ -177,11 +180,25 @@ func buildUploadPlan(entries []scanEntry) []uploadPlanFile {
 	var off int64
 	for _, e := range entries {
 		if e.Size > 0 {
-			plan = append(plan, uploadPlanFile{Abs: e.Abs, Offset: off, Size: e.Size})
+			plan = append(plan, uploadPlanFile{Abs: e.Abs, Rel: e.Rel, Offset: off, Size: e.Size})
 		}
 		off += e.Size
 	}
 	return plan
+}
+
+// transferFileCount 返回会进入拼接流（即非空）的文件数，用作"已校验 N/M 个文件"里的 M。
+//
+// 空文件也进 manifest（服务端在 complete 时补建），但它们不占任何一个字节，也就永远不会
+// "被校验通过"：把它们算进 M，进度就会永远差那几格（真实观感："都传完了还显示 999/1000"）。
+func transferFileCount(entries []scanEntry) int {
+	n := 0
+	for _, e := range entries {
+		if e.Size > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // sanitizeScanRootBase 返回用于 manifest.root 的展示名（避免把客户端完整本地路径上送）。

@@ -1027,6 +1027,15 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 > （盘在 `JobCreateDiff` 结尾刚变 ready，客户端就被 `awaitBackingReady` 唤醒），
 > 输的一方 INSERT 失败后回查把赢家的记录认下来，否则两个目标映射同一块 VHDX。
 >
+> **挂载侧的"等盘"必须比客户端更有耐心**（`IscsiService.awaitBackingReady`，预算
+> `awaitBackingTimeout` = 60 秒）：分配把差异盘派生交给异步任务，紧接着的挂载请求会抢跑；
+> 而派生任务与"回收存储库"共用 `lock.RepoKey`（派生要独占打开母盘），与回收、别的客户端的
+> 派生一起排队时可能几十秒都领不到锁（母盘被杀毒/索引占用时还会原地退避重试）。
+> 预算过小（曾是 15 秒）就会抢在盘变好之前报 `disk.not_ready`，而用户手动取消再挂一次恰好
+> 命中"盘已就绪"—— 表现就是"第一次挂载必卡住、重挂才上去"（真实反馈）。
+> 上界由客户端挂载申请超时约束（3 分钟，其中首次全量下发 iSCSI 目标约 35 秒、读回约 7 秒），故取 60 秒；
+> 超时错误带 `waited_ms` 与磁盘状态，用来区分"派生在排队"和"盘根本没建"。
+>
 > | 来源 | 触发点 | 绑定 | 代码 |
 > | --- | --- | --- | --- |
 > | 池化共享库的池位盘 | 建库阶段三（母盘 → 池位盘 → 目标） | 空串（此时确实还没有分配） | `runPrepareRepo` → `EnsurePoolTarget` |
@@ -1218,10 +1227,18 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 >
 > **超时口径必须区分"超时"与"连不上"**：挂载申请 `POST /v1/allocations/{id}/mount` 在服务端是
 > **同步重活**（发布 iSCSI 目标 / CHAP / initiator 全走 PowerShell，单次约 10s，多步常超 30s）。
-> 因此代理侧对它的超时单独放宽为 **2 分钟**（`mountRequestTimeout`），并把超时映射为
+> 因此代理侧对它的超时单独放宽为 **3 分钟**（`longRequestTimeout`），并把超时映射为
 > `agent.server_timeout`（504，args.timeout_seconds）而不是 `agent.server_unreachable`——
 > 后者会把排查方向直接带偏到地址/网络（真实工单：界面显示"无法连接服务端"，实际是 30s 超时）。
 > 渲染层等待挂载的上限相应放宽为 5 分钟（`MOUNT_TIMEOUT_MS`）。
+>
+> **首次挂载那条路径上最容易白等**（真实工单：首次挂载报 500、手动重挂立刻成功）。三件事会撞在
+> 一起：等差异盘（≤60s）、预创建正在下发、挂载自己也要下发。其中两处是净浪费 ——
+> ① 目标快照是**锁外**读的，而预创建可能刚下发过同一份期望状态并写回指纹，不重读就会把 35 秒的
+> 全量下发再付一遍（`IscsiService.refreshAppliedFromStore`，日志形态："已建立 iSCSI 映射 skipped
+> + 又更新一次目标"）；② "读回实际目标名"与"记诊断状态"原先各起一次 PowerShell（每次约 5~7 秒），
+> 合并为一次读回（`readBackTarget`）。服务端每次挂载末尾记一条 `挂载发布完成` 日志
+> （`await_disk_ms` / `pushed` / `cost_ms`）：下次失败先看这行，判断时间花在等盘还是下发上。
 >
 > **挂载阶段必须逐个反馈给界面**：上面两步（等服务端准备磁盘、等 PowerShell 下发目标）合计
 > 常达数十秒，期间客户端只有一个 HTTP 请求在等待 —— 只显示"挂载中"用户无从知道卡在哪一步
@@ -1484,34 +1501,77 @@ Dismount-VHD -Path $vhdx
            repo_mode?: 'shared'|'exclusive',   // 默认 shared
            storage_id?: '<目标存储 ID>',        // 默认按可用空间自动选根
 }
-   → 服务端校验总大小 vs **用户配额**（库的**容量**即它占用的配额；库自身不再有"配额"字段） → 返回 { upload_id, chunk_size: 8MiB, missing_chunks: [...], received_bytes, total_bytes }
+   → 服务端校验总大小 vs **用户配额**（库的**容量**即它占用的配额；库自身不再有"配额"字段）
+   → **先处理同名残留**（见 ③ 与"要点"）：能续传的直接复用旧会话；上次失败留下的残骸
+     （库/会话/暂存）就地清掉；只有"库是别人的、或正被使用"才拒绝
+   → 返回 { upload_id, chunk_size: 8MiB, missing_chunks: [...], received_bytes, total_bytes,
+            files_done, reused, overwrote_repo }
+     reused=true 表示这次没有新建会话，而是复用了同名未完成会话（missing_chunks 只是"还缺的那几块"）
 
 ② 客户端并发（建议 4 路）PUT /v1/uploads/{id}/chunks/{index}
    Header: X-Chunk-SHA256（必填，小写 hex）
    Body: 原始字节
-   → 服务端写入 staging/<upload_id>/<index>.part，校验 SHA256，登记 upload_chunks
+   → 服务端校验 SHA256 → **按偏移直接写进 staging/<upload_id>/tree/ 的最终位置**
+     （偏移 = index × chunk_size，WriteAt；一个分块跨文件边界时各写各的）
+   → 登记 upload_chunks（记录该块的相对路径与校验值）
+   → 返回 { index, size, received_bytes, done, files_done: [...], files_total }
+     files_done = 本次分块写完后"覆盖到的文件分块已全部到齐且逐块校验通过"的文件（通常 0~1 个）
    → 幂等：同 index 重复上传直接返回 200（已存在且校验一致）
    → 分块规则：整段字节流 = 按 manifest.files 顺序把各文件内容串起来再按 8MiB 切块（分块可跨文件）；
      除最后一块外必须恰好 8MiB
 
+   ⚠️ **为什么不是"每块先存 <index>.part、complete 时再顺序拼成文件树"**（旧实现）：
+   拼接是一次全量复制。100GB 的库意味着 `POST /complete` 要在**一次 HTTP 请求里**复制 100GB，
+   客户端固定 30s 的请求超时必然先到（真实故障：`agent.server_timeout`，
+   cause = `Post .../complete: context deadline exceeded`），上传永远走不到建库。
+   改为"分块自带偏移 → WriteAt 就位"后：写一块落一块，与到达顺序无关（4 路并发 + 续传本就不保证顺序），
+   complete 退化为核对，成本与库大小无关。
+
 ③ 断点续传：客户端持久化 upload_id 后调用 GET /v1/uploads/{id}
-   → 服务端返回 { state, total_files, total_bytes, received_bytes, missing_chunks }
-   → 客户端只重传 missing_chunks（注意：POST /v1/uploads 每次都会新建会话，缺失清单一律为全量，
-     因此续传必须由客户端自行持久化 upload_id）
+   → 服务端返回 { state, total_files, total_bytes, received_bytes, missing_chunks, files_done }
+   → 客户端只重传 missing_chunks
+   → files_done 是"已逐文件校验通过"的文件数，客户端用作 **N/M 的续传起点**：
+     已传完的文件不会再重传、也就不会再收到逐块回报，从 0 重数会让进度条当场倒退
+   → **服务端也会按名字续传**（`reused=true`）：本地记录丢了、换了机器、或者上次就失败在
+     这里，只要同名且内容一致（文件数 + 总字节），POST /v1/uploads 就把旧会话原样还回来，
+     `missing_chunks` 只是"还缺的那几块" —— 不必依赖客户端那份 JSON 才能续上
 
 ④ POST /v1/uploads/{id}/complete（无请求体）
-   → 服务端串行重组文件树到 staging/<upload_id>/tree/
-   → 校验文件数与总字节
+   → 服务端**只核对不重组**（`finalizeTree`）：逐个 Lstat 比对存在性/大小/非常规文件（拒绝符号链接）
+     + 补建清单里的空文件（它们不占拼接流，没有任何分块会写到它们）
+   → 树对不上时先自愈：作废"对不上文件"覆盖的分块登记并返回冲突，让客户端只重传那些块
+     （旧实现是整体失败后从头再来；详见下方"自愈"要点）
+   → 必要时兜底一次重组（仅升级前创建、暂存里还是 `*.part` 的 legacy 会话，见下）
    → 投递 Job: upload_complete（异步建库任务）
    → 响应 202 { job_id }
+   → **整棵树的全量走查（verifyTree）留给异步的建库任务**：它本来就要复制一遍，
+     顺路校验是零额外成本；放在请求里则是拿用户的等待时间做同一件事
 
 ⑤ Job（upload_complete）执行：
    create VHDX(尺寸按 5.2 规则) → attach → format → robocopy(staging tree → V:)
-   → 校验（文件数+总字节） → detach → Import → 建 repo
+   → 校验（文件数+总字节；**目标侧统计必须跳过 `System Volume Information` / `$RECYCLE.BIN`
+     等卷根系统保留目录** —— 它们由系统自建且 ACL 默认拒绝访问，进去就是 access_denied，
+     会把一次成功的复制误判为失败） → detach → Import → 建 repo
+   → **拷入阶段必须上报字节进度**：robocopy 自己不打字节进度（输出被 `/NFL /NDL /NP` 压到只剩
+     总结），所以由卷后端按"**目标卷可用空间少了多少**"换算已拷入字节 —— 目标卷是刚格式化的新卷，
+     除了这次拷入没有别的东西在写它，两个数一一对应；每 2s 采样一次（一次 GetDiskFreeSpaceEx /
+     statfs），只在整数百分比真的前进时才写任务进度。这段是整条流水线里唯一的长活
+     （源目录多大就要写多大的盘），30G 的库要跑几十分钟，没有它任务进度就卡在 15 不动 ——
+     用户的观感就是"卡死了"（真实反馈：30G 上传"校验中"等了半小时）
+   → 库在**整个建库期间**是 `importing`（上传中），母盘就绪后才转 `active`：
+     客户端列表据此显示"上传中"卡片并禁用挂载（此前直接写成 active，列表里看着正常、
+     点挂载才报 disk.not_ready，用户完全看不出它还在建）
    → 服务端**不删除客户端本地源目录**；mode=='move' 时只清理服务端 staging，
      由**客户端**在确认建库成功后删除本地源目录（见 agent-api.md）
 
 ⑥ 失败清理：Job 失败 → 保留 staging 供重试（24h），到期 GC
+   → 库与母盘一并回滚为 `error`（`OnFinalFailure` 按任务类型分派：upload_complete 的
+     ref_id 是 upload_id 而非磁盘 ID，必须顺着 payload 找库与母盘，否则两边都回滚不到 ——
+     库停在 importing、母盘停在 creating，且对账刻意跳过 creating，不会自愈）
+   → 重新上传同一目录会**复用 upload_id**（客户端续传记录只在建库成功后才删除），
+     服务端对终态失败的同键任务做重新入队（store.RequeueJob），所以失败可重试
+   → 即便客户端记录也没了，下一次 POST /v1/uploads 会在**上传开始时**同步清掉这些残留
+     （见下"同名残留"要点）：同一个名字永远能再传一次
 ```
 
 要点：
@@ -1519,6 +1579,48 @@ Dismount-VHD -Path $vhdx
 - staging 与 disks 同卷（原子 rename）。`storage_id` 显式指定时，创建会话即把 staging 建在该存储根下；
   完成建库时再次校验"暂存与目标同根"，不一致返回 `storage.staging_mismatch`（409）。
 - 上传需**独立配额与限流**，否则单用户可打满磁盘。
+- **逐文件校验在上传过程中完成**：一个文件覆盖的全部分块一到齐（且每块的 SHA256 都在到达时比对过），
+  服务端立刻把它报回客户端（`files_done`），界面上的"已校验 N/M 个文件"由此一路前进。
+  把校验攒到 complete 一次性做，用户在大目录上传期间只能看到"字节在涨"，看不出"有没有成"。
+- **提交之后的等待不是"校验"**：`POST /complete` 只做核对（逐个 Lstat，成本与库大小无关），
+  真正耗时的建库拷贝才是 `completing` 阶段的长活。所以这一段的界面文案是"建库中"而不是"校验中"，
+  并且必须显示服务端任务的 `progress`（客户端透传为 `build_progress`）：字节进度此刻已经满了，
+  没有它界面就只剩一句"校验中"钉在不动的 100% 上。
+- **分块热路径的日志与审计要静音**（`isQuietTransfer`）：8MiB 一块、100GB 就是一万多条请求，
+  每块一条访问日志 + 一条审计会把日志文件和审计表刷爆、也会把真正有用的告警淹掉。
+  只静音成功（<400）的字节搬运；失败照记 —— 排查上传问题时缺的正是失败记录。
+- **映射解析要缓存**（`planCache`）：分块到达时要把"拼接流偏移"翻译成"文件"，这需要解析会话里
+  几十 MB 的 manifest JSON。每块重解析一遍会让 PutChunk 把 CPU 全花在 JSON 上。
+  缓存按 upload_id 存 `{files, legacy}`，容量 16，`Abort`/`GCStaleUploads` 时主动释放。
+- **legacy 会话必须继续可完成**：升级前创建的会话暂存里是 `*.part`、没有树。判定依据是
+  "staging 下是否存在 `*.part`"（`legacyPartFiles`），这类会话仍走一次性重组；
+  新会话一律走"分块就位"路径。不做区分就会把升级前没传完的会话判成"树损坏"，让用户重传。
+- **同名残留必须在"用户点上传"的那一刻同步清掉**（`prepareUploadName`，**不挂定时器**）。
+  一次失败的上传会在服务端留下三样东西：库记录（建库任务建出来后被打成 `importing`/`error`）、
+  建库任务、暂存目录。旧实现只按库名判重（`repo.name_taken`），于是用户看到的是
+  **"点上传直接失败"**，而且同一个名字**再也**传不进来 —— 只能改名（丢掉已传的分块）或手删库。
+  清理不能等 24h 的 GC，也不能等下一轮对账：用户点上传的那一刻就得干净。规则（顺序即优先级）：
+
+  | 情形 | 动作 |
+  | --- | --- |
+  | 同名未完成会话，内容一致（文件数 + 总字节） | **复用**（返回同一 upload_id，只补 missing_chunks） |
+  | 同名未完成会话，内容已变 / 已作废 | 连同暂存目录一起删除（偏移对不上，留着只会白占盘） |
+  | 同名会话 5 分钟内还被喂过分块 | 只跳过"删暂存"（可能另一台机器在传同名库），**不挡新建会话** |
+  | 同名会话的建库任务仍在 pending/running | **不碰**（正在写盘），并拒绝另起同名上传 |
+  | 同名库，残骸（`importing`/`error`） | 逐块回收磁盘与目标后删库，让建库任务从零重建 |
+  | 同名库，已建成但没人用过（无租约/未挂载/没分配过盘） | 放行，**不删库**，由建库任务就地重建母盘 |
+  | 同名库，非本人 / 有活跃租约 / 已挂载 / 已分配过盘 | 拒绝：409 `repo.upload_conflict`（带 reason） |
+
+- **建库任务之前也要自愈一次残骸**（`purgeUploadRemnant`）：走本地续传记录重试时**不经过**
+  `POST /v1/uploads`，如果只有 `CreateUpload` 会清残骸，这条最常见的重试路径（用户点"重试"）
+  就会一直撞在同一个 `error` 库上（"重试秒失败"）。任务在建盘前只清"本人的、没人用的、
+  状态为 `error`"的库：`importing` 可能是另一个还没跑完的任务，`active` 由就地重建覆盖。
+  暂存里的目录树不动 —— 已上传的字节一个都不用重传。
+- **复用旧会话时只能改建库选项，清单里的文件顺序一个字都不能动**（`manifestWithOptions`）。
+  分块偏移 = 按 `manifest.files` 顺序串联后的字节位置；换了顺序就等于把已上传的数据
+  对到别的文件上（第一块的字节会落进第二个文件），而且是静默的数据错位。
+  同理，内容是否一致只拿"文件数 + 总字节"当判据（与客户端续传判据一致），
+  模式/配额/客户端系统这些选项本就不影响已落盘的分块，跟着本次请求刷新即可。
 - `move` 语义的删除顺序：**服务端 VHDX 创建并校验成功 → 客户端删源**，绝不能先删。
 - manifest 为空（无文件）直接 400；符号链接会被拒绝；同名路径（大小写不敏感）会被拒绝。
 - `source_dir`（POST /v1/repos 的本地目录建库）与 `/v1/fs/*` 一样受 `storage.source_roots` 白名单约束：
@@ -2290,6 +2392,12 @@ POST   /v1/uploads                        创建上传会话（含 manifest 校�
                                           quota_bytes(默认 0=不限)
 GET    /v1/uploads/{id}                   查询状态（断点续传：返回 missing_chunks）
 PUT    /v1/uploads/{id}/chunks/{index}    上传分块（Header: X-Chunk-SHA256；幂等）
+                                          ★ 高频字节搬运（每 8MiB 一次 PUT，一个库可上万次）：
+                                            成功时不进访问日志、不落审计（见 middlewareAccessLog
+                                            的 isQuietTransfer / middlewareAudit）——
+                                            逐块留痕会把日志页与审计表刷成"某一次上传的流水账"；
+                                            失败（≥400）照记。上传留痕在 POST /v1/uploads、
+                                            /complete、DELETE 各一条
 POST   /v1/uploads/{id}/complete          重组文件树 → 投递 JobUploadComplete（upload_complete）
 DELETE /v1/uploads/{id}                   中止并清理暂存
 ```

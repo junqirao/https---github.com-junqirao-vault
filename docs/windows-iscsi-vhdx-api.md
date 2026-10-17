@@ -186,8 +186,13 @@ if ($code -ge 8) { throw "robocopy failed, exit=$code" }
 
 if ($Mode -eq 'move') {
     # 先校验再删源：校验文件数与总字节数一致
-    $s = Get-ChildItem -LiteralPath $Src -Recurse -Force -File
-    $d = Get-ChildItem -LiteralPath $Dst -Recurse -Force -File
+    # 卷根的 "System Volume Information" / "$RECYCLE.BIN" 默认拒绝访问（-Force 也读不了），
+    # 统计时必须排除：否则这里直接抛 Access denied，一次成功的复制会被判成失败。
+    $skip = '\\System Volume Information\\|\\\$RECYCLE\.BIN\\'
+    $s = Get-ChildItem -LiteralPath $Src -Recurse -Force -File -ErrorAction SilentlyContinue |
+         Where-Object { $_.FullName -notmatch $skip }
+    $d = Get-ChildItem -LiteralPath $Dst -Recurse -Force -File -ErrorAction SilentlyContinue |
+         Where-Object { $_.FullName -notmatch $skip }
     if ($s.Count -ne $d.Count -or ($s | Measure-Object Length -Sum).Sum -ne ($d | Measure-Object Length -Sum).Sum) {
         throw "verification failed, source kept"
     }

@@ -15,7 +15,14 @@ import type { ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
 import { pickMountUsage, repoUsageLoading, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { spacing } from '../../tokens/palette'
-import { formatTime, repoUsage } from '../../utils/format'
+import {
+  CAPACITY_UNIT,
+  capacityNormalize,
+  capacityValueProps,
+  formatBytes,
+  formatTime,
+  repoUsage
+} from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
@@ -36,6 +43,8 @@ interface EditValues {
   group?: string
   quota_bytes?: number
   max_diff_disks?: number
+  /** 共享磁盘限制：每块差异盘允许的容量（字节，表单按 M 录入）；0 = 不限制。 */
+  diff_disk_limit_bytes?: number
 }
 
 const PARENT_ACTIONS: ParentAction[] = [
@@ -148,7 +157,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     editForm.setFieldsValue({
       name: target.name,
       group: target.group,
-      max_diff_disks: target.max_diff_disks
+      max_diff_disks: target.max_diff_disks,
+      diff_disk_limit_bytes: target.diff_disk_limit_bytes
     })
     setError(null)
     setEditOpen(true)
@@ -249,6 +259,16 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                     </div>
                   </Descriptions.Item>
                   <Descriptions.Item label={t('field.maxDiffDisks')}>{repo?.max_diff_disks ?? '-'}</Descriptions.Item>
+                  {/* 共享磁盘限制 = 每块差异盘（每个共享者手里那块盘）允许的容量，也是它计入配额的
+                      量；0 表示不限制（按母盘容量整份记账）。独享库没有差异盘，不摆这一项 ——
+                      摆出来只会让人以为它在这个库上起了什么作用。 */}
+                  {repo?.mode === 'shared' ? (
+                    <Descriptions.Item label={t('field.diffDiskLimit')}>
+                      {repo.diff_disk_limit_bytes > 0
+                        ? formatBytes(repo.diff_disk_limit_bytes)
+                        : t('common.unlimited')}
+                    </Descriptions.Item>
+                  ) : null}
                   <Descriptions.Item label={t('common.createdAt')}>{formatTime(repo?.created_at)}</Descriptions.Item>
                 </Descriptions>
               </SectionCard>
@@ -305,6 +325,26 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
           <Form.Item name="max_diff_disks" label={t('field.maxDiffDisks')}>
             <InputNumber min={0} style={{ width: '100%' }} />
           </Form.Item>
+          {/* 共享磁盘限制：改了它，库里已有的差异盘会一起按新值重新记账（服务端同步刷新），
+              所以在这里改是"立刻生效"，不用等盘被回收重建。独享库没有差异盘，禁用。 */}
+          <Form.Item
+            name="diff_disk_limit_bytes"
+            label={t('field.diffDiskLimit')}
+            extra={
+              repo?.mode === 'exclusive'
+                ? t('repo.create.diffDiskLimitExclusive')
+                : t('repo.create.diffDiskLimitHint')
+            }
+            getValueProps={capacityValueProps}
+            normalize={capacityNormalize}
+          >
+            <InputNumber
+              min={0}
+              disabled={repo?.mode === 'exclusive'}
+              addonAfter={CAPACITY_UNIT}
+              style={{ width: '100%' }}
+            />
+          </Form.Item>
         </Form>
       </Modal>
 
@@ -353,8 +393,11 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
  *
  * 尺寸取中号：这一排（返回/编辑/母盘操作/复制/删除）都是 antd 默认尺寸，挂载按钮必须同款
  * （真实反馈："存储库详情里的挂载按钮要和其他按钮一样大"），卡片里的小号尺寸是紧凑排布才用的。
+ *
+ * 样式取描边：这一排邻居清一色是描边按钮，挂载按钮若还是卡片的实心主色，尺寸虽同、视觉重量
+ * 却压过整排（真实反馈："看起来比别的按钮大了，我要统一"）。实心留给卡片——那里它是唯一的主操作。
  */
 function RepoDetailMountActions({ repo, currentUserId }: { repo: RepoDTO; currentUserId: string }): JSX.Element {
   const controller = useRepoMount(repo, currentUserId)
-  return <RepoMountActions controller={controller} size="middle" />
+  return <RepoMountActions controller={controller} size="middle" variant="outlined" />
 }

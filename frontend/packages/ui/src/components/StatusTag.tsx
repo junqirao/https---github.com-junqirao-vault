@@ -23,6 +23,8 @@ const TONE_BY_VALUE: Record<string, Tone> = {
   pending: 'processing',
   running: 'processing',
   creating: 'processing',
+  // 上传中（本地目录上传建库还没结束）：与 creating 同为进行中，但语义是"数据还在传"。
+  importing: 'processing',
   sealing: 'processing',
   mounting: 'processing',
   releasing: 'processing',

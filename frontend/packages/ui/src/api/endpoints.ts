@@ -16,7 +16,6 @@ import type {
   CreateUserResponse,
   DeviceReleaseReportDTO,
   DiskDTO,
-  EnrollmentTokenResponse,
   EstimatePoolSizeRequest,
   EstimatePoolSizeResponse,
   FsBrowseResult,
@@ -264,13 +263,6 @@ export class VaultApi extends ApiClient {
     return this.request<void>(
       'DELETE',
       `/v1/users/${encodeURIComponent(userId)}/certificates/${encodeURIComponent(certificateId)}`
-    )
-  }
-
-  issueEnrollmentToken(id: string): Promise<EnrollmentTokenResponse> {
-    return this.request<EnrollmentTokenResponse>(
-      'POST',
-      `/v1/users/${encodeURIComponent(id)}/enrollment-token`
     )
   }
 

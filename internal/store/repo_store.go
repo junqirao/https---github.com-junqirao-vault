@@ -29,7 +29,7 @@ func fromJSON(s string, v any) {
 // ---------- repositories ----------
 
 const repoCols = `id, name, mode, owner_id, parent_disk_id, parent_version, parent_condition,
-	max_diff_disks, quota_bytes, used_bytes, state, meta, created_at, updated_at`
+	max_diff_disks, diff_disk_limit_bytes, quota_bytes, used_bytes, state, meta, created_at, updated_at`
 
 // repoCapacitySQL 是"库容量"的派生表达式（库容量 = 建库时设定的容量，见 domain.Repository.CapacityBytes）。
 //
@@ -51,21 +51,22 @@ const repoCapacitySQL = `COALESCE(
 // 不能并入 repoCols：那份列表同时用作 INSERT 的列清单（见 CreateRepository）。
 // 引用它的查询必须把 repositories 别名为 r（repoCapacitySQL 依赖这个别名）。
 const repoReadCols = `r.id, r.name, r.mode, r.owner_id, r.parent_disk_id, r.parent_version,
-	r.parent_condition, r.max_diff_disks, r.quota_bytes, r.used_bytes, r.state, r.meta,
-	r.created_at, r.updated_at, ` + repoCapacitySQL + ` AS capacity_bytes`
+	r.parent_condition, r.max_diff_disks, r.diff_disk_limit_bytes, r.quota_bytes, r.used_bytes,
+	r.state, r.meta, r.created_at, r.updated_at, ` + repoCapacitySQL + ` AS capacity_bytes`
 
 // repoRow 是 repositories 表的扁平映射，用于解决 meta 的 JSON 编解码。
 type repoRow struct {
-	ID              string  `db:"id"`
-	Name            string  `db:"name"`
-	Mode            string  `db:"mode"`
-	OwnerID         string  `db:"owner_id"`
-	ParentDiskID    *string `db:"parent_disk_id"`
-	ParentVersion   int     `db:"parent_version"`
-	ParentCondition *string `db:"parent_condition"`
-	MaxDiffDisks    int     `db:"max_diff_disks"`
-	QuotaBytes      int64   `db:"quota_bytes"`
-	UsedBytes       int64   `db:"used_bytes"`
+	ID                 string  `db:"id"`
+	Name               string  `db:"name"`
+	Mode               string  `db:"mode"`
+	OwnerID            string  `db:"owner_id"`
+	ParentDiskID       *string `db:"parent_disk_id"`
+	ParentVersion      int     `db:"parent_version"`
+	ParentCondition    *string `db:"parent_condition"`
+	MaxDiffDisks       int     `db:"max_diff_disks"`
+	DiffDiskLimitBytes int64   `db:"diff_disk_limit_bytes"`
+	QuotaBytes         int64   `db:"quota_bytes"`
+	UsedBytes          int64   `db:"used_bytes"`
 	// CapacityBytes 是读时派生的库容量（见 repoCapacitySQL），不是表里的列。
 	CapacityBytes int64  `db:"capacity_bytes"`
 	State         string `db:"state"`
@@ -76,19 +77,20 @@ type repoRow struct {
 
 func (r repoRow) toDomain() *domain.Repository {
 	repo := &domain.Repository{
-		ID:            r.ID,
-		Name:          r.Name,
-		Mode:          domain.RepoMode(r.Mode),
-		OwnerID:       r.OwnerID,
-		ParentDiskID:  r.ParentDiskID,
-		ParentVersion: r.ParentVersion,
-		MaxDiffDisks:  r.MaxDiffDisks,
-		QuotaBytes:    r.QuotaBytes,
-		CapacityBytes: r.CapacityBytes,
-		UsedBytes:     r.UsedBytes,
-		State:         domain.RepoState(r.State),
-		CreatedAt:     r.CreatedAt,
-		UpdatedAt:     r.UpdatedAt,
+		ID:                 r.ID,
+		Name:               r.Name,
+		Mode:               domain.RepoMode(r.Mode),
+		OwnerID:            r.OwnerID,
+		ParentDiskID:       r.ParentDiskID,
+		ParentVersion:      r.ParentVersion,
+		MaxDiffDisks:       r.MaxDiffDisks,
+		DiffDiskLimitBytes: r.DiffDiskLimitBytes,
+		QuotaBytes:         r.QuotaBytes,
+		CapacityBytes:      r.CapacityBytes,
+		UsedBytes:          r.UsedBytes,
+		State:              domain.RepoState(r.State),
+		CreatedAt:          r.CreatedAt,
+		UpdatedAt:          r.UpdatedAt,
 	}
 	if r.ParentCondition != nil {
 		c := domain.ParentCondition(*r.ParentCondition)
@@ -109,22 +111,24 @@ func (s *Store) CreateRepository(ctx context.Context, r *domain.Repository) erro
 	_, err := s.q.NamedExecContext(ctx,
 		`INSERT INTO repositories (`+repoCols+`)
 		 VALUES (:id, :name, :mode, :owner_id, :parent_disk_id, :parent_version, :parent_condition,
-		         :max_diff_disks, :quota_bytes, :used_bytes, :state, :meta, :created_at, :updated_at)`,
+		         :max_diff_disks, :diff_disk_limit_bytes, :quota_bytes, :used_bytes, :state, :meta,
+		         :created_at, :updated_at)`,
 		map[string]any{
-			"id":               r.ID,
-			"name":             r.Name,
-			"mode":             string(r.Mode),
-			"owner_id":         r.OwnerID,
-			"parent_disk_id":   r.ParentDiskID,
-			"parent_version":   r.ParentVersion,
-			"parent_condition": nullableCondition(r),
-			"max_diff_disks":   r.MaxDiffDisks,
-			"quota_bytes":      r.QuotaBytes,
-			"used_bytes":       r.UsedBytes,
-			"state":            string(r.State),
-			"meta":             toJSON(r.Meta),
-			"created_at":       r.CreatedAt,
-			"updated_at":       r.UpdatedAt,
+			"id":                    r.ID,
+			"name":                  r.Name,
+			"mode":                  string(r.Mode),
+			"owner_id":              r.OwnerID,
+			"parent_disk_id":        r.ParentDiskID,
+			"parent_version":        r.ParentVersion,
+			"parent_condition":      nullableCondition(r),
+			"max_diff_disks":        r.MaxDiffDisks,
+			"diff_disk_limit_bytes": r.DiffDiskLimitBytes,
+			"quota_bytes":           r.QuotaBytes,
+			"used_bytes":            r.UsedBytes,
+			"state":                 string(r.State),
+			"meta":                  toJSON(r.Meta),
+			"created_at":            r.CreatedAt,
+			"updated_at":            r.UpdatedAt,
 		})
 	if isDuplicate(err) {
 		return apperr.RepoNameTaken().WithArg("name", r.Name)
@@ -140,6 +144,21 @@ func nullableCondition(r *domain.Repository) any {
 		return nil
 	}
 	return string(*r.ParentCondition)
+}
+
+// SetRepositoryState 只更新存储库的生命周期状态，返回受影响行数为 0 时的 RepoNotFound。
+//
+// 为什么不直接用 UpdateRepository：它整行写回（name/quota/meta/used_bytes/…），
+// 而"上传建库把库切成 uploading→active"是与其它写路径（配额调整、成员变更）并发的，
+// 整行回写会拿旧快照覆盖别人的修改。
+func (s *Store) SetRepositoryState(ctx context.Context, id string, state domain.RepoState) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE repositories SET state = ?, updated_at = ? WHERE id = ?`),
+		string(state), nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新存储库状态失败: %w", err)
+	}
+	return mustAffect(res, apperr.RepoNotFound().WithArg("id", id))
 }
 
 // GetRepository 按 ID 查询存储库。
@@ -211,21 +230,23 @@ func (s *Store) UpdateRepository(ctx context.Context, r *domain.Repository) erro
 	res, err := s.q.NamedExecContext(ctx,
 		`UPDATE repositories SET name=:name, parent_disk_id=:parent_disk_id,
 		 parent_version=:parent_version, parent_condition=:parent_condition,
-		 max_diff_disks=:max_diff_disks, quota_bytes=:quota_bytes, used_bytes=:used_bytes,
+		 max_diff_disks=:max_diff_disks, diff_disk_limit_bytes=:diff_disk_limit_bytes,
+		 quota_bytes=:quota_bytes, used_bytes=:used_bytes,
 		 state=:state, meta=:meta, updated_at=:updated_at
 		 WHERE id=:id`,
 		map[string]any{
-			"id":               r.ID,
-			"name":             r.Name,
-			"parent_disk_id":   r.ParentDiskID,
-			"parent_version":   r.ParentVersion,
-			"parent_condition": nullableCondition(r),
-			"max_diff_disks":   r.MaxDiffDisks,
-			"quota_bytes":      r.QuotaBytes,
-			"used_bytes":       r.UsedBytes,
-			"state":            string(r.State),
-			"meta":             toJSON(r.Meta),
-			"updated_at":       r.UpdatedAt,
+			"id":                    r.ID,
+			"name":                  r.Name,
+			"parent_disk_id":        r.ParentDiskID,
+			"parent_version":        r.ParentVersion,
+			"parent_condition":      nullableCondition(r),
+			"max_diff_disks":        r.MaxDiffDisks,
+			"diff_disk_limit_bytes": r.DiffDiskLimitBytes,
+			"quota_bytes":           r.QuotaBytes,
+			"used_bytes":            r.UsedBytes,
+			"state":                 string(r.State),
+			"meta":                  toJSON(r.Meta),
+			"updated_at":            r.UpdatedAt,
 		})
 	if isDuplicate(err) {
 		return apperr.RepoNameTaken().WithArg("name", r.Name)
@@ -333,8 +354,8 @@ func (s *Store) GetRepoMember(ctx context.Context, repoID, userID string) (*doma
 // ---------- disks ----------
 
 const diskCols = `id, repo_id, kind, vhdx_path, parent_id, parent_version, content_fingerprint,
-	size_bytes, physical_bytes, vhd_type, state, desired_state, observed_state, mounted, file_system,
-	created_at, updated_at`
+	size_bytes, accounted_bytes, physical_bytes, vhd_type, state, desired_state, observed_state,
+	mounted, file_system, created_at, updated_at`
 
 // CreateDisk 插入磁盘记录。
 func (s *Store) CreateDisk(ctx context.Context, d *domain.Disk) error {
@@ -347,8 +368,8 @@ func (s *Store) CreateDisk(ctx context.Context, d *domain.Disk) error {
 	_, err := s.q.NamedExecContext(ctx,
 		`INSERT INTO disks (`+diskCols+`)
 		 VALUES (:id, :repo_id, :kind, :vhdx_path, :parent_id, :parent_version, :content_fingerprint,
-		         :size_bytes, :physical_bytes, :vhd_type, :state, :desired_state, :observed_state,
-		         :mounted, :file_system, :created_at, :updated_at)`,
+		         :size_bytes, :accounted_bytes, :physical_bytes, :vhd_type, :state, :desired_state,
+		         :observed_state, :mounted, :file_system, :created_at, :updated_at)`,
 		map[string]any{
 			"id":                  d.ID,
 			"repo_id":             d.RepoID,
@@ -358,6 +379,7 @@ func (s *Store) CreateDisk(ctx context.Context, d *domain.Disk) error {
 			"parent_version":      d.ParentVersion,
 			"content_fingerprint": d.ContentFingerprint,
 			"size_bytes":          d.SizeBytes,
+			"accounted_bytes":     d.AccountedBytes,
 			"physical_bytes":      d.PhysicalBytes,
 			"vhd_type":            string(d.VHDType),
 			"state":               string(d.State),
@@ -387,6 +409,7 @@ func (s *Store) scanDisk(ctx context.Context, query string, args ...any) (*domai
 		ParentVersion      int     `db:"parent_version"`
 		ContentFingerprint string  `db:"content_fingerprint"`
 		SizeBytes          int64   `db:"size_bytes"`
+		AccountedBytes     int64   `db:"accounted_bytes"`
 		PhysicalBytes      int64   `db:"physical_bytes"`
 		VHDType            string  `db:"vhd_type"`
 		State              string  `db:"state"`
@@ -409,6 +432,7 @@ func (s *Store) scanDisk(ctx context.Context, query string, args ...any) (*domai
 		ParentVersion:      row.ParentVersion,
 		ContentFingerprint: row.ContentFingerprint,
 		SizeBytes:          row.SizeBytes,
+		AccountedBytes:     row.AccountedBytes,
 		PhysicalBytes:      row.PhysicalBytes,
 		VHDType:            domain.VHDType(row.VHDType),
 		State:              domain.DiskState(row.State),
@@ -469,6 +493,7 @@ func (s *Store) listDisks(ctx context.Context, query string, args ...any) ([]dom
 		ParentVersion      int     `db:"parent_version"`
 		ContentFingerprint string  `db:"content_fingerprint"`
 		SizeBytes          int64   `db:"size_bytes"`
+		AccountedBytes     int64   `db:"accounted_bytes"`
 		PhysicalBytes      int64   `db:"physical_bytes"`
 		VHDType            string  `db:"vhd_type"`
 		State              string  `db:"state"`
@@ -493,6 +518,7 @@ func (s *Store) listDisks(ctx context.Context, query string, args ...any) ([]dom
 			ParentVersion:      r.ParentVersion,
 			ContentFingerprint: r.ContentFingerprint,
 			SizeBytes:          r.SizeBytes,
+			AccountedBytes:     r.AccountedBytes,
 			PhysicalBytes:      r.PhysicalBytes,
 			VHDType:            domain.VHDType(r.VHDType),
 			State:              domain.DiskState(r.State),
@@ -558,14 +584,16 @@ func (s *Store) UpdateDisk(ctx context.Context, d *domain.Disk) error {
 	d.UpdatedAt = nowMillis()
 	res, err := s.q.NamedExecContext(ctx,
 		`UPDATE disks SET parent_version=:parent_version, content_fingerprint=:content_fingerprint,
-		 size_bytes=:size_bytes, physical_bytes=:physical_bytes, state=:state,
-		 desired_state=:desired_state, observed_state=:observed_state, mounted=:mounted, updated_at=:updated_at
+		 size_bytes=:size_bytes, accounted_bytes=:accounted_bytes, physical_bytes=:physical_bytes,
+		 state=:state, desired_state=:desired_state, observed_state=:observed_state,
+		 mounted=:mounted, updated_at=:updated_at
 		 WHERE id=:id`,
 		map[string]any{
 			"id":                  d.ID,
 			"parent_version":      d.ParentVersion,
 			"content_fingerprint": d.ContentFingerprint,
 			"size_bytes":          d.SizeBytes,
+			"accounted_bytes":     d.AccountedBytes,
 			"physical_bytes":      d.PhysicalBytes,
 			"state":               string(d.State),
 			"desired_state":       d.DesiredState,

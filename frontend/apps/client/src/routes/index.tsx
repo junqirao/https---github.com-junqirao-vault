@@ -17,6 +17,7 @@ import {
   StorageCreateForm,
   StorageList,
   SystemSettings,
+  UploadTaskPage,
   UserList,
   useAuth,
   useI18n,
@@ -80,6 +81,28 @@ function RepoDetailRoute(): JSX.Element {
   )
 }
 
+/**
+ * 上传任务页的来源（写进 `location.state.from`），决定「返回」回到哪。
+ *
+ * 上传进度只存在**发起它的那台机器**的代理内存里，所以入口目前只有应用端「我的存储库」；
+ * 这里仍沿用详情页那套 from 约定，是为了将来从别处（比如任务中心）跳进来时不用再改。
+ */
+function UploadTaskRoute(): JSX.Element {
+  const { uploadId } = useParams<{ uploadId: string }>()
+  const navigate = useNavigate()
+  const location = useLocation()
+  if (!uploadId) return <Navigate to="/my-repos" replace />
+  const backTo = (location.state as RepoDetailState | null)?.from ?? '/my-repos'
+  return (
+    <UploadTaskPage
+      uploadId={uploadId}
+      onBack={() => navigate(backTo, { replace: true })}
+      // 完成后进详情：用 replace 把上传页从历史里顶掉，否则后退会回到那张已经结束的进度页。
+      onOpenRepo={(repoId) => navigate(`/repos/${repoId}`, { replace: true, state: { from: backTo } })}
+    />
+  )
+}
+
 function ClientSettingsRoute(): JSX.Element {
   const setLanguage = useAppStore((state) => state.setLanguage)
   const language = useAppStore((state) => state.language)
@@ -122,6 +145,10 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
               onCreate={() => navigate('/my-repos/new')}
               // 详情「返回」靠这个来源回到应用端列表（见 RepoDetailRoute）。
               onOpen={(repoId) => navigate(`/repos/${repoId}`, { state: { from: '/my-repos' } })}
+              // 上传中的库点进「上传任务」页：进度只在本机代理里，所以只有应用端有这个入口。
+              onOpenUpload={(uploadId) =>
+                navigate(`/uploads/${uploadId}`, { state: { from: '/my-repos' } })
+              }
             />
           }
         />
@@ -140,6 +167,8 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
         />
         <Route path="logs" element={<LogViewer />} />
         <Route path="repos/:repoId" element={<RepoDetailRoute />} />
+        {/* 上传任务页独立于存储库详情：上传中的库在服务端可能还不存在（压根没有 repoId 可用）。 */}
+        <Route path="uploads/:uploadId" element={<UploadTaskRoute />} />
         <Route path="settings" element={<ClientSettingsRoute />} />
         {/* 「关于」是页面而不是弹窗：链接能分享、刷新能回来、前进后退也对得上
             （弹窗关掉就等于没去过，被问"你那边什么版本"时没法把它留在那儿对着念）。 */}

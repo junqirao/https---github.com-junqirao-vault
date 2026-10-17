@@ -70,6 +70,10 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("POST /agent/uploads/start", a.handleUploadStart)
 	mux.HandleFunc("GET /agent/uploads", a.handleListUploads)
 	mux.HandleFunc("DELETE /agent/uploads/{upload_id}", a.handleCancelUpload)
+	// 暂停 / 恢复上传：用 POST 而不是 PUT（主进程按方法放行，PUT 会被挡下，见上面 repo-mounts
+	// 那段注释）。暂停只停住"继续传下一块"，会话与已传分块一律保留，可随时恢复。
+	mux.HandleFunc("POST /agent/uploads/{upload_id}/pause", a.handlePauseUpload)
+	mux.HandleFunc("POST /agent/uploads/{upload_id}/resume", a.handleResumeUpload)
 
 	// 客户端证书身份（免密登录）；一台机器可同时保存多个服务端的证书。
 	mux.HandleFunc("GET /agent/identity", a.handleGetIdentity)

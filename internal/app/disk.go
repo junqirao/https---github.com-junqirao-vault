@@ -10,6 +10,7 @@ import (
 	"vault/internal/domain"
 	"vault/internal/job"
 	"vault/internal/lock"
+	"vault/internal/platform"
 	"vault/internal/store"
 )
 
@@ -383,7 +384,12 @@ func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk
 	if sourceDir != "" {
 		// 有源目录：由卷后端一次性完成"激活 → 分区 → 格式化 → 拷入 → 卸载"，
 		// 中间的挂载细节（Windows=盘符/robocopy，Linux=分区+ntfs3/ntfs-3g/copyTree）不再泄漏到本层。
-		if _, _, err := s.Vol.MountAndCopy(ctx, disk.VHDXPath, sourceDir, fs, "VAULT"); err != nil {
+		//
+		// 拷入这一段是整条流水线里唯一的长活（源目录有多大就要写多大的盘：30G 的库就是
+		// 30G 的读 + 30G 的写），而它此前只上报 15 → 85 两个端点，中间几十分钟进度条纹丝不动，
+		// 用户看到的就是"卡住了"。这里把卷后端采样到的字节进度映射到同一区间，让它走得动。
+		onCopy := copyProgressReporter(rep, 15, 85)
+		if _, _, err := s.Vol.MountAndCopy(ctx, disk.VHDXPath, sourceDir, fs, "VAULT", onCopy); err != nil {
 			return err
 		}
 	} else {
@@ -422,6 +428,29 @@ func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk
 	s.audit(ctx, "", "disk.create.done", "disk:"+disk.ID, disk.VHDXPath, domain.AuditResultOK)
 	s.prePublishTarget(ctx, disk)
 	return nil
+}
+
+// copyProgressReporter 把"拷入虚拟盘"的字节进度映射到任务进度的 [from, to] 区间。
+//
+// 只在整数百分比真的前进时才上报：拷入可能持续几十分钟、采样间隔只有两秒，每次都写一遍
+// 任务进度就是成千上万条无意义的 UPDATE（值还一模一样）。
+func copyProgressReporter(rep job.Reporter, from, to int) platform.CopyProgressFunc {
+	span := to - from
+	last := 0
+	return func(copied, total int64) {
+		if span <= 0 || total <= 0 {
+			return
+		}
+		pct := to
+		if copied < total {
+			pct = from + int(int64(span)*copied/total)
+		}
+		if pct <= last {
+			return
+		}
+		last = pct
+		rep.Progress(pct)
+	}
 }
 
 // isDiskBuilt 判断磁盘是否已经建好（published 蕴含"已建好"，是 ready 的超集）。

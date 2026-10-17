@@ -109,9 +109,15 @@ type repoDTO struct {
 	//
 	// MaxDiffDisks 是它改名前的字段，两者**永远同值**：老字段保留一段时间，
 	// 免得已发布的前端读不到这个数（差异盘数量是卡片上的关键信息）。
-	ShareCount   int   `json:"share_count"`
-	MaxDiffDisks int   `json:"max_diff_disks"`
-	QuotaBytes   int64 `json:"quota_bytes"`
+	ShareCount   int `json:"share_count"`
+	MaxDiffDisks int `json:"max_diff_disks"`
+	// DiffDiskLimitBytes 共享磁盘限制：本库每块差异盘（每个共享者手里那块盘）允许的容量，
+	// 也是它计入配额的量；0 表示不限制（差异盘按母盘容量整份记账）。
+	//
+	// 注意它不是"这块盘有多大"：盘挂出去仍是母盘容量（客户端按容量匹配本地盘），
+	// 这个值管的是"按多少计费"（见 domain.Disk.AccountedBytes）。
+	DiffDiskLimitBytes int64 `json:"diff_disk_limit_bytes"`
+	QuotaBytes         int64 `json:"quota_bytes"`
 	// CapacityBytes 库容量：建库时设定的容量（那块盘的 VHDX 标称容量）。
 	//
 	// 卡片上的「已用 / 容量」进度条用它当分母。**不要用 QuotaBytes 当分母**：
@@ -155,7 +161,8 @@ func toRepoDTO(r *domain.Repository) repoDTO {
 		ID: r.ID, Name: r.Name, Mode: string(r.Mode), OwnerID: r.OwnerID,
 		ParentVersion: r.ParentVersion,
 		ShareCount:    r.MaxDiffDisks, MaxDiffDisks: r.MaxDiffDisks,
-		QuotaBytes: r.QuotaBytes, CapacityBytes: r.CapacityBytes,
+		DiffDiskLimitBytes: r.DiffDiskLimitBytes,
+		QuotaBytes:         r.QuotaBytes, CapacityBytes: r.CapacityBytes,
 		UsedBytes: r.UsedBytes, State: string(r.State),
 		Group: r.Meta.Group, ClientConfig: r.Meta.ClientConfig,
 		Pool:      r.Meta.Pool,

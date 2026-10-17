@@ -12,6 +12,7 @@ import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
 import { MountStateCell, mountSessionLive, mountStateNoteworthy, openTargetOf } from '../mount/MountControls'
+import { isPlaceholderRepoId } from './uploadView'
 
 /** 存储库卡片上的挂载能力控制器。 */
 export interface RepoMountController {
@@ -109,10 +110,13 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
   const [error, setError] = useState<unknown>(null)
 
   // 代理不可用时既无法挂载也拿不到本地挂载状态，直接跳过请求。
+  // 上传中的**占位库**（服务端还没这条记录，id 是列表临时合成的）同样跳过：拿它去查分配
+  // 只会换回一次注定 404 的请求。它本来也没有分配可查（见 uploadPlaceholderRepo）。
+  const placeholder = isPlaceholderRepoId(repo.id)
   const allocationsQuery = useQuery({
     queryKey: ['repo-allocations', repo.id],
     queryFn: () => api.listAllocations(repo.id),
-    enabled: agent.available
+    enabled: agent.available && !placeholder
   })
 
   const allocationId = useMemo(() => {
@@ -164,7 +168,12 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
   const disabledReason = !agent.available
     ? t('agent.hostMissing')
     : !repoReady
-      ? t('repo.card.notReady', { state: t(`state.repo.${repo.state}`) })
+      ? repo.state === 'importing'
+        // 上传中：只说一句"不能挂载"等于让人干等 —— 必须告诉他进度在哪看（真实反馈：
+        // "没有办法知道没有完成上传，且可以被挂载"）。入口就是这张卡片本身：整卡点击进
+        // 「上传任务」页（见 RepoCards 的 useRepoCardClick），进度不再摊在卡片上。
+        ? t('repo.card.uploading')
+        : t('repo.card.notReady', { state: t(`state.repo.${repo.state}`) })
       : canMount
         ? undefined
         : t('repo.card.notAllocated')
@@ -271,12 +280,27 @@ export interface RepoMountActionsProps {
    * 挂载按钮若还按卡片的小号来，会明显小一号（真实反馈："存储库详情里的挂载按钮要和其他按钮一样大"）。
    */
   size?: 'small' | 'middle' | 'large'
+  /**
+   * 按钮的视觉重量。默认 `solid`（实心主色）：卡片动作区里它是唯一的主操作。
+   *
+   * 详情页顶部那排要 `outlined`：同排「返回/编辑/母盘操作/复制/删除」清一色是描边按钮，
+   * 夹一个实心蓝按钮进去，两侧**尺寸虽同**（都是 36px），视觉重量却压过整排
+   * （真实反馈："存储库详情里的挂载按钮看起来比别的按钮大了，我要统一"——
+   * 尺寸那一步已经对齐过，这里缺的只是样式）。
+   */
+  variant?: 'solid' | 'outlined'
 }
 
 /** 卡片头部的挂载/卸载按钮：与「打开」图标并排，随标题行垂直居中。 */
-export function RepoMountActions({ controller, size = 'small' }: RepoMountActionsProps): JSX.Element {
+export function RepoMountActions({
+  controller,
+  size = 'small',
+  variant = 'solid'
+}: RepoMountActionsProps): JSX.Element {
   const { t } = useI18n()
   const { mount, sessionLost, pending, resolving, busy, canMount, canUnmount, disabledReason } = controller
+  // "挂载"在卡片里是主操作（实心），在详情页那排里只是普通成员（描边，与邻居同款）。
+  const buttonType = variant === 'outlined' ? 'default' : 'primary'
   // 挂载/卸载只受"代理可用 + 有分配"约束，与库状态无关：库异常/建库中时仍要能摘掉本机的盘。
   // "操作进行中"（pending）由下面的 working 统一接管，这里不再重复判断。
   const mountDisabled = !canMount
@@ -336,7 +360,7 @@ export function RepoMountActions({ controller, size = 'small' }: RepoMountAction
           <span style={{ display: 'inline-block' }}>
             <Button
               size={size}
-              type="primary"
+              type={buttonType}
               disabled={mountDisabled}
               onClick={() => void controller.mountRepo()}
             >

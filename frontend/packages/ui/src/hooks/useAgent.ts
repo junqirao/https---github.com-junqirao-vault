@@ -298,7 +298,14 @@ const ACTIVE_UPLOAD_STATES: ReadonlyArray<UploadState['state']> = [
   'completing'
 ]
 
-function isActiveUpload(upload: UploadState): boolean {
+/**
+ * 是否"还没结束"的上传。
+ *
+ * 导出给「我的存储库」用：进行中的上传要在列表里占一张"上传中"卡片，判据必须与
+ * 代理侧（internal/agent 的 isActiveUploadState）以及本模块合并逻辑保持一致 ——
+ * 三处各写一份的话，迟早出现"卡片上还在转、任务已被判结束"这种对不上的状态。
+ */
+export function isActiveUpload(upload: UploadState): boolean {
   return ACTIVE_UPLOAD_STATES.includes(upload.state)
 }
 

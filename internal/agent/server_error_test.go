@@ -87,19 +87,19 @@ func TestRequestMountReportsTimeoutNotUnreachable(t *testing.T) {
 	}
 }
 
-// TestRequestMountUsesLongTimeout 锁定挂载申请走的是长耗时客户端（2 分钟），
-// 而不是普通接口的 30s —— 这是本次"服务端还没干完就被掐断"的直接原因。
+// TestRequestMountUsesLongTimeout 锁定"服务端同步重活"类接口走的是长耗时客户端（2 分钟），
+// 而不是普通接口的 30s —— 这是"服务端还没干完就被掐断"的直接原因。
 func TestRequestMountUsesLongTimeout(t *testing.T) {
-	if mountRequestTimeout <= serverRequestTimeout {
-		t.Fatalf("mountRequestTimeout(%s) 必须大于 serverRequestTimeout(%s)：挂载接口在服务端是同步重活",
-			mountRequestTimeout, serverRequestTimeout)
+	if longRequestTimeout <= serverRequestTimeout {
+		t.Fatalf("longRequestTimeout(%s) 必须大于 serverRequestTimeout(%s)：挂载/上传完成在服务端是同步重活",
+			longRequestTimeout, serverRequestTimeout)
 	}
 	client := &serverClient{
 		http:   &http.Client{Timeout: serverRequestTimeout},
-		long:   &http.Client{Timeout: mountRequestTimeout},
+		long:   &http.Client{Timeout: longRequestTimeout},
 		stream: &http.Client{},
 	}
-	if client.long.Timeout != mountRequestTimeout {
-		t.Fatalf("长耗时客户端超时 = %s，期望 %s", client.long.Timeout, mountRequestTimeout)
+	if client.long.Timeout != longRequestTimeout {
+		t.Fatalf("长耗时客户端超时 = %s，期望 %s", client.long.Timeout, longRequestTimeout)
 	}
 }

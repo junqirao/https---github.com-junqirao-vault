@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"vault/internal/apperr"
 	"vault/internal/domain"
@@ -17,6 +18,10 @@ import (
 
 // mountOptions 是 ntfs-3g 的挂载选项。big_writes 显著提升大块写入吞吐（建盘拷入场景）。
 const mountOptions = "big_writes"
+
+// copyProgressInterval 是拷贝期间推算进度的采样间隔（与 Windows 侧同一口径，
+// 见 winvhd.CopyTree）：拷贝要跑几十分钟，2 秒一次 statfs 换一条能动的进度条很划算。
+const copyProgressInterval = 2 * time.Second
 
 // EnsureFormatted 幂等地把盘准备好：分区表 + 单分区 + 分区上的文件系统。
 //
@@ -79,7 +84,8 @@ func (m *Manager) EnsureFormatted(ctx context.Context, ref, fileSystem, label st
 // MountAndCopy 一次性完成"激活 → 分区 → 格式化 → 递归拷入 sourceDir 内容 → 校验 → 卸载"。
 //
 // 校验口径与项目既有 CopyTree 一致：目标侧文件数/字节数不得少于源，否则 platform.copy_failed。
-func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string) (int, int64, error) {
+// onCopy 用于上报拷入过程的字节进度（可为 nil，见 platform.CopyProgressFunc）。
+func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string, onCopy platform.CopyProgressFunc) (int, int64, error) {
 	src := filepath.Clean(sourceDir)
 	info, err := os.Stat(src)
 	if err != nil || !info.IsDir() {
@@ -123,7 +129,7 @@ func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, 
 	if err != nil {
 		return 0, 0, apperr.New(CodeCopyFailed, http.StatusInternalServerError).WithCause(err)
 	}
-	dstFiles, dstBytes, err := copyTree(ctx, src, mnt)
+	dstFiles, dstBytes, err := m.copyTreeWithProgress(ctx, src, mnt, srcBytes, onCopy)
 	if err != nil {
 		return dstFiles, dstBytes, apperr.New(CodeCopyFailed, http.StatusInternalServerError).WithCause(err)
 	}
@@ -157,6 +163,62 @@ func (m *Manager) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, 
 	}
 	m.logger.Info("已完成卷格式化与内容拷贝", "ref", ref, "files", dstFiles, "bytes", dstBytes)
 	return dstFiles, dstBytes, nil
+}
+
+// copyTreeWithProgress 执行 copyTree，并在拷贝期间按挂载点剩余空间推算进度回报给 onCopy。
+//
+// 口径与 Windows 侧一致（见 winvhd.CopyTree）：目标卷是刚格式化的新卷，除了这次拷入没有
+// 别的东西在写它，"可用空间少了多少"就是已拷入字节。onCopy 为 nil 时退化为原样调用。
+// 只在进度真的前进时回报：整段拷贝可能几十分钟，重复上报同一百分比只是白刷任务进度。
+func (m *Manager) copyTreeWithProgress(ctx context.Context, src, mnt string, srcBytes int64, onCopy platform.CopyProgressFunc) (int, int64, error) {
+	if onCopy == nil || srcBytes <= 0 {
+		return copyTree(ctx, src, mnt)
+	}
+	base, ok := statfsFreeBytes(mnt)
+	if !ok {
+		// 读不到挂载点容量：宁可没有细粒度进度，也不编一个假的。
+		m.logger.Warn("读不到目标卷可用空间，本次拷贝不上报进度", "mountpoint", mnt)
+		return copyTree(ctx, src, mnt)
+	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(copyProgressInterval)
+		defer ticker.Stop()
+		var last int64
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				free, ok := statfsFreeBytes(mnt)
+				if !ok || free >= base {
+					continue
+				}
+				copied := int64(base - free)
+				if copied > srcBytes {
+					copied = srcBytes
+				}
+				if copied <= last {
+					continue
+				}
+				last = copied
+				onCopy(copied, srcBytes)
+			}
+		}
+	}()
+	return copyTree(ctx, src, mnt)
+}
+
+// statfsFreeBytes 返回挂载点所在文件系统的可用空间（字节）；读不到返回 false。
+func statfsFreeBytes(path string) (int64, bool) {
+	size, err := statfsSize(path)
+	if err != nil {
+		return 0, false
+	}
+	return size.freeBytes, true
 }
 
 // SpaceUsageOf 返回路径所在卷的标识、文件系统与可用/总空间。

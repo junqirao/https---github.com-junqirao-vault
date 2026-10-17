@@ -35,10 +35,11 @@ type uploadManifestDTO struct {
 
 // createUploadRequest 是创建上传会话请求。
 //
-// repo_mode / storage_id / quota_bytes 为**可选**扩展字段（向后兼容）：
+// repo_mode / storage_id / quota_bytes / diff_disk_limit_bytes 为**可选**扩展字段（向后兼容）：
 //   - repo_mode：建库模式 shared | exclusive，留空默认 shared；
 //   - storage_id：目标存储 ID，留空自动选（校验同 RepoService.Create）；
-//   - quota_bytes：应用层配额，0 表示不限。
+//   - quota_bytes：应用层配额，0 表示不限；
+//   - diff_disk_limit_bytes：共享磁盘限制（每块差异盘允许的容量），0 表示不限。
 type createUploadRequest struct {
 	RepoName string `json:"repo_name"`
 	// Mode copy | move。
@@ -47,6 +48,8 @@ type createUploadRequest struct {
 	RepoMode   string            `json:"repo_mode"`
 	StorageID  string            `json:"storage_id"`
 	QuotaBytes int64             `json:"quota_bytes"`
+	// DiffDiskLimitBytes 共享磁盘限制：建出来的库每块差异盘允许的容量（也是计入配额的量）。
+	DiffDiskLimitBytes int64 `json:"diff_disk_limit_bytes"`
 	// ClientOS 将使用该库的客户端操作系统（windows | linux，留空按 windows）：
 	// 决定建盘用的文件系统并记在盘上（见 domain.ClientOS），建完之后不能改。
 	ClientOS string `json:"client_os"`
@@ -90,14 +93,15 @@ func (r *Router) handleCreateUpload(w http.ResponseWriter, req *http.Request) {
 		files = append(files, domain.ManifestEntry{Path: f.Path, Size: f.Size, Mtime: f.Mtime, SHA256: f.SHA256})
 	}
 	session, err := r.deps.App.Uploads().CreateUpload(req.Context(), app.CreateUploadInput{
-		UserID:     p.UserID,
-		RepoName:   in.RepoName,
-		Mode:       in.Mode,
-		Manifest:   domain.UploadManifest{Root: in.Manifest.Root, Files: files},
-		RepoMode:   in.RepoMode,
-		StorageID:  in.StorageID,
-		QuotaBytes: in.QuotaBytes,
-		ClientOS:   in.ClientOS,
+		UserID:             p.UserID,
+		RepoName:           in.RepoName,
+		Mode:               in.Mode,
+		Manifest:           domain.UploadManifest{Root: in.Manifest.Root, Files: files},
+		RepoMode:           in.RepoMode,
+		StorageID:          in.StorageID,
+		QuotaBytes:         in.QuotaBytes,
+		DiffDiskLimitBytes: in.DiffDiskLimitBytes,
+		ClientOS:           in.ClientOS,
 	})
 	if err != nil {
 		r.writeError(w, req, err)

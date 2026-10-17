@@ -226,6 +226,35 @@ func (s *Store) ResetJobToPending(ctx context.Context, id, lastErr string) error
 	return mustAffect(res, apperr.JobNotFound().WithArg("id", id))
 }
 
+// RequeueJob 把**已失败/已取消**的任务重新置为待执行，供"同一条任务再跑一次"的场景使用
+// （例如上传完成建库任务失败后，用户重试上传：暂存目录还在，任务却已钉死在终态）。
+//
+// 与 ResetJobToPending 的两点区别，都是刻意为之：
+//   - 只重置 failed/cancelled（状态条件写在 SQL 里保证原子性）：调用方无法预知此刻任务
+//     是否正被 worker 执行，把 running/pending 重置会造成重复投递；succeeded 更不能重置。
+//   - 把 attempt 清零：ResetJobToPending 是 worker **内部重试**，attempt 必须保留（否则
+//     最大尝试次数形同虚设）；而这里语义是"用户重新发起一次"，必须归还完整的重试预算 ——
+//     否则一条 attempt 已用尽（= MaxAttempt）的失败任务重置后，第一次失败就又直接终结。
+//
+// 返回 true 表示确实完成了重置（未重置时调用方应复用既有任务）。
+func (s *Store) RequeueJob(ctx context.Context, id, lastErr string) (bool, error) {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE jobs
+		            SET state = ?, progress = 0, attempt = 0, last_error = ?,
+		                started_at = 0, finished_at = 0
+		            WHERE id = ? AND state IN (?, ?)`),
+		string(domain.JobStatePending), lastErr, id,
+		string(domain.JobStateFailed), string(domain.JobStateCancelled))
+	if err != nil {
+		return false, fmt.Errorf("store: 重新入队任务失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: 重新入队任务失败: %w", err)
+	}
+	return n > 0, nil
+}
+
 // ListJobs 查询任务列表，state 为空表示不过滤。
 func (s *Store) ListJobs(ctx context.Context, state domain.JobState, limit, offset int) ([]domain.Job, error) {
 	if limit <= 0 || limit > 500 {
@@ -329,6 +358,20 @@ func (s *Store) UpdateUploadState(ctx context.Context, id, state string) error {
 		state, nowMillis(), id)
 	if err != nil {
 		return fmt.Errorf("store: 更新上传状态失败: %w", err)
+	}
+	return mustAffect(res, apperr.UploadNotFound().WithArg("id", id))
+}
+
+// UpdateUploadManifest 覆盖上传会话的清单（复用旧会话时把本次的建库选项写回去）。
+//
+// 只动 manifest 一列：TotalFiles/TotalBytes 不变（复用前提就是内容一致），
+// StagingDir 更不动（已上传的分块就落在那儿）。
+func (s *Store) UpdateUploadManifest(ctx context.Context, id, manifest string) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE uploads SET manifest = ?, updated_at = ? WHERE id = ?`),
+		manifest, nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新上传清单失败: %w", err)
 	}
 	return mustAffect(res, apperr.UploadNotFound().WithArg("id", id))
 }
@@ -510,6 +553,70 @@ func (s *Store) UploadChunkExists(ctx context.Context, uploadID string, index in
 		return false, fmt.Errorf("store: 查询上传分块失败: %w", err)
 	}
 	return n > 0, nil
+}
+
+// GetUploadChunk 查询单个分块的登记（不存在返回 nil, nil）。
+//
+// 与"把整个会话的分块全拉回来再线性找"（ListUploadChunks）相比，这是热路径上该用的那一个：
+// 每上传一个 8MiB 分块都要做一次幂等判定，而一个 100GB 的库有上万条分块记录。
+func (s *Store) GetUploadChunk(ctx context.Context, uploadID string, index int) (*domain.UploadChunk, error) {
+	var out []domain.UploadChunk
+	err := s.q.SelectContext(ctx, &out,
+		s.q.Rebind(`SELECT upload_id, chunk_index, rel_path, offset, size, checksum, received_at
+		            FROM upload_chunks WHERE upload_id = ? AND chunk_index = ?`), uploadID, index)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询上传分块失败: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
+}
+
+// ListUploadChunksInRange 列出某会话在 [from, to] 闭区间内已收到的分块（按索引升序）。
+//
+// 用来回答"某个文件覆盖的那些分块到齐了没有、它们的校验值是什么"（见 app.UploadService 的
+// readyFiles）：文件在拼接流里的位置决定区间，逐个分块去查会把上传拖成 O(分块数²)。
+func (s *Store) ListUploadChunksInRange(ctx context.Context, uploadID string, from, to int) ([]domain.UploadChunk, error) {
+	var out []domain.UploadChunk
+	err := s.q.SelectContext(ctx, &out,
+		s.q.Rebind(`SELECT upload_id, chunk_index, rel_path, offset, size, checksum, received_at
+		            FROM upload_chunks WHERE upload_id = ? AND chunk_index >= ? AND chunk_index <= ?
+		            ORDER BY chunk_index`), uploadID, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询上传分块失败: %w", err)
+	}
+	return out, nil
+}
+
+// CountUploadChunksInRange 统计某会话在 [from, to] 闭区间内已登记的分块数。
+//
+// 只数不取，成因见 ListUploadChunksInRange：判定"到齐了没有"只需要数量，
+// 而校验值只有在确实到齐时才值得取回来（见 readyFiles 的两步做法）。
+func (s *Store) CountUploadChunksInRange(ctx context.Context, uploadID string, from, to int) (int, error) {
+	var n int
+	err := s.q.GetContext(ctx, &n,
+		s.q.Rebind(`SELECT COUNT(*) FROM upload_chunks WHERE upload_id = ? AND chunk_index >= ? AND chunk_index <= ?`),
+		uploadID, from, to)
+	if err != nil {
+		return 0, fmt.Errorf("store: 统计上传分块失败: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteUploadChunksInRange 删除某会话在 [from, to] 闭区间内的分块登记，返回删除条数。
+//
+// 用于作废"已登记但文件树对不上"的那部分登记（见 upload.go 的 healTreeMismatch）：
+// 作废后客户端把这些分块重传一遍即可自愈，不必整库重传。
+func (s *Store) DeleteUploadChunksInRange(ctx context.Context, uploadID string, from, to int) (int, error) {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`DELETE FROM upload_chunks WHERE upload_id = ? AND chunk_index >= ? AND chunk_index <= ?`),
+		uploadID, from, to)
+	if err != nil {
+		return 0, fmt.Errorf("store: 删除上传分块失败: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // ---------- audit ----------

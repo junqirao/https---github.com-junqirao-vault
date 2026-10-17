@@ -129,6 +129,7 @@ export {
   type SourceDirValue
 } from './features/repo/SourceDirPicker'
 export { RepoDetail, type RepoDetailProps } from './features/repo/RepoDetail'
+export { UploadTaskPage, type UploadTaskPageProps } from './features/repo/UploadTaskPage'
 export { LogViewer } from './features/logs/LogViewer'
 export { UserList } from './features/user/UserList'
 export { UserForm, type UserFormProps } from './features/user/UserForm'

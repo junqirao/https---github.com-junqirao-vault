@@ -12,8 +12,9 @@ import { PageShell } from '../../components/PageShell'
 import { StatusTag } from '../../components/StatusTag'
 import { usageColor } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
+import type { UploadState } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
-import { useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
+import { isActiveUpload, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { useAuth } from '../../hooks/useAuth'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
@@ -21,11 +22,30 @@ import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { RepoCard, RepoRow } from './RepoCards'
 import { RepoMountSettingsModal } from './RepoMountSettings'
+import { isPlaceholderRepoId, uploadPlaceholderRepo } from './uploadView'
 
 export interface RepoListProps {
   isSuperAdmin: boolean
   onCreate: () => void
   onOpen: (repoId: string) => void
+  /**
+   * 打开「上传任务」页：进行中的上传就以库的身份摆在列表里（见 RepoListEntry），
+   * 点它进这个页面看进度 / 取消。
+   *
+   * 可选：管理端看的是服务端全量库，本机上传与它无关，不传即不出现上传中的条目。
+   */
+  onOpenUpload?: (uploadId: string) => void
+}
+
+/**
+ * 列表里的一行：一个存储库，外加它此刻的上传进度（正在上传时才有）。
+ *
+ * 上传中的库**不另起一块区域**，就和其他库并排躺在同一个分组里，用同一套卡片零件渲染 ——
+ * 只有状态不同（真实反馈："就放在存储库那里展示，和其他存储库一样的样式，只是状态不同"）。
+ */
+interface RepoListEntry {
+  repo: RepoDTO
+  upload?: UploadState
 }
 
 /** 用户端展示形式：卡片网格（默认，一眼扫过多块盘）/ 整页宽度的列表（一库一行，便于横向比对）。 */
@@ -213,13 +233,14 @@ function RepoViewSwitch({
 
 interface RepoSectionProps {
   title: string
-  items: RepoDTO[]
+  items: RepoListEntry[]
   viewMode: RepoViewMode
   currentUserId: string
   /** 标题行右侧的附加内容（形态切换）；只由列表页交给第一个分组。 */
   headerExtra?: ReactNode
   onOpen: (repoId: string) => void
   onConfigure: (repo: RepoDTO) => void
+  onOpenUpload?: (uploadId: string) => void
 }
 
 /**
@@ -235,7 +256,8 @@ function RepoSection({
   currentUserId,
   headerExtra,
   onOpen,
-  onConfigure
+  onConfigure,
+  onOpenUpload
 }: RepoSectionProps): JSX.Element {
   const [page, setPage] = useState(1)
   const pageSize = PAGE_SIZE[viewMode]
@@ -252,16 +274,31 @@ function RepoSection({
       {title || headerExtra ? <RepoGroupHeader title={title} count={items.length} extra={headerExtra} /> : null}
       {viewMode === 'card' ? (
         <Row gutter={[spacing.md, spacing.md]}>
-          {visible.map((repo) => (
+          {visible.map(({ repo, upload }) => (
             <Col key={repo.id} xs={24} sm={12} xl={8} xxl={6}>
-              <RepoCard repo={repo} currentUserId={currentUserId} onOpen={onOpen} onConfigure={onConfigure} />
+              <RepoCard
+                repo={repo}
+                upload={upload}
+                onOpenUpload={onOpenUpload}
+                currentUserId={currentUserId}
+                onOpen={onOpen}
+                onConfigure={onConfigure}
+              />
             </Col>
           ))}
         </Row>
       ) : (
         <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
-          {visible.map((repo) => (
-            <RepoRow key={repo.id} repo={repo} currentUserId={currentUserId} onOpen={onOpen} onConfigure={onConfigure} />
+          {visible.map(({ repo, upload }) => (
+            <RepoRow
+              key={repo.id}
+              repo={repo}
+              upload={upload}
+              onOpenUpload={onOpenUpload}
+              currentUserId={currentUserId}
+              onOpen={onOpen}
+              onConfigure={onConfigure}
+            />
           ))}
         </Space>
       )}
@@ -308,7 +345,7 @@ function RepoListSkeleton({ viewMode }: { viewMode: RepoViewMode }): JSX.Element
 }
 
 /** 存储库列表：管理端表格；用户端卡片/列表两种形态（可切换 + 分组分页）。 */
-export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX.Element {
+export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload }: RepoListProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const { user } = useAuth()
@@ -356,12 +393,39 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
     return map
   }, [usersQuery.data])
 
-  const rows = useMemo(() => {
+  // 进行中的上传（本机代理的实时快照，含速率与 ETA）：它们就以库的身份混在列表里（见 entries）。
+  // 管理端不参与：上传是本机代理的行为，而它看的是服务端全量库。
+  const activeUploads = useMemo(
+    () => (isSuperAdmin || !onOpenUpload ? [] : agent.uploads.filter(isActiveUpload)),
+    [agent.uploads, isSuperAdmin, onOpenUpload]
+  )
+
+  const entries = useMemo<RepoListEntry[]>(() => {
     const items = reposQuery.data?.items ?? []
+    const byName = new Map(activeUploads.map((upload) => [upload.repo_name, upload]))
+
+    // 服务端已经有这个库（上传到了建库阶段）：用**服务端记录**承载上传进度，
+    // 这样点进去有真 id、状态也以服务端为准 —— 不另造一张同名卡片。
+    const merged: RepoListEntry[] = items.map((repo) => {
+      const upload = byName.get(repo.name)
+      // 仍然是 active 的库不算"上传中"：它此刻能正常挂载使用（这是重传覆盖还没轮到重建
+      // 母盘的场景），给它贴上「上传中」只会让人以为库不能用了 —— 这次覆盖上传的进度去
+      // 「上传任务」页看（新建页发起后就在那儿）。
+      return { repo, upload: upload && repo.state !== 'active' ? upload : undefined }
+    })
+
+    // 服务端还没有的（扫描 / 建会话 / 传数据三个阶段）：合成一条，让它和其他库一样出现在
+    // 列表里 —— 发起上传的人必须马上在列表里看到"这块库正在生成"。
+    const known = new Set(items.map((repo) => repo.name))
+    for (const upload of activeUploads) {
+      if (known.has(upload.repo_name)) continue
+      merged.push({ repo: uploadPlaceholderRepo(upload, user?.id ?? ''), upload })
+    }
+
     const lowered = keyword.trim().toLowerCase()
-    if (!lowered) return items
-    return items.filter((repo) => repo.name.toLowerCase().includes(lowered))
-  }, [reposQuery.data, keyword])
+    if (!lowered) return merged
+    return merged.filter((entry) => entry.repo.name.toLowerCase().includes(lowered))
+  }, [reposQuery.data, keyword, activeUploads, user?.id])
 
   const columns = useMemo<TableColumnsType<RepoDTO>>(() => {
     const base: TableColumnsType<RepoDTO> = [
@@ -414,7 +478,8 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
   const renderUserRepos = (): JSX.Element => {
     if (reposQuery.isLoading) return <RepoListSkeleton viewMode={viewMode} />
 
-    if (rows.length === 0) {
+    // 上传中的占位库已经算在 entries 里，所以这里不必再单独判一次"有没有在上传"。
+    if (entries.length === 0) {
       return (
         <EmptyState
           title={t('repo.empty')}
@@ -427,14 +492,15 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
     const userId = user?.id
     const sections = userId
       ? [
-          { key: 'owned', title: t('repo.group.owned'), items: rows.filter((repo) => repo.owner_id === userId) },
-          { key: 'joined', title: t('repo.group.joined'), items: rows.filter((repo) => repo.owner_id !== userId) }
+          { key: 'owned', title: t('repo.group.owned'), items: entries.filter((entry) => entry.repo.owner_id === userId) },
+          { key: 'joined', title: t('repo.group.joined'), items: entries.filter((entry) => entry.repo.owner_id !== userId) }
         ]
-      : [{ key: 'all', title: '', items: rows }]
+      : [{ key: 'all', title: '', items: entries }]
 
     return (
       <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
-        <QuotaOverview repos={rows} />
+        {/* 配额总览只认服务端的库：还没建成的上传中库不算"一个存储库"，也不占容量。 */}
+        <QuotaOverview repos={entries.filter((entry) => !isPlaceholderRepoId(entry.repo.id)).map((entry) => entry.repo)} />
         {sections
           .filter((section) => section.items.length > 0)
           .map((section, index) => (
@@ -451,6 +517,7 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
               headerExtra={index === 0 ? <RepoViewSwitch value={viewMode} onChange={changeView} /> : undefined}
               onOpen={onOpen}
               onConfigure={setSettingsRepo}
+              onOpenUpload={onOpenUpload}
             />
           ))}
       </Space>
@@ -484,7 +551,7 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen }: RepoListProps): JSX
       {isSuperAdmin ? (
         <DataTable<RepoDTO>
           columns={columns}
-          rows={rows}
+          rows={entries.map((entry) => entry.repo)}
           rowKey={(repo) => repo.id}
           loading={reposQuery.isLoading}
           empty={

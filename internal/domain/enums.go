@@ -48,10 +48,17 @@ const (
 	// 该状态下拒绝分配与挂载：池还没建好，让用户分配只会得到"没盘可用"，
 	// 而挂载会退回到"边挂边等建盘"的慢路径（那正是本状态想消除的体验）。
 	RepoStateCreating RepoState = "creating"
-	RepoStateActive   RepoState = "active"
-	RepoStateSealing  RepoState = "sealing"
-	RepoStateDeleting RepoState = "deleting"
-	RepoStateError    RepoState = "error"
+	// RepoStateImporting 上传中：本地目录上传的数据正在写入暂存、校验并构建母盘。
+	//
+	// 与 creating（异步预创建差异盘池）的区别是"数据都还没收完"：母盘要么不存在、
+	// 要么是不可用的半成品。和 creating 一样必须拒绝挂载与分配 —— 卡片上要能一眼看出
+	// 这个库还没准备好。此前上传期间库被直接写成 active，列表里显示正常、点挂载才报
+	// disk.not_ready，用户完全看不出它正在建。
+	RepoStateImporting RepoState = "importing"
+	RepoStateActive    RepoState = "active"
+	RepoStateSealing   RepoState = "sealing"
+	RepoStateDeleting  RepoState = "deleting"
+	RepoStateError     RepoState = "error"
 )
 
 // ParentCondition 母盘用途条件。

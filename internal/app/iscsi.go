@@ -53,6 +53,11 @@ const defaultChapSecretChars = 15
 type IscsiService struct {
 	Deps
 	Disks *DiskService
+	// backingWaitTimeout 覆盖"等底层盘就绪"的上限（零值 = awaitBackingTimeout）。
+	//
+	// 只用于测试注入：把 60 秒的真实预算压到毫秒级，才能覆盖"超时"与"跨多次轮询后成功"
+	// 两条分支，而不必让测试真的睡一分钟。生产装配不要设置它，否则等于出现了第二个真源。
+	backingWaitTimeout time.Duration
 }
 
 // targetIQN 返回该目标**应当下发给客户端**的 IQN：优先用下发/对账时读回并持久化的实际名字，
@@ -124,6 +129,14 @@ func (s *IscsiService) discoverActualTargetName(ctx context.Context, iqn, shortN
 			return name
 		}
 	}
+	return s.findTargetByShortName(ctx, shortName)
+}
+
+// findTargetByShortName 在全部目标里按"短名后缀"找（即 discoverActualTargetName 的降级路径）。
+//
+// 单独拆出来是为了让 readBackTarget 在**精确查刚刚失败过**之后不必再查一遍 —— 每次
+// ListTargets/GetTarget 都是一次 PowerShell，挂载路径上每次多查都是用户多等几秒。
+func (s *IscsiService) findTargetByShortName(ctx context.Context, shortName string) string {
 	targets, err := s.Iscsi.ListTargets(ctx)
 	if err != nil {
 		return ""
@@ -144,6 +157,28 @@ func (s *IscsiService) discoverActualTargetName(ctx context.Context, iqn, shortN
 		}
 	}
 	return ""
+}
+
+// readBackTarget 一次读回平台侧目标，同时给出"实际目标名"与"读到的那份详情"。
+//
+// 为什么合并成一次：这两个数据原先各读一次 GetTarget —— 在 Windows 上每次都是一次
+// PowerShell（实测 5~7 秒），而**首次挂载必然走到这里**（还没读回过），十几秒就白白叠在
+// 用户的等待里（预算见 agent 侧 longRequestTimeout / 服务端"挂载最坏路径"的账）。
+//
+// 返回 (nil, 降级找到的名字, err) 表示精确读回失败：详情只在精确读回成功时可用，
+// 此时不拿降级路径的数据去填诊断 —— 诊断要的是平台侧真实状态，给半份假数据比不给更坏。
+func (s *IscsiService) readBackTarget(ctx context.Context, iqn, shortName string) (*platform.TargetInfo, string, error) {
+	if s.Iscsi == nil {
+		return nil, "", nil
+	}
+	info, err := s.Iscsi.GetTarget(ctx, iqn)
+	if err != nil || info == nil {
+		return nil, s.findTargetByShortName(ctx, shortName), err
+	}
+	if actual := strings.TrimSpace(info.IQN); actual != "" {
+		return info, actual, nil
+	}
+	return info, strings.TrimSpace(info.Name), nil
 }
 
 // isRewrittenIQN 判断平台读回的**实际**目标名是否只是"我们下发的 IQN 被套进了平台自己的命名"。
@@ -595,6 +630,10 @@ func (s *IscsiService) ensureUserTarget(ctx context.Context, repo *domain.Reposi
 	unlock := s.Locks.Acquire(lock.TargetKey(target.TargetName))
 	defer unlock()
 
+	// 拿到锁后重读一次记账（同 Publish）：这个 target 也是锁外读出来的快照，而挂载路径可能
+	// 刚下发过同一份期望状态并写回指纹 —— 不重读就会把这次预创建的全量下发再付一遍 35 秒。
+	s.refreshAppliedFromStore(ctx, target)
+
 	iqn := target.IQN(s.iqnPrefix())
 	// 这里是整条预创建链路最慢的一步：Windows 上一次全量下发实测约 35 秒（见 IscsiService 说明）。
 	// 付一次就够 —— 期望状态与"已下发"记账都进了 DB，之后的每次挂载只是分发。
@@ -624,6 +663,10 @@ func (s *IscsiService) ensureUserTarget(ctx context.Context, repo *domain.Reposi
 }
 
 func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domain.IscsiTarget, error) {
+	// 挂载是客户端**同步等**的重活（等盘 + 下发 + 读回），整条路径的耗时直接决定用户等多久，
+	// 也决定它会不会撞上客户端超时（见 agent 侧 longRequestTimeout）。故这里记账并在末尾
+	// 汇总一条日志：下次"首次挂载又失败"时，一眼能看出时间花在等盘还是下发上。
+	started := time.Now()
 	alloc, err := s.Store.GetAllocation(ctx, allocationID)
 	if err != nil {
 		return nil, err
@@ -676,9 +719,14 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	if err := s.awaitBackingReady(ctx, disk); err != nil {
 		return nil, err
 	}
+	awaitDiskMs := time.Since(started).Milliseconds()
 
 	unlock := s.Locks.Acquire(lock.TargetKey(target.TargetName))
 	defer unlock()
+	// 拿到锁后重读一次下发记账：target 是锁外读的快照，而"预创建"（JobCreateDiff 结尾的
+	// prePublishTarget）可能刚下发过同一份期望状态并写回指纹 —— 不重读就会把这次挂载的
+	// 十几秒再付一遍（见 refreshAppliedFromStore 的说明）。
+	s.refreshAppliedFromStore(ctx, target)
 
 	iqn := target.IQN(s.iqnPrefix())
 
@@ -694,11 +742,13 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	// 实际 IQN 与诊断只在"刚下发过 / 还没读回过"时做：两者都要再起一次 PowerShell，
 	// 而分发路径（已下发且已读回）用落库的值就够了。
 	if pushed || strings.TrimSpace(target.ActualIQN) == "" {
-		// 读回平台侧**实际**的目标名，作为下发给客户端的 IQN。
+		// 一次读回，供两件事用：① 下发给客户端的**实际**目标名；② 排障用的实际状态。
 		//
-		// 以平台为准而不是以推导值为准：只要两者不一致，客户端就是"端口通、登录失败"。
-		// 读不到时回退到推导值并告警（不阻塞挂载，让排障有据）。
-		if found := s.discoverActualTargetName(ctx, iqn, target.TargetName); found != "" {
+		// 为什么合并成一次：原先这两件事各起一次 GetTarget（Windows 上一次 PowerShell 实测
+		// 5~7 秒），而首次挂载必然走到这里（还没读回过）—— 十几秒白白叠在用户的等待里，
+		// 正好是客户端超时的最后一段。
+		info, found, readErr := s.readBackTarget(ctx, iqn, target.TargetName)
+		if found != "" {
 			switch {
 			case strings.EqualFold(found, iqn):
 				// 平台原样保留，无需任何日志。
@@ -715,6 +765,8 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 			}
 			s.rememberActualIQN(ctx, target, found)
 		} else {
+			// 以平台为准而不是以推导值为准：只要两者不一致，客户端就是"端口通、登录失败"。
+			// 读不到时回退到推导值并告警（不阻塞挂载，让排障有据）。
 			s.Log.Warn("下发后读不回 iSCSI 目标（平台可能改写了目标名），按推导 IQN 下发",
 				"target", target.TargetName, "iqn", iqn)
 		}
@@ -725,14 +777,14 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 		// 只有这几项能定案：到底是被 Windows 改了名、没启用、还是 initiator 白名单拒绝
 		// （真实事故：目标明明 created+enabled+mapped，客户端仍连不上）。挂载失败时请贴这行。
 		// 按寻址名（iqn）读回——TargetIqn 是连接名，`-TargetName` 查不到它。
-		if info, err := s.Iscsi.GetTarget(ctx, iqn); err == nil && info != nil {
+		if info != nil {
 			s.Log.Info("iSCSI 目标实际状态",
 				"target", s.targetIQN(target),
 				"enabled", info.Enabled,
 				"initiators", strings.Join(info.Initiators, ","),
 				"mapped_devices", len(info.Devices))
 		} else {
-			s.Log.Warn("读回 iSCSI 目标状态失败", "target", iqn, "error", err)
+			s.Log.Warn("读回 iSCSI 目标状态失败", "target", iqn, "error", readErr)
 		}
 	}
 
@@ -748,6 +800,15 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 			return nil, err
 		}
 	}
+	// 一条总账：下次"首次挂载又失败"时先看这行 —— await_disk_ms 大 = 差异盘派生慢（或它在排
+	// 预创建的队），pushed=true 且 cost_ms 大 = 这次真的现场全量下发了。
+	s.Log.Info("挂载发布完成",
+		"allocation_id", allocationID,
+		"target", s.targetIQN(target),
+		"disk_id", disk.ID,
+		"pushed", pushed,
+		"await_disk_ms", awaitDiskMs,
+		"cost_ms", time.Since(started).Milliseconds())
 	s.audit(ctx, "", "iscsi.publish", "target:"+target.TargetName, "alloc="+allocationID, domain.AuditResultOK)
 	return target, nil
 }
@@ -1104,11 +1165,29 @@ func (s *IscsiService) buildTargetSpec(ctx context.Context, target *domain.Iscsi
 
 // 等待被发布磁盘就绪的参数。
 //
-// 取值理由：差异盘创建实测在百毫秒级（同一卷内建差异盘），因此正常情况下轮询一两次即返回；
-// 上限刻意压得比客户端请求超时（30s）短，避免"用户已经超时、服务端还在干等"。
+// 取值理由：差异盘派生正常在百毫秒级（同一卷内建差异盘），轮询一两次即返回；但**慢的时候
+// 会明显超过原来的 15 秒**，而慢恰恰是最该继续等的时候：
+//   - 派生任务与"回收存储库"共用 lock.RepoKey（派生要独占打开母盘），回收任务、别的客户端
+//     的派生一起排队时，任务可能几十秒都领不到锁；
+//   - 母盘被占用（杀毒/索引服务扫描）时 createDiffWithRetry 会原地退避重试。
+//
+// 原值 15s 的注释写的是"压得比客户端请求超时（30s）短"，但客户端早已把挂载申请单独放宽到
+// 2 分钟（见 internal/agent 的 mountRequestTimeout 与那条超时测试），15s 于是变成了**比
+// 客户端还没耐心**的一方：盘还在派生报 disk.not_ready，用户手动取消再挂一次却立刻成功
+// （真实反馈：第一次点挂载卡在"服务端正在准备磁盘中"，取消重挂才上去）—— 那一次是白等，
+// 盘恰恰是在 15 秒的窗口之后才好的。
+//
+// 60s 的来历：客户端挂载申请上限 2 分钟，其中首次全量下发 iSCSI 目标实测约 35 秒，
+// 留给"等盘"的预算 = 2 分钟 − 35 秒 − 余量 ≈ 60 秒。等满仍未就绪才认输，返回可重试的
+// disk.not_ready。
 const (
-	awaitBackingTimeout      = 15 * time.Second
+	awaitBackingTimeout      = 60 * time.Second
 	awaitBackingPollInterval = 200 * time.Millisecond
+	// awaitBackingSlowLogInterval 是等待期间打点日志的间隔。
+	//
+	// 盘迟迟不就绪意味着"用户正在干等"，日志必须留下它等了多久、卡在哪个状态：
+	// 否则事后只剩一行超时，分不清是任务排队、母盘被占用，还是盘已经被删了。
+	awaitBackingSlowLogInterval = 5 * time.Second
 )
 
 // awaitBackingReady 有限等待磁盘创建完成（状态 ready 且底层盘确实存在）。
@@ -1117,13 +1196,18 @@ const (
 // 就绪即返回；超时返回**可重试**的 disk.not_ready（409），而不是把一个"文件不存在"的
 // 脚本错误包装成 platform.ps_failed 500 —— 后者会让用户以为出了硬故障。
 //
+// 等待预算见 awaitBackingTimeout 的说明：它必须比客户端更有耐心，否则表现就是"第一次挂载
+// 报错、手动重挂一次就成功"（重挂时盘刚好已经好了）。
+//
 // 平台未装配磁盘后端时（单元测试等）直接放行，保持既有行为。
 func (s *IscsiService) awaitBackingReady(ctx context.Context, disk *domain.Disk) error {
 	// 未装配存储（单元测试）时无从查询状态，保持既有行为直接放行。
 	if s.Store == nil || disk == nil || disk.ID == "" {
 		return nil
 	}
-	deadline := time.Now().Add(awaitBackingTimeout)
+	started := time.Now()
+	deadline := started.Add(s.backingWaitLimit())
+	lastLog := started
 	for {
 		if d, err := s.Store.GetDisk(ctx, disk.ID); err == nil {
 			disk = d
@@ -1135,23 +1219,38 @@ func (s *IscsiService) awaitBackingReady(ctx context.Context, disk *domain.Disk)
 			//
 			// 卸载（LeaseService.Release）后磁盘**保持 published**——这是刻意的：
 			// 目标继续发布，客户端可以再次挂载。而 published 蕴含"盘已建好且已发布成功"，
-			// 是 ready 的超集。只认 ready 会让"卸载后再挂载"每次白等 15 秒，
+			// 是 ready 的超集。只认 ready 会让"卸载后再挂载"每次白等一整个等待预算，
 			// 然后报 disk.not_ready（用户看到的就是这个，且 100% 复现）。
 			if s.Disk != nil && !s.Disk.Exists(disk.VHDXPath) {
 				// 状态说就绪但文件不在：交给后续步骤报明确错误，这里不空等。
 				return apperr.DiskNotFound().WithArg("id", disk.ID)
 			}
+			if waited := time.Since(started); waited >= awaitBackingSlowLogInterval {
+				// 等过一段时间的都要记账：正常路径（盘早已就绪）不该留下这行，
+				// 它一旦出现就说明派生被排队/被占用，是"用户干等了一回"的证据。
+				s.Log.Info("等到了差异盘就绪", "disk_id", disk.ID, "waited_ms", waited.Milliseconds())
+			}
 			return nil
 		case domain.DiskStateError:
 			// 建盘已彻底失败（状态由 MarkCreateFailed 回滚写入）：立刻给出确定结论，
-			// 既不白等 15 秒，也不用"仍在创建中，请稍后重试"误导用户。
+			// 既不白等，也不用"仍在创建中，请稍后重试"误导用户。
 			return apperr.DiskCreateFailed().WithArg("disk_id", disk.ID)
 		}
 
-		if !time.Now().Before(deadline) {
+		now := time.Now()
+		if !now.Before(deadline) {
 			return apperr.DiskNotReady().
 				WithArg("disk_id", disk.ID).
-				WithArg("state", string(disk.State))
+				WithArg("state", string(disk.State)).
+				// 等待时长必须带上：事后判断"是派生在排队、还是盘根本没建"全靠它，
+				// 也能区分"刚点就报"与"等满预算才报"两种完全不同的现场。
+				WithArg("waited_ms", now.Sub(started).Milliseconds())
+		}
+		if now.Sub(lastLog) >= awaitBackingSlowLogInterval {
+			lastLog = now
+			s.Log.Info("仍在等待差异盘就绪",
+				"disk_id", disk.ID, "state", string(disk.State),
+				"waited_ms", now.Sub(started).Milliseconds())
 		}
 		select {
 		case <-ctx.Done():
@@ -1159,6 +1258,17 @@ func (s *IscsiService) awaitBackingReady(ctx context.Context, disk *domain.Disk)
 		case <-time.After(awaitBackingPollInterval):
 		}
 	}
+}
+
+// backingWaitLimit 返回本次"等盘"的上限。
+//
+// 零值即生产行为（awaitBackingTimeout）；只有测试会注入更短的值来覆盖超时分支 ——
+// 让 60 秒的真实预算能在毫秒级被测到，而不必让测试真的睡一分钟。
+func (s *IscsiService) backingWaitLimit() time.Duration {
+	if s.backingWaitTimeout > 0 {
+		return s.backingWaitTimeout
+	}
+	return awaitBackingTimeout
 }
 
 // pushTarget 把 DB 中的目标配置下发给平台后端（enabled 由调用方给出）。
@@ -1239,6 +1349,30 @@ func (s *IscsiService) markApplied(ctx context.Context, target *domain.IscsiTarg
 	}
 	target.AppliedFingerprint = fp
 	target.AppliedAt = time.Now().UnixMilli()
+}
+
+// refreshAppliedFromStore 在**拿到目标锁之后**重新读一次这块目标的下发记账与实际名。
+//
+// 为什么必须重读：调用方手里的 target 是**锁外**读出来的快照，而同一个目标上"预创建"
+// （JobCreateDiff 结尾的 prePublishTarget）与"挂载"（Publish）会几乎同时走到下发这一步。
+// 先到的一方在锁内下发并写回指纹，后到的一方若仍用旧快照判断，就会把同一份期望状态
+// **再下发一遍**（Windows 实测 15~35 秒）。首次挂载恰好必然撞上这个窗口：差异盘刚派生完、
+// 预创建正在收尾 —— 日志形态就是"已建立 iSCSI 映射 skipped（映射已存在）+ 又更新一次目标"，
+// 而这几秒正是客户端超时的最后一段（真实工单：首次挂载失败，手动重挂立刻成功）。
+//
+// 只同步参与判据的三个字段（指纹 / 下发时刻 / 实际名）：其余字段以调用方自己的写为准。
+// 读失败只静默返回 —— 最坏回到老行为（多下发一次），不该让一次刷新失败变成挂载失败。
+func (s *IscsiService) refreshAppliedFromStore(ctx context.Context, target *domain.IscsiTarget) {
+	if s == nil || s.Store == nil || target == nil || target.ID == "" {
+		return
+	}
+	fresh, err := s.Store.GetIscsiTarget(ctx, target.ID)
+	if err != nil || fresh == nil {
+		return
+	}
+	target.AppliedAt = fresh.AppliedAt
+	target.AppliedFingerprint = fresh.AppliedFingerprint
+	target.ActualIQN = fresh.ActualIQN
 }
 
 // clearApplied 抹掉下发记账（平台侧目标已被拆除或被判定为漂移），下次必须重新下发。

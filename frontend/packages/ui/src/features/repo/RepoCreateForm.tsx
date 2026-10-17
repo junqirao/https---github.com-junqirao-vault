@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button, Col, Form, Input, InputNumber, Progress, Row, Select, Space, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -13,10 +13,11 @@ import { useApi } from '../../api/provider'
 import type { CreateRepoRequest, RepoDTO, RepoMode, StorageDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
 import { useServerConfig } from '../../hooks/useServerConfig'
-import { useI18n, type I18nApi } from '../../i18n'
+import { useI18n } from '../../i18n'
 import { CAPACITY_UNIT, capacityNormalize, capacityValueProps, formatBytes } from '../../utils/format'
 import { fontSize, palette, spacing } from '../../tokens/palette'
 import { SourceDirPicker, type SourceDirValue } from './SourceDirPicker'
+import { UploadCurrentFile, UploadMeta, UploadNotice, uploadPercent, uploadStageText } from './uploadView'
 
 export interface RepoCreateFormProps {
   isSuperAdmin: boolean
@@ -68,6 +69,8 @@ export function RepoCreateForm({
   const [sourceDirValid, setSourceDirValid] = useState(true)
   const [upload, setUpload] = useState<UploadState | null>(null)
   const { uploads, refreshUploads } = useAgent()
+  // 上一次**由源目录自动写入**的库名，用来判断"这个名字还是不是我填的"（见 autoFillName）。
+  const autoNameRef = useRef('')
 
   const usersQuery = useQuery({
     queryKey: ['users', 'options'],
@@ -151,6 +154,26 @@ export function RepoCreateForm({
     void queryClient.invalidateQueries({ queryKey: ['me'] })
   }, [tracked?.state, queryClient])
 
+  /**
+   * 选了源目录就顺手把库名填上（真实反馈："从文件创建库会自动填写库名为目录名"）。
+   *
+   * 为什么该自动：拿一个目录建库的人，十有八九就是想把那个目录做成同名库，名字几乎总是
+   * 最后一段目录名。还要他先选目录、再回头敲一遍同样的几个字，纯属白费 —— 而且顺序反过来
+   * （先起名、后选目录）同样常见，所以两种顺序都得能自动补上。
+   *
+   * 为什么只在"名字是空的 / 还停在我上次自动填的那个值"时才写：用户手改过的名字是他的，
+   * 换个目录就覆盖等于把他刚打的字吃掉。他一旦改过，这个名字就归他，此后换目录不再动它。
+   */
+  const autoFillName = (changed: Partial<RepoFormValues>): void => {
+    if (!('source_dir' in changed)) return
+    const picked = repoNameFromPath(changed.source_dir?.path ?? '')
+    if (!picked) return
+    const current = form.getFieldValue('name') as string | undefined
+    if (current && current !== autoNameRef.current) return
+    autoNameRef.current = picked
+    form.setFieldValue('name', picked)
+  }
+
   const submit = async (): Promise<void> => {
     const values = await form.validateFields()
     setError(null)
@@ -162,6 +185,10 @@ export function RepoCreateForm({
         repo_mode: values.mode,
         storage_id: values.storage_id || undefined,
         // 不传 quota_bytes：库没有"配额"，建库只需要**容量**（容量即它占用的配额）。
+        //
+        // 但共享磁盘限制要传：它随上传会话的清单一起存下来，服务端在上传结束建库时写进库配置，
+        // 不传的话这条路径建出来的库会丢掉用户填的限制（服务端建库那条路径是直接建库，不存在这个问题）。
+        diff_disk_limit_bytes: values.diff_disk_limit_bytes,
         source_mode: 'copy',
         // 存储 ID 只对**它所属的那台**服务端有意义：多服务端下必须说清建到哪台。
         server_key: active?.key,
@@ -192,8 +219,11 @@ export function RepoCreateForm({
           <Form
             form={form}
             layout="vertical"
-            initialValues={{ mode: 'shared', max_diff_disks: 1 }}
-            onValuesChange={(_changed, values) => setExclusive(values.mode === 'exclusive')}
+            initialValues={{ mode: 'shared', max_diff_disks: 1, diff_disk_limit_bytes: 0 }}
+            onValuesChange={(changed, values) => {
+              setExclusive(values.mode === 'exclusive')
+              autoFillName(changed)
+            }}
             style={{ maxWidth: 880 }}
           >
             <Row gutter={16}>
@@ -313,6 +343,33 @@ export function RepoCreateForm({
                 </Form.Item>
               </Col>
               <Col span={12}>
+                {/*
+                  共享磁盘限制 = 每块差异盘（每个共享者手里那块盘）**允许**的容量，也是它计入配额的量。
+                  差异盘只装差异数据、实际写入往往只有几十兆，按母盘容量整份记账会把共享者的配额
+                  一次吃光（30G 的库分给 5 个人 = 每人扣 30G），所以这里默认 0（不限制）、
+                  想省配额的人填一个够用的小值即可。
+
+                  单位与容量字段一致（M，见 CAPACITY_UNIT / capacityValueProps）：同一个表单里
+                  两个容量输入框不该用两种单位。
+                */}
+                <Form.Item
+                  name="diff_disk_limit_bytes"
+                  label={t('field.diffDiskLimit')}
+                  extra={
+                    exclusive ? t('repo.create.diffDiskLimitExclusive') : t('repo.create.diffDiskLimitHint')
+                  }
+                  getValueProps={capacityValueProps}
+                  normalize={capacityNormalize}
+                >
+                  <InputNumber
+                    min={0}
+                    disabled={exclusive}
+                    addonAfter={CAPACITY_UNIT}
+                    style={{ width: '100%' }}
+                  />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
                 <Form.Item name="source_dir" label={t('field.sourceDirOptional')}>
                   <SourceDirPicker onValidityChange={setSourceDirValid} />
                 </Form.Item>
@@ -336,6 +393,23 @@ export function RepoCreateForm({
   )
 }
 
+/** 库名长度上限：与名称输入框的 maxLength 一致（服务端只要求非空，长度在这里把关）。 */
+const REPO_NAME_MAX_LEN = 64
+
+/**
+ * 从源目录路径取库名：最后一段目录名，例如 `D:\data\photos` 与 `/srv/data/photos` 都得 `photos`。
+ *
+ * 同时兼容 Windows 反斜杠与 POSIX 斜杠（服务端目录与本地目录都可能出现在这一个输入里），
+ * 并忽略尾随分隔符 —— 路径常是从地址栏或资源管理器里抄来的，尾巴上带不带 `\` 不由我们决定。
+ * 取不出名字时返回空串（根路径 `D:\`、`/`、以及 `.` / `..` 这种没有名字的段），调用方据此不填。
+ */
+function repoNameFromPath(path: string): string {
+  const parts = path.split(/[\\/]/).filter((part) => part !== '')
+  const last = (parts[parts.length - 1] ?? '').trim()
+  if (last === '.' || last === '..') return ''
+  return last.length > REPO_NAME_MAX_LEN ? last.slice(0, REPO_NAME_MAX_LEN) : last
+}
+
 /** 组装服务端建库请求：仅服务端目录作为 source_dir 传给 /v1/repos。 */
 function buildCreatePayload(values: RepoFormValues, source: SourceDirValue | undefined): CreateRepoRequest {
   const payload: CreateRepoRequest = {
@@ -345,30 +419,11 @@ function buildCreatePayload(values: RepoFormValues, source: SourceDirValue | und
     storage_id: values.storage_id,
     size_bytes: values.size_bytes,
     max_diff_disks: values.max_diff_disks,
+    diff_disk_limit_bytes: values.diff_disk_limit_bytes,
     group: values.group
   }
   if (source?.kind === 'server' && source.path) payload.source_dir = source.path
   return payload
-}
-
-/** 上传阶段文案。 */
-function stageText(t: I18nApi['t'], state: UploadStatus): string {
-  switch (state) {
-    case 'scanning':
-      return t('upload.stage.scanning')
-    case 'creating':
-      return t('upload.stage.creating')
-    case 'uploading':
-      return t('upload.stage.uploading')
-    case 'completing':
-      return t('upload.stage.completing')
-    case 'done':
-      return t('upload.done')
-    case 'failed':
-      return t('upload.failed')
-    case 'canceled':
-      return t('disk.copy.canceled')
-  }
 }
 
 /** 本地目录上传进度面板（替代表单区域，不跳转页面）。 */
@@ -385,8 +440,6 @@ function UploadPanel({
 }): JSX.Element {
   const { t } = useI18n()
   const active = ACTIVE_UPLOAD_STATES.includes(upload.state)
-  const percent =
-    upload.total_bytes > 0 ? Math.min(100, Math.round((upload.uploaded_bytes / upload.total_bytes) * 100)) : 0
 
   return (
     <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
@@ -398,20 +451,22 @@ function UploadPanel({
         {upload.local_dir}
       </Typography.Text>
       <Progress
-        percent={percent}
+        percent={uploadPercent(upload)}
         status={upload.state === 'failed' ? 'exception' : active ? 'active' : 'normal'}
       />
       <Space size={spacing.sm} wrap>
-        <Typography.Text type="secondary">
-          {`${formatBytes(upload.uploaded_bytes)} / ${formatBytes(upload.total_bytes)}`}
-        </Typography.Text>
-        <Typography.Text type="secondary">{stageText(t, upload.state)}</Typography.Text>
+        <Typography.Text type="secondary">{uploadStageText(t, upload.state)}</Typography.Text>
         {active ? (
           <Button type="link" size="small" danger loading={canceling} onClick={onCancel}>
             {t('upload.cancel')}
           </Button>
         ) : null}
       </Space>
+      {/* 与「上传任务」页共用同一份元信息（已传/总量 · 速度 · 预计剩余 · 文件 · 分块）：
+          新建页是"刚发起的任务"、任务页是"回头查看同一件事"，两处口径必须一致。 */}
+      <UploadMeta upload={upload} />
+      <UploadCurrentFile upload={upload} style={{ display: 'block' }} />
+      <UploadNotice upload={upload} style={{ display: 'block' }} />
       {upload.state === 'done' ? (
         <Space size={spacing.sm} wrap>
           <Typography.Text type="success">{t('upload.done')}</Typography.Text>

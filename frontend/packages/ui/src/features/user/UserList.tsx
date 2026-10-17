@@ -14,11 +14,10 @@ import { useI18n } from '../../i18n'
 import { formatBytes, formatTime } from '../../utils/format'
 import { roleLabel } from '../../utils/labels'
 import { IssuedCertificateModal } from './IssuedCertificateModal'
-import { UserEnrollmentModal } from './UserEnrollmentModal'
 import { UserCertificates } from './UserCertificates'
 import { UserForm } from './UserForm'
 
-/** 用户管理（管理员）：列表 / 新建 / 编辑 / 删除 / 签发注册令牌 / 证书。 */
+/** 用户管理（管理员）：列表 / 新建 / 编辑 / 删除 / 证书。 */
 export function UserList(): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
@@ -29,7 +28,6 @@ export function UserList(): JSX.Element {
   const [formOpen, setFormOpen] = useState(false)
   const [editing, setEditing] = useState<UserDTO | null>(null)
   const [pendingDelete, setPendingDelete] = useState<UserDTO | null>(null)
-  const [enrollUser, setEnrollUser] = useState<UserDTO | null>(null)
   const [certUser, setCertUser] = useState<UserDTO | null>(null)
   const [issuedCert, setIssuedCert] = useState<IssuedCertificateDTO | null>(null)
 
@@ -91,9 +89,6 @@ export function UserList(): JSX.Element {
               }}
             >
               {t('common.edit')}
-            </Button>
-            <Button type="link" size="small" onClick={() => setEnrollUser(user)}>
-              {t('action.enrollment')}
             </Button>
             <Button type="link" size="small" onClick={() => setCertUser(user)}>
               {t('user.certificates.title')}
@@ -159,7 +154,6 @@ export function UserList(): JSX.Element {
         }}
       />
 
-      <UserEnrollmentModal open={enrollUser !== null} userId={enrollUser?.id} onClose={() => setEnrollUser(null)} />
       <UserCertificates open={certUser !== null} userId={certUser?.id} onClose={() => setCertUser(null)} />
       <IssuedCertificateModal
         open={issuedCert !== null}

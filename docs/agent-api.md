@@ -636,13 +636,27 @@ DELETE /agent/uploads/{upload_id}
   # 取消会停止上传并**尽力**调用服务端 DELETE /v1/uploads/{id} 放弃会话（清理服务端暂存），
   # 同时删除本地续传记录。
 
+POST /agent/uploads/{upload_id}/pause
+POST /agent/uploads/{upload_id}/resume
+  ↑ {ok:true}                                    # 暂停 / 恢复分块上传；幂等（不存在也返回 ok）
+  # 暂停只停住"继续发下一块"：在飞的那几块跑完就停（分块 PUT 发出去就无法中断），服务端会话、
+  # 已传分块、本地续传记录一律保留，resume 从断点接着传，不必重新握手。
+  # 用 POST 而不是 PUT：请求由主进程代发，它按方法放行（PUT 会被挡下）。
+  # 处于 completing（服务端建库）时暂停不生效 —— 那一刻字节已经传完，干活的是服务端。
+
 UploadState = {
   upload_id,                                     # 服务端上传会话 ID（scanning 阶段可能为空）
   repo_name, local_dir,
   state:"scanning"|"creating"|"uploading"|"completing"|"done"|"failed"|"canceled",
+  paused,                                        # true = 用户暂停了（state 不变；省略即未暂停）
   total_files, total_bytes, uploaded_bytes,
   chunk_total, chunk_done,
+  files_total, files_done,                       # 已逐个校验通过的文件数 N / 会进校验的文件总数 M
+  current_file,                                  # 此刻正在读取/上传的文件（相对路径；未知时省略）
+  speed_bytes_per_sec,                           # 实时速率（字节/秒，客户端按采样窗口+指数平滑算）
+  eta_seconds,                                   # 预计剩余秒数（0 = 不可估算或已传完，界面显示 "--"）
   job_id,                                        # 建库任务 ID（completing 起）
+  build_progress,                                # 服务端建库任务进度 0~100（仅在 completing 有意义）
   repo_id,                                       # 建库成功后按名称反查得到（拿不到时省略）
   error,                                         # 稳定错误码字符串（如 agent.upload_failed / agent.scan_empty）
   started_at, finished_at                        # 毫秒时间戳
@@ -662,14 +676,39 @@ UploadState = {
 - **分块**：从本地文件按**全局偏移量**读取 `[index*8MiB, min(...))` 区间拼成一个 8MiB 缓冲
   （可跨多个文件，用 `sync.Pool` 复用），计算 SHA256（小写 hex）后 PUT；请求头 `X-Chunk-SHA256` 必填，
   除最后一块外必须恰好 8MiB。
+- **逐文件校验进度**：服务端**不等到 complete 才校验**，而是每收满一个文件覆盖的全部分块就立刻回报
+  （PUT 响应里的 `files_done`），客户端累加进 `files_done`（按路径去重，避免重传/自愈重传时重复计数，
+  并以 `files_total` 为上限夹住）。`files_total` 只数**非空文件**：空文件不占拼接流、也没有任何分块
+  会写到它们（由服务端在 complete 补建），把它们算进分母会让进度永远差几格。
+  `current_file` 取自"刚读出这块所属的文件"（二分定位），用于界面展示"当前处理中的文件"；
+  4 路并发下它是"最近开始处理的那一个"，刻意不做更精细的协调。
+- **续传起点**：`GET /v1/uploads/{id}` 的 `files_done` 用作 N 的起点。已传完的文件不会再重传、
+  也就不会再收到逐块回报，从 0 重数会让界面上的进度当场倒退（用户看到的是"白传了"）。
 - **重试**：单块最多尝试 5 次，退避 1s/2s/4s/8s（可被取消打断）。可重试：429、5xx、网络错误、读超时；
   不可重试：4xx 确定性错误与上下文取消。
 - **续传**：把 `{upload_id, local_dir, repo_name, total_bytes, total_files, started_at, 选项}` 持久化到
   `<DataDir>/uploads.json`（临时文件 + `MoveFileEx` 原子替换）。再次 `start` 时若存在**同一 local_dir +
   repo_name** 的未完成会话，且服务端 `GET /v1/uploads/{id}` 仍报未完成、且总大小/文件数与本地一致，
-  则复用该 `upload_id` 并从 `missing_chunks` 继续（不重传已完成的块）。会话已终态或本地内容已变化时，
-  丢弃记录并新建会话；服务端不可达时明确失败（不静默新建）。
+  则复用该 `upload_id` 并从 `missing_chunks` 继续（不重传已完成的块）。会话已终态（`complete`/`aborted`/
+  `failed`）或本地内容已变化时，丢弃记录并新建会话；服务端不可达时明确失败（不静默新建）。
+- **按名字续传（本地记录不参与）**：`POST /v1/uploads` 的响应带 `reused` / `files_done`。服务端在**上传开始时**
+  会清掉同名残留（上次失败留下的库/会话/暂存），并把"同名且内容一致"的未完成会话直接还回来：
+  这种情况下 `missing_chunks` 只是"还缺的那几块"，进度要从返回的 `files_done` 起算，而不是 0
+  （否则界面上的"已校验 N/M"会当场倒退）。因此**本地记录丢失、换机器、上次失败**都能续上，
+  `uploads.json` 只是省一次往返的快路径。`overwrote_repo=true` 表示服务端接管了同名存储库
+  （残骸已清掉、或空壳库由其就地重建），日志按 WARN 记一条即可。
+- **名字被占时的失败语义**：只有当同名库**不是本人的**、或**正在被使用**（活跃租约/已挂载/已分配过盘）
+  时服务端才拒绝，返回 409 `repo.upload_conflict`（`reason` 给出具体原因）。这是确定性错误：
+  不重试、直接把 `err.repo.upload_conflict` 展示给用户（"改名上传或先删库"）。
+- **`completing` 不是"校验"**：校验在上传过程中已经逐块逐文件做完（见上），`POST /complete` 只核对。
+  这一段真正在跑的是服务端建库 —— 把刚上传的整棵树**再写一份**进新建的虚拟盘（30G 的库就是 30G 的
+  读 + 30G 的写），几十分钟起步。客户端把服务端任务的 `progress` 透传为 `build_progress` 并推给界面
+  （只在数值变化时推），界面据此显示"写入母盘 N%"；把 `progress` 丢掉的话，用户看到的就是
+  "100% + 校验中"钉死几十分钟（真实反馈："上传 30G 等了半小时，以为卡死了"）。
 - **move 语义**：**仅**在服务端建库任务成功完成后删除本地源目录（删除前记 INFO 日志）；失败/取消**绝不删**。
+- **暂停语义**：`paused` 是独立于 `state` 的标志位 —— 暂停不改阶段，只是停住推进（`state` 仍为
+  `uploading`，速度/ETA 归零，界面据此把按钮翻成「继续」）。恢复后从断点接着传；暂停期间取消也
+  照常生效（等待中的那块会被 ctx 唤醒并退出）。
 - **取消语义**：进程退出等上下文取消 → 停止上传、保留服务端会话与已传分块（可续传），推送 `canceled`；
   显式 `DELETE /agent/uploads/{id}` → 除上述外，尽力调用服务端 DELETE 放弃会话并删除续传记录。
   例外：完成建库任务**已提交**（状态 `completing`）后取消，**不再**调用服务端 DELETE——
@@ -940,7 +979,7 @@ POST /agent/shutdown       ↑ {ok:true}   # 托盘"退出"使用；代理会先
 | `agent.busy_mounts` | 有活跃挂载，操作被拒（409） |
 | `agent.not_mounted` | 指定分配当前未挂载（404） |
 | `agent.server_unreachable` | 无法连接服务端（502） |
-| `agent.server_timeout` | 服务端未在超时内响应（504，args.timeout_seconds）。**与上一行的区别**：挂载申请等服务端同步重活超时用此码，避免把"服务端还在干活"误报成"连不上"（挂载申请超时为 2 分钟） |
+| `agent.server_timeout` | 服务端未在超时内响应（504，args.timeout_seconds）。**与上一行的区别**：挂载申请等服务端同步重活超时用此码，避免把"服务端还在干活"误报成"连不上"（挂载申请超时为 3 分钟） |
 | `agent.download_failed` | 母盘下载失败（500，args.stage 指明阶段，如 download_body / verify_size / resume_range） |
 | `agent.web_update_failed` | 渲染层资源热更失败（500，args.stage 指明阶段，如 extract / activate / activate_pointer） |
 | `update.not_available` | 当前没有可用更新（409；渲染层热更无 `client_web` 产物时也会以该码写入 `web_update.error`） |

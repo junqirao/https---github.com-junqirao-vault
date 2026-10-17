@@ -81,17 +81,65 @@ type UploadState struct {
 	RepoName      string `json:"repo_name"`
 	LocalDir      string `json:"local_dir"`
 	State         string `json:"state"`
-	TotalFiles    int    `json:"total_files"`
+	// Paused 为 true 表示用户把这个上传暂停了（State 不变，仍是 uploading）。
+	//
+	// 为什么不把暂停做成一个 UploadStatus 取值：暂停说的是"任务还在，只是停住了"，阶段
+	// 并没有变。把它塞进 State，每一个读 State 的地方（是否进行中、能否取消、标签文案）
+	// 都得多认一个取值，而它们要的答案一个字都没变。
+	Paused     bool `json:"paused,omitempty"`
+	TotalFiles int  `json:"total_files"`
 	TotalBytes    int64  `json:"total_bytes"`
 	UploadedBytes int64  `json:"uploaded_bytes"`
 	ChunkTotal    int    `json:"chunk_total"`
 	ChunkDone     int    `json:"chunk_done"`
+	// FilesTotal / FilesDone 是"已逐个校验通过的文件"进度（M 与 N）。
+	//
+	// 为什么在字节与分块之外再报一对文件计数：分块数只说明"字节搬了多少"，用户真正关心的是
+	// "哪些文件已经稳稳落盘并校验通过"。服务端每收满一个文件覆盖的全部分块就回报一次
+	// （见 app.UploadService.PutChunk 的 FilesDone），客户端累加后在这里露出。
+	//
+	// FilesTotal 是**会进入校验的文件数**（非空文件，见 transferFileCount）：空文件不占拼接流，
+	// 提前把它们算进 M 会让进度永远差几格。
+	FilesTotal int `json:"files_total"`
+	FilesDone  int `json:"files_done"`
+	// CurrentFile 是此刻正在读取/上传的那个文件（相对源目录的斜杠路径）；空表示尚不可知。
+	//
+	// 4 路并发下它必然只是"最近开始处理的那一个"，但界面要的是"库在动、动到哪了"的实感 ——
+	// 为此引入更精细的协调（比如列出全部在传文件）不值得。
+	CurrentFile string `json:"current_file,omitempty"`
+	// Notice 是一条"值得让用户知道、但不算失败"的提示码（见 uploadNotice* 常量）。
+	//
+	// 为什么要露出来：上传开始时服务端会清掉同名残留、或者接管一个同名库重建
+	// （见 app.UploadService.prepareUploadName）。这些动作会**改变服务端已有的东西**，
+	// 静默做完对用户不公平 —— "上次失败那次的痕迹被清掉了 / 同名库正在被重建"必须看得见。
+	// 传的是码不是句子：文案要跟着界面语言走（前端 uploadNoticeText）。
+	Notice string `json:"notice,omitempty"`
+	// BuildProgress 是服务端建库任务的进度（0~100，只在 completing 阶段有意义）。
+	//
+	// 为什么要单独一个字段而不是把它并进字节进度：上传的字节数在提交建库的那一刻就已经满了
+	// （进度条 100%），而建库是**另一件活**——把刚上传的整棵树再写一份进新建的虚拟盘，
+	// 30G 的库就是 30G 的读 + 30G 的写。以前客户端只盯任务状态、把这个进度丢掉，
+	// 用户看到的就是"100% + 校验中"钉死几十分钟（真实反馈：上传 30G，等了半小时）。
+	BuildProgress int    `json:"build_progress,omitempty"`
 	JobID         string `json:"job_id,omitempty"`
 	RepoID        string `json:"repo_id,omitempty"`
 	Error         string `json:"error,omitempty"`
 	StartedAt     int64  `json:"started_at"`
 	FinishedAt    int64  `json:"finished_at,omitempty"`
+	// SpeedBytesPerSec 是最近一次采样算出的传输速率（字节/秒）；0 表示尚不可估算。
+	//
+	// 由客户端按"两次采样之间的区间速率 + 指数平滑"算出（见 uploadProgress.sample），
+	// 供上传任务页展示实时速度与 ETA —— 服务端并不知道客户端的实际吞吐。
+	SpeedBytesPerSec int64 `json:"speed_bytes_per_sec,omitempty"`
+	// EtaSeconds 是预计剩余秒数；0 表示不可估算或已传完（前端显示 "--"）。
+	EtaSeconds int64 `json:"eta_seconds,omitempty"`
 }
+
+// 上传提示码（UploadState.Notice 的取值）。前端按码取本地化文案（uploadNoticeText）。
+const (
+	// uploadNoticeRepoOverwritten：同名存储库已存在，本次上传会覆盖重建它。
+	uploadNoticeRepoOverwritten = "repo_overwritten"
+)
 
 // uploadStartRequest 是 POST /agent/uploads/start 的请求体。
 type uploadStartRequest struct {
@@ -103,6 +151,10 @@ type uploadStartRequest struct {
 	StorageID string `json:"storage_id"`
 	// QuotaBytes 应用层配额；0=不限。
 	QuotaBytes int64 `json:"quota_bytes"`
+	// DiffDiskLimitBytes 共享磁盘限制：建出来的库每块差异盘允许的容量；0=不限。
+	//
+	// 透传给服务端（随上传会话清单持久化），建库时写进库配置。
+	DiffDiskLimitBytes int64 `json:"diff_disk_limit_bytes"`
 	// SourceMode copy | move；留空默认 copy。move 仅在服务端建库成功后删除本地源目录。
 	SourceMode string `json:"source_mode"`
 	// ServerKey / ServerURL 指明把库建到**哪台**服务端（多服务端下应带上）。
@@ -119,6 +171,8 @@ type uploadSessionPlan struct {
 	totalBytes int64
 	missing    []int
 	reused     bool
+	// filesDone 是服务端已校验通过的文件数（续传起点，见 app.UploadStatus.FilesDone）。
+	filesDone int
 }
 
 // ---- 任务管理（内存态 + 续传记录） ----
@@ -135,6 +189,13 @@ type uploadTask struct {
 	mu     sync.Mutex
 	state  UploadState
 	cancel context.CancelFunc
+	// paused 为 true 表示用户要求暂停：分块发送循环会在检查点等 gate 被关闭。
+	paused bool
+	// gate 是暂停的闸门：pause 时新建一个未关闭的 channel，resume 时关掉它唤醒等待者。
+	//
+	// 为什么用 channel 而不是 sync.Cond：等的地方必须同时盯着 ctx（用户可能在暂停期间
+	// 直接取消），而 Cond 的等待没法与 ctx.Done() 一起 select。
+	gate chan struct{}
 	// abort 为 true 表示"显式取消"（DELETE 接口）：需尽力调用服务端 DELETE 放弃会话并删除续传记录。
 	abort bool
 	// submitted 为 true 表示"完成建库任务已提交"（job 可能已在跑）：
@@ -180,6 +241,59 @@ func (t *uploadTask) cancelTask(explicit bool) bool {
 	}
 	t.cancel()
 	return true
+}
+
+// pause 请求暂停分块上传；已在暂停中、任务已结束、或阶段上停不住时返回 false。
+//
+// 为什么建库阶段（completing）不给暂停：那一刻字节已经传完，在干活的是服务端的建库任务，
+// 本机停不住它。给了按钮只会让界面显示"已暂停"而进度条继续往前爬。
+func (t *uploadTask) pause() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.paused || !isActiveUploadState(t.state.State) || t.state.State == UploadStateCompleting {
+		return false
+	}
+	t.paused = true
+	t.gate = make(chan struct{})
+	t.state.Paused = true
+	// 停住之后速度与剩余时间都失去意义：不清掉的话界面会一直挂着暂停前那一秒的速度，
+	// 看起来像"还在传"。
+	t.state.SpeedBytesPerSec = 0
+	t.state.EtaSeconds = 0
+	return true
+}
+
+// resume 恢复已暂停的分块上传；不在暂停中返回 false（幂等）。
+func (t *uploadTask) resume() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.paused {
+		return false
+	}
+	t.paused = false
+	close(t.gate)
+	t.gate = nil
+	t.state.Paused = false
+	return true
+}
+
+// waitResume 在暂停期间阻塞到恢复或 ctx 结束；未暂停时立刻返回。
+//
+// 它是暂停的**唯一检查点**：调用方只放在"发下一块"之前 —— 在飞的那几块（并发上限
+// uploadChunkConcurrency）跑完就停住。分块 PUT 无法中断，硬停只会把已传的数据判废。
+func (t *uploadTask) waitResume(ctx context.Context) error {
+	t.mu.Lock()
+	gate := t.gate
+	t.mu.Unlock()
+	if gate == nil {
+		return nil
+	}
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // aborted 返回是否为"显式取消"。
@@ -233,8 +347,11 @@ func (m *uploadManager) findByLocalDir(dir string) (*uploadTask, bool) {
 	return nil, false
 }
 
-// cancel 取消指定 upload_id 进行中的任务；不存在或非进行中返回 false。
-func (m *uploadManager) cancel(uploadID string) bool {
+// find 按 upload_id 找任务（大小写不敏感，与 cancel 同一口径）；不存在返回 false。
+func (m *uploadManager) find(uploadID string) (*uploadTask, bool) {
+	if uploadID == "" {
+		return nil, false
+	}
 	m.mu.Lock()
 	tasks := make([]*uploadTask, 0, len(m.tasks))
 	for _, t := range m.tasks {
@@ -243,10 +360,19 @@ func (m *uploadManager) cancel(uploadID string) bool {
 	m.mu.Unlock()
 	for _, t := range tasks {
 		if strings.EqualFold(t.snapshot().UploadID, uploadID) {
-			return t.cancelTask(true)
+			return t, true
 		}
 	}
-	return false
+	return nil, false
+}
+
+// cancel 取消指定 upload_id 进行中的任务；不存在或非进行中返回 false。
+func (m *uploadManager) cancel(uploadID string) bool {
+	task, ok := m.find(uploadID)
+	if !ok {
+		return false
+	}
+	return task.cancelTask(true)
 }
 
 // list 返回全部上传状态（按开始时间倒序）。
@@ -276,7 +402,10 @@ type uploadResumeRecord struct {
 	RepoMode   string `json:"repo_mode,omitempty"`
 	StorageID  string `json:"storage_id,omitempty"`
 	QuotaBytes int64  `json:"quota_bytes,omitempty"`
-	SourceMode string `json:"source_mode,omitempty"`
+	// DiffDiskLimitBytes 共享磁盘限制（0=不限），续传与重试时要原样带回去 ——
+	// 否则一次断线续传就把用户填的限制弄丢了。
+	DiffDiskLimitBytes int64  `json:"diff_disk_limit_bytes,omitempty"`
+	SourceMode         string `json:"source_mode,omitempty"`
 }
 
 // uploadResumeStore 负责续传记录的读写（<DataDir>/uploads.json，原子替换写盘）。
@@ -405,6 +534,10 @@ func (a *Agent) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, apperr.InvalidParam("quota_bytes"))
 		return
 	}
+	if req.DiffDiskLimitBytes < 0 {
+		a.writeError(w, apperr.InvalidParam("diff_disk_limit_bytes"))
+		return
+	}
 	req.RepoMode = mode
 	req.SourceMode = sourceMode
 	req.StorageID = strings.TrimSpace(req.StorageID)
@@ -474,6 +607,40 @@ func (a *Agent) handleCancelUpload(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// handlePauseUpload 暂停指定 upload_id 的分块上传（幂等：不存在 / 不可暂停也返回 ok）。
+//
+// 语义：停住"往下传"，**不是**放弃 —— 服务端会话、已传分块、续传记录一律原样保留，
+// 随时可以 resume 接着传（用户改主意 / 换网络 / 要腾出带宽时用）。
+func (a *Agent) handlePauseUpload(w http.ResponseWriter, r *http.Request) {
+	uploadID := strings.TrimSpace(r.PathValue("upload_id"))
+	if uploadID == "" {
+		a.writeError(w, apperr.InvalidParam("upload_id"))
+		return
+	}
+	task, ok := a.uploads.find(uploadID)
+	if ok && task.pause() {
+		a.logger.Info("已暂停上传", "upload_id", uploadID)
+		// 立刻把 paused 推给界面：不然按钮要等下一次进度事件才翻成"继续"。
+		a.publishUpload(task)
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleResumeUpload 恢复已暂停的分块上传（幂等：不存在 / 未暂停也返回 ok）。
+func (a *Agent) handleResumeUpload(w http.ResponseWriter, r *http.Request) {
+	uploadID := strings.TrimSpace(r.PathValue("upload_id"))
+	if uploadID == "" {
+		a.writeError(w, apperr.InvalidParam("upload_id"))
+		return
+	}
+	task, ok := a.uploads.find(uploadID)
+	if ok && task.resume() {
+		a.logger.Info("已恢复上传", "upload_id", uploadID)
+		a.publishUpload(task)
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // ---- 上传执行 ----
 
 // runUpload 在后台执行：扫描 → 建/续会话 → 并发分块 → 完成建库 → 轮询任务 → 终态。
@@ -486,6 +653,8 @@ func (a *Agent) runUpload(ctx context.Context, task *uploadTask, client *serverC
 	task.update(func(s *UploadState) {
 		s.TotalFiles = scan.TotalFiles
 		s.TotalBytes = scan.TotalBytes
+		// 校验进度的分母在扫描完成时就定了：非空文件数（见 transferFileCount）。
+		s.FilesTotal = transferFileCount(scan.Entries)
 	})
 	a.publishUpload(task)
 	a.logger.Info("本地目录扫描完成", "local_dir", dir, "file_count", scan.TotalFiles, "total_bytes", scan.TotalBytes)
@@ -515,9 +684,12 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		case err == nil:
 			if !isTerminalServerUploadState(st.State) && st.TotalBytes == scan.TotalBytes && st.TotalFiles == scan.TotalFiles {
 				a.logger.Info("复用未完成上传会话，从缺失分块续传",
-					"upload_id", rec.UploadID, "missing_chunks", len(st.MissingChunks))
+					"upload_id", rec.UploadID, "missing_chunks", len(st.MissingChunks), "files_done", st.FilesDone)
 				task.update(func(s *UploadState) { s.UploadID = rec.UploadID })
-				return &uploadSessionPlan{uploadID: rec.UploadID, totalBytes: st.TotalBytes, missing: st.MissingChunks, reused: true}, nil
+				return &uploadSessionPlan{
+					uploadID: rec.UploadID, totalBytes: st.TotalBytes,
+					missing: st.MissingChunks, reused: true, filesDone: st.FilesDone,
+				}, nil
 			}
 			// 会话已终态，或与本地现有内容不一致：丢弃记录并重建会话。
 			a.logger.Info("已有上传会话不可复用，重新创建",
@@ -541,12 +713,13 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		manifest.Files = append(manifest.Files, uploadManifestEntry{Path: e.Rel, Size: e.Size, Mtime: e.Mtime})
 	}
 	sess, err := client.CreateUpload(ctx, createUploadRequest{
-		RepoName:   req.RepoName,
-		Mode:       req.SourceMode,
-		Manifest:   manifest,
-		RepoMode:   req.RepoMode,
-		StorageID:  req.StorageID,
-		QuotaBytes: req.QuotaBytes,
+		RepoName:           req.RepoName,
+		Mode:               req.SourceMode,
+		Manifest:           manifest,
+		RepoMode:           req.RepoMode,
+		StorageID:          req.StorageID,
+		QuotaBytes:         req.QuotaBytes,
+		DiffDiskLimitBytes: req.DiffDiskLimitBytes,
 	})
 	if err != nil {
 		return nil, err
@@ -565,10 +738,29 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		RepoMode:   req.RepoMode,
 		StorageID:  req.StorageID,
 		QuotaBytes: req.QuotaBytes,
-		SourceMode: req.SourceMode,
+		// 与 quota_bytes 一样随记录留存：这几个建库选项是"这次上传要建什么样的库"的
+		// 全部信息，记录里缺一项，将来从记录重建请求时就会静默丢一项配置。
+		DiffDiskLimitBytes: req.DiffDiskLimitBytes,
+		SourceMode:         req.SourceMode,
 	})
-	a.logger.Info("已创建上传会话", "upload_id", sess.UploadID, "total_bytes", sess.TotalBytes, "missing_chunks", len(sess.MissingChunks))
-	return &uploadSessionPlan{uploadID: sess.UploadID, totalBytes: sess.TotalBytes, missing: sess.MissingChunks}, nil
+	// 服务端可能并没有新建会话：它会在上传开始时清掉同名残骸，并把与本地内容一致的
+	// 未完成会话直接还给我们（本地没有记录、或记录已失效时走的就是这条路）。
+	// 此时 missing 只是"还缺的那几块"，进度也要从服务端已校验的文件数起算。
+	if sess.Reused {
+		a.logger.Info("服务端复用了同名未完成会话，续传",
+			"upload_id", sess.UploadID, "missing_chunks", len(sess.MissingChunks), "files_done", sess.FilesDone)
+	}
+	if sess.OverwroteRepo {
+		a.logger.Warn("同名存储库已存在，本次上传将覆盖重建它",
+			"repo", req.RepoName, "upload_id", sess.UploadID)
+		task.update(func(s *UploadState) { s.Notice = uploadNoticeRepoOverwritten })
+	}
+	a.logger.Info("已创建上传会话", "upload_id", sess.UploadID, "total_bytes", sess.TotalBytes,
+		"missing_chunks", len(sess.MissingChunks), "reused", sess.Reused)
+	return &uploadSessionPlan{
+		uploadID: sess.UploadID, totalBytes: sess.TotalBytes,
+		missing: sess.MissingChunks, reused: sess.Reused, filesDone: sess.FilesDone,
+	}, nil
 }
 
 // uploadChunks 并发上传 missing_chunks（4 路），每块独立重试与退避。
@@ -580,12 +772,16 @@ func (a *Agent) uploadChunks(ctx context.Context, client *serverClient, task *up
 		missingBytes += uploadChunkSizeAt(idx, total, uploadChunkSize)
 	}
 	done := chunkTotal - len(plan.missing)
+	filesCap := transferFileCount(scan.Entries)
 	prog := newUploadProgress(a, task)
 	task.update(func(s *UploadState) {
 		s.State = UploadStateUploading
 		s.ChunkTotal = chunkTotal
+		s.FilesTotal = filesCap
+		// 续传起点：服务端按分块登记推导出的已校验文件数，避免进度从 0 重数、看起来在倒退。
+		s.FilesDone = plan.filesDone
 	})
-	prog.reset(total, total-missingBytes, done)
+	prog.reset(total, total-missingBytes, done, plan.filesDone, filesCap)
 
 	if len(plan.missing) == 0 {
 		return nil
@@ -625,21 +821,31 @@ func (a *Agent) uploadChunks(ctx context.Context, client *serverClient, task *up
 				if size <= 0 {
 					continue
 				}
-				if err := readUploadChunk(planFiles, int64(idx)*uploadChunkSize, buf[:size]); err != nil {
+				offset := int64(idx) * uploadChunkSize
+				if err := readUploadChunk(planFiles, offset, buf[:size]); err != nil {
 					fail(errUploadFailed("read_local", err))
 					return
 				}
-				if err := a.putUploadChunkWithRetry(runCtx, client, plan.uploadID, idx, buf[:size]); err != nil {
+				// 在读盘/上传之前就切到"当前处理中的文件"：8MiB 在慢链路上要传好一会儿，
+				// 等传完才更新会让界面在整块传输期间一直停在上一份文件上。
+				prog.setCurrentFile(uploadFileAt(planFiles, offset))
+				ack, err := a.putUploadChunkWithRetry(runCtx, client, plan.uploadID, idx, buf[:size])
+				if err != nil {
 					fail(err)
 					return
 				}
-				prog.addChunk(size)
+				prog.addChunk(size, ack)
 			}
 		})
 	}
 
 sendLoop:
 	for _, idx := range plan.missing {
+		// 暂停的唯一检查点：卡在这里发不出下一块，在飞的那几块（并发上限 4）跑完就停住。
+		// 不往 worker 里面塞检查点 —— 分块 PUT 发出去就无法中断，硬停等于把这一块判废。
+		if err := task.waitResume(runCtx); err != nil {
+			break sendLoop
+		}
 		select {
 		case <-runCtx.Done():
 			break sendLoop
@@ -658,10 +864,11 @@ sendLoop:
 	return nil
 }
 
-// putUploadChunkWithRetry 上传单个分块：计算 SHA256 → PUT → 失败按退避重试。
+// putUploadChunkWithRetry 上传单个分块：计算 SHA256 → PUT → 失败按退避重试，成功时把服务端的
+// 逐块回报（本次校验通过的文件）交给调用方。
 //
 // 可重试：429 / 5xx / 网络错误 / 读超时；不可重试：4xx 确定性错误与上下文取消。
-func (a *Agent) putUploadChunkWithRetry(ctx context.Context, client *serverClient, uploadID string, index int, body []byte) error {
+func (a *Agent) putUploadChunkWithRetry(ctx context.Context, client *serverClient, uploadID string, index int, body []byte) (*chunkAck, error) {
 	sum := sha256.Sum256(body)
 	sha := hex.EncodeToString(sum[:])
 	var lastErr error
@@ -673,30 +880,33 @@ func (a *Agent) putUploadChunkWithRetry(ctx context.Context, client *serverClien
 				"delay", delay.String(), "error", lastErr)
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return nil, ctx.Err()
 			case <-time.After(delay):
 			}
 		}
 		reqCtx, cancel := context.WithTimeout(ctx, uploadChunkTimeout)
-		err := client.PutUploadChunk(reqCtx, uploadID, index, sha, body)
+		ack, err := client.PutUploadChunk(reqCtx, uploadID, index, sha, body)
 		cancel()
 		if err == nil {
-			return nil
+			return ack, nil
 		}
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 		if !isRetryableUploadError(err) {
-			return err
+			return nil, err
 		}
 		lastErr = err
 	}
-	return errUploadFailed("attempts_exhausted", lastErr)
+	return nil, errUploadFailed("attempts_exhausted", lastErr)
 }
 
 // completeUpload 提交建库任务并轮询至终态；成功后记录 repo_id 并按 move 语义清理本地源目录。
 func (a *Agent) completeUpload(ctx context.Context, client *serverClient, task *uploadTask, plan *uploadSessionPlan, dir, repoName, sourceMode string) error {
-	task.update(func(s *UploadState) { s.State = UploadStateCompleting })
+	task.update(func(s *UploadState) {
+		s.State = UploadStateCompleting
+		s.BuildProgress = 0
+	})
 	a.publishUpload(task)
 
 	jobID, err := client.CompleteUpload(ctx, plan.uploadID)
@@ -708,7 +918,7 @@ func (a *Agent) completeUpload(ctx context.Context, client *serverClient, task *
 	a.publishUpload(task)
 	a.logger.Info("已提交建库任务，等待完成", "upload_id", plan.uploadID, "job_id", jobID)
 
-	job, err := a.waitUploadJob(ctx, client, jobID)
+	job, err := a.waitUploadJob(ctx, client, task, jobID)
 	if err != nil {
 		return err
 	}
@@ -738,6 +948,10 @@ func (a *Agent) completeUpload(ctx context.Context, client *serverClient, task *
 	state := task.update(func(s *UploadState) {
 		s.State = UploadStateDone
 		s.UploadedBytes = s.TotalBytes
+		// 终态对齐：建库任务成功意味着清单里的文件全都就位（含只在 complete 补建的空文件），
+		// 进度条不该在"完成"时还差着几格。
+		s.FilesDone = s.FilesTotal
+		s.CurrentFile = ""
 		s.FinishedAt = now
 	})
 	a.hub.Publish(Event{Type: "upload", Data: state})
@@ -745,8 +959,8 @@ func (a *Agent) completeUpload(ctx context.Context, client *serverClient, task *
 	return nil
 }
 
-// waitUploadJob 轮询 GET /v1/jobs/{id} 直到终态。
-func (a *Agent) waitUploadJob(ctx context.Context, client *serverClient, jobID string) (*serverJob, error) {
+// waitUploadJob 轮询 GET /v1/jobs/{id} 直到终态，并把建库进度透传给任务状态。
+func (a *Agent) waitUploadJob(ctx context.Context, client *serverClient, task *uploadTask, jobID string) (*serverJob, error) {
 	if strings.TrimSpace(jobID) == "" {
 		return nil, errUploadFailed("complete", errors.New("服务端未返回 job_id"))
 	}
@@ -758,6 +972,7 @@ func (a *Agent) waitUploadJob(ctx context.Context, client *serverClient, jobID s
 		if err != nil {
 			return nil, err
 		}
+		a.reportBuildProgress(task, j)
 		switch j.State {
 		case "succeeded", "failed", "cancelled":
 			return j, nil
@@ -767,6 +982,27 @@ func (a *Agent) waitUploadJob(ctx context.Context, client *serverClient, jobID s
 			return nil, ctx.Err()
 		case <-time.After(uploadJobPollInterval):
 		}
+	}
+}
+
+// reportBuildProgress 把服务端建库任务的进度写进上传状态，并在变化时推给界面。
+//
+// 只在数值真的变了才推：轮询每两秒一次，而建库任务的进度粒度是 1%（拷入阶段每两秒采样一次），
+// 无脑推送只会让前端白白重渲染。
+func (a *Agent) reportBuildProgress(task *uploadTask, j *serverJob) {
+	if task == nil || j == nil || j.Progress <= 0 {
+		return
+	}
+	changed := false
+	state := task.update(func(s *UploadState) {
+		if s.BuildProgress == j.Progress {
+			return
+		}
+		s.BuildProgress = j.Progress
+		changed = true
+	})
+	if changed {
+		a.hub.Publish(Event{Type: "upload", Data: state})
 	}
 }
 
@@ -838,6 +1074,9 @@ func currentUploadID(task *uploadTask) string {
 
 // uploadProgress 汇总上传进度：uploaded 为已完成分块字节之和，统一经 progressThrottle
 // 节流后才推送 SSE，避免多 worker 并发推送与高频率刷屏。
+//
+// 同时按采样窗口估算速率与 ETA（见 sample / etaSeconds）并随进度一起下发：
+// 上传任务页要显示"实时速度 / 预计剩余"，而进度推送本来就有节流，正好充当采样节拍。
 type uploadProgress struct {
 	a    *Agent
 	task *uploadTask
@@ -848,32 +1087,116 @@ type uploadProgress struct {
 
 	mu       sync.Mutex
 	throttle progressThrottle
+	// speed 是指数平滑后的速率（字节/秒）。
+	speed float64
+	// sampleAt / sampleVal 是上次采样基线（时刻 + 累计字节）。
+	//
+	// 刻意不复用 throttle 的 lastAt/lastVal：throttle 在 force 推送（reset、状态跃迁）
+	// 时会无条件刷新基线，用它算速率会得到"间隔 0 秒"的假峰值；而且 throttle 还承担
+	// "是否推送"的判定，两者语义不同，混用会让速率随节流参数漂移。
+	sampleAt  time.Time
+	sampleVal int64
+	// filesDone 是"已逐个校验通过"的文件数；filesCap 是它的上限（会进入校验的文件数）。
+	filesDone int
+	filesCap  int
+	// verified 记录本次运行内**已计数过**的相对路径，避免同一文件被重复累加
+	// （幂等重试、或服务端自愈后要求重传，都会让同一个文件再次出现在回报里）。
+	verified map[string]struct{}
+	// currentFile 是当前正在处理中的文件（最近开始读取/上传的那一个）。
+	currentFile string
 }
 
 func newUploadProgress(a *Agent, task *uploadTask) *uploadProgress {
-	return &uploadProgress{a: a, task: task, throttle: newProgressThrottle(0)}
+	return &uploadProgress{
+		a: a, task: task, throttle: newProgressThrottle(0),
+		verified: make(map[string]struct{}),
+	}
 }
 
-// reset 重置进度基线并立即推送一次。
-func (p *uploadProgress) reset(total, uploaded int64, done int) {
+// reset 重置进度基线并立即推送一次；filesDone 是续传起点，filesCap 是会进校验的文件总数。
+func (p *uploadProgress) reset(total, uploaded int64, done, filesDone, filesCap int) {
 	p.total.Store(total)
 	p.uploaded.Store(uploaded)
 	p.chunksDone.Store(int64(done))
+	p.mu.Lock()
+	// 续传/重试会改变累计字节的起点，旧速率与旧基线都不再适用（不清零会算出负增量）。
+	p.speed = 0
+	p.sampleAt = time.Time{}
+	p.sampleVal = uploaded
+	// 续传起点由服务端推导、分母由本地清单推导，两者的"空文件"口径若出现偏差，
+	// 直接采用会让界面显示"已校验 N/M"且 N > M；夹一次比展示一个自相矛盾的数字便宜。
+	if filesDone > filesCap {
+		filesDone = filesCap
+	}
+	p.filesDone = filesDone
+	p.filesCap = filesCap
+	p.verified = make(map[string]struct{})
+	p.mu.Unlock()
 	p.push(true)
 }
 
-// addChunk 记录一个分块完成。
-func (p *uploadProgress) addChunk(size int64) {
+// setCurrentFile 记下"当前正在处理中的文件"，供上传任务页直接展示。
+//
+// 并发为 4，所以它表示"最近开始处理的那一个"而不是唯一在传的文件：界面要的是"库不是在空转"
+// 的实感与一个可读的文件名，为此引入更精细的协调不值得。
+func (p *uploadProgress) setCurrentFile(rel string) {
+	if rel == "" {
+		return
+	}
+	p.mu.Lock()
+	p.currentFile = rel
+	p.mu.Unlock()
+}
+
+// addChunk 记录一个分块完成，并吸收服务端回报的"本块之后通过文件级校验的文件"。
+func (p *uploadProgress) addChunk(size int64, ack *chunkAck) {
 	p.uploaded.Add(size)
 	p.chunksDone.Add(1)
+	if ack != nil {
+		for _, rel := range ack.FilesDone {
+			p.markVerified(rel)
+		}
+	}
 	p.push(false)
+}
+
+// markVerified 记下一个"分块已到齐且逐块校验通过"的文件；同一路径只计一次。
+//
+// 去重是必要的：重传（幂等重试，或服务端因树对不上而作废分块后的自愈重传）会让同一个文件
+// 再次出现在 FilesDone 里，直接累加会让"已校验 N/M"越过 M。
+func (p *uploadProgress) markVerified(rel string) {
+	if rel == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.filesDone >= p.filesCap {
+		return
+	}
+	if _, ok := p.verified[rel]; ok {
+		return
+	}
+	p.verified[rel] = struct{}{}
+	p.filesDone++
 }
 
 // push 在节流允许时推送进度。
 func (p *uploadProgress) push(force bool) {
 	uploaded := p.uploaded.Load()
+	now := time.Now()
 	p.mu.Lock()
-	ok := p.throttle.allow(force, uploaded, time.Now())
+	ok := p.throttle.allow(force, uploaded, now)
+	var (
+		speed       float64
+		filesDone   int
+		currentFile string
+	)
+	if ok {
+		p.sample(now, uploaded)
+		speed = p.speed
+		filesDone = p.filesDone
+		currentFile = p.currentFile
+	}
 	p.mu.Unlock()
 	if !ok {
 		return
@@ -885,8 +1208,67 @@ func (p *uploadProgress) push(force bool) {
 		s.TotalBytes = total
 		s.UploadedBytes = uploaded
 		s.ChunkDone = int(done)
+		s.FilesDone = filesDone
+		s.CurrentFile = currentFile
+		s.SpeedBytesPerSec = int64(speed)
+		s.EtaSeconds = etaSeconds(total, uploaded, speed)
 	})
 	p.a.hub.Publish(Event{Type: "upload", Data: state})
+}
+
+// sampleMinInterval 是两次速率采样之间的最小间隔。
+//
+// 更短的窗口里噪声占主导：分块并发为 4，一个分块完成就能把瞬时速率放大好几倍。
+const sampleMinInterval = 200 * time.Millisecond
+
+// sample 用"距上次采样新增的字节 / 间隔"更新平滑速率（调用方须持 p.mu）。
+//
+// 为什么必须平滑：单次采样窗口里可能完成 0 个、也可能完成 4 个分块，瞬时速率能差几倍；
+// 不平滑的话前端 ETA 会来回跳几十分钟 —— 那比不显示还糟。
+func (p *uploadProgress) sample(now time.Time, uploaded int64) {
+	if p.sampleAt.IsZero() {
+		p.sampleAt, p.sampleVal = now, uploaded
+		return
+	}
+	dt := now.Sub(p.sampleAt).Seconds()
+	if dt < sampleMinInterval.Seconds() {
+		return
+	}
+	delta := uploaded - p.sampleVal
+	p.sampleAt, p.sampleVal = now, uploaded
+	if delta <= 0 {
+		// 窗口内没有新增：保持上一次速率，避免速度瞬间归零、ETA 闪成 "--"。
+		return
+	}
+	inst := float64(delta) / dt
+	if p.speed <= 0 {
+		p.speed = inst
+		return
+	}
+	// 新样本权重 0.4：既跟得上真实的带宽变化，又不被单次抖动带偏。
+	p.speed = p.speed*0.6 + inst*0.4
+}
+
+// maxEtaSeconds 是 ETA 的上限（30 天）：超过它一律按"不可估算"处理。
+//
+// 起步阶段（只传完一两个分块时）算出的 ETA 常常大得离谱（"剩余 400 天"）。
+// 与其展示一个必然错误的数字，不如显示 "--" 让用户看速度自行判断。
+const maxEtaSeconds = 30 * 24 * 3600
+
+// etaSeconds 用平滑速率估计剩余秒数；速度未知、已传完或结果离谱时返回 0（前端显示 "--"）。
+func etaSeconds(total, uploaded int64, speed float64) int64 {
+	remaining := total - uploaded
+	if remaining <= 0 || speed <= 0 {
+		return 0
+	}
+	eta := float64(remaining) / speed
+	if eta > maxEtaSeconds {
+		return 0
+	}
+	if eta < 1 {
+		return 1
+	}
+	return int64(eta)
 }
 
 // ---- 纯函数辅助 ----
@@ -933,6 +1315,18 @@ func readUploadChunk(plan []uploadPlanFile, start int64, buf []byte) error {
 		cur += n
 	}
 	return nil
+}
+
+// uploadFileAt 返回拼接流偏移 offset 落在哪个文件（相对路径）；越界返回空串。
+//
+// 只服务于展示（"当前处理中的文件"）：并发 4 路时它必然是近似的，但比把整份清单塞进每次
+// 进度推送便宜得多 —— 二分一次足够。
+func uploadFileAt(plan []uploadPlanFile, offset int64) string {
+	i := sort.Search(len(plan), func(i int) bool { return plan[i].Offset+plan[i].Size > offset })
+	if i >= len(plan) {
+		return ""
+	}
+	return plan[i].Rel
 }
 
 // uploadChunkCount 计算分块总数。
@@ -1002,9 +1396,12 @@ func isActiveUploadState(state string) bool {
 	return false
 }
 
-// isTerminalServerUploadState 判断服务端上传会话是否已终态。
+// isTerminalServerUploadState 判断服务端会话是否已到终态（不能再续传）。
+//
+// failed 也算终态：那种会话的暂存已被判定没救，继续往里写分块没有任何意义 ——
+// 丢掉本地记录让服务端重新开一份（或复用另一份）才是出路。
 func isTerminalServerUploadState(state string) bool {
-	return state == "complete" || state == "aborted"
+	return state == "complete" || state == "aborted" || state == "failed"
 }
 
 // normalizeUploadRepoMode 归一化建库模式（留空默认 shared）。

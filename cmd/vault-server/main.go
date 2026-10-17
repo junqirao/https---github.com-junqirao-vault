@@ -659,6 +659,18 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	// 否则磁盘永远停在中间态，挂载/发布每次都报 disk.not_ready 且不会自愈。
 	// 各建盘任务的 ref_id 都是磁盘 ID（见 app/repo.go 的 EnqueueWith 调用）。
 	jobs.OnFinalFailure(func(ctx context.Context, j *domain.Job, cause error) {
+		if j == nil {
+			return
+		}
+		if j.Type == domain.JobUploadComplete {
+			// 上传建库的 ref_id 是 **upload_id**（不是磁盘 ID），回滚要顺着 payload 找到库
+			// 与母盘。此前这里统一按 ref_id 回滚磁盘，结果两边都没回滚到：库停在中间态、
+			// 母盘停在 creating，只留下一条"回滚磁盘状态失败"的 WARN。
+			if err := application.Uploads().MarkUploadCompleteFailed(ctx, j.Payload, cause); err != nil {
+				log.Warn("回滚上传建库状态失败", "job_id", j.ID, "error", err)
+			}
+			return
+		}
 		if err := application.Disks().MarkCreateFailed(ctx, j.RefID, cause); err != nil {
 			log.Warn("回滚磁盘状态失败", "job_id", j.ID, "ref_id", j.RefID, "error", err)
 		}

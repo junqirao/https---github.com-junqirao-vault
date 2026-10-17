@@ -27,11 +27,18 @@ const allocationReleasedSQL = string(domain.AllocationStateReleased)
 //     （size_bytes）计费，与盘里实际写了多少（physical_bytes）无关 —— 动态盘 / thin
 //     差异盘的实测占用常常接近 0，按实测记账会让"已分配 2TB"的库显示成"用了 5MB"，
 //     配额也就形同虚设；
-//  2. 建盘终态失败（state=error）计 0：这份盘根本不存在，按容量计费就是永久挂账
+//  2. 盘上写了 accounted_bytes（共享库配了"共享磁盘限制"的差异盘）时按它计：差异盘
+//     只装差异数据、实际用不了多少，按母盘容量整份计会把共享者的配额一次吃光。
+//     size_bytes 动不得（客户端按容量匹配本地 iSCSI 盘，见 Lease.DiskSizeBytes），
+//     所以记账口径单独放在 accounted_bytes 上；
+//  3. 建盘终态失败（state=error）计 0：这份盘根本不存在，按容量计费就是永久挂账
 //     （真实反馈："我一点空间都没用就占了 1G"），见 DiskService.MarkCreateFailed；
-//  3. 没被分配出去的盘（母盘、建库时预创建的池位盘）被 allocatedDiskSQL 挡在账外，
+//  4. 没被分配出去的盘（母盘、建库时预创建的池位盘）被 allocatedDiskSQL 挡在账外，
 //     进不了这个表达式。
+//
+// 顺序要紧：error 判在最前面 —— 失败盘不占账，哪怕它带着 accounted_bytes。
 const accountedUsageSQL = `CASE WHEN d.state = '` + diskStateErrorSQL + `' THEN 0
+	       WHEN d.accounted_bytes > 0 THEN d.accounted_bytes
 	       ELSE d.size_bytes END`
 
 // allocatedDiskSQL 是"这块盘当前有未释放的分配"的过滤条件（引用 disks 的别名 d）。
@@ -90,6 +97,29 @@ func (s *Store) RecomputeUserUsage(ctx context.Context, userID string) (int64, e
 		return 0, fmt.Errorf("store: 写回用户用量失败: %w", err)
 	}
 	return used, nil
+}
+
+// SyncRepoDiffDiskAccounting 把库内全部差异盘的记账容量刷成当前限制值；
+// limitBytes<=0 表示"不限制"，各盘清回 0（即按 size_bytes 计）。
+//
+// 改完库的"共享磁盘限制"必须调用它：账是按盘上的 accounted_bytes 算出来的，
+// 老盘不刷就仍按旧值占配额，用户改完限制在界面上看不出任何变化。
+//
+// 只刷差异盘（母盘与独享盘不按这个限制走）；限制值超过某块盘自身容量时按 size_bytes
+// 夹住 —— 记在账上的量不该比这块盘本身还大。
+func (s *Store) SyncRepoDiffDiskAccounting(ctx context.Context, repoID string, limitBytes int64) error {
+	limit := limitBytes
+	if limit < 0 {
+		limit = 0
+	}
+	if _, err := s.q.ExecContext(ctx, s.q.Rebind(
+		`UPDATE disks SET accounted_bytes = CASE WHEN ? > 0 AND ? < size_bytes THEN ? ELSE 0 END,
+		        updated_at = ?
+		  WHERE repo_id = ? AND kind = ?`),
+		limit, limit, limit, nowMillis(), repoID, string(domain.DiskKindDiff)); err != nil {
+		return fmt.Errorf("store: 同步差异盘记账容量失败: %w", err)
+	}
+	return nil
 }
 
 // RecomputeUsage 以 disks 表为**唯一真源**重算存储库与用户的已用量，返回被修正的行数。

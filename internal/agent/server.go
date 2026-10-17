@@ -26,17 +26,26 @@ import (
 const (
 	// serverRequestTimeout 单次服务端调用的超时（普通接口）。
 	serverRequestTimeout = 30 * time.Second
-	// mountRequestTimeout 挂载申请（POST /v1/allocations/{id}/mount）的专用超时。
+	// longRequestTimeout 是"服务端同步重活"类接口的专用超时（走 doLong）。
 	//
-	// 为什么要单独放宽：该接口在服务端是**同步重活** —— 发布 iSCSI 目标、配置 CHAP、
-	// 登记 initiator 都要跑 PowerShell（单次约 10s，多步叠加常超 30s）。
-	// 沿用 30s 会导致：代理先超时，并把错误报成 agent.server_unreachable
-	// （界面显示"本地代理无法连接服务端"），同时把取消传到服务端，服务端日志则是
-	// "PowerShell 执行超时或被取消 + status=500" —— 用户看到的两条错误其实是同一次超时，
-	// 与地址、连通性无关。
-	// 渲染层等待挂载的上限为 MOUNT_TIMEOUT_MS（3 分钟），这里取 2 分钟，
-	// 给随后的 iSCSI 会话建立（最多 60s）留出余量。
-	mountRequestTimeout = 2 * time.Minute
+	// 两类调用用它：
+	//
+	//   - 挂载申请 POST /v1/allocations/{id}/mount：服务端在**这一个请求内同步**做三件重活 ——
+	//     等差异盘派生完成（最长 60s，见 app.awaitBackingTimeout）、把期望状态全量下发到平台
+	//     （Windows 实测约 35s：两次 Set-IscsiServerTarget 各约 15s + 一次映射约 5s）、读回
+	//     平台侧实际目标（一次 PowerShell 约 5~7s）。首次挂载三件事必然同时发生，实测 ≥110s；
+	//     再叠上"预创建任务正持着这把目标锁"的排队，2 分钟会在**读回这一步**被掐断 ——
+	//     服务端日志是 "PowerShell 执行超时或被取消 + status=500"，同一个 500 后面还跟着一条
+	//     "写入审计失败: context canceled"（真实工单：首次挂载失败一次，用户手动重挂就成功）。
+	//     沿用 30s 则更早失败，且错误被报成 agent.server_unreachable（界面显示"本地代理无法
+	//     连接服务端"）—— 用户看到的两条错误其实是同一次超时，与地址、连通性无关。
+	//     取 3 分钟：渲染层等待挂载的上限是 MOUNT_TIMEOUT_MS（5 分钟），扣掉这里的 3 分钟，
+	//     还够后面的 iSCSI 会话建立（最多 60s）与磁盘上线。
+	//   - 上传完成 POST /v1/uploads/{id}/complete：服务端要遍历整棵树做一次核对
+	//     （每个文件一次 Lstat）；二十万文件在慢盘或杀软实时扫描下能吃掉几十秒。
+	//     它是整条上传链路的**最后一步**，在这里被 30s 砍掉等于让用户把几十上百 GB
+	//     白传一遍 —— 宁可多等，也不要在这里失败。
+	longRequestTimeout = 3 * time.Minute
 	// maxServerResponseBytes 服务端响应体的读取上限。
 	maxServerResponseBytes = 4 << 20
 	// leaseRevokedCode 服务端在租约被撤销时返回的错误码。
@@ -131,8 +140,8 @@ type serverClient struct {
 	logger *slog.Logger
 
 	http *http.Client
-	// long 是"长耗时调用"专用客户端（目前只有挂载申请），与 http 共用 Transport，
-	// 仅超时不同；原因见 mountRequestTimeout 的说明。
+	// long 是"长耗时调用"专用客户端（挂载申请、上传完成），与 http 共用 Transport，
+	// 仅超时不同；原因见 longRequestTimeout 的说明。
 	long   *http.Client
 	stream *http.Client
 
@@ -200,7 +209,7 @@ func newServerClient(baseURL, token, certSHA256 string, logger *slog.Logger) (*s
 		token:  token,
 		logger: logger,
 		http:   &http.Client{Timeout: serverRequestTimeout, Transport: transport},
-		long:   &http.Client{Timeout: mountRequestTimeout, Transport: transport},
+		long:   &http.Client{Timeout: longRequestTimeout, Transport: transport},
 		stream: &http.Client{Transport: transport},
 	}, nil
 }
@@ -266,7 +275,7 @@ func newMTLSClient(baseURL, certPEM, keyPEM, certSHA256 string, logger *slog.Log
 		base:   strings.TrimRight(raw, "/"),
 		logger: logger,
 		http:   &http.Client{Timeout: serverRequestTimeout, Transport: transport},
-		long:   &http.Client{Timeout: mountRequestTimeout, Transport: transport},
+		long:   &http.Client{Timeout: longRequestTimeout, Transport: transport},
 		stream: &http.Client{Transport: transport},
 	}, nil
 }
@@ -282,8 +291,8 @@ func (c *serverClient) SystemInfo(ctx context.Context) (*SystemInfo, error) {
 
 // RequestMount 调用 POST /v1/allocations/{id}/mount 获取挂载参数。
 //
-// 用 doLong（2 分钟）：服务端会在该请求内同步发布 iSCSI 目标（PowerShell 多步），
-// 30s 的普通超时必然先把请求掐断（详见 mountRequestTimeout）。
+// 用 doLong（3 分钟）：服务端会在该请求内同步等差异盘、发布 iSCSI 目标并读回（PowerShell 多步），
+// 30s 的普通超时必然先把请求掐断（详见 longRequestTimeout）。
 func (c *serverClient) RequestMount(ctx context.Context, allocationID, clientID string) (*MountSpec, error) {
 	if strings.TrimSpace(allocationID) == "" {
 		return nil, apperr.InvalidParam("allocation_id")
@@ -355,6 +364,8 @@ type createUploadRequest struct {
 	StorageID string         `json:"storage_id,omitempty"`
 	// QuotaBytes 0=不限。
 	QuotaBytes int64 `json:"quota_bytes,omitempty"`
+	// DiffDiskLimitBytes 共享磁盘限制（每块差异盘允许的容量）；0=不限。
+	DiffDiskLimitBytes int64 `json:"diff_disk_limit_bytes,omitempty"`
 }
 
 // uploadSession 是创建上传会话的响应。
@@ -364,6 +375,15 @@ type uploadSession struct {
 	MissingChunks []int  `json:"missing_chunks"`
 	ReceivedBytes int64  `json:"received_bytes"`
 	TotalBytes    int64  `json:"total_bytes"`
+	// FilesDone 是服务端已逐文件校验通过的文件数（复用旧会话时非 0）。
+	FilesDone int `json:"files_done"`
+	// Reused 为真表示服务端复用了同名未完成会话（我们本地没有记录、或记录已失效）。
+	//
+	// 这条路径让"agent 换了台机器 / 清了本地状态 / 上次失败"都能续上已传的分块，
+	// 而不是把几百 GB 从头再传一遍。
+	Reused bool `json:"reused"`
+	// OverwroteRepo 为真表示服务端清掉/接管了同名存储库（覆盖上传）。
+	OverwroteRepo bool `json:"overwrote_repo"`
 }
 
 // uploadStatus 是查询上传会话状态的响应（断点续传用）。
@@ -374,6 +394,24 @@ type uploadStatus struct {
 	TotalBytes    int64  `json:"total_bytes"`
 	ReceivedBytes int64  `json:"received_bytes"`
 	MissingChunks []int  `json:"missing_chunks"`
+	// FilesDone 是服务端已逐文件校验通过的文件数（分块全部到齐）。
+	//
+	// 续传时把它当作"已校验 N/M 个文件"的起点：已传完的文件不会再重传，也就不会再收到
+	// 逐块回报，从 0 重数会让进度条倒退（真实观感："明明传了一半，怎么从头开始"）。
+	FilesDone int `json:"files_done"`
+}
+
+// chunkAck 是 PUT /v1/uploads/{id}/chunks/{index} 的响应（服务端逐块回报）。
+//
+// FilesDone 是"上传一个文件校验一个"的落点：本次分块写完后，凡覆盖到的文件分块已到齐且
+// 逐块 SHA256 校验通过，服务端立刻把它们报回来（通常 0~1 个），客户端据此累加进度。
+type chunkAck struct {
+	Index         int      `json:"index"`
+	Size          int64    `json:"size"`
+	ReceivedBytes int64    `json:"received_bytes"`
+	Done          bool     `json:"done"`
+	FilesDone     []string `json:"files_done,omitempty"`
+	FilesTotal    int      `json:"files_total"`
 }
 
 // serverJob 是 GET /v1/jobs/{id} 的最小响应形状。
@@ -416,15 +454,19 @@ func (c *serverClient) UploadStatus(ctx context.Context, uploadID string) (*uplo
 	return &out, nil
 }
 
-// PutUploadChunk 调用 PUT /v1/uploads/{id}/chunks/{index} 上传单个分块（原始字节）。
+// PutUploadChunk 调用 PUT /v1/uploads/{id}/chunks/{index} 上传单个分块（原始字节），
+// 返回服务端的逐块回报（含本次校验通过的文件，见 chunkAck）。
 //
 // 使用无整体超时的 stream 客户端上传（8MiB 分块在慢链路上可能超过普通请求的固定超时），
 // 超时控制交由 ctx。X-Chunk-SHA256 为小写十六进制。
-func (c *serverClient) PutUploadChunk(ctx context.Context, uploadID string, index int, sha256Hex string, body []byte) error {
+//
+// 响应体解析失败不算失败：块已经稳稳写进服务端，为一个显示用的附带信息把成功的上传判死
+// 是本末倒置（进度少一格而已）。
+func (c *serverClient) PutUploadChunk(ctx context.Context, uploadID string, index int, sha256Hex string, body []byte) (*chunkAck, error) {
 	path := "/v1/uploads/" + url.PathEscape(uploadID) + "/chunks/" + strconv.Itoa(index)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.base+path, bytes.NewReader(body))
 	if err != nil {
-		return errServerUnreachable(err)
+		return nil, errServerUnreachable(err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Chunk-SHA256", sha256Hex)
@@ -433,23 +475,36 @@ func (c *serverClient) PutUploadChunk(ctx context.Context, uploadID string, inde
 	}
 	resp, err := c.stream.Do(req)
 	if err != nil {
-		return errServerUnreachable(err)
+		return nil, errServerUnreachable(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxServerResponseBytes))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return parseServerError(resp.StatusCode, data)
+		return nil, parseServerError(resp.StatusCode, data)
 	}
-	return nil
+	var ack chunkAck
+	if err := json.Unmarshal(data, &ack); err != nil {
+		return nil, nil
+	}
+	return &ack, nil
 }
 
 // CompleteUpload 调用 POST /v1/uploads/{id}/complete 触发建库任务，返回 job_id。
+// CompleteUpload 调用 POST /v1/uploads/{id}/complete 提交建库任务。
+//
+// 用 doLong（3 分钟）：服务端在这一步要遍历整棵树逐个核对（每个文件一次 Lstat，见
+// app.UploadService.finalizeTree），二十万文件的库在慢盘或杀软实时扫描下可能远超 30s。
+// 这一步是整条上传链路的最后一环 —— 在这里超时意味着用户几十上百 GB 白传，
+// 所以宁可多等（详见 longRequestTimeout）。
+//
+// 注意：服务端**不再**在这一步重组文件树（分块到达时已按偏移写进最终位置），
+// 耗时与库大小同阶而非数据量同阶 —— 也正因如此，"传完 100GB"不会再卡死在这里。
 func (c *serverClient) CompleteUpload(ctx context.Context, uploadID string) (string, error) {
 	var out struct {
 		JobID string `json:"job_id"`
 	}
 	path := "/v1/uploads/" + url.PathEscape(uploadID) + "/complete"
-	if err := c.do(ctx, http.MethodPost, path, nil, &out); err != nil {
+	if err := c.doLong(ctx, http.MethodPost, path, nil, &out); err != nil {
 		return "", err
 	}
 	return out.JobID, nil
@@ -619,9 +674,10 @@ func (c *serverClient) do(ctx context.Context, method, path string, body any, ou
 	return c.doWith(ctx, c.http, method, path, body, out)
 }
 
-// doLong 与 do 同语义，但使用**长耗时调用**专用超时（见 mountRequestTimeout）。
+// doLong 与 do 同语义，但使用**长耗时调用**专用超时（见 longRequestTimeout）。
 //
-// 目前只有挂载申请走这条路：该接口在服务端是同步重活，30s 必然超时。
+// 目前挂载申请与上传完成走这条路：两者在服务端都是同步重活（前者跑 PowerShell 发布 iSCSI
+// 目标，后者要遍历整棵树核对），30s 的普通超时会把"服务端还在干活"误报成失败。
 func (c *serverClient) doLong(ctx context.Context, method, path string, body any, out any) error {
 	return c.doWith(ctx, c.long, method, path, body, out)
 }
@@ -694,7 +750,7 @@ func (c *serverClient) doOnceWith(ctx context.Context, cl *http.Client, method, 
 
 // serverCallError 把传输层错误映射为稳定错误码：**超时与不可达必须区分**。
 //
-// 为什么要区分：挂载接口在服务端是同步重活（见 mountRequestTimeout），
+// 为什么要区分：挂载接口在服务端是同步重活（见 longRequestTimeout），
 // 把"服务端还在干活"笼统报成"无法连接服务端"，会把排查直接引向错误的地址/网络方向
 // （真实工单：客户端显示 server_unreachable，实际是 30s 超时）。
 func serverCallError(err error, timeout time.Duration) *apperr.Error {

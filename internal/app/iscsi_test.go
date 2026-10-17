@@ -172,3 +172,94 @@ func TestAwaitBackingReadyPollsCreating(t *testing.T) {
 	}
 	<-done
 }
+
+// TestAwaitBackingReadyKeepsWaitingWhenDeriveQueues 锁定本次修复的核心现场。
+//
+// 真实反馈："没有派生差异盘的磁盘第一次点挂载会卡在服务端准备磁盘中，手动取消重新挂载
+// 才挂得上去。" —— 分配把差异盘派生交给异步任务，而派生任务与"回收存储库"共用
+// lock.RepoKey（派生要独占打开母盘），排队几十秒很常见；旧实现只肯等 15 秒，于是抢在盘
+// 变好之前报 disk.not_ready，用户重挂时盘恰好已经好了，表现就像"必须重挂一次才挂得上"。
+//
+// 这里把预算按比例缩小（600ms 表达"足够等过排队"）来讲同一件事：就绪时刻落在预算已消耗
+// 一部分的位置上，仍然必须等到并成功。
+func TestAwaitBackingReadyKeepsWaitingWhenDeriveQueues(t *testing.T) {
+	ctx := context.Background()
+	svc, st := newBackingTestService(t, true)
+	svc.backingWaitTimeout = 600 * time.Millisecond
+
+	disk := &domain.Disk{
+		RepoID:   seedRepo(t, st),
+		Kind:     domain.DiskKindDiff,
+		VHDXPath: filepath.Join("C:", "vault", "disk.vhdx"),
+		State:    domain.DiskStateCreating,
+	}
+	if err := st.CreateDisk(ctx, disk); err != nil {
+		t.Fatalf("建磁盘记录失败：%v", err)
+	}
+
+	// 派生"排队"一段（跨过若干次轮询）之后才完成。
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(300 * time.Millisecond)
+		current, err := st.GetDisk(context.Background(), disk.ID)
+		if err != nil {
+			return
+		}
+		current.State = domain.DiskStateReady
+		_ = st.UpdateDisk(context.Background(), current)
+	}()
+
+	if err := svc.awaitBackingReady(ctx, disk); err != nil {
+		t.Fatalf("派生排队时挂载侧必须继续等，实际错误=%v", err)
+	}
+	<-done
+}
+
+// TestAwaitBackingReadyTimeoutReportsWaited 超时必须说明"等了多久、卡在什么状态"。
+//
+// 没有 waited_ms 时，事后分不清是"派生在排队"（该继续等 / 该扩大预算）还是"盘根本没建"
+// （该去查派生任务），而这两种现场的处理方式完全不同。
+func TestAwaitBackingReadyTimeoutReportsWaited(t *testing.T) {
+	ctx := context.Background()
+	svc, st := newBackingTestService(t, true)
+	svc.backingWaitTimeout = 120 * time.Millisecond
+
+	disk := &domain.Disk{
+		RepoID:   seedRepo(t, st),
+		Kind:     domain.DiskKindDiff,
+		VHDXPath: filepath.Join("C:", "vault", "disk.vhdx"),
+		State:    domain.DiskStateCreating,
+	}
+	if err := st.CreateDisk(ctx, disk); err != nil {
+		t.Fatalf("建磁盘记录失败：%v", err)
+	}
+
+	err := svc.awaitBackingReady(ctx, disk)
+	e, ok := apperr.As(err)
+	if !ok || e.Code != "disk.not_ready" {
+		t.Fatalf("超时应返回可重试的 disk.not_ready，实际=%v", err)
+	}
+	if e.Args["state"] != string(domain.DiskStateCreating) {
+		t.Fatalf("错误里应带上磁盘状态，实际=%v", e.Args["state"])
+	}
+	if waited, _ := e.Args["waited_ms"].(int64); waited <= 0 {
+		t.Fatalf("错误里应带上等待时长，实际=%v", e.Args["waited_ms"])
+	}
+}
+
+// TestAwaitBackingTimeoutBudget 守住等待预算的上下界。
+//
+// 下界：必须显著大于历史值 15 秒 —— 派生的排队时间由仓库锁决定，15 秒挡不住它，
+// 而失败表现就是"用户被迫手动重挂一次"。
+// 上界：客户端挂载申请上限 2 分钟，其中首次全量下发 iSCSI 目标实测约 35 秒。服务端若比
+// 客户端还晚认输，用户只会看到客户端超时（agent.server_unreachable），比 disk.not_ready
+// 更难解释，也更难重试。
+func TestAwaitBackingTimeoutBudget(t *testing.T) {
+	if awaitBackingTimeout <= 15*time.Second {
+		t.Fatalf("等盘预算(%v)必须明显大于历史值 15s：派生排队会超过它", awaitBackingTimeout)
+	}
+	if awaitBackingTimeout > 90*time.Second {
+		t.Fatalf("等盘预算(%v)过大：客户端挂载申请上限 2 分钟，还要给首次下发约 35s 留量", awaitBackingTimeout)
+	}
+}

@@ -1,15 +1,19 @@
 import type { CSSProperties, MouseEvent } from 'react'
-import { useState } from 'react'
+import { useCallback, useState } from 'react'
 import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
 import { InfoCircleOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
+import { useMutation } from '@tanstack/react-query'
 
 import { StatusTag } from '../../components/StatusTag'
 import { UsageBar, UsageValueText } from '../../components/UsageBar'
-import type { AgentMountVolumeUsage } from '../../api/agentTypes'
+import { agentApi } from '../../api/agentClient'
+import type { AgentMountVolumeUsage, UploadState } from '../../api/agentTypes'
+import { translateError } from '../../api/errors'
 import type { RepoDTO } from '../../api/types'
+import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { repoUsage } from '../../utils/format'
+import { formatBytes, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { CacheMetricsDialog } from './CacheMetricsDialog'
 import {
@@ -19,12 +23,34 @@ import {
   useRepoMount,
   type RepoMountController
 } from './RepoMount'
+import { isPlaceholderRepoId, uploadPercent } from './uploadView'
 
 export interface RepoCardProps {
   repo: RepoDTO
   currentUserId: string
   onOpen: (repoId: string) => void
   onConfigure: (repo: RepoDTO) => void
+  /**
+   * 该库正在上传时的实时进度（`repo` 可能是服务端记录，也可能是列表合成的占位库）。
+   *
+   * 卡片上**只留与上传有关的两样**：
+   *   - **上传进度条**（见 RepoUploadProgress）：占住建库进度条那个位置，写"已传 / 总量"
+   *     与条内百分比（真实反馈一路是："上传中的库就不展示进度条了" → 又"进度条加回去，
+   *     改为上传进度，上面展示进度 xx GB/yy GB"）。速度/剩余/当前文件/分块仍然不上卡片：
+   *     那些数字每两秒变一次，混在一片库卡里又挤又吵，完整进度在「上传任务」页；
+   *   - **动作区换成「暂停 / 继续」+「取消」**（见 RepoUploadActions）：上传中的库挂不了，
+   *     此刻能做的只有"停一下"和"算了"（真实反馈："上传状态下的挂载按钮改成暂停，
+   *     加一个取消按钮"）。
+   *
+   * 它还决定**整卡点击去哪**：普通库点开本机挂载目录，而上传中的库根本没有目录可开
+   * （点下去只会得到一句"未挂载"），所以改去进度页。
+   *
+   * 其余零件（状态圆点 / 标签行 / 用量 / 次要信息）一概照旧：它在列表里就是一张普通库卡，
+   * 只是状态不同。
+   */
+  upload?: UploadState
+  /** 打开「上传任务」页；不传则整卡点击仍是普通库的行为（打开挂载目录）。 */
+  onOpenUpload?: (uploadId: string) => void
 }
 
 /**
@@ -103,7 +129,8 @@ function RepoTagRow({
 }): JSX.Element {
   return (
     <Space size={spacing.xs} wrap style={style}>
-      <Tag>{repoModeLabel(repo.mode)}</Tag>
+      {/* 占位库（服务端还没有这条记录）拿不到模式，宁可不显示也不猜：见 uploadPlaceholderRepo。 */}
+      {isPlaceholderRepoId(repo.id) ? null : <Tag>{repoModeLabel(repo.mode)}</Tag>}
       {repo.state === 'active' ? null : <StatusTag group="repo" value={repo.state} />}
       <RepoMountStateTag controller={controller} />
     </Space>
@@ -263,13 +290,82 @@ function RepoMetaLine({
 }
 
 /**
+ * 上传中的动作区：把挂载按钮换成「暂停 / 继续」+「取消」。
+ *
+ * 为什么是这两个（真实反馈："上传状态下的挂载按钮改成暂停，加一个取消按钮"）：上传中的库
+ * 既挂不了（服务端还没有可分配的盘），用户此刻真正想做的只有"停一下"和"算了"。
+ *
+ * 风格照旧：尺寸与间距都沿用动作区那一套（只换内容，不换排布），「暂停」占住原来挂载按钮
+ * 那个主操作的位置；「取消」用与「上传任务」页同一款 danger 按钮 —— 同一个动作在两处长得一样。
+ *
+ * 「暂停」在建库阶段（completing）置灰：那一刻在干活的是服务端，本机停不住它，代理侧同样
+ * 会拒绝（见 uploadTask.pause）—— 给一个按下去没反应的按钮比不给更糟。
+ */
+function RepoUploadActions({ upload }: { upload: UploadState }): JSX.Element {
+  const { t } = useI18n()
+  const { refreshUploads } = useAgent()
+  // 暂停的标志位在代理那边（UploadState.paused），不在 state 里：暂停不改阶段，只停住推进。
+  const paused = Boolean(upload.paused)
+  const building = upload.state === 'completing'
+
+  // 两个动作成功后都主动拉一次快照：SSE 一般已经推过来了，但代理没连上时（事件通道断了）
+  // 就只剩这条路 —— 不然点了暂停按钮还显示"暂停"，用户只能以为点空了。
+  const reload = (): void => {
+    void refreshUploads().catch(() => undefined)
+  }
+  const fail = (error: unknown): void => {
+    // 文案口径与 ErrorNotice 一致（业务错误按 code 本地化，见 api/errors.translateError）；
+    // 卡片里摆不下那一整块提示，所以只弹一句。
+    message.error(translateError(error) || t('upload.actionFailed'))
+  }
+
+  const toggle = useMutation({
+    mutationFn: () => (paused ? agentApi.resumeUpload(upload.upload_id) : agentApi.pauseUpload(upload.upload_id)),
+    onSuccess: reload,
+    onError: fail
+  })
+  const cancel = useMutation({
+    mutationFn: () => agentApi.cancelUpload(upload.upload_id),
+    onSuccess: reload,
+    onError: fail
+  })
+
+  return (
+    <>
+      <Tooltip title={building ? t('upload.pauseBlocked') : undefined}>
+        <span style={{ display: 'inline-block' }}>
+          <Button
+            type="primary"
+            size="small"
+            disabled={building}
+            loading={toggle.isPending}
+            onClick={() => toggle.mutate()}
+          >
+            {paused ? t('upload.resume') : t('upload.pause')}
+          </Button>
+        </span>
+      </Tooltip>
+      <Button danger size="small" loading={cancel.isPending} onClick={() => cancel.mutate()}>
+        {t('upload.cancelShort')}
+      </Button>
+    </>
+  )
+}
+
+/**
  * 右侧动作区：「详情」（列表形态才有）/「配置」/ 挂载按钮。
  *
  * 按钮一律靠右（marginLeft: auto），不被内容挤到左边；容器可点打开挂载目录，
  * 因此整块动作区都要拦住冒泡。
+ *
+ * 上传中的**占位库**（服务端还没有这条记录，见 uploadPlaceholderRepo）没有可用的 id：
+ * 「详情」会导航到一个不存在的库、 「配置」保存时会把补丁打到不存在的库上，所以这两个入口
+ * 对占位库都不渲染 —— 动作区不至于空掉：上传中的条目换成「暂停 / 继续」+「取消」
+ * （见 RepoUploadActions），不是上传中的照旧画挂载按钮。
  */
 function RepoActions({
   repo,
+  upload,
   controller,
   onOpen,
   onConfigure,
@@ -282,6 +378,7 @@ function RepoActions({
 }): JSX.Element {
   const { t } = useI18n()
   const stop = (event: MouseEvent): void => event.stopPropagation()
+  const placeholder = isPlaceholderRepoId(repo.id)
   return (
     <div
       onClick={stop}
@@ -294,7 +391,7 @@ function RepoActions({
         ...style
       }}
     >
-      {showDetail ? (
+      {showDetail && !placeholder ? (
         <Tooltip title={t('repo.card.detail')}>
           <Button
             type="text"
@@ -305,21 +402,24 @@ function RepoActions({
           />
         </Tooltip>
       ) : null}
-      <Tooltip title={t('repo.settings.title')}>
-        <Button
-          type="text"
-          size="small"
-          icon={<SettingOutlined />}
-          aria-label={t('repo.settings.title')}
-          onClick={() => onConfigure(repo)}
-        />
-      </Tooltip>
+      {placeholder ? null : (
+        <Tooltip title={t('repo.settings.title')}>
+          <Button
+            type="text"
+            size="small"
+            icon={<SettingOutlined />}
+            aria-label={t('repo.settings.title')}
+            onClick={() => onConfigure(repo)}
+          />
+        </Tooltip>
+      )}
       {/* 监控入口放在「设置」右侧：它开的是一个普通指标弹窗。
           必须留在动作区里 —— antd Modal 走 React portal，但合成事件仍沿 React 组件树冒泡，
           若把弹窗挂在标题行（Card 子树内），点弹窗里任何位置都会冒泡到整卡的
           onClick（打开挂载目录）。动作区外层已拦截冒泡，弹窗才不会被当成"点卡片"。 */}
       <RepoMonitorTag controller={controller} repoName={repo.name} />
-      <RepoMountActions controller={controller} />
+      {/* 上传中的条目：挂载按钮换成「暂停 / 继续」+「取消」（见 RepoUploadActions）。 */}
+      {upload ? <RepoUploadActions upload={upload} /> : <RepoMountActions controller={controller} />}
     </div>
   )
 }
@@ -329,6 +429,9 @@ function RepoActions({
  *
  * 只在 state=creating 且拿到进度时有意义：建库是个几十秒到几分钟的异步过程，
  * 只显示"建库中"三个字，用户无法区分"在建"和"卡住了"。
+ *
+ * **本机正在上传这一份时不走这里**：那一刻卡片上要的是上传进度（见 RepoUploadProgress），
+ * 两张条同处一个位置，由调用方二选一 —— 看别人的库建到哪一步的人没有上传任务，仍然是这一条。
  */
 function RepoPrepareProgress({ repo }: { repo: RepoDTO }): JSX.Element | null {
   const { t } = useI18n()
@@ -359,6 +462,42 @@ function RepoPrepareProgress({ repo }: { repo: RepoDTO }): JSX.Element | null {
 }
 
 /**
+ * 上传进度：本机正在上传这个库时，卡片上要看得见"传到哪了"。
+ *
+ * 外观与建库进度条同款（同样一行"左说明 + 右数字"、同样一条 small 进度条、同样的上边距）：
+ * 两条条在同一位置接力（传完换成建库进度），用户眼里是一件事在往前走，不该中途换张脸。
+ *
+ * 三处刻意的取舍（真实反馈："进度条加回去，改一下逻辑，改为上传进度，上面展示的是进度
+ * xx GB/yy GB；进度条里面也展示百分比和原来的样式一致，但是不变色，都蓝色就行"）：
+ *   - 上面那行左边是「进度」、右边是"已传 / 总量"：只给百分比看不出还剩多少 GB；
+ *   - 百分比交给进度条自己画（antd 在 small 尺寸下就画在**条内**），不再另拼一行文字；
+ *   - **不传 status、不变色**：完成变绿、失败变红会让卡片之间跳色，而这条要回答的只有
+ *     "还在不在动" —— 蓝色从头到尾最好读。
+ */
+function RepoUploadProgress({ upload }: { upload: UploadState }): JSX.Element {
+  const { t } = useI18n()
+  return (
+    <div style={{ marginTop: spacing.sm }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+          {t('repo.card.progress')}
+        </Typography.Text>
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+          {`${formatBytes(upload.uploaded_bytes)} / ${formatBytes(upload.total_bytes)}`}
+        </Typography.Text>
+      </div>
+      <Progress
+        percent={uploadPercent(upload)}
+        size="small"
+        strokeColor={palette.accent}
+        trailColor={palette.neutralFill}
+        style={{ marginTop: spacing.xxs, marginBottom: 0 }}
+      />
+    </div>
+  )
+}
+
+/**
  * 打开本机挂载目录（整卡的点击行为）。
  *
  * 原来的「打开目录」小按钮撤掉了（按用户要求把"点击卡片进详情"换成"打开文件"）；
@@ -376,23 +515,53 @@ function useOpenMountDir(controller: RepoMountController): () => void {
 }
 
 /**
+ * 整卡点击的去处：上传中的库没有挂载目录（点下去只会得到一句"未挂载"），所以改去
+ * 「上传任务」页看进度；其余情况仍是普通库的"打开挂载目录"。
+ *
+ * 这里只管点击；上传带来的外观差异（进度条、暂停/取消按钮）都不在这里，见 RepoCardProps.upload。
+ */
+function useRepoCardClick(
+  upload: UploadState | undefined,
+  onOpenUpload: ((uploadId: string) => void) | undefined,
+  openMountDir: () => void
+): () => void {
+  return useCallback(() => {
+    if (upload && onOpenUpload) {
+      onOpenUpload(upload.upload_id)
+      return
+    }
+    openMountDir()
+  }, [upload, onOpenUpload, openMountDir])
+}
+
+/**
  * 卡片形态（网格）：竖向排版，适合一眼扫过多块盘。
  *
  * 卡片上的动作分工（都能在这一张卡上完成，不必先进详情页）：
- *   - 整卡点击 = 打开文件（未挂载时如实提示）；
+ *   - 整卡点击 = 打开文件（未挂载时如实提示；上传中的库进「上传任务」页）；
  *   - 库名前的状态圆点 = 本机挂载状态一眼可辨；
  *   - 「详情」图标 = 进详情页（默认停在「设置」tab）；
  *   - 「配置」图标 + 挂载按钮 = 这个库在本机怎么挂 / 挂上或卸下。
+ *
+ * 上传中的库**就用这套渲染**，不另起一套（真实反馈："上传中状态的存储库的卡片或列表不要
+ * 展示那么多东西，和原有展示逻辑一样，只是状态标签不同"）—— 标签行多出「上传中」，
+ * 进度条与动作区换成上传那两件（见 RepoUploadProgress / RepoUploadActions），其余零件照旧。
  */
-export function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardProps): JSX.Element {
+export function RepoCard(props: RepoCardProps): JSX.Element {
+  return <RepoMountCard {...props} />
+}
+
+/** 库卡片：本机挂载这条链路（状态圆点 / 用量 / 挂载按钮 / 监控）只在这一支里。 */
+function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onConfigure }: RepoCardProps): JSX.Element {
   const { t } = useI18n()
   const mountController = useRepoMount(repo, currentUserId)
   const openMountDir = useOpenMountDir(mountController)
+  const onClick = useRepoCardClick(upload, onOpenUpload, openMountDir)
 
   return (
     <Card
       hoverable
-      onClick={openMountDir}
+      onClick={onClick}
       style={{ height: '100%' }}
       styles={{ body: { padding: spacing.md } }}
     >
@@ -404,18 +573,21 @@ export function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardP
             {repo.name}
           </Typography.Text>
         </div>
-        <Tooltip title={t('repo.card.detail')}>
-          <Button
-            type="text"
-            size="small"
-            icon={<InfoCircleOutlined />}
-            aria-label={t('repo.card.detail')}
-            onClick={(event) => {
-              event.stopPropagation()
-              onOpen(repo.id)
-            }}
-          />
-        </Tooltip>
+        {/* 占位库没有服务端 id，进详情页只会 404（见 RepoActions 同一处理）。 */}
+        {isPlaceholderRepoId(repo.id) ? null : (
+          <Tooltip title={t('repo.card.detail')}>
+            <Button
+              type="text"
+              size="small"
+              icon={<InfoCircleOutlined />}
+              aria-label={t('repo.card.detail')}
+              onClick={(event) => {
+                event.stopPropagation()
+                onOpen(repo.id)
+              }}
+            />
+          </Tooltip>
+        )}
       </div>
 
       <RepoTagRow repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
@@ -426,8 +598,9 @@ export function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardP
         style={{ marginTop: spacing.md }}
       />
 
-      {/* 建库进度：只在这一刻有信息量（服务端正在预创建差异盘/目标），建完换回常驻信息行 */}
-      <RepoPrepareProgress repo={repo} />
+      {/* 进度块（二选一）：上传中的库画上传进度（已传字节 + 条内百分比），其余画建库进度 ——
+          两张条同处一个位置，传完接力过去，卡片高度不会跳。 */}
+      {upload ? <RepoUploadProgress upload={upload} /> : <RepoPrepareProgress repo={repo} />}
 
       <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
 
@@ -450,15 +623,23 @@ export function RepoCard({ repo, currentUserId, onOpen, onConfigure }: RepoCardP
  * 两栏结构：状态圆点 + 名称 + 标签 + 次要信息 | 用量 + 动作。
  * 与网格形态共用同一批零件（状态圆点/标签行/用量/次要信息/动作），只换排版，
  * 因此两种形态下看到的状态与可执行的动作**完全一致**（不会切个视图就少一个按钮）。
+ *
+ * 上传中的库同样走这一套（只多一个「上传中」标签，进度条与动作区换成上传那两件），见 RepoCard。
  */
-export function RepoRow({ repo, currentUserId, onOpen, onConfigure }: RepoCardProps): JSX.Element {
+export function RepoRow(props: RepoCardProps): JSX.Element {
+  return <RepoMountRow {...props} />
+}
+
+/** 库行（列表形态）。 */
+function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onConfigure }: RepoCardProps): JSX.Element {
   const mountController = useRepoMount(repo, currentUserId)
   const openMountDir = useOpenMountDir(mountController)
+  const onClick = useRepoCardClick(upload, onOpenUpload, openMountDir)
 
   return (
     <Card
       hoverable
-      onClick={openMountDir}
+      onClick={onClick}
       styles={{ body: { padding: `${spacing.sm}px ${spacing.md}px` } }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: spacing.md, flexWrap: 'wrap' }}>
@@ -472,7 +653,7 @@ export function RepoRow({ repo, currentUserId, onOpen, onConfigure }: RepoCardPr
               <RepoTagRow repo={repo} controller={mountController} />
             </span>
           </div>
-          <RepoPrepareProgress repo={repo} />
+          {upload ? <RepoUploadProgress upload={upload} /> : <RepoPrepareProgress repo={repo} />}
           <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.xxs }} />
         </div>
 
