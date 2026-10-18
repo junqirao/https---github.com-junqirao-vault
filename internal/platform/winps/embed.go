@@ -85,6 +85,8 @@ const (
 	ScriptVHDResetDiskIdentifier = "vhd_reset_disk_identifier.ps1"
 	// ScriptVHDOptimize 回收 VHDX 空间（Retrim / Compact）。
 	ScriptVHDOptimize = "vhd_optimize.ps1"
+	// ScriptVHDResize 扩容 VHDX（Resize-VHD，只扩不缩）。
+	ScriptVHDResize = "vhd_resize.ps1"
 	// ScriptTLSCertFingerprint 查询本机证书指纹（可选能力）。
 	ScriptTLSCertFingerprint = "tls_cert_fingerprint.ps1"
 )

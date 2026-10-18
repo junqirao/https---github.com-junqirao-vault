@@ -182,6 +182,8 @@ func (r *Router) routes() {
 		g.Get("/v1/repos/{id}/allocations", r.handleListAllocations)
 		g.Post("/v1/repos/{id}/allocations", r.handleAllocate)
 		g.Post("/v1/repos/{id}/parent/actions", r.handleParentAction)
+		g.Post("/v1/repos/{id}/parent/cleanup-diffs", r.handleCleanupDiffs)
+		g.Post("/v1/repos/{id}/parent/resize", r.handleResizeParent)
 		g.Post("/v1/repos/{id}/copy", r.handleCopyRepo)
 		g.Get("/v1/repos/{id}/disks", r.handleListRepoDisks)
 		g.Get("/v1/repos/{id}/iscsi", r.handleListRepoIscsi)
@@ -221,6 +223,8 @@ func (r *Router) routes() {
 		// 任务
 		g.Get("/v1/jobs", r.handleListJobs)
 		g.Get("/v1/jobs/{id}", r.handleGetJob)
+		// 取消任务仅超管：会杀掉正在执行的平台命令并释放锁，属运维级操作。
+		g.With(r.requireSuperAdminMW).Post("/v1/jobs/{id}/cancel", r.handleCancelJob)
 	})
 
 	// 架构调整：服务端**只提供 API**，不再承载任何 Web 静态资源。

@@ -195,6 +195,10 @@ type TargetSnapshot struct {
 	Stats Stats
 	// IQN is the target's IQN, the same value TargetIQN reports for its key.
 	IQN string
+	// CacheEnabled reports whether the target has a read cache at all. A pure
+	// pass-through target (the repository did not enable caching) is still
+	// observable for I/O, but its cache counters stay zero forever.
+	CacheEnabled bool
 }
 
 // Snapshots returns every registered target's counters, keyed the way the portal
@@ -224,7 +228,7 @@ func (p *Portal) Snapshots() map[string]TargetSnapshot {
 
 	out := make(map[string]TargetSnapshot, len(list))
 	for _, r := range list {
-		out[r.key] = TargetSnapshot{Stats: r.t.statsSnapshot(), IQN: r.iqn}
+		out[r.key] = TargetSnapshot{Stats: r.t.statsSnapshot(), IQN: r.iqn, CacheEnabled: !r.t.noCache}
 	}
 	return out
 }

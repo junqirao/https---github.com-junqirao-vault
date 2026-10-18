@@ -62,6 +62,9 @@ const api = {
   /** 打开系统目录选择框（选择源目录）；用户取消时 canceled=true。 */
   selectDirectory: (): Promise<{ canceled: boolean; path?: string }> =>
     ipcRenderer.invoke('vault:select-directory'),
+  /** 为本地挂载点创建快捷方式（Windows/.lnk）；dir 为空时落到系统桌面。 */
+  createShortcut: (input: { target: string; name?: string; dir?: string }): Promise<{ ok: boolean; path?: string; reason?: string }> =>
+    ipcRenderer.invoke('vault:create-shortcut', input),
   openPath: (target: string): Promise<void> => ipcRenderer.invoke('vault:open-path', target),
   showItemInFolder: (target: string): Promise<void> => ipcRenderer.invoke('vault:show-item', target),
   quit: (): Promise<void> => ipcRenderer.invoke('vault:quit'),

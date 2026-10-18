@@ -170,6 +170,19 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
     }
   }
 
+  // 选择快捷方式默认目录：空串表示桌面，由客户端主进程兜底。
+  const chooseShortcutDir = async (): Promise<void> => {
+    setError(null)
+    setNotice(null)
+    try {
+      const selection = await selectDirectory()
+      if (!selection || selection.canceled || !selection.path) return
+      patch({ shortcut_dir: selection.path })
+    } catch (err) {
+      setError(err)
+    }
+  }
+
   const save = async (): Promise<void> => {
     if (!config) return
     // 与服务端 validateAbsDir 对齐：非空且为绝对路径；失败时沿用服务端错误码文案。
@@ -180,6 +193,18 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
           kind: 'business',
           code: 'system.invalid_param',
           args: { field: 'default_download_dir' }
+        })
+      )
+      return
+    }
+    // 快捷方式目录允许留空（= 系统桌面）；非空必须是绝对路径。
+    if (config.shortcut_dir && !isAbsoluteDir(config.shortcut_dir)) {
+      setNotice(null)
+      setError(
+        new ApiError({
+          kind: 'business',
+          code: 'system.invalid_param',
+          args: { field: 'shortcut_dir' }
         })
       )
       return
@@ -201,6 +226,7 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
         auto_mount: config.auto_mount,
         auto_login: config.auto_login,
         default_download_dir: config.default_download_dir,
+        shortcut_dir: config.shortcut_dir,
         language,
         start_at_login: config.start_at_login,
         update_channel: config.update_channel,
@@ -362,6 +388,26 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
               style={{ maxWidth: 420 }}
               onChange={(event) => patch({ default_download_dir: event.target.value })}
             />
+          </div>
+          <div>
+            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>{t('settings.shortcutDir')}</Typography.Text>
+            <Space.Compact style={{ width: '100%', maxWidth: 520 }}>
+              <Input
+                value={config?.shortcut_dir ?? ''}
+                spellCheck={false}
+                disabled={disabled || !config}
+                placeholder={t('settings.shortcutDirPlaceholder')}
+                onChange={(event) => patch({ shortcut_dir: event.target.value })}
+              />
+              {pickerAvailable ? (
+                <Button disabled={disabled || !config} onClick={() => void chooseShortcutDir()}>
+                  {t('sourceDir.browse')}
+                </Button>
+              ) : null}
+            </Space.Compact>
+            <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+              {t('settings.shortcutDirHint')}
+            </Typography.Text>
           </div>
           <div>
             <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>{t('settings.autoMount')}</Typography.Text>

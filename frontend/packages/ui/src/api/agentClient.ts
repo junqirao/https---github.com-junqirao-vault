@@ -110,6 +110,8 @@ export interface VaultBridge {
   trustCertificate?: (serverUrl: string, sha256: string) => Promise<boolean>
   /** 打开系统目录选择框（Electron 下才存在）。 */
   selectDirectory?: () => Promise<DirectorySelection>
+  /** 创建指向本地挂载点的快捷方式（Electron/Windows 下才存在）。 */
+  createShortcut?: (input: { target: string; name?: string; dir?: string }) => Promise<ShortcutResult>
   openPath: (path: string) => Promise<void>
   showItemInFolder: (path: string) => Promise<void>
   quit: () => Promise<void>
@@ -487,6 +489,33 @@ export async function selectDirectory(): Promise<DirectorySelection | null> {
   return select()
 }
 
+/** 创建快捷方式的结果（见 VaultBridge.createShortcut）。 */
+export interface ShortcutResult {
+  ok: boolean
+  path?: string
+  reason?: string
+}
+
+/** 当前环境是否支持创建快捷方式（Electron/Windows）。 */
+export function supportsShortcut(): boolean {
+  return typeof hostBridge()?.createShortcut === 'function'
+}
+
+/**
+ * 为本地挂载点创建快捷方式。
+ *
+ * `dir` 为空时由主进程落到系统桌面；`name` 缺省用目标目录名。
+ */
+export async function createShortcut(input: {
+  target: string
+  name?: string
+  dir?: string
+}): Promise<ShortcutResult> {
+  const create = hostBridge()?.createShortcut
+  if (!create) return { ok: false, reason: 'unsupported' }
+  return create(input)
+}
+
 /** 规范化服务端地址（去空白、去尾部斜杠、主机名大小写不敏感），用于身份归属比较。 */
 function normalizeServerUrl(url: string | undefined): string {
   return (url ?? '').trim().replace(/\/+$/, '').toLowerCase()
@@ -736,6 +765,20 @@ export const agentApi = {
    * 单独一个接口而不是走 PATCH /agent/config 的整表替换：每个库的配置互相独立，
    * 整表替换会让"两个窗口各改一个库"变成后写覆盖前写。
    */
+  /**
+   * 写入**某个存储库分组**的挂载配置（分组名放请求体）。
+   *
+   * 与 setRepoMountPref 同一套字段，额外带 `use_for_repos`：为 true 时组内库挂载
+   * 都用这套配置覆盖自己的配置。
+   */
+  setGroupMountPref(group: string, pref: AgentRepoMountPref): Promise<{ config: AgentConfig }> {
+    return request({
+      method: 'POST',
+      path: '/agent/group-mounts',
+      body: { ...pref, group }
+    })
+  },
+
   setRepoMountPref(repoId: string, pref: AgentRepoMountPref): Promise<{ config: AgentConfig }> {
     return request({
       // 必须是 POST 而不是 PUT：Electron 主进程会按方法放行（只接受 GET/POST/PATCH/DELETE，

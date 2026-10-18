@@ -1,20 +1,21 @@
 import type { CSSProperties, MouseEvent, ReactNode } from 'react'
 import { useCallback, useState } from 'react'
 import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
-import { InfoCircleOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
+import { InfoCircleOutlined, LinkOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
 import { useMutation } from '@tanstack/react-query'
 
 import { StatusTag } from '../../components/StatusTag'
 import { UsageBar, UsageValueText } from '../../components/UsageBar'
-import { agentApi } from '../../api/agentClient'
+import { agentApi, createShortcut } from '../../api/agentClient'
 import type { AgentMountVolumeUsage, UploadState } from '../../api/agentTypes'
 import { translateError } from '../../api/errors'
 import type { RepoDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { formatBytes, repoUsage } from '../../utils/format'
+import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
+import { openTargetOf } from '../mount/MountControls'
 import { CacheMetricsDialog } from './CacheMetricsDialog'
 import {
   RepoMountActions,
@@ -134,6 +135,9 @@ function RepoTagRow({
     <Space size={spacing.xs} wrap style={style}>
       {/* 占位库（服务端还没有这条记录）拿不到模式，宁可不显示也不猜：见 uploadPlaceholderRepo。 */}
       {isPlaceholderRepoId(repo.id) ? null : <Tag>{repoModeLabel(repo.mode)}</Tag>}
+      {/* 维护态是"用户此刻必须知道"的例外状态：期间不能分配/挂载，列表里必须一眼看到。
+          其余父盘状态（idle/temp_shared）不在这里展示，避免正常库也挂一串标签。 */}
+      {repo.parent_condition === 'maintenance' ? <StatusTag group="parentCondition" value="maintenance" /> : null}
       {/* 取值按"这个库现在到底在干什么"来定：服务端记录在 importing 时是**写母盘**（写入中），
           占位库（服务端还没记录）才是**传数据**（上传中）—— 见 repoStateValue。 */}
       {repo.state === 'active' ? null : <StatusTag group="repo" value={repoStateValue(repo, upload)} />}
@@ -323,7 +327,71 @@ function RepoMonitorTag({
   )
 }
 
-/** 次要信息行：共享数量 / 已预创建 / 母盘版本 / 挂载点。 */
+/** 峰值速度统一按 MB/s 展示（保留一位小数，0 也如实报 0.0 而不是 "-"）。 */
+function formatPeakSpeed(bytesPerSecond: number | undefined): string {
+  return `${((bytesPerSecond ?? 0) / (1024 * 1024)).toFixed(1)} MB/s`
+}
+
+/**
+ * 卡片上的次要信息：把原来的「共享数量 / 母盘版本」换成用户真正关心的本地情况。
+ *
+ * 三态：
+ *   - **未挂载**：显示「上次挂载」时间（只存本机、卸载不丢，见 GET /agent/state 的
+ *     last_mounts）；本机从没挂过这个库则什么都不显示；
+ *   - 已挂载但**没有缓存目标**（未开启缓存、或回退直连）：显示「缓存未开启」；
+ *   - 已挂载且有缓存目标：显示 已缓存 / 命中率 / 峰值读速 / 峰值写速。
+ *
+ * 峰值来自代理的状态接口（近 5 分钟采样窗口内的峰值吞吐，见 GET /agent/cache 的
+ * targets[].peak_*_bytes_per_sec），因此卡片不需要自己再拉历史曲线。
+ */
+function RepoCacheStatus({
+  repoId,
+  controller,
+  style
+}: {
+  repoId: string
+  controller: RepoMountController
+  style?: CSSProperties
+}): JSX.Element {
+  const { t } = useI18n()
+  const agent = useAgent()
+  const mount = controller.mount
+  // 未挂载时改展示"上次挂载这个库的时间"：本地根本没有这条挂载链路，
+  // 原来的「缓存未开启」既没意义又会被误读成功能被关掉（真实反馈：那格空了）。
+  // 时间只存在本机代理的本地状态里（卸载也不丢），没记录就什么都不显示。
+  if (!mount) {
+    const lastMount = agent.state?.last_mounts?.[repoId]
+    if (!lastMount) return <></>
+    return (
+      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, ...style }}>
+        {t('repo.card.lastMount', { time: formatTime(lastMount) })}
+      </Typography.Text>
+    )
+  }
+  const target = agent.cache?.targets.find((item) => item.allocation_id === mount.allocation_id)
+
+  if (!target || !target.cache_enabled) {
+    return (
+      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, ...style }}>
+        {t('repo.card.cacheOff')}
+      </Typography.Text>
+    )
+  }
+
+  const used = target.l1_used_bytes + target.l2_used_bytes
+  return (
+    <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, ...style }}>
+      {t('repo.card.cacheSummary', {
+        used: formatBytes(used),
+        rate: `${(target.hit_rate * 100).toFixed(1)}%`,
+        read: formatPeakSpeed(target.peak_read_bytes_per_sec),
+        write: formatPeakSpeed(target.peak_write_bytes_per_sec)
+      })}
+    </Typography.Text>
+  )
+}
+
+/** 次要信息行：缓存状态 / 已预创建 / 挂载状态。 */
 function RepoMetaLine({
   repo,
   controller,
@@ -336,18 +404,13 @@ function RepoMetaLine({
   const { t } = useI18n()
   return (
     <Space size={spacing.md} wrap style={style}>
-      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-        {t('repo.card.shareCount')} {repo.share_count ?? repo.max_diff_disks}
-      </Typography.Text>
+      <RepoCacheStatus repoId={repo.id} controller={controller} />
       {/* 「已预创建」= 差异盘与 iSCSI 目标在建库时就备好：分配到手的盘挂载即用，不必现场下发 */}
       {repo.pool ? (
         <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
           {t('repo.card.pool')}
         </Typography.Text>
       ) : null}
-      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-        {t('repo.parentVersion')} {repo.parent_version}
-      </Typography.Text>
       <RepoMountStatus controller={controller} />
     </Space>
   )
@@ -490,10 +553,66 @@ function RepoActions({
           必须留在动作区里 —— antd Modal 走 React portal，但合成事件仍沿 React 组件树冒泡，
           若把弹窗挂在标题行（Card 子树内），点弹窗里任何位置都会冒泡到整卡的
           onClick（打开挂载目录）。动作区外层已拦截冒泡，弹窗才不会被当成"点卡片"。 */}
+      <RepoShortcutButton repoName={repo.name} controller={controller} />
       <RepoMonitorTag controller={controller} repoName={repo.name} />
       {/* 上传中的条目：挂载按钮换成「暂停 / 继续」+「取消」（见 RepoUploadActions）。 */}
       {upload ? <RepoUploadActions upload={upload} /> : <RepoMountActions controller={controller} />}
     </div>
+  )
+}
+
+/**
+ * 创建快捷方式：把当前挂载点做成一个系统快捷方式，放到配置的目录（默认桌面）。
+ *
+ * 未挂载时没有可指向的路径，按钮置灰并说明原因。
+ */
+function RepoShortcutButton({
+  repoName,
+  controller
+}: {
+  repoName: string
+  controller: RepoMountController
+}): JSX.Element {
+  const { t } = useI18n()
+  const agent = useAgent()
+  const [busy, setBusy] = useState(false)
+  const mount = controller.mount
+  const disabled = !controller.mounted || !mount
+
+  const create = async (event: MouseEvent): Promise<void> => {
+    event.stopPropagation()
+    if (!mount) return
+    setBusy(true)
+    try {
+      const result = await createShortcut({
+        target: openTargetOf(mount),
+        name: repoName,
+        dir: agent.config?.shortcut_dir
+      })
+      if (result.ok) message.success(t('repo.shortcut.created', { path: result.path ?? '' }))
+      else message.error(t('repo.shortcut.failed'))
+    } catch {
+      message.error(t('repo.shortcut.failed'))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Tooltip title={disabled ? t('repo.shortcut.unmounted') : t('repo.shortcut.create')}>
+      {/* 置灰按钮不派发鼠标事件，Tooltip 靠外层 span 才挂得住。 */}
+      <span style={{ display: 'inline-block' }}>
+        <Button
+          type="text"
+          size="small"
+          icon={<LinkOutlined />}
+          aria-label={t('repo.shortcut.create')}
+          loading={busy}
+          disabled={disabled}
+          onClick={(event) => void create(event)}
+        />
+      </span>
+    </Tooltip>
   )
 }
 

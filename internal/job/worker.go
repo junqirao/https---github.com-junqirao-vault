@@ -107,6 +107,17 @@ type Worker struct {
 	// 中间态，而挂载/发布路径会一直等 ready，表现为"每次点挂载都报 disk.not_ready
 	// 且永远不会变好"（对账也刻意跳过 creating，救不了它）。
 	onFinalFailure func(ctx context.Context, j *domain.Job, cause error)
+
+	// cancelMu 保护 running / cancelRequested，实现"精确取消某一个任务"。
+	cancelMu sync.Mutex
+	// running 记录"正在执行的任务 → 它的取消函数"。Cancel 调它即取消该任务的子 ctx，
+	// 正在跑的 PowerShell 会被 exec.CommandContext 杀掉（Windows 命令本身不可中断，
+	// 但杀进程能让它尽快收场、释放锁）。
+	running map[string]context.CancelFunc
+	// cancelRequested 记录"已被请求取消、但任务还没真正开跑"的 ID：
+	// ClaimJobs 把任务领走与 runOne 注册 running 之间有个窗口，取消请求落在这个窗口里
+	// 就会丢，runOne 开跑前查一次这张表补上。
+	cancelRequested map[string]bool
 }
 
 // NewWorker 构造 Worker。
@@ -124,11 +135,13 @@ func NewWorker(st *store.Store, locks *lock.Keyed, opts Options) *Worker {
 		opts.Logger = slog.Default()
 	}
 	return &Worker{
-		store:  st,
-		locks:  locks,
-		log:    opts.Logger,
-		opts:   opts,
-		byType: make(map[domain.JobType]Handler),
+		store:           st,
+		locks:           locks,
+		log:             opts.Logger,
+		opts:            opts,
+		byType:          make(map[domain.JobType]Handler),
+		running:         make(map[string]context.CancelFunc),
+		cancelRequested: make(map[string]bool),
 	}
 }
 
@@ -195,6 +208,80 @@ func (w *Worker) EnqueueWith(ctx context.Context, t domain.JobType, refID, idemK
 		Payload: string(raw),
 		State:   domain.JobStatePending,
 	})
+}
+
+// Cancel 取消一个任务（供界面"取消"按钮调用）。
+//
+//   - 正在执行：取消它的子 ctx —— exec.CommandContext 会杀掉正在跑的 PowerShell，任务随即
+//     以 cancelled 收场并释放它持有的目标/磁盘锁。这是"卡住的任务"唯一的出口；
+//   - 还在排队：直接置为 cancelled，并登记取消请求，防止它正好被领取后又开跑。
+//
+// 幂等：任务已是终态时返回 nil。
+func (w *Worker) Cancel(ctx context.Context, jobID string) error {
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return errors.New("job: 任务 ID 不能为空")
+	}
+	// 先看是否正在执行：在跑的直接取消它的 ctx。
+	w.cancelMu.Lock()
+	if cancel, ok := w.running[jobID]; ok {
+		w.cancelMu.Unlock()
+		w.log.Info("取消正在执行的任务", "job_id", jobID)
+		cancel()
+		return nil
+	}
+	// 不在跑：登记取消请求（覆盖"已被领取、还没登记 running"的窗口），再看 DB 状态。
+	w.cancelRequested[jobID] = true
+	w.cancelMu.Unlock()
+
+	j, err := w.store.GetJob(ctx, jobID)
+	if err != nil {
+		w.clearCancelRequest(jobID)
+		return err
+	}
+	switch {
+	case j.State.IsTerminal():
+		w.clearCancelRequest(jobID)
+		return nil
+	case j.State == domain.JobStateRunning:
+		// 已被领取但还没登记 running：留给 runOne 开跑前拦下（它读的是同一张表）。
+		w.log.Info("取消请求已登记（任务即将开跑）", "job_id", jobID)
+		return nil
+	default:
+		w.log.Info("取消排队中的任务", "job_id", jobID)
+		w.finish(ctx, j, domain.JobStateCancelled, "已取消")
+		w.clearCancelRequest(jobID)
+		return nil
+	}
+}
+
+// beginJob 在锁内"检查取消请求 + 登记 running"，返回任务专属 ctx。
+//
+// 两件事必须原子：否则取消请求可能落在"被领取"与"登记"之间而丢失。
+func (w *Worker) beginJob(parent context.Context, jobID string) (context.Context, context.CancelFunc, bool) {
+	w.cancelMu.Lock()
+	defer w.cancelMu.Unlock()
+	if w.cancelRequested[jobID] {
+		delete(w.cancelRequested, jobID)
+		return parent, func() {}, true
+	}
+	jobCtx, cancel := context.WithCancel(parent)
+	w.running[jobID] = cancel
+	return jobCtx, cancel, false
+}
+
+// endJob 注销 running 登记。
+func (w *Worker) endJob(jobID string) {
+	w.cancelMu.Lock()
+	delete(w.running, jobID)
+	w.cancelMu.Unlock()
+}
+
+// clearCancelRequest 清掉取消请求标记。
+func (w *Worker) clearCancelRequest(jobID string) {
+	w.cancelMu.Lock()
+	delete(w.cancelRequested, jobID)
+	w.cancelMu.Unlock()
 }
 
 // Start 启动执行循环，直到 ctx 结束。
@@ -266,6 +353,17 @@ func (w *Worker) runOne(ctx context.Context, j *domain.Job) {
 		return
 	}
 
+	// 开跑前处理"已请求取消"的任务，并登记 running（同一把锁，避免取消请求落在
+	// "被领取"与"登记"之间的窗口里丢掉）。
+	jobCtx, cancelJob, preCancelled := w.beginJob(ctx, j.ID)
+	if preCancelled {
+		w.log.Info("任务在执行前已被取消", "job_id", j.ID, "type", j.Type)
+		w.finish(ctx, j, domain.JobStateCancelled, "已取消")
+		return
+	}
+	defer cancelJob()
+	defer w.endJob(j.ID)
+
 	// 按 lock_key 串行：同一资源（如同一磁盘）的操作不能并发。
 	var release func()
 	if j.LockKey != "" {
@@ -276,6 +374,13 @@ func (w *Worker) runOne(ctx context.Context, j *domain.Job) {
 			release()
 		}
 	}()
+
+	// 等锁期间可能被取消：拿到锁后再确认一次，避免白跑一段（也避免锁被取消的任务占着）。
+	if jobCtx.Err() != nil {
+		w.log.Warn("任务在等待锁期间被取消", "job_id", j.ID, "type", j.Type)
+		w.finish(ctx, j, domain.JobStateCancelled, "已取消")
+		return
+	}
 
 	rep := ReporterFunc(func(percent int) {
 		if err := w.store.UpdateJobProgress(ctx, j.ID, percent); err != nil {
@@ -292,7 +397,7 @@ func (w *Worker) runOne(ctx context.Context, j *domain.Job) {
 	log.Info("任务开始")
 	start := time.Now()
 
-	execErr := normalizeNilError(w.execute(ctx, handler, j, rep))
+	execErr := normalizeNilError(w.execute(jobCtx, handler, j, rep))
 	cost := time.Since(start)
 
 	switch {

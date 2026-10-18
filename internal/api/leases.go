@@ -156,3 +156,28 @@ func (r *Router) handleGetJob(w http.ResponseWriter, req *http.Request) {
 	}
 	r.writeJSON(w, http.StatusOK, toJobDTO(job))
 }
+
+// handleCancelJob 取消一个任务（仅超级管理员）。
+//
+// 排队中的任务直接置为 cancelled；正在执行的任务取消其 ctx —— 正在跑的 PowerShell 会被杀掉，
+// 任务随即以 cancelled 收场并释放它持有的目标/磁盘锁。这是"卡住的任务"唯一的出口
+// （真实诉求："任务一直卡着，给个取消按钮"）。
+func (r *Router) handleCancelJob(w http.ResponseWriter, req *http.Request) {
+	id := chi.URLParam(req, "id")
+	p, err := r.principal(req)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	if err := r.deps.App.JobWorker().Cancel(req.Context(), id); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	job, err := r.deps.Store.GetJob(req.Context(), id)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.deps.App.Audit(req.Context(), p.UserID, "job.cancel", "job:"+id, "", domain.AuditResultOK)
+	r.writeJSON(w, http.StatusOK, toJobDTO(job))
+}

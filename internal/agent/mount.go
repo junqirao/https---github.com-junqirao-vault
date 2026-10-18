@@ -59,6 +59,9 @@ type MountRequest struct {
 	// RepoID / RepoName 可选：服务端 MountSpec 不含存储库信息，前端可顺带带上用于展示与变量注入。
 	RepoID   string `json:"repo_id"`
 	RepoName string `json:"repo_name"`
+	// RepoGroup 可选：存储库分组名。服务端 MountSpec 也会下发（见 RepoGroup 字段），
+	// 这里主要用于前端在服务端还没响应前就带上分组、以及旧服务端的兜底。
+	RepoGroup string `json:"repo_group,omitempty"`
 	// ServerKey / ServerURL 指明本次挂载归属的服务端（多服务端下二选一必填）。
 	//
 	// 挂载记录会记住这个归属：心跳、挂载点回写、租约释放都发给它（见 Agent.mountClient）。
@@ -201,7 +204,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	// v2 是透传代理：发起端登录的是后端目标的**真实 IQN**，认证也端到端进行。
 	// 代理生效只把门户地址换成该库在本机代理上的监听端口，IQN 不变。
 	effectiveIQN := spec.TargetIQN
-	pref, hasPref := e.repoPref(req.RepoID)
+	pref, hasPref := e.mountPrefFor(req, spec)
 	directMode := hasPref && pref.DirectMode
 	// 缓存默认开启：没有该库条目、或旧配置没写 cache_enabled 时都按开启处理。
 	cacheEnabled := pref.cacheEnabledOrDefault()
@@ -241,6 +244,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		// 库名同时决定盘符模式的卷标与目录模式的目录名（见 mountAt）。
 		// 请求里没有时用服务端下发值兜底：自动重挂/重装后恢复也能拿到库名。
 		RepoName:     repoNameOf(req, spec),
+		RepoGroup:    repoGroupOf(req, spec),
 		AllocationID: allocationID,
 		ServerKey:    serverKey,
 		ServerURL:    serverURL,
@@ -464,6 +468,9 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		out = cp
 	})
 	e.a.publishMount(&out)
+	// 记下"这个库最近一次挂上的时间"：卸载会删掉挂载记录，这张每库时间表要留着，
+	// 卡片在未挂载时显示它（见 stateStore.RecordRepoMount）。
+	e.a.store.RecordRepoMount(out.RepoID, now)
 	e.a.logger.Info("挂载完成",
 		"allocation_id", allocationID, "mount_path", mountPath,
 		"disk_number", diskNumber, "mount_mode", mode)
@@ -1155,6 +1162,17 @@ func repoNameOf(req MountRequest, spec *MountSpec) string {
 	return ""
 }
 
+// repoGroupOf 解析存储库分组：本地请求优先，其次服务端下发值。
+func repoGroupOf(req MountRequest, spec *MountSpec) string {
+	if group := strings.TrimSpace(req.RepoGroup); group != "" {
+		return group
+	}
+	if spec != nil {
+		return strings.TrimSpace(spec.RepoGroup)
+	}
+	return ""
+}
+
 // resolveMountDir 计算目录模式的绝对挂载路径。
 //
 // 规则（界面在挂载设置里如实告知同一条规则，两处必须一致）：
@@ -1174,7 +1192,14 @@ func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec, serverK
 	base := strings.TrimSpace(e.a.cfg.Get().DefaultMountDir)
 	leaf := mountDirLeaf(e.serverAlias(spec, serverKey), repoNameOf(req, spec), req.AllocationID)
 
-	local := strings.TrimSpace(req.MountPath)
+	// 分组覆盖优先：它的语义就是"覆盖组内库自己的配置"，也包括自动挂载带进来的旧路径。
+	local := ""
+	if gp, ok := e.groupOverride(req, spec); ok {
+		local = strings.TrimSpace(gp.MountDir)
+	}
+	if local == "" {
+		local = strings.TrimSpace(req.MountPath)
+	}
 	if local == "" {
 		if pref, ok := e.repoPref(req.RepoID); ok {
 			local = strings.TrimSpace(pref.MountDir)
@@ -1315,6 +1340,44 @@ func (e *mountEngine) repoPref(repoID string) (RepoMountPref, bool) {
 	return pref, ok
 }
 
+// groupPref 返回某个分组在本机的挂载配置。
+func (e *mountEngine) groupPref(group string) (RepoMountPref, bool) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return RepoMountPref{}, false
+	}
+	pref, ok := e.a.cfg.Get().GroupMounts[group]
+	return pref, ok
+}
+
+// groupOverride 返回本次挂载是否命中了"使用分组配置"的分组，以及那份配置。
+func (e *mountEngine) groupOverride(req MountRequest, spec *MountSpec) (RepoMountPref, bool) {
+	group := strings.TrimSpace(req.RepoGroup)
+	if group == "" && spec != nil {
+		group = strings.TrimSpace(spec.RepoGroup)
+	}
+	if group == "" {
+		return RepoMountPref{}, false
+	}
+	gp, ok := e.groupPref(group)
+	if !ok || !gp.UseForRepos {
+		return RepoMountPref{}, false
+	}
+	return gp, true
+}
+
+// mountPrefFor 返回本次挂载实际生效的偏好。
+//
+// 解析顺序：分组配置（且该分组开了"使用分组配置"）优先覆盖单库配置；否则用单库配置；
+// 都没有则由调用方按零值/全局默认处理。分组名优先取请求（前端可直接带上），
+// 其次取服务端下发的 MountSpec。
+func (e *mountEngine) mountPrefFor(req MountRequest, spec *MountSpec) (RepoMountPref, bool) {
+	if gp, ok := e.groupOverride(req, spec); ok {
+		return gp, true
+	}
+	return e.repoPref(req.RepoID)
+}
+
 // mountCacheSatisfied 判断既有挂载记录的门户形态是否已经满足**当前**的每库配置。
 //
 // 判据用 CacheActive（代理真的生效了）而非配置本身：上次"想经代理却回退直连"的记录应当
@@ -1322,7 +1385,10 @@ func (e *mountEngine) repoPref(repoID string) (RepoMountPref, bool) {
 //   - 直连模式期望 CacheActive=false（不经代理），其余期望 true（经代理）；
 //   - 缓存开关变过也要重挂：否则用户新开的缓存不会生效（代理目标带着旧缓存配置）。
 func (e *mountEngine) mountCacheSatisfied(req MountRequest, ms MountState) bool {
-	pref, _ := e.repoPref(req.RepoID)
+	// 这一层只拿得到请求（幂等判断发生在 RequestMount 之前）：分组名优先取请求里的，
+	// 前端挂载时会把分组一起带上（见 RepoMount 的 mountRepo）；旧调用没有分组时
+	// 退化为单库配置的判断，不会误判成"需要重挂"。
+	pref, _ := e.mountPrefFor(req, nil)
 	if ms.CacheActive != !pref.DirectMode {
 		return false
 	}
@@ -1330,11 +1396,17 @@ func (e *mountEngine) mountCacheSatisfied(req MountRequest, ms MountState) bool 
 	return ms.CacheEnabled == pref.cacheEnabledOrDefault()
 }
 
-// resolveMode 确定本次挂载模式：请求 > 每库配置 > 服务端下发 > 本地默认。
+// resolveMode 确定本次挂载模式：分组覆盖 > 请求 > 每库配置 > 服务端下发 > 本地默认。
 //
-// 每库配置排在服务端下发之前：它是用户在这台机器上**确认过**的选择（弹窗里存下来的），
-// 界面上显示什么形态就该挂成什么形态；服务端 client_config 里的 mount_mode 只是库的缺省建议。
+// 分组配置（且开了"使用分组配置"）排在最前：它的语义就是"覆盖组内库自己的配置"，
+// 包括覆盖自动挂载时带进来的旧值。每库配置排在服务端下发之前：它是用户在这台机器上
+// **确认过**的选择（弹窗里存下来的）；服务端 client_config 里的 mount_mode 只是缺省建议。
 func (e *mountEngine) resolveMode(req MountRequest, spec *MountSpec) string {
+	if gp, ok := e.groupOverride(req, spec); ok {
+		if mode := normalizeMountMode(gp.MountMode); mode != "" {
+			return mode
+		}
+	}
 	if mode := normalizeMountMode(req.MountMode); mode != "" {
 		return mode
 	}

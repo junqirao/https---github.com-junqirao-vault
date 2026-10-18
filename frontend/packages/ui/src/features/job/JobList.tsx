@@ -1,15 +1,18 @@
 import { useMemo, useState } from 'react'
-import { Button, Progress, Select } from 'antd'
+import { Button, Popconfirm, Progress, Select, Tooltip, Typography, message } from 'antd'
 import type { TableColumnsType } from 'antd'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { StatusTag } from '../../components/StatusTag'
+import { translateError } from '../../api/errors'
 import { useApi } from '../../api/provider'
 import type { JobDTO, JobState } from '../../api/types'
+import { usePermission } from '../../hooks/useAuth'
+import { isJobTerminal } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
 import { formatTime } from '../../utils/format'
 import { jobStateLabel, jobTypeLabel } from '../../utils/labels'
@@ -20,12 +23,24 @@ const JOB_STATES: JobState[] = ['pending', 'running', 'succeeded', 'failed', 'ca
 export function JobList(): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
+  const { isSuperAdmin } = usePermission()
+  const queryClient = useQueryClient()
   const [state, setState] = useState<JobState | undefined>(undefined)
 
   const jobsQuery = useQuery({
     queryKey: ['jobs', state ?? 'all'],
     queryFn: () => api.listJobs({ state, limit: 200 }),
     refetchInterval: 10000
+  })
+
+  // 取消任务：卡住的发布/拆除任务没有别的出口（真实诉求："任务一直卡着，给个取消按钮"）。
+  const cancelMutation = useMutation({
+    mutationFn: (id: string) => api.cancelJob(id),
+    onSuccess: () => {
+      message.success(t('job.cancelDone'))
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] })
+    },
+    onError: (err) => message.error(translateError(err) || t('job.cancelFailed'))
   })
 
   const columns = useMemo<TableColumnsType<JobDTO>>(
@@ -50,9 +65,44 @@ export function JobList(): JSX.Element {
       },
       { title: t('job.field.attempt'), dataIndex: 'attempt', key: 'attempt', width: 100 },
       { title: t('common.createdAt'), dataIndex: 'created_at', key: 'created_at', width: 170, render: (value: number) => formatTime(value) },
-      { title: t('common.updatedAt'), dataIndex: 'finished_at', key: 'finished_at', width: 170, render: (value: number) => formatTime(value) }
+      { title: t('common.updatedAt'), dataIndex: 'finished_at', key: 'finished_at', width: 170, render: (value: number) => formatTime(value) },
+      {
+        // 失败原因（稳定错误码）直接列出来：否则用户只能看到"失败"却不知道卡在哪，
+        // 又没法翻服务端日志（真实反馈："看不到任何日志"）。
+        title: t('job.field.error'),
+        dataIndex: 'last_error',
+        key: 'last_error',
+        width: 240,
+        render: (value: string | undefined) =>
+          value ? (
+            <Tooltip title={value}>
+              <Typography.Text type="danger" style={{ fontSize: 12 }} ellipsis>
+                {value}
+              </Typography.Text>
+            </Tooltip>
+          ) : null
+      },
+      {
+        title: t('common.actions'),
+        key: 'actions',
+        width: 110,
+        render: (_, job) =>
+          // 只有超管能取消（服务端也仅超管放行）；终态任务无需取消。
+          isSuperAdmin && !isJobTerminal(job.state) ? (
+            <Popconfirm
+              title={t('job.cancelConfirm')}
+              okText={t('common.confirm')}
+              cancelText={t('common.cancel')}
+              onConfirm={() => cancelMutation.mutate(job.id)}
+            >
+              <Button size="small" danger loading={cancelMutation.isPending}>
+                {t('job.cancel')}
+              </Button>
+            </Popconfirm>
+          ) : null
+      }
     ],
-    [t]
+    [t, isSuperAdmin, cancelMutation]
   )
 
   return (
@@ -79,7 +129,7 @@ export function JobList(): JSX.Element {
         rowKey={(job) => job.id}
         loading={jobsQuery.isLoading}
         empty={<EmptyState title={t('job.empty')} />}
-        scroll={{ x: 1100 }}
+        scroll={{ x: 1340 }}
       />
     </PageShell>
   )

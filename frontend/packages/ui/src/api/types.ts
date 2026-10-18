@@ -18,7 +18,7 @@ export type RepoMode = 'shared' | 'exclusive'
 // 还在传数据的那一帧是界面合成的占位库，标签取值另算（见 features/repo/uploadView.tsx 的
 // repoStateValue）。
 export type RepoState = 'creating' | 'importing' | 'active' | 'sealing' | 'deleting' | 'error'
-export type ParentCondition = 'idle' | 'derived' | 'temp_shared' | 'maintenance'
+export type ParentCondition = 'idle' | 'temp_shared' | 'maintenance'
 export type DiskKind = 'parent' | 'diff' | 'standalone'
 export type DiskState = 'creating' | 'ready' | 'published' | 'deleting' | 'error'
 export type AllocationState = 'allocated' | 'mounting' | 'mounted' | 'releasing' | 'released'
@@ -235,6 +235,8 @@ export interface JobDTO {
   created_at: number
   started_at: number
   finished_at: number
+  /** 失败/重试时的错误摘要（稳定错误码与参数）；旧服务端不带该字段。 */
+  last_error?: string
 }
 
 export interface AuditDTO {
@@ -744,13 +746,7 @@ export interface ParentActionRequest {
   action: ParentAction
 }
 
-export type ParentAction =
-  | 'derive'
-  | 'temp_share'
-  | 'unshare'
-  | 'maintenance'
-  | 'finish_maintenance'
-  | 'cleanup_diffs'
+export type ParentAction = 'temp_share' | 'unshare' | 'maintenance' | 'finish_maintenance'
 
 /** 服务端可浏览的根目录（GET /v1/fs/roots）。 */
 export interface FsRoot {

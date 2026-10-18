@@ -69,25 +69,26 @@ const (
 
 // ParentCondition 母盘用途条件。
 //
-// 四种用途**互斥**（见 docs/implementation.md 4.3）：
-// 母盘同一时刻只能处于"可派生 / 已派生 / 临时共享 / 维护更新"之一。
+// 三种用途**互斥**（见 docs/implementation.md 4.3）：
+// 母盘同一时刻只能处于"正常 / 临时共享 / 维护更新"之一。
+//
+// 差异盘是否存在**不再是状态**：正常使用时（idle）可以同时存在任意多个差异盘；
+// 维护态只表示"管理员正在更新母盘、不能再分配/挂载"，清理差异盘是维护态下的一个动作。
 type ParentCondition string
 
 const (
-	// ParentIdle 无差异盘、未发布、未挂载。
+	// ParentIdle 正常可用：可派生、可分配；可以同时存在差异盘。
 	ParentIdle ParentCondition = "idle"
-	// ParentDerived 存在 ≥1 个差异盘。
-	ParentDerived ParentCondition = "derived"
 	// ParentTempShared 以只读 iSCSI 方式临时共享给客户端。
 	ParentTempShared ParentCondition = "temp_shared"
-	// ParentMaintenance 管理员读写挂载，用于更新母盘内容。
+	// ParentMaintenance 维护中：禁止分配/挂载，允许清理差异盘与更新母盘。
 	ParentMaintenance ParentCondition = "maintenance"
 )
 
 // Valid 校验取值。
 func (c ParentCondition) Valid() bool {
 	switch c {
-	case ParentIdle, ParentDerived, ParentTempShared, ParentMaintenance:
+	case ParentIdle, ParentTempShared, ParentMaintenance:
 		return true
 	default:
 		return false
@@ -321,10 +322,26 @@ const (
 	JobPublish           JobType = "publish"
 	JobUnpublish         JobType = "unpublish"
 	JobReclaim           JobType = "reclaim"
-	JobCompact           JobType = "compact"
-	JobReconcile         JobType = "reconcile"
-	JobDeleteDisk        JobType = "delete_disk"
-	JobUploadComplete    JobType = "upload_complete"
+	// JobCleanupDiffs 维护态下清理全部差异盘：先通知在线客户端断开（撤销租约），
+	// 再逐个拆除 iSCSI 目标并删除差异盘。异步且可重试，见 RepoService.CleanupDiffs。
+	JobCleanupDiffs JobType = "cleanup_diffs"
+	// JobParentTeardown 退出维护/撤销临时共享时异步拆除母盘临时 iSCSI 目标。
+	//
+	// 为什么要异步：拆除要走多次 PowerShell（解映射 → 停用 → 删除，实测 30~60 秒，
+	// 卡住时更久），而客户端请求 20 秒就超时 —— 同步做必然报 network.timeout，
+	// 用户"退出不了维护状态"。任务幂等、可重试，见 RepoService.runParentTeardown。
+	JobParentTeardown JobType = "parent_teardown"
+	// JobRepairTarget 对账发现"平台侧目标缺失 / 启用状态不符"时，异步重新下发该目标。
+	//
+	// 为什么不在对账里同步重下发：重下发是多次 PowerShell（几十秒），会被 60s 对账预算
+	// 中途掐断；而**杀掉正在执行的 iSCSI cmdlet 会把 WinTarget 的 WMI 提供程序留在坏状态**，
+	// 之后所有目标操作都会挂死（真实事故：母盘发布 / 退出维护任务一直卡着）。改走 worker：
+	// 无对账预算、按目标锁串行，脚本能完整跑完。见 IscsiService.runRepairTarget。
+	JobRepairTarget   JobType = "repair_target"
+	JobCompact        JobType = "compact"
+	JobReconcile      JobType = "reconcile"
+	JobDeleteDisk     JobType = "delete_disk"
+	JobUploadComplete JobType = "upload_complete"
 	// JobPrepareRepo 建库预创建：母盘 → "共享数量"个差异盘 → 同数量的 iSCSI 目标（见 5.14）。
 	//
 	// 与 JobCreateVHDX 的区别：它不只建母盘，还要把整个"差异盘池"建好并发布，

@@ -16,6 +16,11 @@ type StatsSnapshot struct {
 	Reads int64
 	// Writes counts write commands observed on the wire (WRITE/WRITE SAME/UNMAP).
 	Writes int64
+	// ReadBytes / WriteBytes count the bytes those commands moved (CDB-declared
+	// length; UNMAP carries no data and contributes zero). The agent samples
+	// them to report peak throughput on the repository card.
+	ReadBytes  int64
+	WriteBytes int64
 	// Invalidations counts the cache ranges a write dropped.
 	Invalidations int64
 	// LocalCmds counts read commands answered from the cache without touching the

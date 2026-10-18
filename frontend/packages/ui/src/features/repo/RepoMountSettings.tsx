@@ -3,7 +3,7 @@ import { Alert, Button, Input, Modal, Popconfirm, Radio, Space, Switch, Typograp
 
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { SectionCard } from '../../components/SectionCard'
-import { agentApi } from '../../api/agentClient'
+import { agentApi, selectDirectory, supportsDirectoryPicker } from '../../api/agentClient'
 import type { AgentMountMode } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
@@ -227,12 +227,27 @@ function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Elem
           <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
             {t('repo.settings.mountDir')}
           </Typography.Text>
-          <Input
-            value={dir}
-            disabled={disabled}
-            placeholder={t('agent.mount.dialog.dirHint')}
-            onChange={(event) => state.setDir(event.target.value)}
-          />
+          <Space.Compact style={{ width: '100%' }}>
+            <Input
+              value={dir}
+              disabled={disabled}
+              readOnly={supportsDirectoryPicker()}
+              placeholder={t('agent.mount.dialog.dirHint')}
+              onChange={(event) => state.setDir(event.target.value)}
+            />
+            {supportsDirectoryPicker() ? (
+              <Button
+                disabled={disabled}
+                onClick={() => {
+                  void selectDirectory().then((selection) => {
+                    if (selection && !selection.canceled && selection.path) state.setDir(selection.path)
+                  })
+                }}
+              >
+                {t('sourceDir.browse')}
+              </Button>
+            ) : null}
+          </Space.Compact>
           <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
             {t('repo.settings.dirHint')}
           </Typography.Text>
@@ -310,6 +325,149 @@ function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Elem
 
       {state.error ? <ErrorNotice error={state.error} /> : null}
     </Space>
+  )
+}
+
+/** 分组挂载设置的状态：与单库设置同一套字段，外加"使用分组配置"开关。 */
+export interface GroupMountSettingsState extends RepoMountSettingsState {
+  /** 为 true 时，本分组的配置覆盖组内每个库自己的挂载配置。 */
+  useForRepos: boolean
+  setUseForRepos: (value: boolean) => void
+}
+
+/**
+ * 分组挂载设置：同一套"形态 / 目录 / 自动挂载 / 缓存 / 直连"字段，按**分组名**保存。
+ *
+ * 分组名与存储库分组（meta.group）同名；未分组的库没有分组配置。
+ */
+export function useGroupMountSettings(group: string): GroupMountSettingsState {
+  const agent = useAgent()
+  const { t } = useI18n()
+  const { servers, active } = useServerConfig()
+  const config = agent.config
+  const saved = config?.group_mounts?.[group]
+
+  const effectiveMode: AgentMountMode = saved?.mount_mode || config?.default_mount_mode || 'letter'
+  const effectiveDir = saved?.mount_dir || config?.default_mount_dir || ''
+  const effectiveAuto = saved ? saved.auto_mount : Boolean(config?.auto_mount)
+  const effectiveCache = saved?.cache_enabled ?? true
+  const effectiveDirect = Boolean(saved?.direct_mode)
+  const effectiveUseForRepos = Boolean(saved?.use_for_repos)
+
+  const serverAlias =
+    (servers.length <= 1 ? config?.server_alias : '')?.trim() || (active?.serverName ?? '').trim() || 'vault'
+
+  const [mode, setMode] = useState<AgentMountMode>(effectiveMode)
+  const [dir, setDir] = useState(effectiveDir)
+  const [autoMount, setAutoMount] = useState(effectiveAuto)
+  const [cacheEnabled, setCacheEnabled] = useState(effectiveCache)
+  const [directMode, setDirectMode] = useState(effectiveDirect)
+  const [useForRepos, setUseForRepos] = useState(effectiveUseForRepos)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<unknown>(null)
+
+  useEffect(() => {
+    setMode(effectiveMode)
+    setDir(effectiveDir)
+    setAutoMount(effectiveAuto)
+    setCacheEnabled(effectiveCache)
+    setDirectMode(effectiveDirect)
+    setUseForRepos(effectiveUseForRepos)
+  }, [group, effectiveMode, effectiveDir, effectiveAuto, effectiveCache, effectiveDirect, effectiveUseForRepos])
+
+  const previewDir = effectiveMountDir(dir.trim() || config?.default_mount_dir || '', serverAlias, group)
+
+  const save = async (): Promise<boolean> => {
+    setError(null)
+    setSaving(true)
+    try {
+      await agentApi.setGroupMountPref(group, {
+        mount_mode: mode,
+        mount_dir: dir.trim(),
+        auto_mount: autoMount,
+        cache_enabled: cacheEnabled,
+        direct_mode: directMode,
+        use_for_repos: useForRepos
+      })
+      await agent.refresh()
+      message.success(t('repo.group.saved'))
+      return true
+    } catch (err) {
+      setError(err)
+      return false
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return {
+    mode,
+    dir,
+    autoMount,
+    cacheEnabled,
+    directMode,
+    setMode,
+    setDir,
+    setAutoMount,
+    setCacheEnabled,
+    setDirectMode,
+    useForRepos,
+    setUseForRepos,
+    saving,
+    error,
+    disabled: !agent.available,
+    save,
+    previewDir,
+    // 分组没有"本库此刻的缓存目标"，清空缓存入口不出现。
+    cacheUsedBytes: null,
+    cacheLimitBytes: 0,
+    clearing: false,
+    clearCache: async () => undefined
+  }
+}
+
+/** 分组挂载设置弹窗：字段与单库一致，额外提供"使用分组配置"开关。 */
+export function GroupMountSettingsModal({
+  group,
+  open,
+  onClose
+}: {
+  group: string
+  open: boolean
+  onClose: () => void
+}): JSX.Element {
+  const { t } = useI18n()
+  const state = useGroupMountSettings(group)
+
+  return (
+    <Modal
+      open={open}
+      title={`${t('repo.group.settingsTitle')} · ${group}`}
+      width={520}
+      centered
+      okText={t('common.save')}
+      cancelText={t('common.cancel')}
+      confirmLoading={state.saving}
+      onCancel={onClose}
+      onOk={() => {
+        void state.save().then((saved) => {
+          if (saved) onClose()
+        })
+      }}
+    >
+      <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
+        <div>
+          <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+            {t('repo.group.useForRepos')}
+          </Typography.Text>
+          <Switch checked={state.useForRepos} disabled={state.disabled} onChange={state.setUseForRepos} />
+          <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+            {t('repo.group.useForReposHint')}
+          </Typography.Text>
+        </div>
+        <RepoMountFields state={state} />
+      </Space>
+    </Modal>
   )
 }
 

@@ -34,7 +34,10 @@ import (
 //	    注释），界面上却摆着一个看起来能限制的输入框。配额口径回到"按标称容量计"。
 //	    两列**保留**（不做 DROP COLUMN：方言差异 + 降级回旧版本会缺列），
 //	    本次迁移把存量值清零，代码不再读写。
-const currentSchemaVersion = 8
+//	9 → 移除母盘条件 `derived`：差异盘不再是独立状态，正常态（idle）可以同时存在差异盘；
+//	    维护态用来承载"清理差异盘 + 更新母盘"。存量 `parent_condition='derived'` 一律回填为
+//	    `idle`（它们本来就是有差异盘的正常库），使老库升级后不会卡在一个已不存在的状态上。
+const currentSchemaVersion = 9
 
 // Migrate 建表并记录 schema 版本。
 //
@@ -96,6 +99,15 @@ func (s *Store) Migrate(ctx context.Context) error {
 				_ = tx.Rollback()
 				return fmt.Errorf("store: 清空已废弃的记账列失败: %w", err)
 			}
+		}
+	}
+	// 版本 9 起不再有 derived 状态：存量"已派生"的库其实就是有差异盘的正常库，
+	// 回填为 idle（见 currentSchemaVersion 的版本历史）。
+	if applied < 9 {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE repositories SET parent_condition = 'idle' WHERE parent_condition = 'derived'`); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("store: 回填已废弃的 parent_condition=derived 失败: %w", err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx,

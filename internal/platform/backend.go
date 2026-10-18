@@ -113,6 +113,13 @@ type DiskBackend interface {
 	// Optimize 回收未使用的物理空间（Windows=compact；Linux=trim/discard）。
 	Optimize(ctx context.Context, ref string) error
 
+	// Resize 把虚拟磁盘的逻辑容量调整为 sizeBytes（**只扩不缩**）。
+	//
+	// Windows：Resize-VHD（要求 Hyper-V 模块，且盘处于离线/未挂载状态）；
+	// Linux：lvextend 扩大 thin LV 的虚拟容量。
+	// 调用方必须先确认该盘未被使用（无活跃租约、无 iSCSI 会话）。
+	Resize(ctx context.Context, ref string, sizeBytes int64) error
+
 	// ResetDiskIdentifier 重置磁盘标识（克隆盘去重必需）。
 	// 平台不具备该能力时返回 ErrUnsupported，由上层决定降级策略。
 	ResetDiskIdentifier(ctx context.Context, ref string) error

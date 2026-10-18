@@ -684,7 +684,7 @@ CREATE TABLE repositories (
   owner_id     TEXT NOT NULL REFERENCES users(id),
   parent_disk_id TEXT REFERENCES disks(id), -- shared 模式
   parent_version INTEGER NOT NULL DEFAULT 0,-- 母盘版本号，每次维护更新 +1
-  parent_condition TEXT,                    -- idle | derived | temp_shared | maintenance（见 5.4）
+  parent_condition TEXT,                    -- idle | temp_shared | maintenance（见 5.4；v9 起不再有 derived）
   max_diff_disks INTEGER NOT NULL DEFAULT 50, -- ★ 创建时由 owner 配置的单母盘差异盘上限
   quota_bytes  INTEGER,                     -- 应用层配额（owner 独担，见 13.2-⑧）
   used_bytes   INTEGER NOT NULL DEFAULT 0,
@@ -814,35 +814,44 @@ CREATE TABLE audit_logs (
 **母盘条件（`repositories.parent_condition`）—— 共享模式的核心约束**
 
 ```
-                    ┌──────────────────────────────────────────┐
-                    │  IDLE                                    │
-                    │  无差异盘 / 未发布 / 未挂载               │
-                    └──┬───────────────┬───────────────┬───────┘
-        建差异盘        │               │ 临时只读共享   │ 进入维护
-        (分配用户)      │               │ (发 iSCSI)     │ (需无差异盘)
-                        ▼               ▼               ▼
-                 ┌───────────┐   ┌─────────────┐  ┌──────────────┐
-                 │  DERIVED  │   │ TEMP_SHARED │  │ MAINTENANCE  │
-                 │ 存在≥1差异 │   │ 只读共享中   │  │ 读写挂载更新  │
-                 └─────┬─────┘   └──────┬──────┘  └──────┬───────┘
-     清理全部差异盘 ◄────┘               │ 撤销共享        │ 完成更新
-     (含"维护"前置)                     └────────────────►│
-                        └────────────────────────────────► IDLE
+                 ┌──────────────────────────────────────────────┐
+                 │  IDLE（正常）                                 │
+                 │  可派生差异盘 / 可挂载 / 可分配                 │
+                 └──┬────────────────────────────┬──────────────┘
+   派生差异盘        │                            │ 进入维护
+   （可多次，         │                            ▼
+    状态不变）        │                    ┌──────────────┐
+                     │                    │ MAINTENANCE  │
+                     │                    │ 禁止分配/挂载  │
+                     │                    └──┬───────────┘
+                     │        清理差异盘（异步，通知客户端断开）│
+                     │        更新母盘内容                      │
+                     │                            │ 退出维护
+                     │                            ▼
+                     │                    parent_version += 1
+                     │                    重算指纹
+                     │                            │
+                     │                            ▼
+                     │                          IDLE
+                     ▼
+        ┌─────────────────────────┐
+        │  TEMP_SHARED（临时只读）  │──撤销共享──► IDLE
+        │  要求无差异盘             │
+        └─────────────────────────┘
 ```
 
 | 迁移 | 前置校验 | 副作用 |
 | --- | --- | --- |
-| `IDLE → DERIVED` | 母盘未发布、未挂载 | 创建差异盘，`parent_version` 写入子盘 |
-| `DERIVED → IDLE` | **所有差异盘已卸载**（无 active lease） | 删除全部差异盘与 target；`used_bytes` 回收 |
+| `IDLE` 内派生差异盘 | 正常态、`diff_count < max_diff_disks` | 创建差异盘；**母盘条件不变**（差异盘不再是独立状态） |
 | `IDLE → TEMP_SHARED` | 无差异盘、未挂载 | 发布只读 iSCSI target（落盘登记，崩溃可恢复） |
 | `TEMP_SHARED → IDLE` | 无 active lease | 撤销共享、删除 target |
-| `IDLE → MAINTENANCE` | 无差异盘、未共享 | 允许读写挂载母盘 |
-| `MAINTENANCE → IDLE` | 母盘已卸载 | `parent_version += 1`，重算指纹 |
-| `DERIVED → MAINTENANCE` | **必须先显式"清理差异盘"**（二次确认） | 等价于 `DERIVED → IDLE → MAINTENANCE` |
+| `IDLE → MAINTENANCE` | 未临时共享 | 维护态：禁止新分配/挂载；允许在线旧连接存在，由"清理差异盘"负责断开 |
+| `MAINTENANCE` 内清理差异盘 | 必须是维护态 | 异步任务：先撤销在线租约（通知客户端断开），再拆 iSCSI 目标并删除全部差异盘 |
+| `MAINTENANCE → IDLE` | 无 active lease | `parent_version += 1`，重算指纹；若还有差异盘则保留 |
 
-> ⚠️ **禁止的迁移**：`DERIVED → TEMP_SHARED`（母盘被引用时不可再共享）、`MAINTENANCE` 期间派生差异盘。
+> ⚠️ **禁止的迁移**：`TEMP_SHARED` 期间派生差异盘、`MAINTENANCE` 期间派生差异盘或新分配。
 >
-> ⚠️ **`IDLE → DERIVED` 的数量闸门**：每次派生都需校验 `diff_count < repositories.max_diff_disks`。该上限**由 owner 在创建存储库时配置**（默认 50），创建后可在库设置中调整（调低时若当前数量已超，仅禁止新增、不强制删除）。
+> ⚠️ **差异盘数量闸门**：每次派生都需校验 `diff_count < repositories.max_diff_disks`。该上限**由 owner 在创建存储库时配置**（默认 50），创建后可在库设置中调整（调低时若当前数量已超，仅禁止新增、不强制删除）。
 
 **Disk**
 
@@ -1053,13 +1062,13 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 
 ### 5.4 存储库状态机、维护状态与母盘保护
 
-对应 design.md 第 7、28 条。共享模式的核心是**母盘同一时刻只能处于一种"用途"**，四种用途互斥（详见 4.3 状态机）。
+对应 design.md 第 7、28 条。共享模式的核心是**母盘同一时刻只能处于一种"用途"**，正常 / 临时共享 / 维护三种用途互斥（详见 4.3 状态机）。
 
 **已确认的母盘语义（来自 design.md 更新）**
 1. 只有在**没有任何差异盘**、且母盘**本身没有被挂载**时，母盘才可以被临时挂载；
 2. 临时挂载状态**需要落盘**（本文用 `parent_condition` + 持久 target 登记实现）；
-3. 引入 **`MAINTENANCE`（维护）状态**：因为母盘内容需要更新，进入维护态前**必须支持清理差异盘**；
-4. 只有**没有共享出去**的母盘才可以生成差异盘；
+3. 引入 **`MAINTENANCE`（维护）状态**：进入维护态后可以执行"清理差异盘"（异步任务）并更新母盘内容；
+4. **差异盘不再是独立状态**：正常态（`idle`）本来就可以同时存在差异盘，只有维护/临时共享会禁止分配与挂载；
 5. 母盘**有可能以只读方式挂载给客户端**（即 `TEMP_SHARED` 支持只读共享）。
 
 **母盘保护采用"应用层标记"（D7 决策）**
@@ -1075,32 +1084,46 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 **维护状态（MAINTENANCE）完整流程**
 
 ```
-进入维护：POST /v1/repos/{id}/maintenance
-  ① 前置校验：parent_condition ∈ {IDLE}
-     - 若为 DERIVED → 拒绝，并提示"需先清理差异盘"（前端提供"清理差异盘"入口）
-     - 若为 TEMP_SHARED → 拒绝，需先撤销共享
-  ② 二次确认：列出将被删除的差异盘 / 受影响的分配与用户（若走"清理+维护"路径）
-  ③ 事务：
-       parent_condition = 'MAINTENANCE'
-       所有相关 target 停用（Set-IscsiServerTarget -Enable $false）
-  ④ 服务端本地挂载母盘（读写）、返回挂载点或让管理员通过管理页操作
-  ⑤ 管理员更新内容（拷入新版本游戏文件等）
-  ⑥ 退出维护：POST /v1/repos/{id}/maintenance/complete
-       - 卸载母盘 → 校验已卸载
-       - parent_version += 1
-       - 重算 content_fingerprint
-       - parent_condition = 'IDLE'
-       - 审计记录：本次更新影响了 N 个被清理的差异盘
+进入维护：POST /v1/repos/{id}/parent/actions {action:"maintenance"}
+  ① 前置校验：parent_condition = IDLE（临时共享需先撤销）
+  ② 为母盘建立临时 iSCSI 目标与占位分配（user_id=@temp，读写），并置
+     parent_condition = 'MAINTENANCE'：立即禁止新的分配与挂载
+  ③ 管理员可在客户端把这块母盘**临时挂载到本地**读写，更新内容
+     （清理差异盘 / 拷入新版本文件等）
+  ④ 可扩容母盘：POST /v1/repos/{id}/parent/resize {size_bytes}
+     - 仅维护态；只扩不缩
+     - 要求没有差异盘、没有在线客户端（母盘未挂载）
+     - 平台侧：Windows=Resize-VHD，Linux=lvextend；完成后重算母盘指纹
+
+清理差异盘（维护态内，异步）：POST /v1/repos/{id}/parent/cleanup-diffs
+  ① 前置校验：parent_condition = MAINTENANCE
+  ② 入队 JobCleanupDiffs（可重试、幂等）
+  ③ 任务：
+       - 逐个撤销该库在线租约（SSE 通知客户端断开并展示原因）
+       - 拆除差异盘的全部 iSCSI 目标（不先拆目标，VHDX 文件会因映射/会话被占用而删不掉）
+       - 删除差异盘记录、分配记录与 VHDX 文件
+  ④ 任务失败可重试：每次尝试重新列出仍存在的差异盘，不会重复处理已删盘
+
+退出维护：POST /v1/repos/{id}/parent/actions {action:"finish_maintenance"}
+  ① 请求内只做**快**的两件事：把母盘临时挂载的在线租约标记为 revoked（SSE 推 revoke
+     指令，客户端据此卸载并展示原因），以及状态机校验（ActiveLeases 归零）
+  ② 入队 JobParentTeardown（异步、可重试）：拆母盘临时 iSCSI 目标并清理占位分配
+     —— 拆除要走多次 PowerShell（解映射/停用/删除，实测 30~60 秒，卡住时更久），
+        同步做会超过客户端 20s 超时（真实反馈："退出不了维护状态 / network.timeout"）
+  ③ 任务完成后：parent_version += 1 → 重算 content_fingerprint → 刷新盘上元数据 →
+     parent_condition = 'IDLE'（此后母盘又可正常派生差异盘）
+  - 撤销临时共享（action:"unshare"）走同一套异步拆除
+  - 返回 202 + JobDTO；界面用任务进度展示（见 useJobProgress）
 ```
 
-**清理差异盘（`DERIVED → IDLE`）是危险操作，必须强调**
+**清理差异盘（维护态内的异步任务）是危险操作，必须强调**
 
 | 风险 | 处理 |
 | --- | --- |
-| 用户数据丢失 | 差异盘内含用户改动；清理前**必须所有客户端卸载**（无 active lease），且需 owner 二次确认并输入库名 |
+| 用户数据丢失 | 差异盘内含用户改动；清理会先给在线客户端推送断开指令（`repo_maintenance` 原因），再拆目标删盘。这是破坏性操作，界面在维护横幅里单独给入口 |
 | 用户存档 | ⚠️ **产品决策点**：若差异盘承载用户存档，清理即丢档。design.md 未定义。建议明确"共享库仅承载可再生数据（缓存/日志/临时配置），用户存档应放独立独享库" |
 | 误删 | 清理默认走 `meta/trash/` 软删除，保留 7 天 |
-| 中途失败 | Job 幂等；`parent_condition` 保持 `DERIVED` 直到全部子盘删除成功 |
+| 中途失败 | Job 幂等：每次重试重新列出仍存在的差异盘；`parent_condition` 保持 `MAINTENANCE` 直到用户显式退出维护 |
 
 ### 5.5 客户端挂载流程
 
@@ -1706,6 +1729,15 @@ Dismount-VHD -Path $vhdx
 > 另外，虚拟盘登记（`ImportVirtualDisk`，脚本内要枚举 `Get-IscsiVirtualDisk`，约 10 秒）在
 > 进程内**记忆已登记路径**跳过重复执行；登记被移除或后续映射步骤失败时会主动失效，
 > 避免"以为登记过其实没有"的隐性故障。
+>
+> **目标收敛只枚举一次平台目标，且不在对账里同步重下发**：`ReconcileTargets` 先跑一次
+> `List-IscsiServerTarget`，再在内存里与 DB 逐条比对；**不再逐目标 `GetTarget`**（那是每个目标
+> 一次 PowerShell，约 10 秒）。发现"平台侧目标缺失 / 启用状态不符"时，**入队 `JobRepairTarget`**
+> 而不是当场重下发：重下发是多次 PowerShell（几十秒），会被 60s 对账预算中途掐断，而
+> **杀掉正在执行的 iSCSI cmdlet 会把 WinTarget 的 WMI 提供程序留在坏状态**，之后所有目标操作
+> 都会挂死（真实事故：母盘发布 / 退出维护任务一直卡着）。修复任务走 worker（无对账预算）、
+> 按目标锁与挂载串行，脚本能完整跑完；幂等键按 5 分钟分桶，避免对持续故障的目标刷任务。
+> 旧命名目标的清理也复用同一份平台列表，不再额外枚举一次。
 
 ### 5.12 任务系统（Job）
 
@@ -1714,7 +1746,7 @@ Dismount-VHD -Path $vhdx
 | 执行器 | 单进程内固定大小 worker pool（默认 4），**同一 disk_id / repo_id 的 job 串行**（按 key 哈希到固定 worker） |
 | 幂等 | `jobs.idem_key` 唯一索引；重复提交返回已有 job |
 | 持久化 | 状态在 DB，进程重启后 `running` 的 job 重置为 `pending`（attempt+1） |
-| 取消 | `state=cancelled` + 协作式检查点；Windows 命令不可中断，只能整条命令跑完再退出 |
+| 取消 | `POST /v1/jobs/{id}/cancel`（仅超管）。排队中直接置 `cancelled`；执行中取消该任务的子 ctx，`exec.CommandContext` 会杀掉正在跑的 PowerShell，任务随即以 `cancelled` 收场并**释放它持有的目标/磁盘锁**（卡住的任务的唯一出口）。取消请求落在"被领取"与"登记 running"之间的窗口由 `cancelRequested` 兜底 |
 | 进度 | Job 内部上报 `progress 0-100`；通过 SSE 推给发起者 |
 | 重试 | 最多 3 次，指数退避；第 3 次失败 → `failed` + 告警 |
 | 超时 | 每类 job 单独配置（如 `create_vhdx` 30min，`copy_vhdx` 按大小动态算） |
@@ -3561,9 +3593,9 @@ dist/
 - **问题**：design.md 第 28 条原文为"母盘在只有没有任何差异盘或本身没有被挂载的情况下可以被临时挂载"。判定条件必须是"**不存在任何差异盘**（无论是否在线）"，而不是"没有差异盘被连接"。
 - **影响**：母盘被写入会**静默污染所有差异盘**（差异盘读取母盘时假设其内容不变），且极难排查。
 - **改进（已按你的决策调整）**：
-  1. 采用本文 5.4 的 `parent_condition` 状态机，**四种用途互斥**：`IDLE / DERIVED / TEMP_SHARED / MAINTENANCE`；
+  1. 采用本文 5.4 的 `parent_condition` 状态机，**三种用途互斥**：`IDLE / TEMP_SHARED / MAINTENANCE`（差异盘不再是状态）；
   2. 母盘**需要更新**，因此**不用**只读挂载硬锁，改用**应用层标记 + 三重兜底**（指纹校验 + `parent_version` 校验 + 目录 ACL），见 5.4；
-  3. 要更新母盘必须先进入 `MAINTENANCE`，而进入前置条件是**清理完全部差异盘**（对应 design.md 新增的"维护状态"要求）；
+  3. 要更新母盘必须先进入 `MAINTENANCE`；差异盘在维护态内通过**异步清理任务**处理（先通知客户端断开再拆目标删盘），而不是进入维护的前置条件；
   4. 母盘以只读方式共享给客户端时归入 `TEMP_SHARED`，与"派生差异盘"互斥；
   5. ⚠️ 残留风险：应用层标记无法阻止**绕过 Vault 直接挂载母盘写入**，只能靠指纹比对事后发现 → 见 R2 与 13.4-㉙。
 

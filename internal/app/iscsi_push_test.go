@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"vault/internal/domain"
+	"vault/internal/job"
+	"vault/internal/lock"
 	"vault/internal/platform"
 )
 
@@ -101,14 +103,41 @@ func (f *fakeIscsiBackend) drift(name string, mutate func(*platform.TargetInfo))
 }
 
 // newPushTestService 构造只带 Store / Log / 假后端的 IscsiService。
+//
+// 带一个**未启动**的 worker：对账现在只入队 repair_target 任务、不同步重下发，
+// 测试需要能查询到这些任务并手动执行（见 runPendingRepairJobs）。
 func newPushTestService(t *testing.T, backend platform.IscsiBackend) *IscsiService {
 	t.Helper()
+	st := openAppTestStore(t)
 	return &IscsiService{Deps: Deps{
-		Store: openAppTestStore(t),
+		Store: st,
 		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Disk:  fakeDiskBackend{exists: true},
 		Iscsi: backend,
+		Locks: lock.NewKeyed(),
+		Jobs:  job.NewWorker(st, lock.NewKeyed(), job.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}),
 	}}
+}
+
+// runPendingRepairJobs 手动执行所有待处理的 repair_target 任务，返回执行个数。
+func runPendingRepairJobs(t *testing.T, svc *IscsiService) int {
+	t.Helper()
+	ctx := context.Background()
+	jobs, err := svc.Store.ListJobs(ctx, domain.JobStatePending, 50, 0)
+	if err != nil {
+		t.Fatalf("列出任务失败：%v", err)
+	}
+	n := 0
+	for i := range jobs {
+		if jobs[i].Type != domain.JobRepairTarget {
+			continue
+		}
+		if err := svc.runRepairTarget(ctx, &jobs[i], job.ReporterFunc(func(int) {})); err != nil {
+			t.Fatalf("执行修复任务失败：%v", err)
+		}
+		n++
+	}
+	return n
 }
 
 // TestPushTargetSkipsWhenUnchanged 锁定用户工单的核心诉求：
@@ -229,13 +258,59 @@ func TestPushTargetKeepsFastPathOnExternalDrift(t *testing.T) {
 		t.Fatalf("挂载路径不该读回平台，实际读回 %d 次", got)
 	}
 
-	// 对账器才是纠偏入口：启用状态不符时会强制下发（这里把平台侧停用）。
+	// 对账器才是纠偏入口：启用状态不符时**入队修复任务**（不再同步重下发 —— 重下发是多次
+	// PowerShell，会被 60s 对账预算中途杀掉 iSCSI cmdlet，把 WinTarget 的 WMI 提供程序拖坏）。
 	backend.drift(svc.targetIQN(target), func(info *platform.TargetInfo) { info.Enabled = false })
 	if err := svc.ReconcileTargets(ctx); err != nil {
 		t.Fatalf("对账失败：%v", err)
 	}
+	if got := backend.pushes(); got != 1 {
+		t.Fatalf("对账不应同步重下发，实际下发次数=%d", got)
+	}
+	if runPendingRepairJobs(t, svc) == 0 {
+		t.Fatal("对账应入队 repair_target 任务")
+	}
 	if got := backend.pushes(); got != 2 {
-		t.Fatalf("对账应把平台侧被停用的目标收敛回来，实际下发次数=%d", got)
+		t.Fatalf("修复任务应把平台侧被停用的目标收敛回来，实际下发次数=%d", got)
+	}
+}
+
+// TestReconcileTargetsRebuildsMissingTargetWithSingleScan 锁定对账器的两个关键点：
+//  1. 平台侧目标被外部删掉（DB 仍在）时能自愈 —— 但**不再同步重建**，而是入队 repair_target
+//     任务（避免被 60s 对账预算中途杀掉 iSCSI cmdlet 把 WinTarget 拖坏）；
+//  2. 查询平台现状只走**一次** ListTargets，不再逐目标 GetTarget。
+func TestReconcileTargetsRebuildsMissingTargetWithSingleScan(t *testing.T) {
+	ctx := context.Background()
+	backend := newFakeIscsiBackend()
+	svc := newPushTestService(t, backend)
+	target, _ := seedPublishFixture(t, svc, "vault-1111-2222")
+
+	if pushed, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
+		t.Fatalf("首次下发失败：pushed=%v err=%v", pushed, err)
+	}
+	if got := backend.pushes(); got != 1 {
+		t.Fatalf("首次下发后 pushes=%d，期望 1", got)
+	}
+
+	// 模拟平台侧目标被外部删除（DB 记录仍在）。
+	if err := backend.RemoveTarget(ctx, svc.targetIQN(target)); err != nil {
+		t.Fatalf("删除平台目标失败：%v", err)
+	}
+
+	if err := svc.ReconcileTargets(ctx); err != nil {
+		t.Fatalf("对账失败：%v", err)
+	}
+	if got := backend.pushes(); got != 1 {
+		t.Fatalf("对账不应同步重建，实际下发次数=%d", got)
+	}
+	if got := backend.reads(); got != 0 {
+		t.Fatalf("对账应只走一次 ListTargets、不逐目标 GetTarget，实际 GetTarget 次数=%d", got)
+	}
+	if runPendingRepairJobs(t, svc) == 0 {
+		t.Fatal("对账应入队 repair_target 任务")
+	}
+	if got := backend.pushes(); got != 2 {
+		t.Fatalf("修复任务应重建被删掉的目标，实际下发次数=%d", got)
 	}
 }
 

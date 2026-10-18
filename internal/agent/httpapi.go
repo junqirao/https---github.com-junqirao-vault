@@ -59,6 +59,9 @@ func (a *Agent) localMux() http.Handler {
 	// **按方法放行**（只接受 GET/POST/PATCH/DELETE，见 apps/client/electron/main.ts 的
 	// parseAgentRequest）—— 用 PUT 会被主进程挡下、在界面上表现为 network.error。
 	mux.HandleFunc("POST /agent/repo-mounts/{repo_id}", a.handleSetRepoMountPref)
+	// 单个存储库**分组**的挂载配置：group 放在请求体里（分组名可能含空格/斜杠，
+	// 放进路径要额外处理转义；POST body 更省事，也与主进程按方法放行的约定一致）。
+	mux.HandleFunc("POST /agent/group-mounts", a.handleSetGroupMountPref)
 
 	// 母盘内容下载（后台异步，见 docs/agent-api.md「磁盘内容下载」）。
 	mux.HandleFunc("POST /agent/disks/download", a.handleDiskDownload)
@@ -287,6 +290,8 @@ func (a *Agent) handleState(w http.ResponseWriter, _ *http.Request) {
 		"servers":     servers,
 		"primary_key": primary,
 		"mounts":      a.store.ListMounts(),
+		// 每库最近一次挂载成功的时间：卸载后挂载记录就没了，卡片要显示"上次挂载"只能靠它。
+		"last_mounts": a.store.LastMounts(),
 		"auto_mount":  a.cfg.Get().AutoMount,
 		// host 是本机就绪状态（当前只有 iSCSI 发起端）：界面据此在启动时挂横幅，
 		// 而不是等挂载失败（阶段：connect）才知道 MSiSCSI 没启动。
@@ -578,6 +583,41 @@ type repoMountPrefRequest struct {
 	//
 	// 同样属于**整条偏好替换**的一部分，必须与其它字段一起回传。
 	DirectMode bool `json:"direct_mode"`
+}
+
+// groupMountPrefRequest 是存储库分组挂载配置的写入请求。
+type groupMountPrefRequest struct {
+	// Group 服务端存储库分组名（repo.meta.group）。
+	Group string `json:"group"`
+	repoMountPrefRequest
+	// UseForRepos 为 true 时，这套分组配置覆盖组内每个库自己的挂载配置。
+	UseForRepos bool `json:"use_for_repos"`
+}
+
+// handleSetGroupMountPref 写入某个分组的挂载配置（与单库配置互不影响）。
+func (a *Agent) handleSetGroupMountPref(w http.ResponseWriter, r *http.Request) {
+	var in groupMountPrefRequest
+	if err := decodeJSON(r, &in); err != nil {
+		a.writeError(w, err)
+		return
+	}
+	cacheEnabled := true
+	if in.CacheEnabled != nil {
+		cacheEnabled = *in.CacheEnabled
+	}
+	cfg, err := a.cfg.SetGroupMountPref(in.Group, RepoMountPref{
+		MountMode:    in.MountMode,
+		MountDir:     in.MountDir,
+		AutoMount:    in.AutoMount,
+		CacheEnabled: cacheEnabled,
+		DirectMode:   in.DirectMode,
+		UseForRepos:  in.UseForRepos,
+	})
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
 }
 
 // handleSetRepoMountPref 写入单个存储库的挂载偏好（每个库各自独立，互不影响）。

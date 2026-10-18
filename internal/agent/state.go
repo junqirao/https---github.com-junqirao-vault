@@ -209,8 +209,10 @@ type UserState struct {
 
 // MountState 是单个分配的挂载状态（对外契约类型）。
 type MountState struct {
-	RepoID       string `json:"repo_id"`
-	RepoName     string `json:"repo_name"`
+	RepoID   string `json:"repo_id"`
+	RepoName string `json:"repo_name"`
+	// RepoGroup 存储库分组名（服务端下发，用于挂载时套用分组配置；旧记录可能为空）。
+	RepoGroup    string `json:"repo_group,omitempty"`
 	AllocationID string `json:"allocation_id"`
 	LeaseID      string `json:"lease_id"`
 	// TargetIQN / Portal 是**本次实际连接**的目标与门户。
@@ -344,6 +346,11 @@ type persistedState struct {
 	Server *ServerState `json:"server,omitempty"`
 	User   *UserState   `json:"user,omitempty"`
 	Mounts []MountState `json:"mounts"`
+	// LastMounts 是**每库**最近一次挂载成功的时间（repo_id → 毫秒时间戳）。
+	//
+	// 挂载记录（Mounts）在卸载后就被删除，界面于是无从回答"这块库上次是什么时候挂的"。
+	// 这张表单独留存，卸载后仍在；只写本机（服务端不参与），键是存储库 ID。
+	LastMounts map[string]int64 `json:"last_mounts,omitempty"`
 }
 
 // serverEntry 是**一台**服务端的本地状态：连接状态 + 登录用户 + 会话（会话仅内存）。
@@ -376,6 +383,8 @@ type stateStore struct {
 	primary string
 	mounts  map[string]*MountState
 	runtime map[string]*mountRuntime
+	// lastMounts 每库最近一次挂载成功时间（repo_id → 毫秒时间戳），见 persistedState.LastMounts。
+	lastMounts map[string]int64
 }
 
 // sameServerRef 判断两组"服务端引用"（实例 ID + 地址）是否指向同一个服务端实例。
@@ -400,11 +409,12 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 		path = DefaultStatePath()
 	}
 	s := &stateStore{
-		path:    path,
-		logger:  logger,
-		servers: make(map[string]*serverEntry),
-		mounts:  make(map[string]*MountState),
-		runtime: make(map[string]*mountRuntime),
+		path:       path,
+		logger:     logger,
+		servers:    make(map[string]*serverEntry),
+		mounts:     make(map[string]*MountState),
+		runtime:    make(map[string]*mountRuntime),
+		lastMounts: make(map[string]int64),
 	}
 
 	data, err := os.ReadFile(path)
@@ -445,6 +455,12 @@ func NewStateStore(path string, logger *slog.Logger) (*stateStore, error) {
 					}
 				}
 				s.mounts[m.AllocationID] = &m
+			}
+			// 上次挂载时间：卸载后挂载记录会被删，这张表单独留存（见 persistedState.LastMounts）。
+			for repoID, at := range loaded.LastMounts {
+				if repoID != "" && at > 0 {
+					s.lastMounts[repoID] = at
+				}
 			}
 		}
 	case os.IsNotExist(err):
@@ -1113,6 +1129,39 @@ func (s *stateStore) ListMounts() []MountState {
 	return out
 }
 
+// RecordRepoMount 记录某个存储库最近一次挂载成功的时间并持久化。
+//
+// 挂载记录在卸载后即被删除，界面于是看不到"上次挂载时间"。这里单独留一张每库时间表
+// （只在本机，见 persistedState.LastMounts），卸载不影响它。repoID 为空时忽略。
+func (s *stateStore) RecordRepoMount(repoID string, at int64) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" || at <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastMounts == nil {
+		s.lastMounts = make(map[string]int64)
+	}
+	// 只前进不后退：并发的多次挂载/恢复不应把时间改小。
+	if at <= s.lastMounts[repoID] {
+		return
+	}
+	s.lastMounts[repoID] = at
+	_ = s.persistLocked()
+}
+
+// LastMounts 返回每库最近一次挂载成功时间的副本（repo_id → 毫秒时间戳）。
+func (s *stateStore) LastMounts() map[string]int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]int64, len(s.lastMounts))
+	for repoID, at := range s.lastMounts {
+		out[repoID] = at
+	}
+	return out
+}
+
 // MountByLease 按 lease_id 反查挂载状态。
 func (s *stateStore) MountByLease(leaseID string) (MountState, bool) {
 	if strings.TrimSpace(leaseID) == "" {
@@ -1157,6 +1206,12 @@ func (s *stateStore) persistLocked() error {
 		PrimaryKey: s.primaryKeyLocked(),
 		Servers:    make([]persistedServer, 0, len(s.servers)),
 		Mounts:     make([]MountState, 0, len(s.mounts)),
+	}
+	if len(s.lastMounts) > 0 {
+		state.LastMounts = make(map[string]int64, len(s.lastMounts))
+		for repoID, at := range s.lastMounts {
+			state.LastMounts[repoID] = at
+		}
 	}
 	for _, key := range s.orderedKeysLocked() {
 		entry := s.servers[key]

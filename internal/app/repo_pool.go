@@ -117,15 +117,7 @@ func (s *DiskService) runPrepareRepo(ctx context.Context, j *domain.Job, rep job
 		rep.Progress(38 + 36*(idx+1)/count)
 	}
 
-	// 池位盘已经存在 → 母盘进入 derived。
-	//
-	// 这里不走 domain.CanDerive：它的判据是"母盘还处于 idle"，而批量派生是服务端
-	// 自己的建库动作（不是用户触发的派生），语义上不需要那道用户侧校验。
-	if repo.Condition() == domain.ParentIdle {
-		if err := s.Store.SetParentCondition(ctx, repo.ID, domain.ParentDerived, false); err != nil {
-			return err
-		}
-	}
+	// 池位盘建好后母盘仍保持 idle：差异盘不再是独立状态，正常态本来就可以带着差异盘。
 
 	// ---- 阶段三：iSCSI 目标 ----
 	//

@@ -329,8 +329,34 @@ export class VaultApi extends ApiClient {
     return this.request<AllocationDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/allocations`, { user_id: userId })
   }
 
-  parentAction(id: string, action: ParentAction): Promise<RepoDTO> {
-    return this.request<RepoDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/actions`, { action })
+  /**
+   * 母盘用途迁移。
+   *
+   * 进入维护 / 临时共享：同步返回更新后的 `RepoDTO`。
+   * 退出维护 / 撤销共享：服务端要拆母盘临时 iSCSI 目标（多次 PowerShell，几十秒起），
+   * 改为异步任务，返回 202 + `JobDTO`（界面用任务进度展示，见 useJobProgress）。
+   */
+  parentAction(id: string, action: ParentAction): Promise<RepoDTO | JobDTO> {
+    return this.request<RepoDTO | JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/actions`, {
+      action
+    })
+  }
+
+  /**
+   * 维护态下清理该库全部差异盘（异步任务，202）。
+   *
+   * 服务端会先给在线客户端推送断开指令、再拆 iSCSI 目标并删盘，可能耗时较长且会重试；
+   * 界面用 useJobProgress 展示进度。
+   */
+  cleanupDiffs(id: string): Promise<JobDTO> {
+    return this.request<JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/cleanup-diffs`)
+  }
+
+  /** 维护态下扩容母盘（只扩不缩）；要求没有差异盘、没有在线客户端。 */
+  resizeParentDisk(id: string, sizeBytes: number): Promise<RepoDTO> {
+    return this.request<RepoDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/resize`, {
+      size_bytes: sizeBytes
+    })
   }
 
   copyRepo(id: string, newRepoName: string): Promise<JobDTO> {
@@ -449,5 +475,15 @@ export class VaultApi extends ApiClient {
 
   getJob(id: string): Promise<JobDTO> {
     return this.request<JobDTO>('GET', `/v1/jobs/${encodeURIComponent(id)}`)
+  }
+
+  /**
+   * 取消任务（仅超管）。
+   *
+   * 排队中的任务直接置为 cancelled；正在执行的任务取消其 ctx —— 正在跑的平台命令会被杀掉，
+   * 任务随即以 cancelled 收场并释放它持有的锁（卡住的任务的出口）。
+   */
+  cancelJob(id: string): Promise<JobDTO> {
+    return this.request<JobDTO>('POST', `/v1/jobs/${encodeURIComponent(id)}/cancel`)
   }
 }

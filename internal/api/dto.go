@@ -338,17 +338,21 @@ type jobDTO struct {
 	CreatedAt  int64  `json:"created_at"`
 	StartedAt  int64  `json:"started_at"`
 	FinishedAt int64  `json:"finished_at"`
+	// LastError 是任务失败/重试时的错误摘要（稳定错误码与参数，不是原始平台报错文本 ——
+	// 后者仍只进日志）。给管理端在任务中心直接看到"为什么失败"，不必去翻服务端日志
+	// （真实反馈："任务一直卡着，也看不到任何日志"）。
+	LastError string `json:"last_error,omitempty"`
 }
 
 // toJobDTO 转换任务。
 //
-// 刻意不输出 idem_key 与 last_error：前者是内部去重键，
-// 后者可能包含底层平台错误文本（错误文本只应进日志，见 6.5）。
+// 刻意不输出 idem_key（内部去重键）；last_error 只输出错误码摘要，原始平台报错文本仍只进日志。
 func toJobDTO(j *domain.Job) jobDTO {
 	return jobDTO{
 		ID: j.ID, Type: string(j.Type), RefID: j.RefID, State: string(j.State),
 		Progress: j.Progress, Attempt: j.Attempt, Failed: j.LastError != "",
 		CreatedAt: j.CreatedAt, StartedAt: j.StartedAt, FinishedAt: j.FinishedAt,
+		LastError: j.LastError,
 	}
 }
 

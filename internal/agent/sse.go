@@ -355,13 +355,22 @@ func (w *jobWatch) publish(j serverJob) {
 // 归属标注（界面据此把事件落到对应那台）。
 func (a *Agent) handleServerEvent(key, eventType string, data json.RawMessage) {
 	switch eventType {
-	case "revoke", "lease.revoked", "lease_revoked":
+	case "revoke", "lease.revoked", "lease_revoked", "lease":
+		// 服务端"踢下线"可能以两种形态到达：
+		//   - 独立 topic：revoke / lease.revoked / lease_revoked；
+		//   - 通用 lease 事件里带 action=revoke（管理员强制下线、维护清理差异盘都走这条）。
+		// 旧代理只认前一种，结果"管理员点了强制下线、客户端却要等心跳超时"——
+		// 维护清理差异盘更等不起：客户端不先断开，盘文件会因占用删不掉。
 		var payload struct {
+			Action       string `json:"action"`
 			AllocationID string `json:"allocation_id"`
 			LeaseID      string `json:"lease_id"`
 			Reason       string `json:"reason"`
 		}
 		_ = json.Unmarshal(data, &payload)
+		if eventType == "lease" && strings.TrimSpace(payload.Action) != "revoke" {
+			return
+		}
 
 		allocationID := strings.TrimSpace(payload.AllocationID)
 		if allocationID == "" && payload.LeaseID != "" {

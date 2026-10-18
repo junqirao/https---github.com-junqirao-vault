@@ -110,7 +110,10 @@ type MountSpec struct {
 	ServerInstanceID string `json:"server_instance_id"`
 	ServerName       string `json:"server_name"`
 	// RepoName 存储库名称：用于卷标（盘符模式）与目录名（目录模式），见 mountEngine.mountAt。
-	RepoName      string `json:"repo_name"`
+	RepoName string `json:"repo_name"`
+	// RepoGroup 存储库分组：用于判断是否套用"分组挂载配置"（见 Config.GroupMounts）。
+	RepoGroup string `json:"repo_group"`
+
 	TargetIQN     string `json:"target_iqn"`
 	PortalAddress string `json:"portal_address"`
 	PortalPort    int    `json:"portal_port"`

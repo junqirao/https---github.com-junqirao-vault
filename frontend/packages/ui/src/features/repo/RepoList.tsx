@@ -1,9 +1,23 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
-import { Button, Card, Col, Input, Pagination, Progress, Row, Segmented, Skeleton, Space, Typography } from 'antd'
+import {
+  Button,
+  Card,
+  Col,
+  Input,
+  Pagination,
+  Progress,
+  Row,
+  Segmented,
+  Skeleton,
+  Space,
+  Tooltip,
+  Typography,
+  message
+} from 'antd'
 import type { TableColumnsType } from 'antd'
-import { AppstoreOutlined, BarsOutlined } from '@ant-design/icons'
-import { useQuery } from '@tanstack/react-query'
+import { AppstoreOutlined, ArrowLeftOutlined, BarsOutlined, FolderOutlined, SettingOutlined } from '@ant-design/icons'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
@@ -12,16 +26,17 @@ import { PageShell } from '../../components/PageShell'
 import { StatusTag } from '../../components/StatusTag'
 import { usageColor } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
-import type { UploadState } from '../../api/agentTypes'
+import type { AgentMountState, UploadState } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
-import { isActiveUpload, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
+import { isActiveUpload, pickMountUsage, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { useAuth } from '../../hooks/useAuth'
+import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { RepoCard, RepoRow } from './RepoCards'
-import { RepoMountSettingsModal } from './RepoMountSettings'
+import { GroupMountSettingsModal, RepoMountSettingsModal } from './RepoMountSettings'
 import { isPlaceholderRepoId, uploadPlaceholderRepo } from './uploadView'
 
 export interface RepoListProps {
@@ -72,6 +87,34 @@ const PAGE_SIZE: Record<RepoViewMode, number> = { card: 8, list: 10 }
  * Electron 渲染进程两边都在，刷新/重开都还在。
  */
 const VIEW_PREF_KEY = 'vault.repo.view'
+
+/**
+ * 当前所在分组的会话记忆键。
+ *
+ * 用户从分组里点进存储库详情后，RepoList 会被卸载；按「返回」回来时组件重建，
+ * 组件内的 activeGroup 已归零，于是回到外面的大列表而不是原来那个分组。
+ * 用 sessionStorage 记住"这次会话最后进入的分组"：返回时能落回分组，关掉客户端后
+ * 自然清空（下次进来仍从总览开始）。空串是一个合法分组（未分组），null = 总览。
+ */
+const GROUP_PREF_KEY = 'vault.repo.group'
+
+function readStoredGroup(): string | null {
+  try {
+    const raw = window.sessionStorage.getItem(GROUP_PREF_KEY)
+    return raw === null ? null : raw
+  } catch {
+    return null
+  }
+}
+
+function storeGroup(group: string | null): void {
+  try {
+    if (group === null) window.sessionStorage.removeItem(GROUP_PREF_KEY)
+    else window.sessionStorage.setItem(GROUP_PREF_KEY, group)
+  } catch {
+    // 会话记忆失败不影响使用：返回时落到总览而已。
+  }
+}
 
 /** 读取本地记住的展示形式：读不到、值不合法、存储不可用，一律退回默认的卡片。 */
 function readStoredView(): RepoViewMode {
@@ -371,6 +414,359 @@ function RepoListSkeleton({ viewMode }: { viewMode: RepoViewMode }): JSX.Element
   )
 }
 
+/** 把库按 meta.group 归类；空分组单独归为一组（未分组）。 */
+function groupKeyOf(repo: RepoDTO): string {
+  return (repo.group ?? '').trim()
+}
+
+interface RepoGroupBucket {
+  key: string
+  title: string
+  items: RepoListEntry[]
+}
+
+/** 按分组聚合条目，供"总览"页渲染分组卡片；未分组排在最后。 */
+function buildGroups(entries: RepoListEntry[], ungroupedLabel: string): RepoGroupBucket[] {
+  const map = new Map<string, RepoListEntry[]>()
+  for (const entry of entries) {
+    const key = groupKeyOf(entry.repo)
+    const list = map.get(key)
+    if (list) list.push(entry)
+    else map.set(key, [entry])
+  }
+  const buckets = Array.from(map.entries()).map(([key, items]) => ({
+    key,
+    // 分组名**没有**变化：key 就是服务端 meta.group 原值（空串 = 未分组）。
+    title: key || ungroupedLabel,
+    items
+  }))
+  buckets.sort((a, b) => {
+    if (a.key === '') return 1
+    if (b.key === '') return -1
+    return a.key.localeCompare(b.key)
+  })
+  return buckets
+}
+
+/**
+ * 分组批量操作的状态放在**模块级**而不是组件内：批量挂载/卸载可能跑几十秒，
+ * 用户切到别的页面再回来时组件已经卸载重建，组件内的 busy/progress 会归零 ——
+ * 看起来像"操作消失了"，其实后台还在跑。这里按分组 key 保存进度，任何页面重新挂载
+ * 都能接着显示，也不会因为重新挂载而重复触发同一批操作。
+ */
+interface GroupOpState {
+  busy: boolean
+  progress: { done: number; total: number }
+}
+
+const GROUP_OP_IDLE: GroupOpState = { busy: false, progress: { done: 0, total: 0 } }
+const groupOps = new Map<string, GroupOpState>()
+const groupOpListeners = new Set<() => void>()
+
+function setGroupOp(key: string, state: GroupOpState): void {
+  groupOps.set(key, state)
+  for (const listener of groupOpListeners) listener()
+}
+
+function subscribeGroupOps(listener: () => void): () => void {
+  groupOpListeners.add(listener)
+  return () => {
+    groupOpListeners.delete(listener)
+  }
+}
+
+function useGroupOpState(key: string): GroupOpState {
+  return useSyncExternalStore(
+    subscribeGroupOps,
+    () => groupOps.get(key) ?? GROUP_OP_IDLE,
+    () => GROUP_OP_IDLE
+  )
+}
+
+/**
+ * 分组整体挂载 / 卸载：按组内每个库的分配逐个调本机代理。
+ *
+ * 为什么在客户端做而不是服务端：挂载是"这台机器"的行为（盘符、本地会话、缓存代理都在
+ * 本机），服务端只下发目标；分组只是一个标签。因此这里按组遍历，逐个复用单库挂载那一套
+ * 语义（没有分配先建、再交给代理）。
+ */
+function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string) {
+  const api = useApi()
+  const agent = useAgent()
+  const { active } = useServerConfig()
+  const queryClient = useQueryClient()
+  const { t } = useI18n()
+  const op = useGroupOpState(groupKey)
+
+  const mountAll = useCallback(async (): Promise<void> => {
+    if (groupOps.get(groupKey)?.busy) return
+    const targets = repos.filter((repo) => repo.state === 'active' && !isPlaceholderRepoId(repo.id))
+    if (targets.length === 0) return
+    setGroupOp(groupKey, { busy: true, progress: { done: 0, total: targets.length } })
+    let ok = 0
+    let fail = 0
+    for (const repo of targets) {
+      try {
+        const allocations = await api.listAllocations(repo.id)
+        let allocation = allocations.items.find(
+          (item) => item.user_id === currentUserId && item.state !== 'released'
+        )
+        if (!allocation && repo.owner_id === currentUserId) {
+          allocation = await api.allocate(repo.id, currentUserId)
+        }
+        if (!allocation) throw new Error(t('repo.card.notAllocated'))
+        await agent.mount({
+          allocation_id: allocation.id,
+          repo_id: repo.id,
+          repo_name: repo.name,
+          repo_group: repo.group,
+          server_key: active?.key,
+          server_url: active?.baseUrl
+        })
+        ok += 1
+      } catch {
+        fail += 1
+      }
+      setGroupOp(groupKey, {
+        busy: true,
+        progress: { done: (groupOps.get(groupKey)?.progress.done ?? 0) + 1, total: targets.length }
+      })
+    }
+    await queryClient.invalidateQueries({ queryKey: ['repo-allocations'] })
+    await queryClient.invalidateQueries({ queryKey: ['leases'] })
+    setGroupOp(groupKey, { busy: false, progress: { done: 0, total: 0 } })
+    if (fail > 0) message.warning(t('repo.group.mountPartial', { ok, fail }))
+    else message.success(t('repo.group.mountDone', { count: ok }))
+  }, [active?.baseUrl, active?.key, agent, api, currentUserId, groupKey, queryClient, repos, t])
+
+  const unmountAll = useCallback(async (): Promise<void> => {
+    if (groupOps.get(groupKey)?.busy) return
+    const mounted = agent.state?.mounts ?? []
+    const targets = repos
+      .map((repo) => mountOfRepo(mounted, repo))
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    if (targets.length === 0) return
+    setGroupOp(groupKey, { busy: true, progress: { done: 0, total: targets.length } })
+    let ok = 0
+    let fail = 0
+    for (const item of targets) {
+      try {
+        await agent.unmount({ allocation_id: item.allocation_id })
+        ok += 1
+      } catch {
+        fail += 1
+      }
+      setGroupOp(groupKey, {
+        busy: true,
+        progress: { done: (groupOps.get(groupKey)?.progress.done ?? 0) + 1, total: targets.length }
+      })
+    }
+    await queryClient.invalidateQueries({ queryKey: ['repo-allocations'] })
+    await queryClient.invalidateQueries({ queryKey: ['leases'] })
+    setGroupOp(groupKey, { busy: false, progress: { done: 0, total: 0 } })
+    if (fail > 0) message.warning(t('repo.group.unmountPartial', { ok, fail }))
+    else message.success(t('repo.group.unmountDone', { count: ok }))
+  }, [agent, groupKey, queryClient, repos, t])
+
+  return { busy: op.busy, progress: op.progress, mountAll, unmountAll }
+}
+
+/** 某条挂载记录是否属于这个库（repo_id 优先，旧记录缺 repo_id 时退回库名匹配）。 */
+function mountOfRepo(mounts: AgentMountState[], repo: RepoDTO): AgentMountState | undefined {
+  return mounts.find(
+    (mount) => mount.repo_id === repo.id || (mount.repo_id === '' && mount.repo_name === repo.name)
+  )
+}
+
+/** 分组总览卡片：组名 + 库数 + 挂载/卸载 + 分组挂载设置。 */
+function RepoGroupCard({
+  bucket,
+  currentUserId,
+  onOpen,
+  onSettings
+}: {
+  bucket: RepoGroupBucket
+  currentUserId: string
+  onOpen: () => void
+  onSettings: () => void
+}): JSX.Element {
+  const { t } = useI18n()
+  const agent = useAgent()
+  const repos = bucket.items.map((entry) => entry.repo)
+  const { busy, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
+  const mounts = agent.state?.mounts ?? []
+  const mountedRepos = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined)
+  const mountedCount = mountedRepos.length
+  const activeCount = repos.filter((repo) => repo.state === 'active').length
+  const totalBytes = repos.reduce((sum, repo) => sum + (repo.capacity_bytes || 0), 0)
+  const mountedBytes = mountedRepos.reduce(
+    (sum, repo) => sum + (pickMountUsage(agent.usage, repo.id)?.total_bytes || repo.capacity_bytes || 0),
+    0
+  )
+  // 一个按钮承载挂载 / 卸载：只要组内有库挂载着，就提供"卸载"；否则是"挂载"。
+  const hasMounted = mountedCount > 0
+  const percent = totalBytes > 0 ? Math.min(100, Math.round((mountedBytes / totalBytes) * 100)) : 0
+
+  return (
+    <Card
+      hoverable
+      onClick={onOpen}
+      style={{ height: '100%', minHeight: 184 }}
+      styles={{ body: { padding: spacing.md, display: 'flex', flexDirection: 'column', height: '100%' } }}
+    >
+      {/* 标题行：图标与组名保持常规字号，只有卡片本身更大；数量贴右。 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs }}>
+        <FolderOutlined style={{ color: palette.accent }} />
+        <Typography.Text strong ellipsis style={{ minWidth: 0, fontSize: fontSize.lg }}>
+          {bucket.title}
+        </Typography.Text>
+        <Typography.Text type="secondary" style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
+          {t('repo.group.repoCount', { count: repos.length })}
+        </Typography.Text>
+      </div>
+
+      <div style={{ marginTop: spacing.md, marginBottom: spacing.sm, flex: 1 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+            {t('repo.group.mountedStorage')}
+          </Typography.Text>
+          <Typography.Text style={{ fontSize: fontSize.sm }}>
+            {formatBytes(mountedBytes)} / {formatBytes(totalBytes)}
+          </Typography.Text>
+        </div>
+        <Progress
+          percent={percent}
+          showInfo={false}
+          size="small"
+          strokeColor={usageColor(percent)}
+          trailColor={palette.neutralFill}
+          style={{ marginTop: spacing.xxs, marginBottom: 0 }}
+        />
+      </div>
+
+      {/* 动作放右下：挂载/卸载一个按钮，设置只留图标、不要边框。 */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: spacing.xs }}>
+        <Button
+          size="small"
+          type={hasMounted ? 'default' : 'primary'}
+          loading={busy}
+          disabled={repos.length === 0 || (!hasMounted && activeCount === 0)}
+          onClick={(event) => {
+            event.stopPropagation()
+            void (hasMounted ? unmountAll() : mountAll())
+          }}
+        >
+          {busy && progress.total > 0
+            ? `${t(hasMounted ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
+            : hasMounted
+              ? t('repo.group.unmountAll')
+              : t('repo.group.mountAll')}
+        </Button>
+        {/* 未分组没有分组名，无法承载分组配置；不给设置入口。 */}
+        {bucket.key ? (
+          <Tooltip title={t('repo.group.settings')}>
+            <Button
+              type="text"
+              size="small"
+              icon={<SettingOutlined />}
+              aria-label={t('repo.group.settings')}
+              onClick={(event) => {
+                event.stopPropagation()
+                onSettings()
+              }}
+            />
+          </Tooltip>
+        ) : null}
+      </div>
+    </Card>
+  )
+}
+
+/** 分组下钻后的内容：返回 + 组名 + 批量挂载/卸载 + 分组设置 + 库列表。 */
+function RepoGroupDetail({
+  bucket,
+  currentUserId,
+  viewMode,
+  onViewModeChange,
+  onBack,
+  onOpen,
+  onConfigure,
+  onOpenUpload,
+  onSettings
+}: {
+  bucket: RepoGroupBucket
+  currentUserId: string
+  viewMode: RepoViewMode
+  onViewModeChange: (next: RepoViewMode) => void
+  onBack: () => void
+  onOpen: (repoId: string) => void
+  onConfigure: (repo: RepoDTO) => void
+  onOpenUpload?: (uploadId: string) => void
+  onSettings: () => void
+}): JSX.Element {
+  const { t } = useI18n()
+  const agent = useAgent()
+  const repos = bucket.items.map((entry) => entry.repo)
+  const { busy, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
+  const mounts = agent.state?.mounts ?? []
+  const mountedCount = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined).length
+  const activeCount = repos.filter((repo) => repo.state === 'active').length
+  const hasMounted = mountedCount > 0
+
+  return (
+    <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, flexWrap: 'wrap' }}>
+        <Button icon={<ArrowLeftOutlined />} onClick={onBack}>
+          {t('repo.group.back')}
+        </Button>
+        <FolderOutlined style={{ color: palette.accent }} />
+        <Typography.Text strong>{bucket.title}</Typography.Text>
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+          {bucket.items.length}
+        </Typography.Text>
+        <span style={{ marginLeft: 'auto' }}>
+          <Space wrap>
+            <Button
+              type={hasMounted ? 'default' : 'primary'}
+              size="small"
+              loading={busy}
+              disabled={repos.length === 0 || (!hasMounted && activeCount === 0)}
+              onClick={() => void (hasMounted ? unmountAll() : mountAll())}
+            >
+              {busy && progress.total > 0
+                ? `${t(hasMounted ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
+                : hasMounted
+                  ? t('repo.group.unmountAll')
+                  : t('repo.group.mountAll')}
+            </Button>
+            {bucket.key ? (
+              <Tooltip title={t('repo.group.settings')}>
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<SettingOutlined />}
+                  aria-label={t('repo.group.settings')}
+                  onClick={onSettings}
+                />
+              </Tooltip>
+            ) : null}
+            <RepoViewSwitch value={viewMode} onChange={onViewModeChange} />
+          </Space>
+        </span>
+      </div>
+      <RepoSection
+        title=""
+        items={bucket.items}
+        viewMode={viewMode}
+        currentUserId={currentUserId}
+        onOpen={onOpen}
+        onConfigure={onConfigure}
+        onOpenUpload={onOpenUpload}
+      />
+    </Space>
+  )
+}
+
 /** 存储库列表：管理端表格；用户端卡片/列表两种形态（可切换 + 分组分页）。 */
 export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImport }: RepoListProps): JSX.Element {
   const api = useApi()
@@ -388,6 +784,15 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
   }
   // 挂载配置弹窗只服务当前点开的这一个库（弹窗在列表这一层只保留一份，避免每张卡都挂一个）。
   const [settingsRepo, setSettingsRepo] = useState<RepoDTO | null>(null)
+  // 分组挂载设置弹窗（同一次只开一个分组）。
+  const [settingsGroup, setSettingsGroup] = useState<string | null>(null)
+  // 用户端的分组下钻：null = 分组总览；否则是当前进入的分组 key（空串 = 未分组）。
+  // 初值取会话记忆：从详情页返回时能落回原来的分组（见 GROUP_PREF_KEY）。
+  const [activeGroup, setActiveGroupState] = useState<string | null>(readStoredGroup)
+  const setActiveGroup = useCallback((next: string | null): void => {
+    setActiveGroupState(next)
+    storeGroup(next)
+  }, [])
 
   // 缓存用量与命中情况会随读写持续变化：页面在时按 10s 轮询一次（离开页面即停）。
   // 管理端是运维表、不展示缓存，跳过轮询。单个轮询器放在这一层：放到卡片里会变成每张卡一个。
@@ -413,6 +818,13 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
     queryFn: () => api.listUsers({ limit: 200 }),
     enabled: isSuperAdmin
   })
+
+  // 记忆的分组可能已经被改名/删空：这时落回总览，别停在一个不存在的分组里。
+  useEffect(() => {
+    if (isSuperAdmin || activeGroup === null || reposQuery.isLoading) return
+    const exists = (reposQuery.data?.items ?? []).some((repo) => groupKeyOf(repo) === activeGroup)
+    if (!exists) setActiveGroup(null)
+  }, [activeGroup, isSuperAdmin, reposQuery.data, reposQuery.isLoading, setActiveGroup])
 
   const ownerName = useMemo(() => {
     const map = new Map<string, string>()
@@ -566,37 +978,44 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
       )
     }
 
-    const userId = user?.id
-    const sections = userId
-      ? [
-          { key: 'owned', title: t('repo.group.owned'), items: entries.filter((entry) => entry.repo.owner_id === userId) },
-          { key: 'joined', title: t('repo.group.joined'), items: entries.filter((entry) => entry.repo.owner_id !== userId) }
-        ]
-      : [{ key: 'all', title: '', items: entries }]
+    const userId = user?.id ?? ''
+    const groups = buildGroups(entries, t('repo.group.ungrouped'))
+    const current = activeGroup === null ? undefined : groups.find((bucket) => bucket.key === activeGroup)
+
+    // 下钻视图：只列当前分组的库。分组被删除/改名（服务端数据变了）时回退到总览。
+    if (current) {
+      return (
+        <RepoGroupDetail
+          key={`${current.key}-${keyword}`}
+          bucket={current}
+          currentUserId={userId}
+          viewMode={viewMode}
+          onViewModeChange={changeView}
+          onBack={() => setActiveGroup(null)}
+          onOpen={onOpen}
+          onConfigure={setSettingsRepo}
+          onOpenUpload={onOpenUpload}
+          onSettings={() => setSettingsGroup(current.key)}
+        />
+      )
+    }
 
     return (
       <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
         {/* 配额总览只认服务端的库：还没建成的上传中库不算"一个存储库"，也不占容量。 */}
         <QuotaOverview repos={entries.filter((entry) => !isPlaceholderRepoId(entry.repo.id)).map((entry) => entry.repo)} />
-        {sections
-          .filter((section) => section.items.length > 0)
-          .map((section, index) => (
-            // key 里带上关键字：搜索词一变就重挂载，页码随之回到第 1 页
-            // （否则在第 3 页搜索很容易搜出"空结果"，其实结果在第 1 页）。
-            <RepoSection
-              key={`${section.key}-${keyword}`}
-              title={section.title}
-              items={section.items}
-              viewMode={viewMode}
-              currentUserId={userId ?? ''}
-              // 切换控件只挂第一个分组（正常就是「我拥有的」）的标题行右侧：
-              // 它管的是下面这一整片列表，挂一次就够；没有自己拥有的库时自然落到「我参与的」标题行。
-              headerExtra={index === 0 ? <RepoViewSwitch value={viewMode} onChange={changeView} /> : undefined}
-              onOpen={onOpen}
-              onConfigure={setSettingsRepo}
-              onOpenUpload={onOpenUpload}
-            />
+        <Row gutter={[spacing.md, spacing.md]}>
+          {groups.map((bucket) => (
+            <Col key={bucket.key || '__ungrouped__'} xs={24} sm={12} xl={12} xxl={8}>
+              <RepoGroupCard
+                bucket={bucket}
+                currentUserId={userId}
+                onOpen={() => setActiveGroup(bucket.key)}
+                onSettings={() => setSettingsGroup(bucket.key)}
+              />
+            </Col>
           ))}
+        </Row>
       </Space>
     )
   }
@@ -627,6 +1046,10 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
       {/* 每库独立的挂载配置：卡片「配置」图标打开，只改被点的这一个库 */}
       {settingsRepo ? (
         <RepoMountSettingsModal repo={settingsRepo} open onClose={() => setSettingsRepo(null)} />
+      ) : null}
+      {/* 分组挂载设置：一次只开一个分组（含"使用分组配置"开关）。 */}
+      {settingsGroup !== null ? (
+        <GroupMountSettingsModal group={settingsGroup} open onClose={() => setSettingsGroup(null)} />
       ) : null}
       {isSuperAdmin ? (
         <DataTable<RepoDTO>

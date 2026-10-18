@@ -294,6 +294,7 @@ func (s *session) handleCommandIT(f *frame) bool {
 		// 计在**命令观测**层，而不是缓存的命中层：这样只要代理看到读流量，
 		// 读 IOPS 就有数（缓存尚未绑定/首次未命中也不例外）。命中率另用 RequestHits。
 		s.tgt.stats.reads.Add(1)
+		s.countReadBytes(cdb)
 		return s.handleRead(f)
 	case iscsi.SCSIInquiry:
 		s.handleInquiry(f)
@@ -347,6 +348,23 @@ func readBufGet(n int) []byte {
 // touch it afterwards.
 func readBufPut(b []byte) {
 	readBufPools[readBufClass(cap(b))].Put(b[:cap(b)])
+}
+
+// countReadBytes adds one read command's CDB-declared byte length to the target's
+// throughput counter.
+//
+// Length is unknown until READ CAPACITY has been observed (block size 0): those
+// commands only bump the IOPS counter, never the byte counter.
+func (s *session) countReadBytes(cdb []byte) {
+	bs := s.tgt.lunBlockSize()
+	if bs == 0 {
+		return
+	}
+	p, err := iscsi.ParseReadWrite(cdb)
+	if err != nil || p.Blocks <= 0 {
+		return
+	}
+	s.tgt.stats.readBytes.Add(int64(p.Blocks) * int64(bs))
 }
 
 // handleRead serves a read from the cache when the whole range is present in L1
@@ -452,16 +470,18 @@ func (s *session) invalidateWrite(cdb []byte) {
 	if bs == 0 {
 		return
 	}
-	c := t.getCache()
-	if c == nil {
-		return
-	}
 	p, err := iscsi.ParseReadWrite(cdb)
 	if err != nil {
 		return
 	}
 	length := int64(p.Blocks) * int64(bs)
 	if length <= 0 {
+		return
+	}
+	// 字节计数在缓存判断之前：未开缓存的库走纯透传，同样要能报写吞吐。
+	t.stats.writeBytes.Add(length)
+	c := t.getCache()
+	if c == nil {
 		return
 	}
 	// 写路径只把 L1 失效同步做掉（廉价、纯内存，且是"写完再读不能读到旧数据"的
@@ -525,6 +545,7 @@ func (s *session) invalidateWriteSame(cdb []byte) {
 		s.dropAll("write-same-range-out-of-bounds")
 		return
 	}
+	t.stats.writeBytes.Add(int64(blocks) * int64(bs))
 	s.invalidateRange(int64(p.LBA)*int64(bs), int64(blocks)*int64(bs))
 }
 

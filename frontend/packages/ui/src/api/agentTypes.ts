@@ -295,6 +295,13 @@ export interface AgentState {
   server: AgentServerState
   user: AgentUserState
   mounts: AgentMountState[]
+  /**
+   * 每库最近一次挂载成功的时间（repo_id → 毫秒时间戳），只存在本机。
+   *
+   * 挂载记录（mounts）在卸载后即被删除；卡片在未挂载时改用它显示「上次挂载」。旧版代理
+   * 不带该字段，界面按"没有记录"处理（不显示）。
+   */
+  last_mounts?: Record<string, number>
   auto_mount: boolean
   /** 本机就绪状态（iSCSI 发起端）；代理尚未探测完时字段可能缺省。 */
   host?: AgentHostState
@@ -369,6 +376,11 @@ export interface AgentRepoMountPref {
    * （界面上的「监控」入口置灰）。改动需要**重新挂载**这个库才生效。
    */
   direct_mode?: boolean
+  /**
+   * 仅分组配置有意义：为 true 时用这套分组配置覆盖组内每个库自己的挂载配置；
+   * 为 false（默认）时组内库各用各的配置，分组配置只作为默认值保留。
+   */
+  use_for_repos?: boolean
 }
 
 /** GET /agent/config 与 PATCH /agent/config。 */
@@ -383,6 +395,8 @@ export interface AgentConfig {
   default_mount_dir: string
   /** 母盘下载到本地时的默认目标目录（绝对路径）。 */
   default_download_dir: string
+  /** 存储库快捷方式的默认存放目录；空串表示系统桌面。 */
+  shortcut_dir: string
   language: string
   start_at_login: boolean
   update_channel: string
@@ -413,6 +427,12 @@ export interface AgentConfig {
   cache_l2_dir: string
   /** 按存储库 ID 保存的挂载偏好；没有条目的库跟随上面的全局默认值（PATCH 不接受该字段）。 */
   repo_mounts?: Record<string, AgentRepoMountPref>
+  /**
+   * 按**存储库分组名**保存的挂载配置（PATCH 不接受该字段）。
+   *
+   * 分组条目上的 `use_for_repos=true` 时，组内库挂载会用这套配置覆盖各自 repo_mounts 的配置。
+   */
+  group_mounts?: Record<string, AgentRepoMountPref>
 }
 
 /**
@@ -426,6 +446,11 @@ export interface AgentCacheTargetStatus {
   allocation_id: string
   /** 本地门户为该库公示的 IQN（挂载链路上实际连接的那个）。 */
   target_iqn: string
+  /**
+   * 该目标是否真的带读缓存。false = 该库没开缓存（纯透传），缓存计数恒为 0，
+   * 卡片显示「缓存未开启」而不是「已缓存 0 B」。
+   */
+  cache_enabled: boolean
   l1_used_bytes: number
   l1_limit_bytes: number
   /**
@@ -449,6 +474,12 @@ export interface AgentCacheTargetStatus {
   writes: number
   /** request_hits / reads（0..1）；reads 为 0 时为 0。 */
   hit_rate: number
+  /**
+   * 近 5 分钟采样窗口内的读写**峰值吞吐**（字节/秒），卡片上的"峰值速度"直接读它。
+   * 按相邻采样点差分取最大；目标重建计数归零的区间跳过。
+   */
+  peak_read_bytes_per_sec?: number
+  peak_write_bytes_per_sec?: number
 }
 
 /**
@@ -529,6 +560,9 @@ export interface AgentCacheSample {
   reads: number
   hits: number
   writes: number
+  /** 累计读/写字节数（用于差分算吞吐）；旧代理可能没有这两个字段。 */
+  read_bytes?: number
+  write_bytes?: number
   backend_reads: number
   l1_used_bytes: number
   l2_used_bytes: number

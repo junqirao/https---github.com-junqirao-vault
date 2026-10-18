@@ -202,6 +202,7 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
         allocation_id: target,
         repo_id: repo.id,
         repo_name: repo.name,
+        repo_group: repo.group,
         server_key: active?.key,
         server_url: active?.baseUrl
       })
@@ -211,7 +212,7 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     } finally {
       setBusy(false)
     }
-  }, [active?.baseUrl, active?.key, agent, allocationId, api, currentUserId, invalidate, repo.id, repo.name])
+  }, [active?.baseUrl, active?.key, agent, allocationId, api, currentUserId, invalidate, repo.id, repo.name, repo.group])
 
   const unmountRepo = useCallback(async (): Promise<void> => {
     if (!mount) return

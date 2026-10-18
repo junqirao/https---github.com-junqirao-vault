@@ -156,6 +156,8 @@ type CacheSample struct {
 	Hits  int64 `json:"hits"`
 	// Writes/BackendReads 是写命令数与回后端读次数的累计值。
 	Writes       int64 `json:"writes"`
+	ReadBytes    int64 `json:"read_bytes"`
+	WriteBytes   int64 `json:"write_bytes"`
 	BackendReads int64 `json:"backend_reads"`
 	// L1UsedBytes/L2UsedBytes 是采样时刻的缓存占用（瞬时值，不做差分）。
 	L1UsedBytes int64 `json:"l1_used_bytes"`
@@ -349,6 +351,8 @@ func (m *cacheManager) sample(now time.Time) {
 			// Writes/Reads 都取代理**观测到的命令数**：与缓存是否命中无关，
 			// 前端据此画出的 IOPS 反映真实经过代理的负载。
 			Writes:       stats.Proxy.Writes,
+			ReadBytes:    stats.Proxy.ReadBytes,
+			WriteBytes:   stats.Proxy.WriteBytes,
 			BackendReads: cs.BackendReads,
 			L1UsedBytes:  cs.L1UsedBytes,
 		}
@@ -366,6 +370,35 @@ func (m *cacheManager) sample(now time.Time) {
 			delete(m.history, key)
 		}
 	}
+}
+
+// peakThroughput 返回某库在**当前采样窗口内**的读写峰值吞吐（字节/秒）。
+//
+// 按相邻采样点差分取最大；计数归零（目标重建）的区间跳过，与历史曲线同一口径。
+func (m *cacheManager) peakThroughput(key string) (read, write float64) {
+	if m == nil {
+		return 0, 0
+	}
+	m.historyMu.Lock()
+	samples := append([]CacheSample(nil), m.history[key]...)
+	m.historyMu.Unlock()
+	for i := 1; i < len(samples); i++ {
+		dt := samples[i].T - samples[i-1].T
+		if dt <= 0 {
+			continue
+		}
+		if dr := samples[i].ReadBytes - samples[i-1].ReadBytes; dr > 0 {
+			if r := float64(dr) / float64(dt); r > read {
+				read = r
+			}
+		}
+		if dw := samples[i].WriteBytes - samples[i-1].WriteBytes; dw > 0 {
+			if r := float64(dw) / float64(dt); r > write {
+				write = r
+			}
+		}
+	}
+	return read, write
 }
 
 // History 返回近 5 分钟的采样窗口（GET /agent/cache/history）。
@@ -828,6 +861,9 @@ type CacheTargetStatus struct {
 	AllocationID string `json:"allocation_id"`
 	// TargetIQN 是挂载链路上实际登录的 IQN。v2 透传代理用它对应的后端目标真实 IQN。
 	TargetIQN string `json:"target_iqn"`
+	// CacheEnabled 该目标是否真的带读缓存。false = 该库没开缓存（纯透传），
+	// 此时下面的缓存计数恒为 0，界面应显示"缓存未开启"而不是"已缓存 0 B"。
+	CacheEnabled bool `json:"cache_enabled"`
 	// L1UsedBytes/L1LimitBytes 是内存缓存占用与配额。占用只算块数据
 	// （blocks × blockSize），配额口径与它一致。
 	//
@@ -866,6 +902,12 @@ type CacheTargetStatus struct {
 	Writes       int64 `json:"writes"`
 	// HitRate 是 RequestHits/Reads（0..1）；Reads 为 0 时为 0。
 	HitRate float64 `json:"hit_rate"`
+	// PeakReadBytesPerSec / PeakWriteBytesPerSec 是**近 5 分钟采样窗口内**的读写峰值
+	// 吞吐（字节/秒）：界面卡片上的"峰值速度"直接读它，不必再单独拉历史。
+	//
+	// 峰值按相邻采样点差分算，窗口滑出后自动下降，不会留下一次压测的历史高水位。
+	PeakReadBytesPerSec  float64 `json:"peak_read_bytes_per_sec"`
+	PeakWriteBytesPerSec float64 `json:"peak_write_bytes_per_sec"`
 }
 
 // Status 汇总缓存代理状态，供客户端展示用量与命中情况。
@@ -911,6 +953,7 @@ func (m *cacheManager) Status() CacheStatus {
 		ts := CacheTargetStatus{
 			AllocationID:    key,
 			TargetIQN:       snap.IQN,
+			CacheEnabled:    snap.CacheEnabled,
 			L1UsedBytes:     cs.L1UsedBytes,
 			L1LimitBytes:    cs.L1LimitBytes,
 			L1ResidentBytes: cs.L1ResidentBytes,
@@ -935,6 +978,7 @@ func (m *cacheManager) Status() CacheStatus {
 		if reads > 0 {
 			ts.HitRate = float64(cs.RequestHits) / float64(reads)
 		}
+		ts.PeakReadBytesPerSec, ts.PeakWriteBytesPerSec = m.peakThroughput(key)
 		st.Targets = append(st.Targets, ts)
 	}
 	return st

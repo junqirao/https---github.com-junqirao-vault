@@ -28,7 +28,10 @@ type MountSpec struct {
 	ServerName       string `json:"server_name"`
 	// RepoName 存储库名称：客户端用它命名挂载点（盘符模式的卷标、目录模式的目录名，
 	// 见 docs 3.4.5 与客户端 mountAt）。服务端是库名的权威来源，随参数一并下发。
-	RepoName      string `json:"repo_name,omitempty"`
+	RepoName string `json:"repo_name,omitempty"`
+	// RepoGroup 存储库分组（repo.meta.group）：客户端据此决定是否用"分组挂载配置"
+	// 覆盖该库自己的配置（见 agent 的 GroupMounts / use_for_repos）。
+	RepoGroup     string `json:"repo_group,omitempty"`
 	TargetIQN     string `json:"target_iqn"`
 	PortalAddress string `json:"portal_address"`
 	PortalPort    int    `json:"portal_port"`
@@ -112,9 +115,19 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 		return nil, apperr.New("repo.state_invalid", 409).WithArg("state", string(repo.State))
 	}
 
-	// 状态机校验：共享库的差异盘必须在 derived 条件下且指纹/版本一致（见 5.4）。
+	// 状态机校验：共享库必须处于正常态（idle，非维护/临时共享），且指纹/版本一致（见 5.4）。
+	//
+	// 例外：母盘临时挂载（占位分配 user_id=@temp）本来就发生在 temp_shared / maintenance
+	// 期间，不能套用"差异盘只能 idle 挂载"那条规则；它挂的是母盘本身，也没有 parent_version
+	// 可比。除这两种状态外仍然拒绝。
 	if repo.IsShared() {
-		if err := domain.CanMount(repo.Condition(), disk.ParentVersion, repo.ParentVersion, s.parentFingerprintOK(ctx, repo)); err != nil {
+		if alloc.UserID == domain.TempAllocationUserID {
+			cond := repo.Condition()
+			if cond != domain.ParentMaintenance && cond != domain.ParentTempShared {
+				return nil, apperr.RepoParentConditionViolation(
+					string(cond), string(domain.ParentMaintenance))
+			}
+		} else if err := domain.CanMount(repo.Condition(), disk.ParentVersion, repo.ParentVersion, s.parentFingerprintOK(ctx, repo)); err != nil {
 			return nil, err
 		}
 	}
@@ -177,6 +190,7 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 		ServerInstanceID: raw.Server.InstanceID,
 		ServerName:       raw.Server.Name,
 		RepoName:         repo.Name,
+		RepoGroup:        repo.Meta.Group,
 		// 必须是**平台实际存储**的目标名：推导出来的 IQN 若与平台不一致，
 		// 客户端就是"TCP 3260 可达、但登录失败"（见 IscsiService.targetIQN 的说明）。
 		TargetIQN:        s.Iscsi.targetIQN(target),
@@ -307,13 +321,45 @@ func (s *LeaseService) List(ctx context.Context, repoID string) ([]domain.Lease,
 	return out, nil
 }
 
+// RevokeReasonRepoMaintenance 是维护态清理差异盘时撤销租约的原因码。
+//
+// 客户端收到后主动卸载并把原因展示给用户（见 internal/agent 的 handleRevoke 与
+// 前端 agent.event.revoked 的文案映射）。
+const RevokeReasonRepoMaintenance = "repo_maintenance"
+
 // Revoke 管理员强制下线：停用目标并标记租约 revoked。
 func (s *LeaseService) Revoke(ctx context.Context, leaseID, operatorID string) error {
+	return s.RevokeWithReason(ctx, leaseID, operatorID, "")
+}
+
+// RevokeWithReason 与 Revoke 相同，但把 reason 一并推给客户端（供界面展示断开原因）。
+//
+// 幂等：已经是 revoked/released 的租约直接返回成功 —— 维护清理任务会对同一批租约重试，
+// 不能因为"上一次已经撤销成功"而让整个任务失败。
+func (s *LeaseService) RevokeWithReason(ctx context.Context, leaseID, operatorID, reason string) error {
+	return s.revoke(ctx, leaseID, operatorID, reason, true)
+}
+
+// RevokeWithoutKick 只标记租约撤销并推事件，**不做**平台侧踢下线/停用目标。
+//
+// 用途：退出维护/撤销临时共享的 HTTP 请求里要把在线租约快速置为 revoked（让状态机的
+// ActiveLeases 归零），但平台侧的踢下线 + 停用目标是 PowerShell（十几秒起），会再次
+// 把请求拖过客户端超时。平台动作交给随后的异步目标拆除（JobParentTeardown）——
+// 它本来就要停用并删除目标，比"只停用"更彻底。
+func (s *LeaseService) RevokeWithoutKick(ctx context.Context, leaseID, operatorID, reason string) error {
+	return s.revoke(ctx, leaseID, operatorID, reason, false)
+}
+
+// revoke 是撤销租约的公共实现。kick 为 true 时先尽力在平台侧踢掉会话并停用目标。
+func (s *LeaseService) revoke(ctx context.Context, leaseID, operatorID, reason string, kick bool) error {
 	lease, err := s.Store.GetLease(ctx, leaseID)
 	if err != nil {
 		return err
 	}
-	if lease.TargetName != "" {
+	if lease.State.IsTerminal() {
+		return nil
+	}
+	if kick && lease.TargetName != "" {
 		if err := s.kickOffline(ctx, lease.TargetName); err != nil {
 			s.Log.Warn("踢下线失败，仍标记租约为撤销", "target", lease.TargetName, "error", err)
 		}
@@ -322,14 +368,18 @@ func (s *LeaseService) Revoke(ctx context.Context, leaseID, operatorID string) e
 		return err
 	}
 	s.audit(ctx, operatorID, "lease.revoke", "lease:"+leaseID, "client="+lease.ClientID, domain.AuditResultOK)
-	s.emit("lease", map[string]any{
+	payload := map[string]any{
 		"action":        "revoke",
 		"lease_id":      leaseID,
 		"allocation_id": lease.AllocationID,
 		"user_id":       lease.UserID,
 		"target_name":   lease.TargetName,
 		"state":         string(domain.LeaseStateRevoked),
-	})
+	}
+	if r := strings.TrimSpace(reason); r != "" {
+		payload["reason"] = r
+	}
+	s.emit("lease", payload)
 	return nil
 }
 

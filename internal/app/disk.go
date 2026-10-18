@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +32,9 @@ const (
 	// 而且任务失败可以安全重试 —— 记录已经不存在，重试没有任何副作用。
 	reclaimFinalizeArtifacts = "artifacts"
 	// reclaimFinalizeParentIdle 回收差异盘后把母盘置回 idle。
+	//
+	// 当前代码已不再产生这种任务（清理差异盘改走 JobCleanupDiffs）；保留只为让升级前
+	// 停在 jobs 表里的历史任务仍能正确收尾。
 	reclaimFinalizeParentIdle = "parent_idle"
 )
 
@@ -99,6 +103,15 @@ type prepareRepoPayload struct {
 	Count int `json:"count"`
 }
 
+// cleanupDiffsPayload 是维护态下"清理全部差异盘"任务的入参。
+//
+// 只带库与母盘 ID：任务每次尝试都重新列出**当前仍存在**的差异盘，天然幂等，
+// 失败重试时不会重复处理已经删掉的盘。
+type cleanupDiffsPayload struct {
+	RepoID       string `json:"repo_id"`
+	ParentDiskID string `json:"parent_disk_id"`
+}
+
 // resetDiffPayload 是"释放后回池"任务（JobResetDiff）的入参。
 type resetDiffPayload struct {
 	DiskID       string `json:"disk_id"`
@@ -118,6 +131,8 @@ type DiskService struct {
 	// ⚠️ 不能叫 Iscsi：Deps 里已经嵌了一个同名的平台后端字段（platform.IscsiBackend），
 	// 同名会把它遮蔽掉，本层所有 s.Iscsi.DetachLun 之类的调用都会编译不过。
 	IscsiSvc *IscsiService
+	// Leases 用于维护清理差异盘前撤销在线租约（通知客户端断开）；在 App 装配时回填。
+	Leases *LeaseService
 }
 
 // RegisterHandlers 把磁盘相关任务注册到 worker。
@@ -135,6 +150,7 @@ func (s *DiskService) RegisterHandlers(w *job.Worker) {
 	w.Register(job.HandlerFunc{T: domain.JobCopyVHDX, F: s.runCopyVHDX})
 	w.Register(job.HandlerFunc{T: domain.JobDeleteDisk, F: s.runDeleteDisk})
 	w.Register(job.HandlerFunc{T: domain.JobReclaim, F: s.runReclaim})
+	w.Register(job.HandlerFunc{T: domain.JobCleanupDiffs, F: s.runCleanupDiffs})
 	w.Register(job.HandlerFunc{T: domain.JobCompact, F: s.runCompact})
 }
 
@@ -833,6 +849,67 @@ func (s *DiskService) runReclaim(ctx context.Context, j *domain.Job, rep job.Rep
 	return nil
 }
 
+// runCleanupDiffs 是 JobCleanupDiffs 的实现：维护态下清理该库全部差异盘。
+//
+// 顺序必须是"先通知客户端断开，再拆 iSCSI 目标，最后删盘文件"：
+//   - 客户端还在使用差异盘（或平台侧 LUN 映射/会话没拆）时，VHDX 文件被占用，删除必然失败；
+//   - 撤销租约会给客户端推 revoke 指令，客户端据此主动卸载并展示原因（见 LeaseService.RevokeWithReason）。
+//
+// 每次尝试都重新列出当前仍存在的差异盘，因此任务重试幂等。
+func (s *DiskService) runCleanupDiffs(ctx context.Context, j *domain.Job, rep job.Reporter) error {
+	var p cleanupDiffsPayload
+	if err := decodePayload(j.Payload, &p); err != nil {
+		return apperr.InvalidParam("payload").WithCause(err)
+	}
+	if strings.TrimSpace(p.ParentDiskID) == "" {
+		return nil
+	}
+	repo, err := s.Store.GetRepository(ctx, p.RepoID)
+	if err != nil {
+		if isNotFound(err) {
+			// 库已经删掉：没有可清理的对象。
+			return nil
+		}
+		return err
+	}
+	disks, err := s.Store.ListDiffDisksByParent(ctx, p.ParentDiskID)
+	if err != nil {
+		return err
+	}
+	rep.Progress(3)
+
+	// ① 撤销该库所有在线租约：服务端把 kick 指令推给客户端，客户端主动卸载并展示原因。
+	// 这一步是"能删文件"的前提，必须尽力完成；失败的租约仍会被停用目标 -> 拆除目标兜底。
+	if s.Leases != nil {
+		leases, lErr := s.Store.ListActiveLeasesByRepo(ctx, repo.ID)
+		if lErr != nil {
+			return lErr
+		}
+		for i := range leases {
+			if err := s.Leases.RevokeWithReason(ctx, leases[i].ID, "system", RevokeReasonRepoMaintenance); err != nil {
+				s.Log.Warn("维护清理：撤销租约失败（继续拆除目标）",
+					"repo_id", repo.ID, "lease_id", leases[i].ID, "error", err)
+			}
+		}
+	}
+	rep.Progress(10)
+
+	if len(disks) == 0 {
+		rep.Progress(100)
+		return nil
+	}
+	for i := range disks {
+		if err := s.deleteDiskArtifacts(ctx, disks[i].ID, ""); err != nil {
+			return err
+		}
+		rep.Progress(10 + 90*(i+1)/len(disks))
+	}
+	s.audit(ctx, "system", "repo.parent.cleanup_diffs.done", "repo:"+repo.ID,
+		"disks="+strconv.Itoa(len(disks)), domain.AuditResultOK)
+	s.Log.Info("维护清理差异盘完成", "repo_id", repo.ID, "disk_count", len(disks))
+	return nil
+}
+
 // purgeRepository 删除存储库记录及其残留的分配、成员与目标。
 func (s *DiskService) purgeRepository(ctx context.Context, repoID string) error {
 	if repoID == "" {
@@ -1036,17 +1113,8 @@ func (s *DiskService) deleteDiskArtifacts(ctx context.Context, diskID, allocatio
 	}
 	// 盘记录已经不在表里了，此时按 disks 表重算就等于"把这块盘的占用退干净"。
 	s.resyncUsage(ctx, disk.RepoID, userID)
-
-	// 差异盘清理完毕后，若已无兄弟子盘则母盘回到 idle。
-	if disk.Kind == domain.DiskKindDiff && disk.ParentID != nil {
-		if n, nErr := s.Store.CountDiffDisks(ctx, *disk.ParentID); nErr == nil && n == 0 {
-			if repo, rErr := s.Store.GetRepository(ctx, disk.RepoID); rErr == nil && repo.Condition() == domain.ParentDerived {
-				if err := s.Store.SetParentCondition(ctx, disk.RepoID, domain.ParentIdle, false); err != nil {
-					s.Log.Warn("置母盘为 idle 失败", "repo_id", disk.RepoID, "error", err)
-				}
-			}
-		}
-	}
+	// 差异盘数量不再改变母盘状态：正常态（idle）本来就允许存在差异盘，
+	// 维护态要等用户显式退出维护才回到 idle（见 TransitionParent）。
 	return nil
 }
 

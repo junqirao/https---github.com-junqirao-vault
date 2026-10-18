@@ -116,6 +116,10 @@ func New(d Deps) *App {
 	// （IscsiService.TeardownTarget），RepoService 不再自己拼平台的三个调用。
 	a.repo.IscsiSvc = a.iscsi
 	a.lease = &LeaseService{Deps: d, Repos: a.repo, Disks: a.disk, Iscsi: a.iscsi}
+	// 维护态清理差异盘前要先撤销在线租约（通知客户端断开），回填给 DiskService 的清理任务。
+	a.disk.Leases = a.lease
+	// 退出维护 / 撤销母盘临时共享前同样要撤销在线租约。
+	a.repo.Leases = a.lease
 	a.upload = &UploadService{Deps: d, Disks: a.disk, Repos: a.repo}
 	a.storage = &StorageService{Deps: d}
 	a.fs = &FSService{Deps: d}
@@ -152,6 +156,11 @@ func (a *App) FS() *FSService { return a.fs }
 
 // Pools 返回存储池（LVM thin pool / dm-cache）管理服务。
 func (a *App) Pools() *PoolService { return a.pool }
+
+// JobWorker 返回任务执行器（供 API 层取消任务，见 Worker.Cancel）。
+//
+// 不叫 Jobs：Deps 里已有同名字段 Jobs，同名方法会把提升字段遮住，破坏内部装配代码。
+func (a *App) JobWorker() *job.Worker { return a.Jobs }
 
 // cfg 返回当前生效的配置快照。
 func (d Deps) cfg() *config.Loaded {
@@ -283,6 +292,7 @@ func (d Deps) compat() config.ResolvedCompat {
 func (a *App) RegisterJobHandlers() {
 	a.disk.RegisterHandlers(a.Jobs)
 	a.iscsi.RegisterHandlers(a.Jobs)
+	a.repo.RegisterHandlers(a.Jobs)
 	a.upload.RegisterHandlers(a.Jobs)
 	a.registerSysDepsHandlers(a.Jobs)
 }

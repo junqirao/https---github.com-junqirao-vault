@@ -276,6 +276,7 @@ func recordedMountRequest(item MountState, prefs map[string]RepoMountPref) (Moun
 		MountPath:    item.MountPath,
 		RepoID:       item.RepoID,
 		RepoName:     item.RepoName,
+		RepoGroup:    item.RepoGroup,
 		// 记录里的归属带回去：恢复必须打在**当初受理这次挂载的那台**上。
 		ServerKey:  item.ServerKey,
 		ServerURL:  item.ServerURL,

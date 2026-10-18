@@ -5,6 +5,7 @@ package winvhd
 import (
 	"context"
 	"net/http"
+	"strconv"
 
 	"vault/internal/apperr"
 	"vault/internal/platform/winps"
@@ -37,6 +38,33 @@ func (m *Manager) ResetDiskIdentifier(ctx context.Context, path string) error {
 		return err
 	}
 	m.logger.Info("已重置 VHDX 磁盘标识", "path", path)
+	return nil
+}
+
+// Resize 扩容 VHDX 的逻辑容量（只扩不缩）。
+//
+// 走 Hyper-V 模块的 Resize-VHD；无 Hyper-V 模块时如实报错（调用方在维护态里明确提示
+// 需要安装 Hyper-V 管理工具）。调用方必须保证该盘**没有客户端挂载**（无活跃租约）。
+func (m *Manager) Resize(ctx context.Context, path string, sizeBytes int64) error {
+	if sizeBytes <= 0 {
+		return apperr.InvalidParam("size_bytes")
+	}
+	if !m.hyperVAvailable {
+		m.logger.Warn("缺少 Hyper-V 模块，无法扩容 VHDX", "path", path)
+		return apperr.New(CodeResetDiskIDUnavailable, http.StatusInternalServerError).
+			WithArg("reason", "hyperv_unavailable")
+	}
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	params := []winps.Param{
+		winps.String("Path", path),
+		winps.String("SizeBytes", strconv.FormatInt(sizeBytes, 10)),
+	}
+	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVHDResize, params, nil); err != nil {
+		return err
+	}
+	m.logger.Info("已扩容 VHDX", "path", path, "size_bytes", sizeBytes)
 	return nil
 }
 

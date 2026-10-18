@@ -213,6 +213,30 @@ func TestCacheStatusWithoutPortal(t *testing.T) {
 	}
 }
 
+// TestPeakThroughput 峰值吞吐按采样窗口内相邻点的最大差分（字节/秒）计算：
+// 卡片上的"峰值速度"直接读它，不能把累计字节数当速度。
+func TestPeakThroughput(t *testing.T) {
+	m := newCacheManager(newCacheTestStore(t), testLogger())
+	m.historyMu.Lock()
+	m.history["alloc-1"] = []CacheSample{
+		{T: 100, ReadBytes: 0, WriteBytes: 0},
+		{T: 101, ReadBytes: 10 << 20, WriteBytes: 5 << 20},
+		{T: 102, ReadBytes: 10 << 20, WriteBytes: 15 << 20},
+	}
+	m.historyMu.Unlock()
+
+	read, write := m.peakThroughput("alloc-1")
+	if read != float64(10<<20) {
+		t.Fatalf("读峰值 = %v，期望 %v", read, float64(10<<20))
+	}
+	if write != float64(10<<20) {
+		t.Fatalf("写峰值 = %v，期望 %v", write, float64(10<<20))
+	}
+	if read, write := m.peakThroughput("missing"); read != 0 || write != 0 {
+		t.Fatalf("没有历史的库峰值应为 0，实际 %v/%v", read, write)
+	}
+}
+
 // TestClearTargetWithoutPortal 门户没打开时清缓存必须是安全空操作并如实回 false：
 // 界面据此提示"当前没有缓存可清"，而不是报一句"已清空"。
 func TestClearTargetWithoutPortal(t *testing.T) {
@@ -286,6 +310,53 @@ func TestLocalConnectAuthKeepsCHAPWithCache(t *testing.T) {
 	// ip 模式（服务端按白名单过滤）在客户端侧是"无认证连接"。
 	if mode, _, _ := localConnectAuth(&MountSpec{AuthMode: "ip"}); mode != iscsiinitiator.AuthModeNone {
 		t.Fatalf("ip 模式应为无认证连接，实际 %q", mode)
+	}
+}
+
+// TestMountPrefForGroupOverride 分组配置开启 use_for_repos 时覆盖组内库自己的配置；
+// 关闭时仍用库自己的配置。
+func TestMountPrefForGroupOverride(t *testing.T) {
+	s := newCacheTestStore(t)
+	if _, err := s.SetRepoMountPref("repo-a", RepoMountPref{
+		MountMode:    mountModeLetter,
+		CacheEnabled: true,
+	}); err != nil {
+		t.Fatalf("写库偏好失败：%v", err)
+	}
+
+	aa := &Agent{logger: testLogger(), cfg: s}
+	aa.engine = &mountEngine{a: aa}
+	req := MountRequest{RepoID: "repo-a", RepoGroup: "games"}
+
+	// 没有分组配置：用库自己的。
+	if pref, ok := aa.engine.mountPrefFor(req, nil); !ok || pref.MountMode != mountModeLetter {
+		t.Fatalf("没有分组配置时应使用库配置，实际 %+v ok=%v", pref, ok)
+	}
+
+	// 有分组配置但开关关闭：仍用库自己的。
+	if _, err := s.SetGroupMountPref("games", RepoMountPref{
+		MountMode: mountModeDirectory, UseForRepos: false,
+	}); err != nil {
+		t.Fatalf("写分组配置失败：%v", err)
+	}
+	if pref, _ := aa.engine.mountPrefFor(req, nil); pref.MountMode != mountModeLetter {
+		t.Fatalf("分组开关关闭时应使用库配置，实际 %q", pref.MountMode)
+	}
+
+	// 开关打开：分组配置覆盖库配置。
+	if _, err := s.SetGroupMountPref("games", RepoMountPref{
+		MountMode: mountModeDirectory, UseForRepos: true,
+	}); err != nil {
+		t.Fatalf("写分组配置失败：%v", err)
+	}
+	if pref, ok := aa.engine.mountPrefFor(req, nil); !ok || pref.MountMode != mountModeDirectory {
+		t.Fatalf("分组开关开启时应使用分组配置，实际 %+v ok=%v", pref, ok)
+	}
+
+	// 分组名也可以只由服务端 MountSpec 下发。
+	spec := &MountSpec{RepoGroup: "games"}
+	if pref, _ := aa.engine.mountPrefFor(MountRequest{RepoID: "repo-a"}, spec); pref.MountMode != mountModeDirectory {
+		t.Fatalf("MountSpec 里的分组应生效，实际 %q", pref.MountMode)
 	}
 }
 

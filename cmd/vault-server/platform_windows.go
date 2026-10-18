@@ -32,7 +32,9 @@ func buildPlatform(ctx context.Context, raw config.Config, log *slog.Logger) (pl
 	}
 	vhd := winvhd.NewManager(winvhd.Options{Logger: log, HyperVModuleAvailable: hyperV})
 	vol := volume.NewManager(ps, log)
-	iscsi := iscsitarget.NewManager(ps, log)
+	// iSCSI 目标用**独立**执行器（更短的单脚本上限，见 iscsitarget.defaultScriptTimeout）：
+	// 它挂死时会占住目标锁把挂载/退出维护一起堵住，需要更快失败、释放锁。
+	iscsi := iscsitarget.NewManager(nil, log)
 
 	// 启动即探测 iSCSI 目标服务器角色：缺失时"发布磁盘 / 挂载"必然失败
 	// （表现为"无法创建 iSCSI 目标"），与其等到用户点按钮才报错，不如启动就说清楚。

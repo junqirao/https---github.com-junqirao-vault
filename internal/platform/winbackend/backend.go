@@ -126,6 +126,11 @@ func (b *Backend) Delete(ctx context.Context, ref string) error { return b.VHD.D
 // Optimize 回收 VHDX 未使用的物理空间（Retrim / Compact）。
 func (b *Backend) Optimize(ctx context.Context, ref string) error { return b.VHD.Optimize(ctx, ref) }
 
+// Resize 扩容 VHDX 的逻辑容量（只扩不缩，需 Hyper-V 模块）。
+func (b *Backend) Resize(ctx context.Context, ref string, sizeBytes int64) error {
+	return b.VHD.Resize(ctx, ref, sizeBytes)
+}
+
 // ResetDiskIdentifier 重置 VHDX 磁盘标识。
 //
 // 无 Hyper-V 模块时 winvhd 会返回 platform.reset_disk_id_unavailable，

@@ -28,7 +28,7 @@ import type {
   UploadState,
   WebUpdateState
 } from '../api/agentTypes'
-import { t } from '../i18n'
+import { hasKey, t } from '../i18n'
 
 /** 挂载相关操作入参。 */
 export interface AgentMountInput {
@@ -38,6 +38,8 @@ export interface AgentMountInput {
   /** 可选：随挂载状态落库用于展示与脚本变量注入（挂载参数本身由服务端下发）。 */
   repo_id?: string
   repo_name?: string
+  /** 可选：存储库分组名，代理据此决定是否套用"分组挂载配置"。 */
+  repo_group?: string
   /**
    * 归属服务端（多服务端下二选一必填）：省略时按"本机既有记录 → 主服务端"兜底。
    *
@@ -448,6 +450,17 @@ function applyServerEvent(current: AgentState, event: Extract<AgentEvent, { type
   return { ...current, servers, server }
 }
 
+/**
+ * 把服务端下发的断开**原因码**翻成用户可读文案；没有对应翻译时原样显示。
+ *
+ * 服务端只发稳定码（如 repo_maintenance），文案必须在这里按语言渲染：
+ * 服务端不知道客户端当前是哪种语言。
+ */
+function revokedReasonText(reason: string): string {
+  const key = `agent.revokedReason.${reason}`
+  return hasKey(key) ? t(key) : reason
+}
+
 function applyEvent(event: AgentEvent): void {
   const current = snapshot.state
   switch (event.type) {
@@ -468,7 +481,19 @@ function applyEvent(event: AgentEvent): void {
       // `previous` 必须存在：连"之前是不是 mounted"都不知道（尚未拿到这条记录）就没有
       // 任何理由弹"已挂载"。真正的挂载流程一定先经过 mounting 状态，不会因此漏提示。
       const previous = current?.mounts.find((item) => item.allocation_id === event.mount.allocation_id)
-      if (current) setSnapshot({ state: { ...current, mounts: upsertMount(current.mounts, event.mount) } })
+      if (current) {
+        // 「上次挂载时间」也在这里就地更新：卸载会删掉挂载记录，等下一次整份状态拉取再补
+        // 会让卡片在卸载后的那一刻显示成上一次的旧时间。mounted_at 由代理随挂载完成下发。
+        const lastMounts = { ...(current.last_mounts ?? {}) }
+        if (event.mount.state === 'mounted' && event.mount.repo_id && event.mount.mounted_at) {
+          if (event.mount.mounted_at > (lastMounts[event.mount.repo_id] ?? 0)) {
+            lastMounts[event.mount.repo_id] = event.mount.mounted_at
+          }
+        }
+        setSnapshot({
+          state: { ...current, mounts: upsertMount(current.mounts, event.mount), last_mounts: lastMounts }
+        })
+      }
       if (
         previous !== undefined &&
         event.mount.state === 'mounted' &&
@@ -503,7 +528,7 @@ function applyEvent(event: AgentEvent): void {
       }
       notify(
         event.reason
-          ? t('agent.event.revoked', { name, reason: event.reason })
+          ? t('agent.event.revoked', { name, reason: revokedReasonText(event.reason) })
           : t('agent.event.revokedNoReason', { name })
       )
       return

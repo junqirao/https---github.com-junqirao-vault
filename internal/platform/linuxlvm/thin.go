@@ -231,6 +231,30 @@ func (m *Manager) Create(ctx context.Context, ref string, sizeBytes int64) error
 	return nil
 }
 
+// Resize 扩容 thin LV 的虚拟容量（只扩不缩）。
+//
+// 用 lvextend -L <size> <vg>/<lv>：-L 传的是**目标绝对大小**，LVM 自己会在目标小于当前
+// 容量时拒绝，因此"只扩不缩"由 LVM 兜底。调用方必须保证该盘没有客户端挂载（无活跃租约）。
+func (m *Manager) Resize(ctx context.Context, ref string, sizeBytes int64) error {
+	if sizeBytes <= 0 {
+		return apperr.InvalidParam("size_bytes")
+	}
+	vg, lv, err := parseRef(ref)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, err := m.run(ctx, "lvextend",
+		"-L", strconv.FormatInt(alignSectorDown(sizeBytes), 10)+"B",
+		vg+"/"+lv,
+	); err != nil {
+		return err
+	}
+	m.logger.Info("已扩容 thin LV", "ref", ref, "size_bytes", sizeBytes)
+	return nil
+}
+
 // CreateDiff 以 parentRef 为原点创建 thin snapshot 作为差异盘（容量继承父盘）。
 func (m *Manager) CreateDiff(ctx context.Context, childRef, parentRef string) error {
 	cvg, clv, err := parseRef(childRef)

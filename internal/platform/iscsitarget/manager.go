@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"vault/internal/apperr"
 	"vault/internal/platform/winps"
@@ -22,6 +23,14 @@ import (
 
 // CodeTargetExists 目标已存在（CreateTarget 专用）。
 const CodeTargetExists = "iscsi.target_exists"
+
+// defaultScriptTimeout 是 iSCSI 目标脚本的单次执行上限。
+//
+// 单个脚本正常约 5~35 秒（登记虚拟盘 / 建目标 / 建映射 / 删目标）；2 分钟留足余量。而一旦挂死
+// （WinTarget 的 WMI 提供程序卡住），默认 5 分钟的上限会让**目标锁被占住太久** —— 挂载、
+// 对账、退出维护全都排在后面等锁（真实反馈："发布任务 / 退出维护任务一直卡着"）。
+// 收紧到 2 分钟，让挂死的操作尽快以失败收场、释放锁，由任务重试与对账接手。
+const defaultScriptTimeout = 2 * time.Minute
 
 // Manager 是 iSCSI 目标服务器操作入口。
 type Manager struct {
@@ -40,7 +49,7 @@ func NewManager(runner *winps.Runner, logger *slog.Logger) *Manager {
 		logger = slog.Default()
 	}
 	if runner == nil {
-		runner = winps.NewRunner(winps.Options{Logger: logger})
+		runner = winps.NewRunner(winps.Options{Logger: logger, Timeout: defaultScriptTimeout})
 	}
 	return &Manager{ps: runner, logger: logger}
 }

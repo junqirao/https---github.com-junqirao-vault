@@ -218,14 +218,27 @@ func isRewrittenIQN(actual, iqn string) bool {
 // 因此删除是安全的。删除失败不阻断（新目标仍会创建，映射冲突时会有明确报错）。
 //
 // 只在"真的要下发"时才调用（见 pushTarget）：它要枚举平台上的全部目标，也是一次 PowerShell。
+// migrateLegacyTargetName 见 migrateLegacyTargetNameFrom（本函数自行枚举平台目标）。
 func (s *IscsiService) migrateLegacyTargetName(ctx context.Context, shortName, iqn string) {
+	s.migrateLegacyTargetNameFrom(ctx, shortName, iqn, nil)
+}
+
+// migrateLegacyTargetNameFrom 清理"旧命名"（短名）的 iSCSI 目标，只保留完整 IQN 的那一个。
+//
+// known 非 nil 时直接复用调用方已经拉到的平台目标列表，不再自己跑一次 ListTargets —— 对账里
+// 每省一次 PowerShell 就是省下约 10 秒的对账预算（见 ReconcileTargets 的说明）。
+func (s *IscsiService) migrateLegacyTargetNameFrom(ctx context.Context, shortName, iqn string, known []platform.TargetInfo) {
 	if s.Iscsi == nil || strings.EqualFold(strings.TrimSpace(shortName), strings.TrimSpace(iqn)) {
 		return
 	}
-	targets, err := s.Iscsi.ListTargets(ctx)
-	if err != nil {
-		s.Log.Warn("列出 iSCSI 目标失败，跳过旧命名迁移", "target", shortName, "error", err)
-		return
+	targets := known
+	if targets == nil {
+		var err error
+		targets, err = s.Iscsi.ListTargets(ctx)
+		if err != nil {
+			s.Log.Warn("列出 iSCSI 目标失败，跳过旧命名迁移", "target", shortName, "error", err)
+			return
+		}
 	}
 	for i := range targets {
 		name := strings.TrimSpace(targets[i].Name)
@@ -391,6 +404,7 @@ func (s *IscsiService) RegisterHandlers(w *job.Worker) {
 		return
 	}
 	w.Register(job.HandlerFunc{T: domain.JobPublish, F: s.runPublish})
+	w.Register(job.HandlerFunc{T: domain.JobRepairTarget, F: s.runRepairTarget})
 }
 
 // Available 探测 iSCSI 目标服务器能力。
@@ -413,48 +427,38 @@ func (s *IscsiService) ReconcileTargets(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if len(targets) == 0 {
+		return nil
+	}
+	// 一次枚举平台上的全部目标，再在内存里逐个比对。
+	//
+	// 为什么不再"逐目标 GetTarget"：那是**每个目标一次 PowerShell**（真实服务器上单次约 10 秒），
+	// 目标一多，光查询就把 60s 对账预算吃光；等轮到真正需要重建的目标时预算已尽，重建刚建好目标、
+	// 还没建映射就被 context deadline 掐断，留下"目标在、映射不在"的半成品 —— 客户端怎么挂都挂不上
+	// （真实事故：维护态挂母盘一直失败，日志停在"重建 iSCSI 目标失败 / ps_failed / deadline exceeded"）。
+	live, err := s.Iscsi.ListTargets(ctx)
+	if err != nil {
+		return err
+	}
+	byName := make(map[string]*platform.TargetInfo, len(live))
+	for i := range live {
+		byName[strings.ToLower(strings.TrimSpace(live[i].Name))] = &live[i]
+	}
 	for i := range targets {
 		t := &targets[i]
 		// 查询/重建用**寻址名**（下发的完整 IQN = Windows TargetName）。
 		// 不能用 targetIQN：那是客户端连接用的 TargetIqn（Windows 改写后的名字）。
 		iqn := t.IQN(s.iqnPrefix())
-		info, getErr := s.Iscsi.GetTarget(ctx, iqn)
-		if getErr != nil {
-			// ⚠️ 只有"确实不存在"（404）才重建。其它错误——脚本超时、权限不足、
-			// 目标名非法（iscsi.invalid_target_name）等——一律原样保留并跳过本轮：
-			// 把任何错误都当成"不存在"去 upsert，会把真因伪装成"重建失败"，
-			// 还会每轮白跑一次昂贵的 PowerShell 调用（真实服务器上单次约 10 秒）。
-			if !isNotFound(getErr) {
-				s.Log.Error("查询 iSCSI 目标失败，跳过本轮收敛",
-					"target", t.TargetName, "error", getErr)
-				continue
-			}
-			// Windows 侧不存在：用 SetTarget（upsert）重建目标并按 DB 期望值启用。
-			// 重建前先清掉旧命名的目标：它们与新 IQN 目标会争抢同一个 VHDX 的映射。
-			//
-			// 必须**强制**下发：记账里的指纹可能还留着（目标是被外部删掉的），
-			// 走会跳过的 pushTarget 会把"重建"变成空操作。
-			s.migrateLegacyTargetName(ctx, t.TargetName, iqn)
-			if err := s.forcePushTarget(ctx, t, t.DesiredEnabled); err != nil {
-				s.Log.Error("重建 iSCSI 目标失败", "target", t.TargetName, "error", err)
-				continue
-			}
-			if err := s.Store.SetIscsiTargetEnabled(ctx, t.ID, t.DesiredEnabled); err != nil {
-				s.Log.Warn("写回目标启用状态失败", "target", t.TargetName, "error", err)
-			}
+		info := byName[strings.ToLower(strings.TrimSpace(iqn))]
+		if info == nil {
+			// 平台侧不存在：**不在这里同步重建**，入队修复任务（见 enqueueTargetRepair 的说明：
+			// 对账预算会中途杀掉 iSCSI cmdlet，把 WinTarget 的 WMI 提供程序留在坏状态）。
+			s.enqueueTargetRepair(ctx, t, "missing")
 			continue
 		}
 		if info.Enabled != t.DesiredEnabled {
-			enabled := t.DesiredEnabled
-			// 强制下发：平台现状已经确知与期望不符，跳过判据在这里不适用。
-			if err := s.forcePushTarget(ctx, t, enabled); err != nil {
-				s.Log.Error("收敛目标启用状态失败", "target", t.TargetName, "error", err)
-				continue
-			}
-			if err := s.Store.SetIscsiTargetEnabled(ctx, t.ID, enabled); err != nil {
-				s.Log.Warn("写回目标启用状态失败", "target", t.TargetName, "error", err)
-			}
-			s.Log.Info("已收敛 iSCSI 目标启用状态", "target", t.TargetName, "enabled", enabled)
+			// 启用状态不符：同样交给修复任务（强制下发），不在对账里同步做。
+			s.enqueueTargetRepair(ctx, t, "enabled_mismatch")
 			continue
 		}
 		// 启用状态一致，但读回与"已下发的期望状态"对不上：平台被外部改动过
@@ -472,6 +476,68 @@ func (s *IscsiService) ReconcileTargets(ctx context.Context) error {
 			}
 		}
 	}
+	return nil
+}
+
+// repairTargetPayload 是"重新下发 iSCSI 目标"任务的入参。
+type repairTargetPayload struct {
+	TargetID string `json:"target_id"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// enqueueTargetRepair 把"重新下发该目标"排进任务队列（对账发现平台侧缺失 / 启用不符时）。
+//
+// 为什么不在对账里同步做：重下发是多次 PowerShell（几十秒），会被 60s 对账预算中途掐断；
+// 而**杀掉正在执行的 iSCSI cmdlet 会把 WinTarget 的 WMI 提供程序留在坏状态**，之后所有
+// 目标操作都会挂死（真实事故：母盘发布 / 退出维护任务一直卡着）。走 worker 则没有对账预算，
+// 脚本能完整跑完，且按目标锁与挂载路径串行。
+//
+// 幂等键按 5 分钟分桶：同一轮对账内不重复入队，下一轮仍会重试，避免对持续故障的目标刷任务。
+func (s *IscsiService) enqueueTargetRepair(ctx context.Context, t *domain.IscsiTarget, reason string) {
+	if s.Jobs == nil || t == nil || t.ID == "" {
+		return
+	}
+	bucket := strconv.FormatInt(time.Now().Unix()/300, 10)
+	payload := repairTargetPayload{TargetID: t.ID, Reason: reason}
+	if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobRepairTarget, t.ID,
+		"repair_target:"+t.ID+":"+bucket, lock.TargetKey(t.TargetName), payload); err != nil {
+		s.Log.Warn("入队 iSCSI 目标修复任务失败", "target", t.TargetName, "error", err)
+		return
+	}
+	s.Log.Info("已入队 iSCSI 目标修复任务", "target", t.TargetName, "reason", reason)
+}
+
+// runRepairTarget 是 JobRepairTarget 的实现：按 DB 期望值**强制**重新下发一个目标。
+//
+// 幂等：目标已被删除（库里没记录）时直接空跑；重复下发同一份期望状态是 upsert，安全。
+func (s *IscsiService) runRepairTarget(ctx context.Context, j *domain.Job, _ job.Reporter) error {
+	var p repairTargetPayload
+	if err := decodePayload(j.Payload, &p); err != nil {
+		return apperr.InvalidParam("payload").WithCause(err)
+	}
+	t, err := s.Store.GetIscsiTarget(ctx, p.TargetID)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	unlock := s.Locks.Acquire(lock.TargetKey(t.TargetName))
+	defer unlock()
+	// 拿到锁后重读下发记账：别的路径可能刚下发过同一份期望状态。
+	s.refreshAppliedFromStore(ctx, t)
+	// 先清旧命名目标（一次平台枚举），再强制下发完整期望状态（必须强制：记账指纹可能还留着，
+	// 走会跳过的 pushTarget 会把"重建"变成空操作）。
+	if live, lErr := s.Iscsi.ListTargets(ctx); lErr == nil {
+		s.migrateLegacyTargetNameFrom(ctx, t.TargetName, t.IQN(s.iqnPrefix()), live)
+	}
+	if err := s.forcePushTarget(ctx, t, t.DesiredEnabled); err != nil {
+		return err
+	}
+	if err := s.Store.SetIscsiTargetEnabled(ctx, t.ID, t.DesiredEnabled); err != nil {
+		s.Log.Warn("写回目标启用状态失败", "target", t.TargetName, "error", err)
+	}
+	s.Log.Info("已重新下发 iSCSI 目标", "target", t.TargetName, "reason", p.Reason)
 	return nil
 }
 

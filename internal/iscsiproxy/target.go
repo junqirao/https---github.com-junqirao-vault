@@ -88,6 +88,8 @@ type TargetConfig struct {
 type counters struct {
 	reads         atomic.Int64
 	writes        atomic.Int64
+	readBytes     atomic.Int64
+	writeBytes    atomic.Int64
 	invalidations atomic.Int64
 	localCmds     atomic.Int64
 	passthrough   atomic.Int64
@@ -505,6 +507,8 @@ func (t *target) statsSnapshot() Stats {
 		Proxy: StatsSnapshot{
 			Reads:         t.stats.reads.Load(),
 			Writes:        t.stats.writes.Load(),
+			ReadBytes:     t.stats.readBytes.Load(),
+			WriteBytes:    t.stats.writeBytes.Load(),
 			Invalidations: t.stats.invalidations.Load(),
 			LocalCmds:     t.stats.localCmds.Load(),
 			Passthrough:   t.stats.passthrough.Load(),

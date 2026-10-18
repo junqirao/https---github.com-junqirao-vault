@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { Alert, Button, Descriptions, Dropdown, Form, Input, InputNumber, Modal, Space, Tabs } from 'antd'
+import { useEffect, useState } from 'react'
+import { Alert, Button, Descriptions, Dropdown, Form, Input, InputNumber, Modal, Progress, Space, Tabs, message } from 'antd'
 import type { MenuProps } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -11,15 +11,18 @@ import { SectionCard } from '../../components/SectionCard'
 import { StatusTag } from '../../components/StatusTag'
 import { UsageBar, UsageValueText } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
-import type { ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
+import type { JobDTO, ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
 import { pickMountUsage, repoUsageLoading, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
+import { isJobTerminal, useJobProgress } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
+import { useServerConfig } from '../../hooks/useServerConfig'
 import { spacing } from '../../tokens/palette'
 import { formatTime, repoUsage } from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
 import { RepoMountActions, useRepoMount } from './RepoMount'
+import { RepoGroupSelect } from './RepoGroupSelect'
 import { RepoMountSettingsPanel } from './RepoMountSettings'
 
 export interface RepoDetailProps {
@@ -40,15 +43,6 @@ interface EditValues {
   note?: string
 }
 
-const PARENT_ACTIONS: ParentAction[] = [
-  'derive',
-  'temp_share',
-  'unshare',
-  'maintenance',
-  'finish_maintenance',
-  'cleanup_diffs'
-]
-
 /** 存储库详情：概览 + 成员 + 磁盘（含分配与挂载），以及编辑/删除/母盘操作/复制。 */
 export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserName, onBack }: RepoDetailProps): JSX.Element {
   const api = useApi()
@@ -59,6 +53,14 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const [editOpen, setEditOpen] = useState(false)
   const [copyOpen, setCopyOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
+  // 维护态「清理差异盘」的异步任务：提交后跟踪它的进度，终态再刷新页面数据。
+  const [cleanupJob, setCleanupJob] = useState<JobDTO | null>(null)
+  // 「退出维护 / 撤销临时共享」的异步任务：拆母盘 iSCSI 目标要走多次 PowerShell（几十秒起），
+  // 服务端改成任务返回，界面跟踪到终态再刷新（见 RepoService.runParentTeardown）。
+  const [parentJob, setParentJob] = useState<JobDTO | null>(null)
+  // 维护态「扩容母盘」弹窗。
+  const [resizeOpen, setResizeOpen] = useState(false)
+  const [resizeForm] = Form.useForm<{ size_gb: number }>()
   const [editForm] = Form.useForm<EditValues>()
   const [copyForm] = Form.useForm<{ new_repo_name: string }>()
 
@@ -75,6 +77,11 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     void queryClient.invalidateQueries({ queryKey: ['repos'] })
     // 容量变更（扩容/维护/母盘更新）会改用户级用量，列表页顶部的总账也要跟着变。
     void queryClient.invalidateQueries({ queryKey: ['me'] })
+    // 维护相关操作会改磁盘记录（扩容改容量、清理删差异盘、退出维护拆目标），
+    // 「磁盘」tab 必须跟着刷新，否则看到的还是操作前的数据。
+    void queryClient.invalidateQueries({ queryKey: ['repo-disks', repoId] })
+    // 母盘临时挂载的 @temp 占位分配也会随维护进入/退出出现/消失。
+    void queryClient.invalidateQueries({ queryKey: ['repo-allocations', repoId] })
   }
 
   const updateMutation = useMutation({
@@ -103,7 +110,123 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
 
   const parentMutation = useMutation({
     mutationFn: (action: ParentAction) => api.parentAction(repoId, action),
-    onSuccess: refresh,
+    onSuccess: (result) => {
+      // 退出维护 / 撤销共享：服务端返回 202 任务（拆目标很慢，不能同步等）。
+      if ('type' in result) {
+        setParentJob(result)
+        // 任务列表页也要能看到这条任务。
+        void queryClient.invalidateQueries({ queryKey: ['jobs'] })
+        return
+      }
+      refresh()
+    },
+    onError: (err) => setError(err)
+  })
+
+  const cleanupMutation = useMutation({
+    mutationFn: () => api.cleanupDiffs(repoId),
+    onSuccess: (job) => {
+      setCleanupJob(job)
+      // 任务列表页也要能看到这条清理任务。
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] })
+    },
+    onError: (err) => setError(err)
+  })
+
+  // 清理任务进度：走服务端事件推送（见 useJobProgress），到终态再刷新库数据。
+  const cleanupProgress = useJobProgress(cleanupJob?.id, cleanupJob)
+  const cleanupRunning = cleanupJob !== null && !isJobTerminal(cleanupProgress?.state)
+  const cleanupState = cleanupProgress?.state
+
+  useEffect(() => {
+    if (!cleanupJob || !isJobTerminal(cleanupState)) return
+    if (cleanupState === 'succeeded') {
+      message.success(t('repo.maintenance.cleanupDone'))
+    } else {
+      message.error(t('repo.maintenance.cleanupFailed'))
+    }
+    setCleanupJob(null)
+    refresh()
+    // refresh 是本组件内的稳定动作（只读 queryClient），不需要进依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cleanupJob, cleanupState, t])
+
+  // 退出维护 / 撤销共享任务进度：与清理差异盘同一套（事件推送 + 终态刷新）。
+  const parentProgress = useJobProgress(parentJob?.id, parentJob)
+  const parentRunning = parentJob !== null && !isJobTerminal(parentProgress?.state)
+
+  // 取消任务（卡住时的唯一出口）：parent_teardown / cleanup_diffs 都能从详情页直接取消。
+  const cancelJobMutation = useMutation({
+    mutationFn: (id: string) => api.cancelJob(id),
+    onSuccess: (_job, id) => {
+      message.success(t('job.cancelDone'))
+      if (parentJob?.id === id) setParentJob(null)
+      if (cleanupJob?.id === id) setCleanupJob(null)
+      refresh()
+    },
+    onError: (err) => setError(err)
+  })
+
+  useEffect(() => {
+    if (!parentJob || !isJobTerminal(parentProgress?.state)) return
+    if (parentProgress?.state === 'succeeded') {
+      message.success(t('repo.parent.teardownDone'))
+    } else {
+      message.error(t('repo.parent.teardownFailed'))
+    }
+    setParentJob(null)
+    refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parentJob, parentProgress?.state, t])
+
+  // 维护态下服务端会为母盘建一个临时占位分配（user_id=@temp）：本地管理员可以据此
+  // 把母盘临时挂到本机读写，更新内容后再退出维护。
+  const { active } = useServerConfig()
+  const allocationsQuery = useQuery({
+    queryKey: ['repo-allocations', repoId],
+    queryFn: () => api.listAllocations(repoId),
+    // 不加 maintenance 条件：进入维护后要立刻能看到 @temp 占位分配，靠 enabled 从 false
+    // 翻到 true 的时机太容易错过（父盘状态还没刷回来的那一拍按钮就是灰的）。
+    enabled: Boolean(repoQuery.data)
+  })
+  const tempAllocation = allocationsQuery.data?.items.find(
+    (item) => item.user_id === '@temp' && item.state !== 'released'
+  )
+  const parentMount = (agent.state?.mounts ?? []).find(
+    (item) => item.allocation_id === tempAllocation?.id
+  )
+  const parentMounted = Boolean(parentMount && parentMount.state === 'mounted')
+  const parentMountMutation = useMutation({
+    mutationFn: async () => {
+      if (parentMount) {
+        await agent.unmount({ allocation_id: parentMount.allocation_id })
+        return
+      }
+      if (!tempAllocation) throw new Error(t('repo.maintenance.parentNotReady'))
+      await agent.mount({
+        allocation_id: tempAllocation.id,
+        // 母盘临时挂载默认用盘符：维护时管理员要直接打开这块盘改内容，盘符最直观。
+        mount_mode: 'letter',
+        repo_id: repoId,
+        repo_name: repoQuery.data?.name,
+        server_key: active?.key,
+        server_url: active?.baseUrl
+      })
+    },
+    onSuccess: () => {
+      // 母盘挂/卸会改磁盘状态与分配，磁盘 tab 与分配列表都要跟着刷新。
+      refresh()
+      void queryClient.invalidateQueries({ queryKey: ['leases'] })
+    },
+    onError: (err) => setError(err)
+  })
+
+  const resizeMutation = useMutation({
+    mutationFn: (sizeBytes: number) => api.resizeParentDisk(repoId, sizeBytes),
+    onSuccess: () => {
+      setResizeOpen(false)
+      refresh()
+    },
     onError: (err) => setError(err)
   })
 
@@ -157,12 +280,25 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     setEditOpen(true)
   }
 
-  const parentMenu: MenuProps = {
-    items: PARENT_ACTIONS.map((action) => ({ key: action, label: parentActionLabel(action) })),
-    onClick: ({ key }) => {
-      setError(null)
-      parentMutation.mutate(key as ParentAction)
-    }
+  // 临时共享仍是独立动作（与维护态互斥），用一个小下拉承载；维护态进入/退出则合成一个按钮。
+  const tempShareMenu: MenuProps | null =
+    repo?.mode === 'shared' && (repo.parent_condition === 'idle' || repo.parent_condition === 'temp_shared')
+      ? {
+          items: [
+            repo.parent_condition === 'idle'
+              ? { key: 'temp_share', label: parentActionLabel('temp_share') }
+              : { key: 'unshare', label: parentActionLabel('unshare') }
+          ],
+          onClick: ({ key }) => {
+            setError(null)
+            parentMutation.mutate(key as ParentAction)
+          }
+        }
+      : null
+  const isMaintenance = repo?.parent_condition === 'maintenance'
+  const toggleMaintenance = (): void => {
+    setError(null)
+    parentMutation.mutate(isMaintenance ? 'finish_maintenance' : 'maintenance')
   }
 
   return (
@@ -183,9 +319,39 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               <Button onClick={() => repo && openEdit(repo)} disabled={!repo}>
                 {t('common.edit')}
               </Button>
-              <Dropdown menu={parentMenu}>
-                <Button loading={parentMutation.isPending}>{t('repo.parent.title')}</Button>
-              </Dropdown>
+              {/* 进入 / 退出维护态合成一个按钮：文案与动作按当前母盘条件切换。 */}
+              {repo?.mode === 'shared' ? (
+                <Button
+                  loading={parentMutation.isPending || parentRunning}
+                  disabled={repo.parent_condition === 'temp_shared' || parentRunning}
+                  title={repo.parent_condition === 'temp_shared' ? t('repo.maintenance.unshareFirst') : undefined}
+                  onClick={toggleMaintenance}
+                >
+                  {t(isMaintenance ? 'repo.parent.action.finish_maintenance' : 'repo.parent.action.maintenance')}
+                </Button>
+              ) : null}
+              {/* 退出维护/撤销共享是异步任务：进度 + 取消按钮就摆在这里，卡住时不用去别处找。
+                  取消仅超管可用（服务端同样只放行超管）。 */}
+              {parentRunning ? (
+                <Space>
+                  <Progress percent={parentProgress?.progress ?? 0} size="small" style={{ width: 160 }} />
+                  {isSuperAdmin ? (
+                    <Button
+                      size="small"
+                      danger
+                      loading={cancelJobMutation.isPending}
+                      onClick={() => cancelJobMutation.mutate(parentJob!.id)}
+                    >
+                      {t('job.cancel')}
+                    </Button>
+                  ) : null}
+                </Space>
+              ) : null}
+              {tempShareMenu ? (
+                <Dropdown menu={tempShareMenu} disabled={parentRunning}>
+                  <Button loading={parentMutation.isPending || parentRunning}>{t('repo.parent.title')}</Button>
+                </Dropdown>
+              ) : null}
               <Button
                 onClick={() => {
                   copyForm.setFieldsValue({ new_repo_name: `${repo?.name ?? 'repo'}-copy` })
@@ -207,6 +373,62 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       {/* 只能看的库（非所有者 / read、mount 成员）说清楚为什么没有管理入口。 */}
       {repo && !canManage ? (
         <Alert type="info" showIcon message={t('repo.detail.readOnly')} style={{ marginBottom: spacing.md }} />
+      ) : null}
+      {/* 维护态横幅：所有能看到这个库的人都该知道它当前不可用；清理入口只给能管理的人。 */}
+      {isMaintenance ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: spacing.md }}
+          message={t('repo.maintenance.banner')}
+          description={
+            <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
+              <span>{t('repo.maintenance.bannerHint')}</span>
+              {canManage ? (
+                <Space wrap>
+                  <Button
+                    size="small"
+                    loading={parentMountMutation.isPending || allocationsQuery.isLoading}
+                    disabled={!parentMount && !tempAllocation}
+                    onClick={() => parentMountMutation.mutate()}
+                  >
+                    {parentMounted ? t('repo.maintenance.unmountParent') : t('repo.maintenance.mountParent')}
+                  </Button>
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      const currentGb = Math.ceil((repo?.capacity_bytes ?? 0) / (1024 * 1024 * 1024))
+                      resizeForm.setFieldsValue({ size_gb: currentGb + 1 })
+                      setResizeOpen(true)
+                    }}
+                  >
+                    {t('repo.maintenance.resize')}
+                  </Button>
+                  {cleanupRunning ? (
+                    <Space>
+                      <Progress percent={cleanupProgress?.progress ?? 0} size="small" style={{ width: 220 }} />
+                      <span>{t('repo.maintenance.cleanupRunning')}</span>
+                      {isSuperAdmin ? (
+                        <Button
+                          size="small"
+                          danger
+                          loading={cancelJobMutation.isPending}
+                          onClick={() => cancelJobMutation.mutate(cleanupJob!.id)}
+                        >
+                          {t('job.cancel')}
+                        </Button>
+                      ) : null}
+                    </Space>
+                  ) : (
+                    <Button danger size="small" loading={cleanupMutation.isPending} onClick={() => cleanupMutation.mutate()}>
+                      {t('repo.maintenance.cleanup')}
+                    </Button>
+                  )}
+                </Space>
+              ) : null}
+            </Space>
+          }
+        />
       ) : null}
 
       <Tabs
@@ -306,7 +528,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
             <Input maxLength={64} />
           </Form.Item>
           <Form.Item name="group" label={t('field.group')}>
-            <Input maxLength={64} />
+            <RepoGroupSelect />
           </Form.Item>
           {/* 备注写在母盘旁边的元数据文件里跟着盘走：换服务端把 disks/ 拷过去后，
               导入页面就能直接告诉管理员"这是财务的 Win10 母盘，别删"。 */}
@@ -351,6 +573,36 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
         onConfirm={() => deleteMutation.mutate()}
         onCancel={() => setDeleteOpen(false)}
       />
+
+      <Modal
+        open={resizeOpen}
+        title={t('repo.maintenance.resizeTitle')}
+        width={480}
+        centered
+        okText={t('common.confirm')}
+        cancelText={t('common.cancel')}
+        confirmLoading={resizeMutation.isPending}
+        onCancel={() => setResizeOpen(false)}
+        onOk={() => {
+          void resizeForm.validateFields().then((values) => {
+            resizeMutation.mutate(Math.round(values.size_gb * 1024 * 1024 * 1024))
+          })
+        }}
+      >
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Alert type="info" showIcon message={t('repo.maintenance.resizeHint')} />
+          <Form form={resizeForm} layout="vertical">
+            <Form.Item name="size_gb" label={t('repo.maintenance.resizeSize')} rules={[{ required: true }]}>
+              <InputNumber
+                min={Math.ceil((repo?.capacity_bytes ?? 0) / (1024 * 1024 * 1024)) + 1}
+                step={1}
+                style={{ width: '100%' }}
+                addonAfter="GB"
+              />
+            </Form.Item>
+          </Form>
+        </Space>
+      </Modal>
     </PageShell>
   )
 }

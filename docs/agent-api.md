@@ -157,6 +157,9 @@ GET /agent/state
       user:{id, username, role},       # role：super_admin | user（界面据此决定管理端入口）
       session:SessionView,             # 可选：主服务端会话（未推送会话时缺省）
       mounts:[MountState...],
+      # 每库最近一次挂载成功的时间（repo_id → 毫秒时间戳），只存本机。
+      # 挂载记录（mounts）在卸载后即被删除，卡片未挂载时靠它显示"上次挂载"；旧版代理不带该字段。
+      last_mounts:{<repo_id>:int64},
       auto_mount:bool,
       host:HostState,
       update:UpdateInfo,
@@ -459,6 +462,9 @@ CacheRecommend = {              # 逐库分到多少没有单一数字，看 tar
 CacheTargetStatus = {
   allocation_id,                # 与挂载记录、存储库卡片一一对应
   target_iqn,                   # 本地门户为该库公示的 IQN（挂载链路上实际连接的）
+  cache_enabled,                # 该目标是否真的带读缓存；false = 纯透传，下面的缓存计数恒为 0
+  # 卡片上的「已缓存 / 命中率 / 峰值速度」直接读这里：
+  peak_read_bytes_per_sec, peak_write_bytes_per_sec,   # 近 5 分钟窗口内的读写峰值吞吐（字节/秒）
   l1_used_bytes, l1_limit_bytes,   # 内存缓存占用与配额（占用只算块数据 blocks×blockSize）
   l1_resident_bytes,            # 上面这份索引**实际**占的堆（估算，含 entry 头/map 桶/队列槽位）
   l2_used_bytes, l2_limit_bytes,   # L2 文件占用与配额（未启用 L2 时均为 0）
@@ -733,17 +739,26 @@ UploadState = {
 
 ```
 GET   /agent/config
-  ↑ {auto_mount:bool, default_mount_mode, default_mount_dir, default_download_dir,
+  ↑ {auto_mount:bool, default_mount_mode, default_mount_dir, default_download_dir, shortcut_dir,
      download_connections, language, start_at_login:bool, update_channel, server_alias,
      cache_l1_bytes:int, cache_l2_bytes:int, cache_l2_dir:string,
-     repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}}}
+     repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}},
+     group_mounts:{<group>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool, use_for_repos:bool}}}
 PATCH /agent/config
-  ↓ 上述字段的任意子集（不含 repo_mounts / default_mount_mode / default_mount_dir）
+  ↓ 上述字段的任意子集（不含 repo_mounts / group_mounts / default_mount_mode / default_mount_dir）
   ↑ {config:{...}}
 POST  /agent/repo-mounts/{repo_id}
   ↓ {mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}
   ↑ {config:{...}}
+POST  /agent/group-mounts
+  ↓ {group, mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool, use_for_repos:bool}
+  ↑ {config:{...}}
 ```
+
+`group_mounts` 是**按存储库分组名**保存的本地挂载配置（分组名来自服务端
+`repo.meta.group`）。`use_for_repos=true` 时，组内库挂载会用这套配置**覆盖**各自的
+`repo_mounts` 配置；为 false 时组内库各用各的配置，分组配置只作为默认值保留。
+挂载时分组名可由挂载请求的 `repo_group` 或服务端下发的 MountSpec `repo_group` 提供。
 
 `repo_mounts` 是**每个存储库各自独立**的挂载偏好（形态 / 目录 / 启动后自动挂载），
 没有条目的库跟随 `default_mount_mode`、`default_mount_dir` 与 `auto_mount` 的兜底默认值；
@@ -853,6 +868,8 @@ GET /agent/events
                        # 非 mounted 变成 mounted** 才提示"已挂载"（会话实测不会产生这种变化）。
      event: unmount     data: {allocation_id}
      event: revoked     data: {allocation_id, reason, server_key}   # 服务端踢下线，代理已自行卸载
+                       # reason 是稳定码：server_revoked（默认）/ repo_maintenance（存储库进入维护、
+                       # 差异盘被清理）等；界面按 agent.revokedReason.* 映射文案，缺失时原样显示。
      event: server      data: {server_key, url, name, connected, phase, fail_count, last_error}
                       # **按台发**：connected / phase / fail_count / last_error 任一变化时发（值未变不发）。
                       # server_key 指这条状态属于哪一台，界面必须据此只更新那一台。

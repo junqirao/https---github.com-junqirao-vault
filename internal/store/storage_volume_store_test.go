@@ -58,6 +58,40 @@ func TestMigrateFreshCreatesStorageVolumes(t *testing.T) {
 	}
 }
 
+// 从 v8 升级到 v9：存量 parent_condition='derived' 必须回填为 idle（该状态已移除）。
+func TestMigrateFromV8RewritesDerivedCondition(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx,
+		`INSERT INTO users (id, username, role, created_at, updated_at) VALUES ('u1', 'u1', 'user', 0, 0)`); err != nil {
+		t.Fatalf("插入用户失败: %v", err)
+	}
+	if _, err := s.DB().ExecContext(ctx,
+		`INSERT INTO repositories (id, name, mode, owner_id, parent_version, parent_condition, state, created_at, updated_at)
+		 VALUES ('r1', 'r1', 'shared', 'u1', 1, 'derived', 'active', 0, 0)`); err != nil {
+		t.Fatalf("插入存储库失败: %v", err)
+	}
+	// 把版本退回 v8，让下一次 Migrate 走 v9 的增量路径。
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM schema_version WHERE version = 9`); err != nil {
+		t.Fatalf("回退版本号失败: %v", err)
+	}
+
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("从 v8 迁移失败: %v", err)
+	}
+	var cond string
+	if err := s.DB().GetContext(ctx, &cond,
+		`SELECT COALESCE(parent_condition, '') FROM repositories WHERE id = 'r1'`); err != nil {
+		t.Fatalf("读取母盘条件失败: %v", err)
+	}
+	if cond != string(domain.ParentIdle) {
+		t.Fatalf("derived 应被回填为 idle，实际 %q", cond)
+	}
+}
+
 // 老库（v2，仅有 storages 表）升级到 v3：补齐 storage_volumes，且重复迁移幂等。
 func TestMigrateFromV2AddsStorageVolumes(t *testing.T) {
 	s := openTestStore(t)

@@ -64,6 +64,11 @@ type RepoMountPref struct {
 	// 从而都能被监控。只有用户显式打开直连才绕过代理 —— 此时该库没有监控数据
 	// （界面上的「监控」入口置灰）。改动需要**重新挂载**该库才生效。
 	DirectMode bool `json:"direct_mode,omitempty"`
+	// UseForRepos 只在**分组配置**里有意义：为 true 时，该分组的这套配置覆盖组内
+	// 每个存储库自己的配置去挂载；为 false 时组内库各用各的配置（分组配置仅作默认值保留）。
+	//
+	// 放在 RepoMountPref 里而不是单独类型，是为了让分组与单库共用同一套字段与归一/校验逻辑。
+	UseForRepos bool `json:"use_for_repos,omitempty"`
 }
 
 // UnmarshalJSON 解析单库偏好，并记录 cache_enabled 是否显式出现过。
@@ -116,6 +121,11 @@ type Config struct {
 	DefaultMountDir string `json:"default_mount_dir"`
 	// DefaultDownloadDir 母盘内容下载的默认目标目录。
 	DefaultDownloadDir string `json:"default_download_dir"`
+	// ShortcutDir 存储库快捷方式的默认存放目录。
+	//
+	// 空串表示由客户端（Electron 主进程）落到系统桌面；非空必须是**绝对路径**，
+	// 否则快捷方式会随进程工作目录漂移到用户意想不到的地方。
+	ShortcutDir string `json:"shortcut_dir"`
 	// DownloadConnections 母盘内容下载的分段并发数（1..8，默认 4）。
 	DownloadConnections int `json:"download_connections"`
 	// Language 界面语言。
@@ -146,6 +156,11 @@ type Config struct {
 	// RepoMounts 按存储库 ID 保存的挂载偏好；没有条目的库跟随上面的全局默认值
 	// （缓存除外：没有条目时按**默认开启**处理，见 RepoMountPref.CacheEnabled）。
 	RepoMounts map[string]RepoMountPref `json:"repo_mounts,omitempty"`
+	// GroupMounts 按**服务端存储库分组名**保存的挂载配置（每台客户端本地）。
+	//
+	// 当条目的 UseForRepos=true 时，组内所有库挂载时都用这套配置覆盖各自的
+	// RepoMounts 配置；否则分组配置只是保留下来，挂载仍按每个库自己的配置。
+	GroupMounts map[string]RepoMountPref `json:"group_mounts,omitempty"`
 
 	// autoLoginSet 记录 auto_login 是否被**显式**配置过。
 	//
@@ -190,6 +205,8 @@ type ConfigPatch struct {
 	AutoLogin *bool `json:"auto_login"`
 	// DefaultDownloadDir 母盘内容下载的默认目标目录。
 	DefaultDownloadDir *string `json:"default_download_dir"`
+	// ShortcutDir 存储库快捷方式的默认存放目录；空串 = 系统桌面。
+	ShortcutDir *string `json:"shortcut_dir"`
 	// DownloadConnections 母盘内容下载的分段并发数（1..8）。
 	DownloadConnections *int    `json:"download_connections"`
 	Language            *string `json:"language"`
@@ -279,6 +296,8 @@ func normalizeConfig(c Config) Config {
 	if strings.TrimSpace(c.DefaultDownloadDir) == "" {
 		c.DefaultDownloadDir = def.DefaultDownloadDir
 	}
+	// 快捷方式目录空串是合法值（默认桌面），只去空白。
+	c.ShortcutDir = strings.TrimSpace(c.ShortcutDir)
 	c.DownloadConnections = normalizeDownloadConnections(c.DownloadConnections)
 	if strings.TrimSpace(c.Language) == "" {
 		c.Language = def.Language
@@ -294,22 +313,30 @@ func normalizeConfig(c Config) Config {
 	c.CacheL2Bytes = clampCacheL2(c.CacheL2Bytes)
 	// L2 目录：空串是合法值（用默认位置），只去空白。
 	c.CacheL2Dir = strings.TrimSpace(c.CacheL2Dir)
-	// 每库挂载偏好：非法形态归一为"跟随默认"（不丢用户的自动挂载表态），目录去空白。
+	// 每库 / 每分组挂载偏好：非法形态归一为"跟随默认"（不丢用户的自动挂载表态），目录去空白。
 	// 这里就地改 map：它只在 load / Patch 的持有锁路径上，不会被外部共享。
 	for repoID, pref := range c.RepoMounts {
-		if mode := normalizeMountMode(pref.MountMode); mode != "" {
-			pref.MountMode = mode
-		} else {
-			pref.MountMode = ""
-		}
-		pref.MountDir = strings.TrimSpace(pref.MountDir)
-		// 缓存默认开启：旧配置缺这个键时补成 true；显式 false 原样保留。
-		if !pref.cacheEnabledSet {
-			pref.CacheEnabled = true
-		}
-		c.RepoMounts[repoID] = pref
+		c.RepoMounts[repoID] = normalizeMountPref(pref)
+	}
+	for group, pref := range c.GroupMounts {
+		c.GroupMounts[group] = normalizeMountPref(pref)
 	}
 	return c
+}
+
+// normalizeMountPref 归一化单条挂载偏好（单库与分组共用）。
+func normalizeMountPref(pref RepoMountPref) RepoMountPref {
+	if mode := normalizeMountMode(pref.MountMode); mode != "" {
+		pref.MountMode = mode
+	} else {
+		pref.MountMode = ""
+	}
+	pref.MountDir = strings.TrimSpace(pref.MountDir)
+	// 缓存默认开启：旧配置缺这个键时补成 true；显式 false 原样保留。
+	if !pref.cacheEnabledSet {
+		pref.CacheEnabled = true
+	}
+	return pref
 }
 
 // normalizeDownloadConnections 归一化下载分段并发数：未配置（<=0）取默认值，
@@ -366,14 +393,20 @@ func (s *ConfigStore) Get() Config {
 
 // cloneConfig 深拷贝配置里的 map，避免调用方（含只读的 GET /agent/config）改到 store 内部状态。
 func cloneConfig(c Config) Config {
-	if len(c.RepoMounts) == 0 {
-		return c
+	if len(c.RepoMounts) > 0 {
+		out := make(map[string]RepoMountPref, len(c.RepoMounts))
+		for repoID, pref := range c.RepoMounts {
+			out[repoID] = pref
+		}
+		c.RepoMounts = out
 	}
-	out := make(map[string]RepoMountPref, len(c.RepoMounts))
-	for repoID, pref := range c.RepoMounts {
-		out[repoID] = pref
+	if len(c.GroupMounts) > 0 {
+		out := make(map[string]RepoMountPref, len(c.GroupMounts))
+		for group, pref := range c.GroupMounts {
+			out[group] = pref
+		}
+		c.GroupMounts = out
 	}
-	c.RepoMounts = out
 	return c
 }
 
@@ -412,6 +445,39 @@ func (s *ConfigStore) SetRepoMountPref(repoID string, pref RepoMountPref) (Confi
 	return cloneConfig(s.cfg), nil
 }
 
+// SetGroupMountPref 写入某个存储库分组的挂载配置并持久化。
+//
+// 与 SetRepoMountPref 一样是"整条替换"：分组与单库各存各的，互不覆盖。
+func (s *ConfigStore) SetGroupMountPref(group string, pref RepoMountPref) (Config, error) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return s.Get(), apperr.InvalidParam("group")
+	}
+	if raw := strings.TrimSpace(pref.MountMode); raw != "" {
+		mode := normalizeMountMode(raw)
+		if mode == "" {
+			return s.Get(), apperr.InvalidParam("mount_mode")
+		}
+		pref.MountMode = mode
+	} else {
+		pref.MountMode = ""
+	}
+	pref.MountDir = strings.TrimSpace(pref.MountDir)
+	pref.cacheEnabledSet = true
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.GroupMounts == nil {
+		s.cfg.GroupMounts = make(map[string]RepoMountPref)
+	}
+	s.cfg.GroupMounts[group] = pref
+	if err := s.persistLocked(); err != nil {
+		s.logger.Warn("写入本地配置失败（仅内存生效）", "path", s.path, "error", err)
+		return cloneConfig(s.cfg), err
+	}
+	return cloneConfig(s.cfg), nil
+}
+
 // Patch 部分更新配置并持久化。
 //
 // 写盘失败不阻断调用（返回新配置与错误），避免因磁盘权限问题让界面配置无法生效。
@@ -433,6 +499,14 @@ func (s *ConfigStore) Patch(p ConfigPatch) (Config, error) {
 			return s.cfg, err
 		}
 		s.cfg.DefaultDownloadDir = dir
+	}
+	if p.ShortcutDir != nil {
+		dir := strings.TrimSpace(*p.ShortcutDir)
+		// 空串是合法取值（交给客户端落到系统桌面）；非空必须是绝对路径。
+		if dir != "" && !filepath.IsAbs(dir) {
+			return s.cfg, apperr.InvalidParam("shortcut_dir")
+		}
+		s.cfg.ShortcutDir = dir
 	}
 	if p.DownloadConnections != nil {
 		if v := *p.DownloadConnections; v < 1 || v > downloadMaxConnections {

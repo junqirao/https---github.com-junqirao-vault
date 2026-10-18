@@ -295,7 +295,10 @@ func (r *Router) handleAllocate(w http.ResponseWriter, req *http.Request) {
 
 // parentActionRequest 是母盘用途迁移请求。
 type parentActionRequest struct {
-	// Action derive | temp_share | unshare | maintenance | finish_maintenance | cleanup_diffs。
+	// Action temp_share | unshare | maintenance | finish_maintenance。
+	//
+	// 清理差异盘不再是状态迁移动作：它是维护态下的异步任务，走
+	// POST /v1/repos/{id}/parent/cleanup-diffs（返回 202 任务）。
 	Action string `json:"action"`
 }
 
@@ -312,11 +315,63 @@ func (r *Router) handleParentAction(w http.ResponseWriter, req *http.Request) {
 		r.writeError(w, req, err)
 		return
 	}
-	if err := r.deps.App.Repos().TransitionParent(req.Context(), id, app.ParentAction(in.Action), p.UserID); err != nil {
+	j, err := r.deps.App.Repos().TransitionParent(req.Context(), id, app.ParentAction(in.Action), p.UserID)
+	if err != nil {
 		r.writeError(w, req, err)
 		return
 	}
+	if j != nil {
+		// 退出维护 / 撤销临时共享：拆母盘目标要走多次 PowerShell（几十秒起），
+		// 同步做客户端 20s 就超时。返回 202 任务，界面用任务进度展示（见 useJobProgress）。
+		r.writeJSON(w, http.StatusAccepted, toJobDTO(j))
+		return
+	}
 	repo, err := r.deps.App.Repos().Get(req.Context(), id)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusOK, toRepoDTO(repo))
+}
+
+// handleCleanupDiffs 在维护态下清理该库全部差异盘（异步任务）。
+//
+// 返回 202 + JobDTO：清理要先通知客户端断开、再拆 iSCSI 目标并删盘，可能耗时较长且会重试，
+// 界面用任务进度展示（见 useJobProgress）。
+func (r *Router) handleCleanupDiffs(w http.ResponseWriter, req *http.Request) {
+	id := chi.URLParam(req, "id")
+	p, err := r.requireRepoPerm(req, id, domain.PermManage)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	j, err := r.deps.App.Repos().CleanupDiffs(req.Context(), id, p.UserID)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusAccepted, toJobDTO(j))
+}
+
+// resizeParentRequest 是维护态下母盘扩容请求（只扩不缩）。
+type resizeParentRequest struct {
+	SizeBytes int64 `json:"size_bytes"`
+}
+
+// handleResizeParent 在维护态下扩容母盘。
+func (r *Router) handleResizeParent(w http.ResponseWriter, req *http.Request) {
+	id := chi.URLParam(req, "id")
+	p, err := r.requireRepoPerm(req, id, domain.PermManage)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	var in resizeParentRequest
+	if err := r.decodeJSON(req, &in); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	repo, err := r.deps.App.Repos().ResizeParentDisk(req.Context(), id, in.SizeBytes, p.UserID)
 	if err != nil {
 		r.writeError(w, req, err)
 		return

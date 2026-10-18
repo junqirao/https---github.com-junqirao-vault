@@ -297,6 +297,33 @@ function registerIpc(): void {
     if (result.canceled || result.filePaths.length === 0) return { canceled: true }
     return { canceled: false, path: result.filePaths[0] }
   })
+  // 为本地挂载点创建快捷方式（Windows Shell Link）。
+  //
+  // dir 为空时落到系统桌面；name 缺省用目标目录名。只支持 Windows：
+  // shell.writeShortcutLink 是 Windows 专有 API，其它平台如实返回 unsupported。
+  ipcMain.handle('vault:create-shortcut', async (_event, payload: unknown) => {
+    const input = (payload ?? {}) as { target?: unknown; name?: unknown; dir?: unknown }
+    const target = typeof input.target === 'string' ? input.target.trim() : ''
+    if (!target) return { ok: false, reason: 'invalid_target' }
+    if (process.platform !== 'win32') return { ok: false, reason: 'unsupported' }
+    const dir =
+      typeof input.dir === 'string' && input.dir.trim() ? input.dir.trim() : app.getPath('desktop')
+    const rawName =
+      typeof input.name === 'string' && input.name.trim() ? input.name.trim() : path.basename(target)
+    const safeName = rawName.replace(/[\\/:*?"<>|]/g, '_').slice(0, 120) || 'Vault'
+    try {
+      await fs.mkdir(dir, { recursive: true })
+      const shortcutPath = path.join(dir, `${safeName}.lnk`)
+      const ok = shell.writeShortcutLink(shortcutPath, {
+        target,
+        cwd: path.dirname(target),
+        description: 'Vault repository'
+      })
+      return ok ? { ok: true, path: shortcutPath } : { ok: false, reason: 'failed' }
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    }
+  })
   ipcMain.handle('vault:show-item', async (_event, target: unknown) => {
     if (typeof target === 'string' && target) shell.showItemInFolder(target)
     return true

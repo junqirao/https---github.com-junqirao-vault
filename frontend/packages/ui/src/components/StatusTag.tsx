@@ -34,7 +34,6 @@ const TONE_BY_VALUE: Record<string, Tone> = {
   paused: 'warning',
   mounting: 'processing',
   releasing: 'processing',
-  derived: 'processing',
   deleting: 'warning',
   expired: 'warning',
   temp_shared: 'warning',

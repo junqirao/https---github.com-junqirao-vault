@@ -16,6 +16,7 @@ import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { CAPACITY_UNIT, capacityNormalize, capacityValueProps, formatBytes } from '../../utils/format'
 import { fontSize, palette, spacing } from '../../tokens/palette'
+import { RepoGroupSelect } from './RepoGroupSelect'
 import { SourceDirPicker, type SourceDirValue } from './SourceDirPicker'
 import { UploadCurrentFile, UploadMeta, UploadNotice, uploadPercent, uploadStageText } from './uploadView'
 
@@ -260,7 +261,7 @@ export function RepoCreateForm({
               ) : null}
               <Col span={12}>
                 <Form.Item name="group" label={t('field.group')}>
-                  <Input maxLength={64} />
+                  <RepoGroupSelect />
                 </Form.Item>
               </Col>
               <Col span={12}>

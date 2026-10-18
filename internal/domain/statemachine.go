@@ -7,24 +7,19 @@ import (
 // parentTransitions 定义母盘用途条件的合法迁移（见 docs/implementation.md 4.3）。
 //
 // 语义提醒：
-//   - 母盘一旦派生了差异盘，差异盘即假设母盘内容不再变化；
-//     因此 derived 状态下**不允许**再以可写方式挂载或只读共享母盘；
-//   - maintenance 用于更新母盘内容，进入前必须先清理全部差异盘。
+//   - 差异盘**不再是独立状态**：正常（idle）时母盘可以带着任意多个差异盘继续被分配；
+//   - 临时共享仍要求"无差异盘"，否则母盘内容一旦变化会污染全部子盘；
+//   - maintenance 用于维护母盘（清理差异盘、更新内容），期间禁止分配与挂载。
 var parentTransitions = map[ParentCondition]map[ParentCondition]bool{
 	ParentIdle: {
-		ParentDerived:     true, // 创建差异盘（分配）
 		ParentTempShared:  true, // 临时只读共享给客户端
-		ParentMaintenance: true, // 进入维护，读写挂载更新母盘
-	},
-	ParentDerived: {
-		ParentIdle:        true, // 清理全部差异盘
-		ParentMaintenance: true, // 等价于 derived→idle→maintenance，业务层需先清理并二次确认
+		ParentMaintenance: true, // 进入维护：维护态内再清理差异盘 / 更新母盘
 	},
 	ParentTempShared: {
 		ParentIdle: true, // 撤销临时共享
 	},
 	ParentMaintenance: {
-		ParentIdle: true, // 完成更新并卸载母盘
+		ParentIdle: true, // 完成维护并回到正常状态
 	},
 }
 
@@ -34,6 +29,9 @@ type TransitionRequest struct {
 	To   ParentCondition
 
 	// DiffCount 当前差异盘数量（含未挂载的）。
+	//
+	// 进入维护**不再要求**它为 0：新流程是"先进维护，再在维护态里清理差异盘"。
+	// 临时共享仍要求没有差异盘。
 	DiffCount int
 	// ActiveLeases 当前指向该库的活跃租约数量。
 	ActiveLeases int
@@ -60,11 +58,6 @@ func (r TransitionRequest) Validate() error {
 	}
 
 	switch r.To {
-	case ParentDerived:
-		// 只有在"无差异盘、未共享、未挂载"的 idle 态才能派生。
-		// 数量上限由业务层按 repositories.max_diff_disks 单独校验。
-		return nil
-
 	case ParentTempShared:
 		// 只要存在差异盘（无论是否在线）就不能共享母盘，
 		// 否则母盘内容一旦变化会污染全部子盘。
@@ -75,18 +68,14 @@ func (r TransitionRequest) Validate() error {
 		return nil
 
 	case ParentMaintenance:
-		// 进入维护：必须先清理完全部差异盘，且无人挂载。
-		if r.DiffCount > 0 {
-			return apperr.New("repo.maintenance_requires_cleanup", 409).
-				WithArg("diff_count", r.DiffCount)
-		}
-		if r.ActiveLeases > 0 {
-			return apperr.RepoHasActiveLease(r.ActiveLeases)
-		}
+		// 进入维护不要求先清理差异盘：用户在维护态里执行"清理差异盘"（异步任务，
+		// 会先通知客户端断开再拆 iSCSI 目标）。有活跃租约也允许进入 —— 维护态本身
+		// 就会拒绝新的分配与挂载，旧连接由清理任务负责踢下线。
 		return nil
 
 	case ParentIdle:
-		// 回到 idle 要求无人在线：清理差异盘 / 撤销共享 / 完成维护都不能有人正在使用。
+		// 回到正常状态要求无人在线：撤销共享 / 完成维护都必须先让所有客户端断开。
+		// 若还有差异盘在使用，用户需要先在维护态里清理差异盘。
 		if r.ActiveLeases > 0 {
 			return apperr.RepoHasActiveLease(r.ActiveLeases)
 		}
@@ -97,6 +86,7 @@ func (r TransitionRequest) Validate() error {
 
 // CanDerive 判断当前母盘条件下是否允许再派生一个差异盘。
 //
+// 正常状态（idle）即可派生，**不要求当前没有差异盘**；临时共享与维护态禁止派生。
 // limit 为该库配置的 max_diff_disks（0 表示不限制）。
 func CanDerive(cond ParentCondition, diffCount, limit int) error {
 	if cond != ParentIdle {
@@ -108,14 +98,25 @@ func CanDerive(cond ParentCondition, diffCount, limit int) error {
 	return nil
 }
 
+// CanAllocate 判断当前是否允许新建分配。
+//
+// 与 CanDerive 分开：池化库分配的是已经派生好的池位盘，不会再派生；但维护/临时共享
+// 期间同样不能把盘交给用户。
+func CanAllocate(cond ParentCondition) error {
+	if cond != ParentIdle {
+		return apperr.RepoParentConditionViolation(string(cond), string(ParentIdle))
+	}
+	return nil
+}
+
 // CanMount 判断差异盘当前是否允许被挂载。
 //
 // 除状态条件外，还要求子盘记录的 parent_version 与当前母盘版本一致，
 // 以及母盘指纹未被篡改（见 docs/implementation.md 5.4）。
 func CanMount(cond ParentCondition, childParentVersion, currentParentVersion int, fingerprintOK bool) error {
-	if cond != ParentDerived {
-		// 母盘被临时共享或处于维护态时，其差异盘不应还在被使用。
-		return apperr.RepoParentConditionViolation(string(cond), string(ParentDerived))
+	if cond != ParentIdle {
+		// 维护/临时共享期间，差异盘不应再被使用。
+		return apperr.RepoParentConditionViolation(string(cond), string(ParentIdle))
 	}
 	if !fingerprintOK {
 		return apperr.DiskParentFingerprintMismatch()

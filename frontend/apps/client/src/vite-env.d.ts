@@ -57,6 +57,12 @@ interface VaultBridge {
   trustCertificate: (serverUrl: string, sha256: string) => Promise<boolean>
   /** 打开系统目录选择框（选择源目录）；用户取消时 canceled=true。 */
   selectDirectory: () => Promise<{ canceled: boolean; path?: string }>
+  /** 为本地挂载点创建快捷方式（Windows/.lnk）。 */
+  createShortcut: (input: { target: string; name?: string; dir?: string }) => Promise<{
+    ok: boolean
+    path?: string
+    reason?: string
+  }>
   openPath: (path: string) => Promise<void>
   showItemInFolder: (path: string) => Promise<void>
   quit: () => Promise<void>

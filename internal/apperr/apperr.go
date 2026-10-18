@@ -368,6 +368,11 @@ func RepoHasActiveLease(count int) *Error {
 	return New("repo.has_active_lease", http.StatusConflict).WithArg("count", count)
 }
 
+// RepoResizeRequiresCleanup 母盘扩容前必须先清理差异盘（差异盘基于旧容量，扩容后不可信）。
+func RepoResizeRequiresCleanup(diffCount int) *Error {
+	return New("repo.resize_requires_cleanup", http.StatusConflict).WithArg("diff_count", diffCount)
+}
+
 // RepoQuotaExceeded 配额不足。
 func RepoQuotaExceeded(quotaBytes, usedBytes, needBytes int64) *Error {
 	return New("repo.quota_exceeded", http.StatusConflict).
