@@ -190,8 +190,8 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	mode := e.resolveMode(req, spec)
 
 	// 生效门户与生效 IQN：除**直连模式**外，所有库都经本机代理（本机发起端 → 代理 → 服务端）。
-	//   - 开了缓存的库：代理带读缓存（命中即本地代答）；
-	//   - 未开缓存的库：代理只做纯透传 —— 不占缓存配额，但读写 IOPS 仍可被观测。
+	//   - 默认（含没有单独配置过的库）：代理带读缓存（命中即本地代答）；
+	//   - 用户明确关了缓存的库：代理只做纯透传 —— 不占缓存配额，但读写 IOPS 仍可被观测。
 	// 只有用户为该库显式打开直连模式时才绕过代理，直连服务端下发的目标。
 	//
 	// v2 的 IQN 两侧相同（后端真实 IQN），只有门户地址不同。
@@ -203,7 +203,8 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	effectiveIQN := spec.TargetIQN
 	pref, hasPref := e.repoPref(req.RepoID)
 	directMode := hasPref && pref.DirectMode
-	cacheEnabled := hasPref && pref.CacheEnabled
+	// 缓存默认开启：没有该库条目、或旧配置没写 cache_enabled 时都按开启处理。
+	cacheEnabled := pref.cacheEnabledOrDefault()
 	cacheActive, cacheErr := false, ""
 	if !directMode {
 		// EnsureTarget 会（首次时）打开本机门户、为该库注册一个本机监听端口。
@@ -1325,7 +1326,8 @@ func (e *mountEngine) mountCacheSatisfied(req MountRequest, ms MountState) bool 
 	if ms.CacheActive != !pref.DirectMode {
 		return false
 	}
-	return ms.CacheEnabled == pref.CacheEnabled
+	// 缓存默认开启：没有条目时也不能拿零值（false）去和记录比较。
+	return ms.CacheEnabled == pref.cacheEnabledOrDefault()
 }
 
 // resolveMode 确定本次挂载模式：请求 > 每库配置 > 服务端下发 > 本地默认。

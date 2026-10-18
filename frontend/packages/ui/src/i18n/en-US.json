@@ -292,7 +292,7 @@
   "repo.settings.autoMount": "Mount on startup",
   "repo.settings.autoMountHint": "Mount this repository automatically when this machine starts; it is independent of whether it was mounted before and of other repositories.",
   "repo.settings.cacheEnabled": "Enable local read cache",
-  "repo.settings.cacheHint": "Routes this machine's traffic through the local cache proxy to the server target. Takes effect after this repository is re-mounted; the cache budget is configured in Client Settings and shared evenly among enabled repositories. If the proxy is unavailable, mounting falls back to a direct connection automatically.",
+  "repo.settings.cacheHint": "Enabled by default. Routes this machine's traffic through the local cache proxy to the server target. Takes effect after this repository is re-mounted; the cache budget is configured in Client Settings and shared evenly among enabled repositories. When disabled, traffic still goes through the local proxy (pass-through, so I/O can be monitored). If the proxy is unavailable, mounting falls back to a direct connection automatically.",
   "repo.settings.directMode": "Direct mode",
   "repo.settings.directHint": "Bypasses the local proxy and connects straight to the server target. Shortest path, but no read/write IOPS monitoring (the Monitor entry is greyed out). Takes effect after this repository is re-mounted.",
   "repo.settings.saved": "Mount settings saved for this repository",

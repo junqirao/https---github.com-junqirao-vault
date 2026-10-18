@@ -199,3 +199,89 @@ func TestConfigMarshalKeepsAutoLoginBool(t *testing.T) {
 		t.Fatal("内部标记不应出现在 JSON 中")
 	}
 }
+
+// TestRepoCacheDefaultsOn 覆盖"存储库默认开启本地读缓存"。
+//
+// 关键点与 auto_login 相同：检测的是 repo_mounts 条目里**有没有 cache_enabled 这个键**，
+// 而不是它的零值 —— 旧版本把 false 用 omitempty 省掉了，不能把"没表态"当成"关闭"。
+func TestRepoCacheDefaultsOn(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "旧配置条目缺少 cache_enabled → 开启",
+			content: `{"repo_mounts":{"repo-a":{"mount_mode":"letter","auto_mount":true}}}`,
+			want:    true,
+		},
+		{
+			name:    "显式关闭 → 关闭",
+			content: `{"repo_mounts":{"repo-a":{"cache_enabled":false}}}`,
+			want:    false,
+		},
+		{
+			name:    "显式开启 → 开启",
+			content: `{"repo_mounts":{"repo-a":{"cache_enabled":true}}}`,
+			want:    true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "agent-config.json")
+			if err := os.WriteFile(path, []byte(c.content), 0o600); err != nil {
+				t.Fatalf("准备配置失败：%v", err)
+			}
+			store, err := NewConfigStore(path, testLogger())
+			if err != nil {
+				t.Fatalf("加载配置失败：%v", err)
+			}
+			if got := store.Get().RepoMounts["repo-a"].CacheEnabled; got != c.want {
+				t.Fatalf("CacheEnabled = %v，期望 %v", got, c.want)
+			}
+		})
+	}
+
+	// 没有偏好条目的库同样按开启处理（挂载路径读的是零值偏好）。
+	if !(RepoMountPref{}).cacheEnabledOrDefault() {
+		t.Fatal("没有偏好条目时应默认开启缓存")
+	}
+}
+
+// TestRepoCacheExplicitOffPersists 显式关闭必须落盘并在重启后仍是关闭。
+func TestRepoCacheExplicitOffPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-config.json")
+	store, err := NewConfigStore(path, testLogger())
+	if err != nil {
+		t.Fatalf("加载配置失败：%v", err)
+	}
+	if _, err := store.SetRepoMountPref("repo-a", RepoMountPref{CacheEnabled: false}); err != nil {
+		t.Fatalf("关闭缓存失败：%v", err)
+	}
+	reloaded, err := NewConfigStore(path, testLogger())
+	if err != nil {
+		t.Fatalf("重新加载配置失败：%v", err)
+	}
+	if got := reloaded.Get().RepoMounts["repo-a"]; got.CacheEnabled {
+		t.Fatal("显式关闭必须持久化，重启后仍为关闭")
+	}
+
+	// 落盘的 JSON 必须明确写出 false（否则重启时又会被当成"没表态"而默认开启）。
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取配置文件失败：%v", err)
+	}
+	var doc struct {
+		RepoMounts map[string]map[string]any `json:"repo_mounts"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("解析配置文件失败：%v", err)
+	}
+	value, ok := doc.RepoMounts["repo-a"]["cache_enabled"]
+	if !ok {
+		t.Fatal("显式关闭时 cache_enabled 必须落盘")
+	}
+	if enabled, isBool := value.(bool); !isBool || enabled {
+		t.Fatalf("cache_enabled 必须是 false，实际 %T(%v)", value, value)
+	}
+}

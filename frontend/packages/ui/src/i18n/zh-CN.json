@@ -292,7 +292,7 @@
   "repo.settings.autoMount": "启动后自动挂载",
   "repo.settings.autoMountHint": "本机启动后自动挂载这个库；有没有挂过、别的库怎么设都不影响它。",
   "repo.settings.cacheEnabled": "启用本地读缓存",
-  "repo.settings.cacheHint": "开启后本机到服务端的链路变成「本地缓存代理 → 服务端目标」，需重新挂载该库才生效；缓存总量在「客户端设置」里配置，按已启用的库均分。代理不可用时会自动回退直连，不影响挂载。",
+  "repo.settings.cacheHint": "默认开启。开启后本机到服务端的链路变成「本地缓存代理 → 服务端目标」，需重新挂载该库才生效；缓存总量在「客户端设置」里配置，按已启用的库均分。关闭后仍经本机代理（纯透传，可监控），代理不可用时会自动回退直连，不影响挂载。",
   "repo.settings.directMode": "直连模式",
   "repo.settings.directHint": "打开后该库绕过本机代理，直接连接服务端目标；链路最短，但没有读写 IOPS 监控（「监控」入口将置灰）。需重新挂载该库才生效。",
   "repo.settings.saved": "已保存该存储库的挂载设置",

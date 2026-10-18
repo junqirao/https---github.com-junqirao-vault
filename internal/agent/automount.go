@@ -436,9 +436,22 @@ func filterReposOnServer(targets []autoMountTarget, names map[string]string) []a
 func (a *Agent) primeRepoSizeIndex(ctx context.Context, key string, prefs map[string]RepoMountPref) {
 	missing := false
 	for repoID, pref := range prefs {
-		if pref.CacheEnabled && a.cache.knownRepoSize(repoID) <= 0 {
+		if pref.cacheEnabledOrDefault() && a.cache.knownRepoSize(repoID) <= 0 {
 			missing = true
 			break
+		}
+	}
+	// 缓存默认开启：本机挂载记录里的库即使**没有偏好条目**也会开缓存，容量同样要补齐。
+	if !missing {
+		for _, item := range a.store.MountsForServer(key) {
+			if item.RepoID == "" || a.cache.knownRepoSize(item.RepoID) > 0 {
+				continue
+			}
+			pref, hasPref := prefs[item.RepoID]
+			if pref.cacheEnabledOrDefault() && (!hasPref || !pref.DirectMode) {
+				missing = true
+				break
+			}
 		}
 	}
 	if !missing {

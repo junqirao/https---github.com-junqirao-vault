@@ -18,7 +18,7 @@ export interface RepoMountSettingsState {
   mode: AgentMountMode
   dir: string
   autoMount: boolean
-  /** 是否为该库启用本地 iSCSI 读缓存代理（默认关闭，需用户手动开启）。 */
+  /** 是否为该库启用本地 iSCSI 读缓存代理（默认开启，用户可关闭）。 */
   cacheEnabled: boolean
   /** 是否为该库启用直连模式（跳过本机代理，默认关闭）。 */
   directMode: boolean
@@ -72,8 +72,8 @@ export function useRepoMountSettings(repoId: string, repoName: string): RepoMoun
   const effectiveMode: AgentMountMode = saved?.mount_mode || config?.default_mount_mode || 'letter'
   const effectiveDir = saved?.mount_dir || config?.default_mount_dir || ''
   const effectiveAuto = saved ? saved.auto_mount : Boolean(config?.auto_mount)
-  // 缓存**默认关闭**：没有该库条目、或条目里没写，一律按关闭（与代理侧零值一致）。
-  const effectiveCache = Boolean(saved?.cache_enabled)
+  // 缓存**默认开启**：没有该库条目、或条目里没写，一律按开启；只有显式 false 才关闭。
+  const effectiveCache = saved?.cache_enabled ?? true
   // 直连模式**默认关闭**：默认所有库都经本机代理（未开缓存也走纯透传，从而可监控）。
   const effectiveDirect = Boolean(saved?.direct_mode)
 

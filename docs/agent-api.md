@@ -264,7 +264,8 @@ MountState = {
   #   **不得**把 session_active 的缺省值当成"断线"（旧代理没有这两个字段，同样按 state 展示）。
   session_active, session_checked_at,
   # cache_enabled / cache_active / cache_error：本库的**本地 iSCSI 读缓存**状态。
-  #   cache_enabled：本库是否启用了缓存（来自 repo_mounts，见「本地配置」）—— 用户的**意图**；
+  #   cache_enabled：本库是否启用了缓存（来自 repo_mounts，默认开启，见「本地配置」）——
+  #                  用户的**意图**；
   #   cache_active ：本次挂载实际是否走了本地缓存代理（挂载链路 = 本机 → 本地缓存代理 →
   #                  服务端目标）—— 实际**生效**结果。此时 target_iqn/portal 记录的是**本地门户**
   #                  公示的 IQN 与地址（127.0.0.1:3261），不是服务端目标；
@@ -428,9 +429,10 @@ MountVolumeUsage = {
 ## 本地读缓存（iSCSI 缓存代理）
 
 客户端本地读加速：**一个客户端只起一个代理进程**（内嵌在 Vault-Agent 内），代理在
-`127.0.0.1:3261` 上开一个 iSCSI 门户，**同时服务多个**启用了缓存的库 —— 按 TargetName
-（每个库一个本地 IQN）路由到各自的后端目标。启用缓存的库挂载链路变为
-**本机 → 本地缓存代理 → 服务端目标**；未启用的库仍是本机 → 服务端目标直连。
+`127.0.0.1:3261` 上开一个 iSCSI 门户，**同时服务多个**存储库 —— 按 TargetName
+（每个库一个本地 IQN）路由到各自的后端目标。存储库**默认启用读缓存**，挂载链路为
+**本机 → 本地缓存代理 → 服务端目标**；用户显式关闭缓存后仍走本机代理但只做纯透传
+（不占缓存配额，读写 IOPS 仍可观测）；只有「直连模式」才绕过代理直连服务端目标。
 
 ```
 GET /agent/cache
@@ -477,7 +479,7 @@ CacheTargetStatus = {
 
 - **设面只按客户端**：L1/L2 总量在「客户端设置」里配（`PATCH /agent/config` 的
   `cache_l1_bytes` / `cache_l2_bytes`，见「本地配置」），**是否启用按库配**
-  （`POST /agent/repo-mounts/{repo_id}` 的 `cache_enabled`）。总量是**上限**，在所有已启用
+  （`POST /agent/repo-mounts/{repo_id}` 的 `cache_enabled`，**默认开启**）。总量是**上限**，在所有已启用
   缓存的库之间按**库容量占比**分摊（1 TB 的库分到的份额是 100 GB 的 10 倍），单库不超过
   自身容量；容量未知的库按"已知库的平均容量"看待（一个都不知时退化为按库数均分）。
   分摊结果在挂载时定下，逐库配额见 `targets[].l1_limit_bytes` / `l2_limit_bytes`。
@@ -756,10 +758,12 @@ POST  /agent/repo-mounts/{repo_id}
   （只接受 GET/POST/PATCH/DELETE），PUT 会被挡在代理之外并向上报成 `network.error`。
 - `mount_mode` 为空串表示跟随 `default_mount_mode`；非法值返回
   `system.invalid_param`（args.field=mount_mode），空 `repo_id` 返回 args.field=repo_id。
-- `cache_enabled` 是"是否为该库启用本地 iSCSI 读缓存代理"（默认 **false**，必须由用户在
-  「存储库 → 挂载设置」手动开启），与 `mount_mode` / `mount_dir` / `auto_mount` 同属**整条
-  偏好**：`POST /agent/repo-mounts/{repo_id}` 是整条替换，只发其中几项会把没发的项重置为
-  默认值。改动**需重新挂载才生效**（挂载链路在挂载时确定），界面据此提示用户。
+- `cache_enabled` 是"是否为该库启用本地 iSCSI 读缓存代理"（默认 **true**，用户可在
+  「存储库 → 挂载设置」关闭；旧配置缺少这个键时同样按开启处理）。它与
+  `mount_mode` / `mount_dir` / `auto_mount` 同属**整条偏好**：
+  `POST /agent/repo-mounts/{repo_id}` 是整条替换，只发其中几项会把没发的项重置为
+  默认值（`cache_enabled` 未带 = 回到默认开启）。改动**需重新挂载才生效**（挂载链路在
+  挂载时确定），界面据此提示用户。
 - `server_alias` 是**全局**别名，只在多服务端改造前/单服务端场景下作为兜底生效。
   多服务端下别名**按台**下发（`POST /agent/session` 的 `alias`，落在 `/agent/state` 里该台的
   `alias` 字段）：全局那一个名字已不足以标识"是哪一台"，继续沿用会让两台服务端的不同库

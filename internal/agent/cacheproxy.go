@@ -38,7 +38,7 @@ const (
 	// v1 vcache 会话断干净（见 mount.go 的 disconnectStaleTargets）。
 	cacheIQNPrefix = "iqn.2024-01.local.vault:vcache-"
 
-	// 缓存预算的默认值与上下界（字节）。缓存只在用户为某个库开启后才真正占用。
+	// 缓存预算的默认值与上下界（字节）。缓存只在库挂载且启用缓存后才真正占用。
 	cacheDefaultL1Bytes = 512 << 20
 	cacheDefaultL2Bytes = 4 << 30
 	// cacheMinL1Bytes 与 cache 包的最小几何对应（64KiB 块 × 256 分片 = 16MiB），留 4 倍余量。
@@ -128,6 +128,14 @@ type cacheManager struct {
 	// 只增不减：库被删掉后留一条旧记录只会让估算略微偏大，比误删活库的记录安全。
 	repoSizeMu sync.Mutex
 	repoSize   map[string]int64
+
+	// activeMu 保护 activeTargets：本进程内**已经建立了缓存目标**的分配。
+	//
+	// 缓存默认开启后，没有单独保存过偏好的库也会开缓存；配额分摊必须把这些库算进去，
+	// 否则后挂的库会把同一份总预算再分一遍，多个库一起用就把内存/磁盘吃穿。
+	// 映射是 分配 ID → 分摊键（库 ID，缺省为分配 ID）。
+	activeMu      sync.Mutex
+	activeTargets map[string]string
 }
 
 // 缓存指标历史：近 5 分钟的滑动窗口（60 点 × 5s），供客户端"缓存指标曲线"弹窗展示。
@@ -168,10 +176,11 @@ func newCacheManager(cfg *ConfigStore, logger *slog.Logger) *cacheManager {
 		logger = slog.Default()
 	}
 	return &cacheManager{
-		cfg:      cfg,
-		logger:   logger,
-		history:  map[string][]CacheSample{},
-		repoSize: map[string]int64{},
+		cfg:           cfg,
+		logger:        logger,
+		history:       map[string][]CacheSample{},
+		repoSize:      map[string]int64{},
+		activeTargets: map[string]string{},
 	}
 }
 
@@ -216,6 +225,74 @@ func (m *cacheManager) repoSizeSnapshot() map[string]int64 {
 		out[id] = size
 	}
 	return out
+}
+
+// markCacheTarget 记下"某个分配已经带着缓存目标注册成功"。
+func (m *cacheManager) markCacheTarget(allocationID, repoKey string) {
+	if m == nil {
+		return
+	}
+	allocationID = strings.TrimSpace(allocationID)
+	repoKey = strings.TrimSpace(repoKey)
+	if allocationID == "" || repoKey == "" {
+		return
+	}
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if m.activeTargets == nil {
+		m.activeTargets = map[string]string{}
+	}
+	m.activeTargets[allocationID] = repoKey
+}
+
+// unmarkCacheTarget 忘掉某个分配的缓存目标（卸载 / 改回纯透传）。
+func (m *cacheManager) unmarkCacheTarget(allocationID string) {
+	if m == nil {
+		return
+	}
+	allocationID = strings.TrimSpace(allocationID)
+	if allocationID == "" {
+		return
+	}
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	delete(m.activeTargets, allocationID)
+}
+
+// activeRepoKeys 返回当前仍有缓存目标的分摊键（去重、稳定排序）。
+func (m *cacheManager) activeRepoKeys() []string {
+	if m == nil {
+		return nil
+	}
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if len(m.activeTargets) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(m.activeTargets))
+	out := make([]string, 0, len(m.activeTargets))
+	for _, key := range m.activeTargets {
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// clearCacheTargets 清空活动目标表（门户关闭后所有目标都已不存在）。
+func (m *cacheManager) clearCacheTargets() {
+	if m == nil {
+		return
+	}
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	m.activeTargets = map[string]string{}
 }
 
 // Start 记录缓存代理的生命周期 context（门户在首次使用时才真正打开），
@@ -320,6 +397,7 @@ func (m *cacheManager) Close() error {
 		cancel()
 	}
 	err := p.Close()
+	m.clearCacheTargets()
 	m.wg.Wait()
 	m.logger.Info("本地 iSCSI 缓存代理已停止")
 	return err
@@ -440,6 +518,12 @@ func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest)
 	}); err != nil {
 		return err
 	}
+	// 配额分摊要看见"已经存在的缓存目标"：默认开启后，没有单独配置过的库也算一份。
+	if req.CacheEnabled {
+		m.markCacheTarget(allocationID, req.key())
+	} else {
+		m.unmarkCacheTarget(allocationID)
+	}
 	fields := []any{
 		"engine", iscsiproxy.Version, "allocation_id", allocationID,
 		"backend", addr, "cache", req.CacheEnabled,
@@ -467,11 +551,17 @@ func (m *cacheManager) TargetAddr(allocationID string) (host string, port int, o
 // 调用时机：卸载流程在**断开会话之后、回写 release 之前** —— 会话断掉之前回收后端
 // 会让仍在飞的命令失败。
 func (m *cacheManager) ReleaseTarget(allocationID string) error {
+	allocationID = strings.TrimSpace(allocationID)
 	p := m.runningPortal()
 	if p == nil {
+		m.unmarkCacheTarget(allocationID)
 		return nil
 	}
-	return p.Remove(strings.TrimSpace(allocationID))
+	if err := p.Remove(allocationID); err != nil {
+		return err
+	}
+	m.unmarkCacheTarget(allocationID)
+	return nil
 }
 
 // quotaFor 计算本次要开缓存的库分到的 L1/L2 配额。
@@ -488,7 +578,7 @@ func (m *cacheManager) quotaFor(req cacheTargetRequest) (l1, l2 int64) {
 		return 0, 0
 	}
 
-	ids := cachePoolRepos(cfg, key)
+	ids := cachePoolRepos(cfg, key, m.activeRepoKeys())
 	repos := make([]cacheRepoSize, 0, len(ids))
 	for _, id := range ids {
 		size := m.knownRepoSize(id)
@@ -672,13 +762,16 @@ func cacheRecommend(totalBytes int64, repos int) CacheRecommend {
 	return rec
 }
 
-// cachePoolRepos 返回配额分摊集合：配置里已启用缓存的库，外加 extra（本次要挂的那个库，
-// 配置可能刚改、还没落盘时以请求为准）。
+// cachePoolRepos 返回配额分摊集合：配置里启用缓存的库、当前已经有缓存目标的库（active），
+// 外加 extra（本次要挂的那个库，配置可能刚改、还没落盘时以请求为准）。
+//
+// active 不能省：缓存**默认开启**后，没有单独保存过偏好（不在 cfg.RepoMounts 里）的库也会
+// 建立缓存目标；只看配置会让后挂的库把同一份总预算再分一遍。
 //
 // 去空白、去重、稳定排序 —— 分摊结果不该随 map 迭代顺序变化。
-func cachePoolRepos(cfg Config, extra string) []string {
-	ids := make([]string, 0, len(cfg.RepoMounts)+1)
-	seen := make(map[string]struct{}, len(cfg.RepoMounts)+1)
+func cachePoolRepos(cfg Config, extra string, active []string) []string {
+	ids := make([]string, 0, len(cfg.RepoMounts)+len(active)+1)
+	seen := make(map[string]struct{}, len(cfg.RepoMounts)+len(active)+1)
 	add := func(id string) {
 		id = strings.TrimSpace(id)
 		if id == "" {
@@ -691,8 +784,11 @@ func cachePoolRepos(cfg Config, extra string) []string {
 		ids = append(ids, id)
 	}
 	add(extra)
+	for _, id := range active {
+		add(id)
+	}
 	for repoID, pref := range cfg.RepoMounts {
-		if pref.CacheEnabled {
+		if pref.cacheEnabledOrDefault() {
 			add(repoID)
 		}
 	}
@@ -784,7 +880,7 @@ func (m *cacheManager) Status() CacheStatus {
 	st := CacheStatus{
 		L1LimitBytes:   cfg.CacheL1Bytes,
 		L2LimitBytes:   cfg.CacheL2Bytes,
-		EnabledRepos:   len(cachePoolRepos(cfg, "")),
+		EnabledRepos:   len(cachePoolRepos(cfg, "", m.activeRepoKeys())),
 		KnownRepoBytes: knownBytes,
 		KnownRepos:     len(known),
 		Recommend:      cacheRecommend(knownBytes, len(known)),

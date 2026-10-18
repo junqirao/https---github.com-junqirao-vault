@@ -220,7 +220,7 @@ type MountState struct {
 	// （session_probe）与卸载断链都用这里的生效值，否则会去断一条根本不存在的会话。
 	TargetIQN string `json:"target_iqn"`
 	Portal    string `json:"portal"`
-	// CacheEnabled 记录"本次挂载时该库是否被用户开启了缓存"；CacheActive 表示缓存
+	// CacheEnabled 记录"本次挂载时该库是否启用了缓存"（默认开启，用户可关）；CacheActive 表示缓存
 	// **真的生效了**（代理已注册目标且连接走代理）。两者可能不一致，原因见 CacheError。
 	//
 	// 为什么不只存一个：用户在页面上看到的是"缓存开关已开"，若静默回退直连他会以为

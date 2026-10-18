@@ -567,11 +567,13 @@ type repoMountPrefRequest struct {
 	// 子目录（见 mountDirLeaf），界面在挂载设置里如实告知用户这一点。
 	MountDir  string `json:"mount_dir"`
 	AutoMount bool   `json:"auto_mount"`
-	// CacheEnabled 是否为该库启用本地 iSCSI 读缓存代理（默认关闭，用户手动开启）。
+	// CacheEnabled 是否为该库启用本地 iSCSI 读缓存代理（默认开启，用户可关闭）。
+	//
+	// 指针用于区分"请求里没带"与"显式关闭"：没带时按默认开启处理。
 	//
 	// ⚠️ 这是**整条偏好替换**（见 SetRepoMountPref）：调用方必须把它与 mount_mode/mount_dir/
 	// auto_mount 一起回传，只发其中几项会把没发的项重置为默认值。
-	CacheEnabled bool `json:"cache_enabled"`
+	CacheEnabled *bool `json:"cache_enabled"`
 	// DirectMode 是否为该库启用直连模式（跳过本机代理，默认关闭）。
 	//
 	// 同样属于**整条偏好替换**的一部分，必须与其它字段一起回传。
@@ -590,11 +592,15 @@ func (a *Agent) handleSetRepoMountPref(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, err)
 		return
 	}
+	cacheEnabled := true // 未带该字段 = 回到默认（开启）
+	if in.CacheEnabled != nil {
+		cacheEnabled = *in.CacheEnabled
+	}
 	cfg, err := a.cfg.SetRepoMountPref(repoID, RepoMountPref{
 		MountMode:    in.MountMode,
 		MountDir:     in.MountDir,
 		AutoMount:    in.AutoMount,
-		CacheEnabled: in.CacheEnabled,
+		CacheEnabled: cacheEnabled,
 		DirectMode:   in.DirectMode,
 	})
 	if err != nil {

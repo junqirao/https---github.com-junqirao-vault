@@ -45,19 +45,50 @@ type RepoMountPref struct {
 	AutoMount bool `json:"auto_mount"`
 	// CacheEnabled 是否为该库启用本地 iSCSI 读缓存代理。
 	//
-	// **默认关闭**，必须由用户在「存储库 → 挂载设置」里手动开启（见 cacheproxy.go）：
+	// **默认开启**：没有保存过偏好的库、以及旧配置里缺少 cache_enabled 的条目都按开启处理
+	// （见 UnmarshalJSON 与 normalizeConfig）。用户可以在「存储库 → 挂载设置」里关闭它。
 	// 开启后本机到服务端目标的链路变成 本机 → 本地缓存代理 → 服务端目标，
-	// 多占用一份本地内存（L1）与磁盘（L2），这不是所有机器都适合的默认。
+	// 多占用一份本地内存（L1）与磁盘（L2）；缓存是**总量上限**，多个库按容量分摊。
 	//
-	// ⚠️ 未开启缓存也会**经过本机代理**（纯透传），从而读写 IOPS 可被监控；
+	// ⚠️ 关闭缓存后仍会**经过本机代理**（纯透传），从而读写 IOPS 可被监控；
 	// 只有 DirectMode 才真正绕过代理。
-	CacheEnabled bool `json:"cache_enabled,omitempty"`
+	CacheEnabled bool `json:"cache_enabled"`
+	// cacheEnabledSet 记录 cache_enabled 是否在配置文件里**显式**出现过。
+	//
+	// 不落盘、不出现在 JSON 里：旧版本默认关闭，写下的条目可能根本没有这个键；
+	// 必须把"用户明确关掉"与"从来没配过"区分开，后者按默认开启处理。
+	cacheEnabledSet bool
 	// DirectMode 是否为该库启用直连模式：跳过本机代理，直接连服务端下发的目标。
 	//
-	// **默认关闭**：默认所有库都经过本机代理（开缓存的书走缓存，未开缓存的走纯透传），
+	// **默认关闭**：默认所有库都经过本机代理（开缓存的库走缓存，关缓存的走纯透传），
 	// 从而都能被监控。只有用户显式打开直连才绕过代理 —— 此时该库没有监控数据
 	// （界面上的「监控」入口置灰）。改动需要**重新挂载**该库才生效。
 	DirectMode bool `json:"direct_mode,omitempty"`
+}
+
+// UnmarshalJSON 解析单库偏好，并记录 cache_enabled 是否显式出现过。
+//
+// 为什么要单独实现：缓存**默认开启**，而旧版本的 false 会被 omitempty 省掉，配置文件里
+// 看不到这个键。只看零值无法区分"用户明确关闭"与"旧配置没表态"，只会把两者都当成关闭。
+func (p *RepoMountPref) UnmarshalJSON(data []byte) error {
+	// plain 去掉本类型的方法集，避免递归调用本方法。
+	type plain RepoMountPref
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	var parsed plain
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	*p = RepoMountPref(parsed)
+	_, p.cacheEnabledSet = probe["cache_enabled"]
+	return nil
+}
+
+// cacheEnabledOrDefault 返回该库实际是否启用缓存：显式关闭才算关闭，未表态按默认开启。
+func (p RepoMountPref) cacheEnabledOrDefault() bool {
+	return !p.cacheEnabledSet || p.CacheEnabled
 }
 
 // Config 是代理的本地配置（见 docs/agent-api.md「本地配置」）。
@@ -112,7 +143,8 @@ type Config struct {
 	// 进程工作目录漂移，缓存文件会出现在用户完全意想不到的地方。目录不存在时会按需创建。
 	// 改动在**下一次挂载**时生效（L2 文件路径在创建缓存目标时定下）。
 	CacheL2Dir string `json:"cache_l2_dir"`
-	// RepoMounts 按存储库 ID 保存的挂载偏好；没有条目的库跟随上面的全局默认值。
+	// RepoMounts 按存储库 ID 保存的挂载偏好；没有条目的库跟随上面的全局默认值
+	// （缓存除外：没有条目时按**默认开启**处理，见 RepoMountPref.CacheEnabled）。
 	RepoMounts map[string]RepoMountPref `json:"repo_mounts,omitempty"`
 
 	// autoLoginSet 记录 auto_login 是否被**显式**配置过。
@@ -187,7 +219,7 @@ func defaultConfig() Config {
 		Language:            "zh-CN",
 		StartAtLogin:        false,
 		UpdateChannel:       "stable",
-		// 缓存代理的总预算（默认值只是"上限"，实际只在用户为某个库开启缓存后才被占用）。
+		// 缓存代理的总预算（默认值只是"上限"，实际只在库挂载且启用缓存后才被占用）。
 		CacheL1Bytes: cacheDefaultL1Bytes,
 		CacheL2Bytes: cacheDefaultL2Bytes,
 	}
@@ -271,6 +303,10 @@ func normalizeConfig(c Config) Config {
 			pref.MountMode = ""
 		}
 		pref.MountDir = strings.TrimSpace(pref.MountDir)
+		// 缓存默认开启：旧配置缺这个键时补成 true；显式 false 原样保留。
+		if !pref.cacheEnabledSet {
+			pref.CacheEnabled = true
+		}
 		c.RepoMounts[repoID] = pref
 	}
 	return c
@@ -360,6 +396,8 @@ func (s *ConfigStore) SetRepoMountPref(repoID string, pref RepoMountPref) (Confi
 		pref.MountMode = ""
 	}
 	pref.MountDir = strings.TrimSpace(pref.MountDir)
+	// 这是整条偏好的显式写入：即使是 false，也代表用户这次确实选了"关闭"。
+	pref.cacheEnabledSet = true
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

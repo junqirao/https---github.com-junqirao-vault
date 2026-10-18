@@ -140,7 +140,8 @@ func TestQuotaForSplitsAcrossEnabledCacheRepos(t *testing.T) {
 			"big":   {CacheEnabled: true},
 			"small": {CacheEnabled: true},
 			// 没开缓存的库既不参与分摊，也不该影响别人的份额。
-			"off": {},
+			// cacheEnabledSet=true 表示这是显式关闭；未表态的条目按默认开启。
+			"off": {cacheEnabledSet: true},
 		},
 	}}
 	m := newCacheManager(cfg, nil)
@@ -184,6 +185,26 @@ func TestQuotaForSplitsAcrossEnabledCacheRepos(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		if got, _ := m.quotaFor(cacheTargetRequest{AllocationID: "a1", RepoID: "big"}); got != l1Big {
 			t.Fatalf("第 %d 次计算得到 %d，期望 %d", i, got, l1Big)
+		}
+	}
+}
+
+// TestCachePoolIncludesActiveAndDefaultRepos 锁定默认开启后的分摊集合：
+// 未表态/未保存过偏好的库与当前已有缓存目标的库都必须参与，显式关闭的库不参与。
+func TestCachePoolIncludesActiveAndDefaultRepos(t *testing.T) {
+	cfg := Config{RepoMounts: map[string]RepoMountPref{
+		"explicit-on":  {CacheEnabled: true, cacheEnabledSet: true},
+		"explicit-off": {CacheEnabled: false, cacheEnabledSet: true},
+		"old-config":   {}, // 旧配置没写 cache_enabled → 默认开启
+	}}
+	got := cachePoolRepos(cfg, "mounting", []string{"active", "old-config"})
+	want := []string{"active", "explicit-on", "mounting", "old-config"}
+	if len(got) != len(want) {
+		t.Fatalf("分摊集合 = %v，期望 %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("分摊集合 = %v，期望 %v", got, want)
 		}
 	}
 }

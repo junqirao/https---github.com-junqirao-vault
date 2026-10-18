@@ -314,7 +314,8 @@ func TestMountCacheSatisfied(t *testing.T) {
 		{"直连模式 + 却走了代理（需重挂）", true, true, false, true, false, false},
 		{"缓存开关变了（记录未开、现要求开）", true, false, true, true, false, false},
 		{"没有该库偏好 + 却直连（需重挂为经代理）", false, false, false, false, false, false},
-		{"没有该库偏好 + 经代理（期望形态）", false, false, false, true, false, true},
+		{"没有该库偏好 + 经代理但记录未开缓存（需重挂）", false, false, false, true, false, false},
+		{"没有该库偏好 + 经代理且缓存已开（默认开启的期望形态）", false, false, false, true, true, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
