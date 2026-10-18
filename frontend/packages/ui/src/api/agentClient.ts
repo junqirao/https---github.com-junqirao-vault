@@ -37,6 +37,7 @@ import type {
   UploadState,
   WebUpdateState
 } from './agentTypes'
+import type { JobState } from './types'
 
 /**
  * 代理状态（主进程下发；已剔除令牌）。
@@ -846,6 +847,17 @@ export const agentApi = {
   }
 }
 
+/** 是否是已知的任务状态（认不出的当 running，见 parseAgentEvent 的 job 分支）。 */
+function isJobState(value: unknown): value is JobState {
+  return (
+    value === 'pending' ||
+    value === 'running' ||
+    value === 'succeeded' ||
+    value === 'failed' ||
+    value === 'cancelled'
+  )
+}
+
 /** 解析一条 SSE 事件（无效数据返回 null，不抛错）。 */
 export function parseAgentEvent(type: string, data: string): AgentEvent | null {
   let raw: unknown
@@ -903,6 +915,22 @@ export function parseAgentEvent(type: string, data: string): AgentEvent | null {
       return { type: 'download', download: raw as DownloadState }
     case 'upload':
       return { type: 'upload', upload: raw as UploadState }
+    case 'job': {
+      // job_id 是归属键：没有它这条事件无意义（代理侧也不会推空的，这里再兜一层）。
+      const jobId = typeof value.job_id === 'string' ? value.job_id : ''
+      if (jobId === '') return null
+      return {
+        type: 'job',
+        job: {
+          job_id: jobId,
+          type: typeof value.type === 'string' ? value.type : undefined,
+          ref_id: typeof value.ref_id === 'string' ? value.ref_id : undefined,
+          // 认不出的状态一律当 running：宁可继续等，也不能靠一条脏数据把等待判成终态。
+          state: isJobState(value.state) ? value.state : 'running',
+          progress: typeof value.progress === 'number' ? value.progress : 0
+        }
+      }
+    }
     case 'heartbeat':
       return {
         type: 'heartbeat',

@@ -83,6 +83,16 @@ type Worker struct {
 	// onFinished 任务结束回调（可选），用于推送 SSE 通知。
 	onFinished func(j *domain.Job)
 
+	// onProgress 进度变化回调（可选），用于把进度实时推给 SSE 订阅者。
+	//
+	// 为什么需要它：客户端（本地代理）过去靠**每 2 秒轮询** GET /v1/jobs/{id} 取建库进度，
+	// 一个几分钟到几十分钟的建库任务会在服务端访问日志里留下成百上千行"同一件事"的流水
+	// （真实反馈："上传时会因为客户端拉上传状态而刷屏服务日志"）。进度本来就是变化驱动的：
+	// 让它随变化沿 SSE 长连接推出去（长连接不产生访问日志），客户端就不必反复来问。
+	//
+	// 只在进度**写库成功**之后回调，取值与服务端返回给查询接口的一致。
+	onProgress func(j *domain.Job, percent int)
+
 	// onPanic handler 发生 panic 时的回调（可选），用于把 panic 落进审计/告警。
 	//
 	// 之所以做成回调而不是在 job 包直接写库：internal/job 不应反向依赖 internal/app，
@@ -132,6 +142,13 @@ func (w *Worker) Register(h Handler) {
 // OnFinished 设置任务结束回调。
 func (w *Worker) OnFinished(fn func(j *domain.Job)) {
 	w.onFinished = fn
+}
+
+// OnProgress 设置进度变化回调（每次进度变化调用一次）。
+//
+// 与 OnFinished / OnPanic 一样在 Start 之前调用（Worker 不持锁读该字段）。
+func (w *Worker) OnProgress(fn func(j *domain.Job, percent int)) {
+	w.onProgress = fn
 }
 
 // OnPanic 设置任务 handler panic 回调。
@@ -263,6 +280,11 @@ func (w *Worker) runOne(ctx context.Context, j *domain.Job) {
 	rep := ReporterFunc(func(percent int) {
 		if err := w.store.UpdateJobProgress(ctx, j.ID, percent); err != nil {
 			w.log.Warn("更新任务进度失败", "job_id", j.ID, "error", err)
+			return
+		}
+		// 写库成功才推：推出去的是"已落库的进度"，订阅者显示的数字与它自己查询得到的完全一致。
+		if w.onProgress != nil {
+			w.onProgress(j, percent)
 		}
 	})
 

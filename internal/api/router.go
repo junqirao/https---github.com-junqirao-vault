@@ -104,7 +104,7 @@ func (r *Router) routes() {
 		// 而不是只有超管能看到原因。只读：修复只在启动期与 doctor 里做。
 		g.Get("/v1/system/deps", r.handleSystemDeps)
 		// 按需安装依赖（当前用于 targetcli 等命令行工具）：会真的调用宿主机包管理器，
-		// 因此仅超级管理员，且返回 202 + 任务对象——前端轮询 /v1/jobs/{id} 显示进度。
+		// 因此仅超级管理员，且返回 202 + 任务对象——进度走 SSE 的 job 事件，不轮询。
 		g.With(r.requireSuperAdminMW).Post("/v1/system/deps/install", r.handleInstallSystemDeps)
 		g.Get("/v1/system/settings", r.requireSuperAdmin(r.handleGetSettings))
 		g.Patch("/v1/system/settings", r.requireSuperAdmin(r.handlePatchSettings))
@@ -119,6 +119,11 @@ func (r *Router) routes() {
 		// 孤儿磁盘文件：对账只报告（见 5.11），这里由管理员在「孤儿磁盘」页面上逐个手动删除。
 		g.With(r.requireSuperAdminMW).Get("/v1/system/orphans", r.handleScanOrphans)
 		g.With(r.requireSuperAdminMW).Post("/v1/system/orphans/delete", r.handleDeleteOrphan)
+		// 导入已有磁盘（管理端「存储库」页的"导入"入口）：把 disks/ 下已存在的 .vhdx
+		// 原地接管成存储库（不复制、不移动），用于换机器迁移母盘。
+		// 与上面的孤儿清理是**同一批文件**的两种处置：一个删除、一个接管。
+		g.With(r.requireSuperAdminMW).Get("/v1/system/disks/import/scan", r.handleScanDiskImports)
+		g.With(r.requireSuperAdminMW).Post("/v1/system/disks/import", r.handleImportDisks)
 
 		// 平台存储池（LVM thin pool / dm-cache）：读取现状与块设备列表、初始化池。
 		// 仅超级管理员；Windows 后端返回 501 platform.unsupported，前端据此隐藏入口。

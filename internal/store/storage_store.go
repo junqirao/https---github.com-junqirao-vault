@@ -148,10 +148,10 @@ type StorageDiskStat struct {
 //
 // 单盘口径：
 //
-//	1. 有实测物理占用 → 用它；
-//	2. 建盘失败（error）→ 0，盘根本不存在；
-//	3. 已建好（ready/published）→ 实测值，**实测 0 就是 0**（thin 差异盘刚派生时独占块为 0）；
-//	4. 其余（creating/deleting，尚未建好）→ 退回标称容量预留。
+//  1. 有实测物理占用 → 用它；
+//  2. 建盘失败（error）→ 0，盘根本不存在；
+//  3. 已建好（ready/published）→ 实测值，**实测 0 就是 0**（thin 差异盘刚派生时独占块为 0）；
+//  4. 其余（creating/deleting，尚未建好）→ 退回标称容量预留。
 func diskAccountedBytes(state string, physical, size int64) int64 {
 	if physical > 0 {
 		return physical

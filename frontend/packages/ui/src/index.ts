@@ -143,6 +143,7 @@ export { AuditList } from './features/audit/AuditList'
 export { StorageList } from './features/storage/StorageList'
 export { StorageCreateForm, type StorageCreateFormProps } from './features/storage/StorageCreateForm'
 export { OrphanDisks } from './features/system/OrphanDisks'
+export { DiskImport, type DiskImportProps } from './features/system/DiskImport'
 export { SystemSettings, type SystemSettingsProps } from './features/system/SystemSettings'
 export { ClientSettings, type ClientSettingsProps } from './features/settings/ClientSettings'
 

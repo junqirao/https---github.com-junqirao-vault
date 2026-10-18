@@ -364,8 +364,8 @@ type createUploadRequest struct {
 	StorageID string         `json:"storage_id,omitempty"`
 	// QuotaBytes 0=不限。
 	QuotaBytes int64 `json:"quota_bytes,omitempty"`
-	// DiffDiskLimitBytes 共享磁盘限制（每块差异盘允许的容量）；0=不限。
-	DiffDiskLimitBytes int64 `json:"diff_disk_limit_bytes,omitempty"`
+	// MaxDiffDisks 共享数量（差异盘上限）；0=用户没填，由服务端回退配置默认值。
+	MaxDiffDisks int `json:"max_diff_disks,omitempty"`
 }
 
 // uploadSession 是创建上传会话的响应。

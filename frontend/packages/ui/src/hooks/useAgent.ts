@@ -17,6 +17,7 @@ import type {
   AgentConfig,
   AgentEvent,
   AgentHealth,
+  AgentJobState,
   AgentMountMode,
   AgentMountState,
   AgentMountVolumeUsage,
@@ -80,6 +81,13 @@ export interface UseAgentResult {
   downloads: DownloadState[]
   /** 本地目录上传任务（来自 upload 事件与 GET /agent/uploads）。 */
   uploads: UploadState[]
+  /**
+   * 最近收到的服务端任务进度（job_id → 状态，来自 `job` 事件）。
+   *
+   * 让界面不再为"一键安装系统依赖"这类任务**每 1.5s 轮询**服务端：进度变化才推送。
+   * 事件是尽力而为的，关心某个任务时请用 useJobProgress（自带兜底查询）。
+   */
+  jobs: Record<string, AgentJobState>
   /** 客户端资源热更状态（来自 web_update 事件与 GET /agent/update/web）。 */
   webUpdate: WebUpdateState | null
   mount: (input: AgentMountInput) => Promise<AgentMountState>
@@ -122,6 +130,13 @@ let snapshot: {
   usagePending: string[]
   downloads: DownloadState[]
   uploads: UploadState[]
+  /**
+   * 最近收到的服务端任务进度（job_id → 状态），来自本地事件流 `event: job`。
+   *
+   * 与服务端任务列表（GET /v1/jobs）不同：这里只有**事件推过**的那几条，是"进度快照"而不是
+   * 历史。界面关心某个任务时用它拿实时进度，收不到就自己兜底查一次（见 useJobProgress）。
+   */
+  jobs: Record<string, AgentJobState>
   webUpdate: WebUpdateState | null
   error: unknown
 } = {
@@ -134,6 +149,7 @@ let snapshot: {
   usagePending: [],
   downloads: [],
   uploads: [],
+  jobs: {},
   webUpdate: null,
   error: null
 }
@@ -345,6 +361,29 @@ function upsertUpload(uploads: UploadState[], next: UploadState): UploadState[] 
   return [next, ...uploads]
 }
 
+/**
+ * 界面保留的最近任务条数上限。
+ *
+ * 任务事件只在**变化时**来（一条任务通常几条），所以这个表很小；设上限只是为了防止长跑
+ * 客户端把每一个曾经见过的 job_id 都留在内存里（建库任务天天有，job_id 各不相同）。
+ */
+const JOB_SNAPSHOT_LIMIT = 32
+
+/**
+ * 写入/更新一条任务进度。
+ *
+ * 超出上限时丢**最早插入**的那条（对象的字符串键保持插入顺序）：界面只关心"正在看的那个"，
+ * 历史进度没有意义，而丢最新的一条会把正在看的任务清掉。
+ */
+function upsertJob(jobs: Record<string, AgentJobState>, job: AgentJobState): Record<string, AgentJobState> {
+  const next: Record<string, AgentJobState> = { ...jobs, [job.job_id]: job }
+  const ids = Object.keys(next)
+  if (ids.length > JOB_SNAPSHOT_LIMIT) {
+    for (const id of ids.slice(0, ids.length - JOB_SNAPSHOT_LIMIT)) delete next[id]
+  }
+  return next
+}
+
 function mountName(allocationId: string): string {
   const found = snapshot.state?.mounts.find((item) => item.allocation_id === allocationId)
   return found?.repo_name || allocationId
@@ -542,6 +581,12 @@ function applyEvent(event: AgentEvent): void {
       if (current) setSnapshot({ state: { ...current, host: event.host } })
       return
     }
+    case 'job': {
+      // 服务端任务进度（建库、装依赖…）：代理从服务端 SSE 原样转发过来，按 job_id 存进快照。
+      // 界面按需取用（见 useJobProgress）——拿到它就是"零请求"的实时进度。
+      setSnapshot({ jobs: upsertJob(snapshot.jobs, event.job) })
+      return
+    }
     case 'heartbeat':
       return
   }
@@ -564,6 +609,7 @@ const EVENT_TYPES = [
   'web_update',
   'download',
   'upload',
+  'job',
   'heartbeat'
 ] as const
 
@@ -915,6 +961,17 @@ export function useAgent(): UseAgentResult {
     refreshUploads,
     applyWebUpdate
   }
+}
+
+/**
+ * 订阅单个服务端任务的最新进度（来自本地事件流 `event: job`）。
+ *
+ * 返回 undefined 表示"事件还没推过这个任务"——此时该回落到已知的初始快照或一次兜底查询，
+ * 而不是当成"进度是 0"（见 useJobProgress）。
+ */
+export function useAgentJob(jobId: string | undefined): AgentJobState | undefined {
+  const { jobs } = useAgent()
+  return jobId ? jobs[jobId] : undefined
 }
 
 /**

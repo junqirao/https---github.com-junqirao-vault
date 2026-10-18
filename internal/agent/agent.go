@@ -143,6 +143,10 @@ type Agent struct {
 	// （挂载由 updater 重启后的自动挂载恢复，见 update.go 的说明）。
 	updateStarted atomic.Bool
 
+	// jobWatch 是"服务端建库任务进度"的订阅中心：等待建库的任务在此登记，由 SSE 事件唤醒
+	// （见 jobWatch）。事件不通时由 waitUploadJob 的兜底查询接管。
+	jobWatch *jobWatch
+
 	subMu sync.Mutex
 	// subRunning 记录"哪些服务端已经在订阅事件流"：多服务端**每台一条** SSE 长连接，
 	// 各自独立重连/降级（见 sse.go）。
@@ -196,6 +200,7 @@ func New(opt Options) (*Agent, error) {
 		store:     state,
 		identity:  newIdentityStore(identityPathFor(state.Path()), logger),
 		hub:       NewEventHub(),
+		jobWatch:  newJobWatch(),
 		ps:        ps,
 		iscsi:     iscsiinitiator.NewManager(ps, logger),
 		vol:       volume.NewManager(ps, logger),
@@ -218,6 +223,12 @@ func New(opt Options) (*Agent, error) {
 	a.cache = newCacheManager(cfg, logger)
 	// 本机挂载卷用量：按挂载点量卷空间（Windows 走 Get-Volume，见 volume.Manager.SpaceUsageOf）。
 	a.usage = newVolumeUsageCache(state.ListMounts, a.vol.SpaceUsageOf)
+	// 把上次退出时没传完的上传摆回列表（一律暂停态，等用户按「继续」）：不摆的话，
+	// 关掉应用再打开，那条"上传中"会整行消失 —— 服务端此刻还没有库记录，
+	// 列表里既没有库也没有上传（见 uploadManager.restoreTasks）。
+	if n := a.uploads.restoreTasks(); n > 0 {
+		a.logger.Info("已恢复上次未完成的上传任务（暂停态，等用户继续）", "count", n)
+	}
 	a.logUpdateKeyStatus()
 	return a, nil
 }

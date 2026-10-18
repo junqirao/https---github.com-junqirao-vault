@@ -424,6 +424,9 @@ func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk
 	if err := s.Store.UpdateDisk(ctx, disk); err != nil {
 		return err
 	}
+	// 贴"出厂标签"（见 diskmeta.go）：盘建好之后才写，且失败只告警 ——
+	// 迁移时能否认出这块盘靠它，但建盘本身不该被它拖失败。
+	s.writeDiskMetaAfterBuild(ctx, disk, sourceDir)
 	rep.Progress(100)
 	s.audit(ctx, "", "disk.create.done", "disk:"+disk.ID, disk.VHDXPath, domain.AuditResultOK)
 	s.prePublishTarget(ctx, disk)
@@ -957,6 +960,9 @@ func (s *DiskService) removeDiskFile(ctx context.Context, path string) error {
 	if s.Disk == nil {
 		return nil
 	}
+	// 顺手删掉同名的元数据 sidecar：它描述的是**这个文件**，文件没了标签就没意义，
+	// 而孤儿扫描只认 .vhdx，留着它没有任何机制能再清理（见 diskmeta.go）。
+	removeDiskMetaFile(s.Log, path)
 	return s.Disk.Delete(ctx, path)
 }
 

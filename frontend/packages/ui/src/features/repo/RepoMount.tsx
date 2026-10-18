@@ -169,10 +169,15 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     ? t('agent.hostMissing')
     : !repoReady
       ? repo.state === 'importing'
-        // 上传中：只说一句"不能挂载"等于让人干等 —— 必须告诉他进度在哪看（真实反馈：
-        // "没有办法知道没有完成上传，且可以被挂载"）。入口就是这张卡片本身：整卡点击进
-        // 「上传任务」页（见 RepoCards 的 useRepoCardClick），进度不再摊在卡片上。
-        ? t('repo.card.uploading')
+        ? placeholder
+          // 占位库：本机还在传数据。只说一句"不能挂载"等于让人干等 —— 必须告诉他进度在哪看
+          // （真实反馈："没有办法知道没有完成上传，且可以被挂载"）。入口就是这张卡片本身：
+          // 整卡点击进「上传任务」页（见 RepoCards 的 useRepoCardClick），进度不再摊在卡片上。
+          ? t('repo.card.uploading')
+          // 服务端记录：**数据早传完了**，现在卡在写入母盘上（30G 的库要几十分钟）。这里说
+          // 「正在上传中」会让用户以为还在传数据、白等（真实反馈："写入母盘这个过程状态展示
+          // 要展示写入中，如果上传中的话可能会造成误会"）。
+          : t('repo.card.writing')
         : t('repo.card.notReady', { state: t(`state.repo.${repo.state}`) })
       : canMount
         ? undefined

@@ -190,8 +190,11 @@ export function isPlaceholderRepoId(id: string): boolean {
  * 为什么需要：服务端要到"数据传完、开始建母盘"时才有这个库的记录，而发起上传的人必须马上
  * 在列表里看到"这块库正在生成" —— 否则刚点完上传的人会以为什么都没发生。
  *
- * 只填界面要读的字段：状态固定 importing（与「上传中」标签同一个取值），容量与分配相关一律 0
- * —— 此刻还没有任何可展示的数字，编一个出来只会误导。
+ * 只填界面要读的字段：状态填 importing（服务端口径：数据已收完、正在写母盘 —— 这样"还差几秒
+ * 服务端记录才出现"的那一帧不会显示成别的状态），容量与分配相关一律 0 —— 此刻还没有任何可
+ * 展示的数字，编一个出来只会误导。
+ *
+ * 注意**标签取值另算**：占位库还在传数据时显示的是「上传中」，见 repoStateValue。
  */
 export function uploadPlaceholderRepo(upload: UploadState, ownerId: string): RepoDTO {
   return {
@@ -204,7 +207,6 @@ export function uploadPlaceholderRepo(upload: UploadState, ownerId: string): Rep
     parent_version: 0,
     share_count: 0,
     max_diff_disks: 0,
-    diff_disk_limit_bytes: 0,
     quota_bytes: 0,
     capacity_bytes: 0,
     used_bytes: 0,
@@ -213,4 +215,24 @@ export function uploadPlaceholderRepo(upload: UploadState, ownerId: string): Rep
     created_at: upload.started_at,
     updated_at: upload.started_at
   }
+}
+
+/**
+ * 状态标签该显示成哪个取值（卡片与列表共用一处口径）。
+ *
+ * 服务端的 `importing` 是「**正在写母盘**」：这个库记录要到"数据都收完了、建库任务开跑"
+ * 才存在（见 ensureRepoForUpload），所以给它贴「上传中」会让人以为数据还在传、白等一场
+ * （真实反馈："写入母盘这个过程状态展示要展示写入中，如果上传中的话可能会造成误会"）。
+ *
+ * 「上传中」属于**本机代理**那侧的阶段：占位库（服务端还没有这条记录）正是"数据还在传"，
+ * 用一个只活在展示层的取值 `uploading` 表达它。于是同一个 `importing` 在两种场景下各说各的：
+ * 服务端记录 → 写入中，占位库 → 上传中。
+ *
+ * 唯一要接上的一帧：占位库走到 completing 时字节已经传完、建库任务已提交（见 agent 的
+ * uploadResumeRecord.Phase），而服务端的库记录可能还没建出来 —— 那一刻照样报「写入中」，
+ * 与服务端状态无缝接上。
+ */
+export function repoStateValue(repo: RepoDTO, upload?: UploadState): string {
+  if (!isPlaceholderRepoId(repo.id)) return repo.state
+  return upload?.state === 'completing' ? 'importing' : 'uploading'
 }

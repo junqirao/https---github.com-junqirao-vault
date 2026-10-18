@@ -27,8 +27,16 @@ import (
 // DefaultUploadChunkSize 是分块上传的默认分块大小（8MiB，见 docs/implementation.md 5.10）。
 const DefaultUploadChunkSize int64 = 8 << 20
 
-// uploadGCRetention 是未完成上传会话的暂存保留时长，超过后由 GC 清理。
+// uploadGCRetention 是未完成上传会话的暂存保留时长：这么久没收到任何分块（见
+// ListStaleUploads 的判定口径），就当这次上传已经废了，连会话行一起清掉。
 const uploadGCRetention = 24 * time.Hour
+
+// stagingSweepGrace 是"已结束会话残留的暂存目录"被回收前的宽限期。
+//
+// 完成流程是"先标记 complete、再删目录"，中间那一瞬间这条会话已经结束而目录还在；
+// 留一段宽限期就不用担心 GC 和收尾动作同时对着同一棵树 RemoveAll（在 Windows 上那会报
+// 共享冲突，白刷一条 WARN）。它只决定"多久之后自愈"，不影响正常路径的即时删除。
+const stagingSweepGrace = time.Hour
 
 // CreateUploadInput 是创建上传会话的入参。
 type CreateUploadInput struct {
@@ -45,9 +53,15 @@ type CreateUploadInput struct {
 	StorageID string
 	// QuotaBytes 可选应用层配额；0 表示不限。
 	QuotaBytes int64
-	// DiffDiskLimitBytes 可选共享磁盘限制：建出来的库每块差异盘允许的容量
-	// （也是它计入配额的量）；0 表示不限制。见 domain.Repository.DiffDiskLimitBytes。
-	DiffDiskLimitBytes int64
+	// MaxDiffDisks 共享数量（差异盘上限）：建出来的库按它定上限，>0 时还会预创建池位。
+	//
+	// ⚠️ 与 RepoService.Create 的入参同义同规则：0 表示"用户没填"，回退配置默认值
+	// （storage.default_max_diff_disks）；独享模式无差异盘，一律归零。
+	//
+	// 为什么要单独一个字段：上传建库曾**整条链路都没有它**（请求、清单、建库三处全缺），
+	// 于是本机目录上传建出来的库，共享数量恒等于配置默认值 —— 用户在同一个表单里填的
+	// 数字被静默丢掉（真实反馈："设置共享数量大于0时会变成50"）。
+	MaxDiffDisks int
 	// ClientOS 可选：将使用该库的客户端操作系统（"windows"/"linux"，留空按 windows）。
 	//
 	// 决定建盘用的文件系统（见 domain.ClientOS），随清单持久化，建盘时生效。
@@ -150,6 +164,21 @@ type UploadService struct {
 	// supersedeIdle 覆盖"同名旧会话还算活着"的时间窗（毫秒）。0 = 用默认值
 	// uploadSupersedeIdleMillis；负值 = 一律按"没人动过"处理（只有测试会这么设）。
 	supersedeIdleMillis int64
+
+	// now 是取当前时间的钩子（nil = time.Now），只被 GC 的两条"多久没动静"判定线使用。
+	//
+	// 做成可注入是因为这两个窗口都没法从数据那侧构造：会话的 updated_at 由"收到分块"刷新
+	// （见 AddUploadReceived），测试**没法把它写回过去**，要造出"已经过期"的会话只能让时间往前走
+	// （见 upload_gc_test.go）。
+	now func() time.Time
+}
+
+// nowFn 返回生效的取时函数。
+func (s *UploadService) nowFn() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 // supersedeIdle 返回生效的"刚活跃过"时间窗。
@@ -194,8 +223,19 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 	if in.QuotaBytes < 0 {
 		return nil, apperr.InvalidParam("quota_bytes")
 	}
-	if in.DiffDiskLimitBytes < 0 {
-		return nil, apperr.InvalidParam("diff_disk_limit_bytes")
+	// 共享数量：校验口径与 RepoService.Create 完全一致（同一份"共享数量"语义，两条建库
+	// 路径不该有两套规则）。独享模式无差异盘，静默归零而不是报错 —— 老客户端可能会带着它。
+	share := in.MaxDiffDisks
+	if share < 0 {
+		return nil, apperr.InvalidParam("max_diff_disks")
+	}
+	if share > maxPreparedDisks {
+		// 每个池位都要真派生一次 VHDX 并下发一次 iSCSI 目标，不设上限的话一次误填就能把
+		// 服务端占住几十分钟（见 maxPreparedDisks）。
+		return nil, apperr.InvalidParam("max_diff_disks")
+	}
+	if domain.RepoMode(repoMode) != domain.RepoModeShared {
+		share = 0
 	}
 	// 客户端系统决定建盘用的文件系统（见 domain.ClientOS），留空按默认（Windows）。
 	clientOS, ok := domain.ParseClientOS(in.ClientOS)
@@ -209,13 +249,13 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 		return nil, err
 	}
 	manifestJSON, err := marshalManifest(uploadManifestRecord{
-		Root:               in.Manifest.Root,
-		Files:              entries,
-		RepoMode:           repoMode,
-		StorageID:          storageID,
-		QuotaBytes:         in.QuotaBytes,
-		DiffDiskLimitBytes: in.DiffDiskLimitBytes,
-		ClientOS:           string(clientOS),
+		Root:         in.Manifest.Root,
+		Files:        entries,
+		RepoMode:     repoMode,
+		StorageID:    storageID,
+		QuotaBytes:   in.QuotaBytes,
+		MaxDiffDisks: share,
+		ClientOS:     string(clientOS),
 	})
 	if err != nil {
 		return nil, err
@@ -234,7 +274,7 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 	size := s.sizing().CalculateVHDXSize(totalBytes, 0)
 	if plan.reusable != nil {
 		return s.resumeUploadSession(ctx, plan, repoMode, storageID, in.QuotaBytes,
-			in.DiffDiskLimitBytes, clientOS, size)
+			share, clientOS, size)
 	}
 	guard, err := s.pickUploadGuard(ctx, storageID, size)
 	if err != nil {
@@ -553,7 +593,8 @@ func (s *UploadService) purgeRemnantRepo(ctx context.Context, repo *domain.Repos
 // agent 拿到的是同一个 upload_id 与"还缺哪几块"，于是已传完的部分不会重传；
 // 已逐文件校验通过的文件数也一并带上，免得界面上的进度从 0 重数。
 func (s *UploadService) resumeUploadSession(ctx context.Context, plan *uploadNamePlan, repoMode, storageID string,
-	quotaBytes, diffDiskLimitBytes int64, clientOS domain.ClientOS, size int64) (*UploadSession, error) {
+	quotaBytes int64, maxDiffDisks int, clientOS domain.ClientOS,
+	size int64) (*UploadSession, error) {
 	u := plan.reusable
 	guard, err := s.guardForUpload(ctx, u)
 	if err != nil {
@@ -568,7 +609,7 @@ func (s *UploadService) resumeUploadSession(ctx context.Context, plan *uploadNam
 		return nil, err
 	}
 	manifestJSON, err := manifestWithOptions(rec, repoMode, storageID, quotaBytes,
-		diffDiskLimitBytes, clientOS)
+		maxDiffDisks, clientOS)
 	if err != nil {
 		return nil, err
 	}
@@ -1056,9 +1097,20 @@ func (s *UploadService) Abort(ctx context.Context, uploadID string) error {
 	return nil
 }
 
-// GCStaleUploads 清理超过 24h 未完成的会话及其暂存目录，返回清理数量。
+// GCStaleUploads 回收上传暂存，返回清理的条目数（过期会话 + 残留的暂存目录）。
+//
+// 两趟各管一类残骸，见 gcStaleSessions / gcLeftoverStaging。两趟互不牵连：一趟失败不该让
+// 另一趟也停摆 —— 它们清的是不同来源的盘占用，而其中任何一处不清都是"磁盘只涨不落"。
 func (s *UploadService) GCStaleUploads(ctx context.Context) (int, error) {
-	cutoff := time.Now().Add(-uploadGCRetention).UnixMilli()
+	sessions, err := s.gcStaleSessions(ctx)
+	// 兜底那趟自己吞掉错误并记 WARN：它扫的是"本来就该没了"的目录，失败也只是晚一轮再试，
+	// 让它把整轮 GC 判成失败反而会盖掉第一趟的真错误。
+	return sessions + s.gcLeftoverStaging(ctx), err
+}
+
+// gcStaleSessions 清理超期未完成的上传会话：删暂存目录 + 删会话行（含分块登记）。
+func (s *UploadService) gcStaleSessions(ctx context.Context) (int, error) {
+	cutoff := s.nowFn().Add(-uploadGCRetention).UnixMilli()
 	stale, err := s.Store.ListStaleUploads(ctx, cutoff, 100)
 	if err != nil {
 		return 0, err
@@ -1066,9 +1118,22 @@ func (s *UploadService) GCStaleUploads(ctx context.Context) (int, error) {
 	cleaned := 0
 	for i := range stale {
 		u := &stale[i]
+		if ctx.Err() != nil {
+			// 一轮只有 5 分钟（见 runTickerOnce），删目录很容易用满：剩下的留给下一轮，
+			// 别拿着已取消的 ctx 继续写库。
+			return cleaned, nil
+		}
+		// 建库任务还在跑（正在从暂存树里建盘）时**绝不能删**：要删的就是它脚下的源。
+		// 过期判定按"最后一次收到分块"算（见 ListStaleUploads），而超大目录的建库本身
+		// 就要跑很久 —— 少了这道判断，用户会在"建库中"看到上传莫名其妙地消失、
+		// 任务随即因为源目录不见而失败。取舍与"同名会话有活跃任务时不碰"一致
+		// （见 prepareUploadName）。
+		if s.uploadCompleteJobAlive(ctx, u.ID) {
+			continue
+		}
 		if u.StagingDir != "" {
 			if err := os.RemoveAll(u.StagingDir); err != nil {
-				s.Log.Warn("清理上传暂存目录失败", "upload_id", u.ID, "error", err)
+				s.Log.Warn("清理上传暂存目录失败", "upload_id", u.ID, "staging_dir", u.StagingDir, "error", err)
 				continue
 			}
 		}
@@ -1085,12 +1150,56 @@ func (s *UploadService) GCStaleUploads(ctx context.Context) (int, error) {
 	return cleaned, nil
 }
 
+// gcLeftoverStaging 回收"已结束（complete/aborted）但暂存目录还挂着"的会话，返回回收的目录数。
+//
+// 这是**兜底**而不是主路径：正常完成时 runUploadComplete 自己就把暂存删了。留这一趟是因为
+// "没删成"并不罕见 —— 目录被占用、进程正好退出、某个版本压根只在 move 模式删 ——
+// 而 24h 那条过期扫描**不看 complete**，这些目录再没人管，于是一台服务器上能攒出几百 G。
+//
+// 只回收目录、清空 staging_dir，**不删会话行**：行是这次上传的记录，
+// 且它参与"同名残留"的判定（见 prepareUploadName），没有顺带的理由就不动。
+func (s *UploadService) gcLeftoverStaging(ctx context.Context) int {
+	cutoff := s.nowFn().Add(-stagingSweepGrace).UnixMilli()
+	remnants, err := s.Store.ListFinishedUploadsWithStaging(ctx, cutoff, 100)
+	if err != nil {
+		s.Log.Warn("查询待回收的上传暂存目录失败", "error", err)
+		return 0
+	}
+	freed := 0
+	for _, r := range remnants {
+		if ctx.Err() != nil {
+			// 同 gcStaleSessions：一轮的预算是 5 分钟，剩下的下一轮再来。
+			return freed
+		}
+		if strings.TrimSpace(r.StagingDir) == "" {
+			continue
+		}
+		if err := os.RemoveAll(r.StagingDir); err != nil {
+			s.Log.Warn("回收已结束会话的暂存目录失败",
+				"upload_id", r.ID, "staging_dir", r.StagingDir, "error", err)
+			continue
+		}
+		if err := s.Store.ClearUploadStagingDir(ctx, r.ID); err != nil {
+			s.Log.Warn("清空上传暂存路径失败", "upload_id", r.ID, "error", err)
+			continue
+		}
+		s.Log.Info("已回收上传残留的暂存目录", "upload_id", r.ID, "staging_dir", r.StagingDir)
+		freed++
+	}
+	if freed > 0 {
+		s.audit(ctx, "system", "upload.gc", "staging", fmt.Sprintf("count=%d", freed), domain.AuditResultOK)
+	}
+	return freed
+}
+
 // ---- 任务处理器 ----
 
 // runUploadComplete 由目录树创建 VHDX 并建立存储库记录（见 5.10 步骤 ⑤）。
 //
 // 幂等：upload.state 已为 complete 时直接返回；建盘流水线本身按 disk 状态幂等。
-// mode=move 时在复制校验成功后才清理 staging（服务端侧源由客户端负责清理）。
+//
+// 收尾时**一律**清理 staging（copy / move 都清，见末尾）：里面的 tree 只是服务端的工作副本，
+// 母盘一建好它就没有用途了。move 语义只决定"客户端本机那份源"删不删，与这里无关。
 func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, rep job.Reporter) error {
 	var p uploadCompletePayload
 	if err := decodePayload(j.Payload, &p); err != nil {
@@ -1133,9 +1242,14 @@ func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, re
 	if err != nil {
 		return err
 	}
-	// 母盘构建完成前一律标为"上传中"：ensureRepoForUpload 对同名库是幂等复用的，
-	// 复用出来的库可能已经是 active（上次建好过、这次是重传覆盖），而这次要把母盘整个
-	// 重建 —— 期间必须拒绝挂载，否则用户挂上去看到的是正在被覆盖的半成品。
+	// 母盘构建期间一律标为 importing（界面「写入中」）：ensureRepoForUpload 对同名库是幂等
+	// 复用的，复用出来的库可能已经是 active（上次建好过、这次是重传覆盖），而这次要把母盘
+	// 整个重建 —— 期间必须拒绝挂载，否则用户挂上去看到的是正在被覆盖的半成品。
+	//
+	// 界面文案是「写入中」而不是「上传中」：走到这里数据早传完了，后面这段长活是把整棵树写进
+	// 新盘（30G 的库要几十分钟），说"上传中"会让人以为还在传数据、白等（真实反馈："写入母盘
+	// 这个过程状态展示要展示写入中，如果上传中的话可能会造成误会"）。
+	// 还在传数据的那一帧由客户端合成的占位库表达，标签取值另算（见前端 repoStateValue）。
 	if repo.State != domain.RepoStateImporting {
 		if err := s.Store.SetRepositoryState(ctx, repo.ID, domain.RepoStateImporting); err != nil {
 			return err
@@ -1166,19 +1280,16 @@ func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, re
 		}
 	}
 
-	// 母盘就绪：库从"上传中"转为正常，卡片上的上传中到此结束。
+	// 母盘就绪：库从「写入中」转为正常，卡片上的转场标签到此结束。
 	if err := s.Store.SetRepositoryState(ctx, repo.ID, domain.RepoStateActive); err != nil {
 		return err
 	}
 	if err := s.Store.UpdateUploadState(ctx, u.ID, domain.UploadStateComplete); err != nil {
 		return err
 	}
-	if u.Mode == domain.UploadModeMove {
-		// 校验成功后才清理暂存（见 5.10 要点）。
-		if err := os.RemoveAll(u.StagingDir); err != nil {
-			s.Log.Warn("清理 move 模式暂存目录失败", "upload_id", u.ID, "error", err)
-		}
-	}
+	// 顺序是刻意的：先标记 complete、再删目录（见 discardStagingAfterComplete 的说明）。
+	s.discardStagingAfterComplete(ctx, u)
+
 	rep.Progress(100)
 	s.audit(ctx, u.UserID, "upload.complete.done", "upload:"+u.ID,
 		"repo="+repo.ID+" disk="+disk.ID, domain.AuditResultOK)
@@ -1186,6 +1297,39 @@ func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, re
 		"action": "complete", "upload_id": u.ID, "repo_id": repo.ID, "state": domain.UploadStateComplete,
 	})
 	return nil
+}
+
+// discardStagingAfterComplete 清理一次上传收尾后已经没用的暂存目录。
+//
+// 关键在"**不看 u.Mode**"：staging 里的 tree 只是服务端的一份**工作副本** —— 母盘已经从它
+// 建好、库也转成 active，剩下这份拷贝没有任何用途。move 语义只决定"客户端本机那份源"要不
+// 要删，与服务端这份副本无关。
+//
+// 原先只在 move 时删（照抄了文档里那句话），而客户端 source_mode 默认就是 copy ——
+// 于是**几乎每一次上传成功都在存储根下永久留下一整棵树**。真实反馈：
+// "staging 目录并没有清空，这个目录的逻辑是什么啊，现在在我的服务器占用了几百 G，
+// 我认为上传完了用完了就应该删掉啊"。
+//
+// 顺序：先标记 upload.state=complete、再删目录。反过来一旦崩在中间，就会留下一条
+// "树已经没了、状态还没完成"的会话，重试只能失败（重试要靠这棵树重建母盘）；
+// 而先标记再删留下的那一帧残骸（目录还在、状态已 complete）由 GC 的兜底那趟回收
+// （见 gcLeftoverStaging）。删除失败也只告警：同样交给那趟 GC，不要因为清不掉一份废拷贝
+// 就把一次成功的建库判成失败。
+func (s *UploadService) discardStagingAfterComplete(ctx context.Context, u *domain.Upload) {
+	if u == nil || u.StagingDir == "" {
+		return
+	}
+	if err := os.RemoveAll(u.StagingDir); err != nil {
+		s.Log.Warn("清理上传暂存目录失败（已交给 GC 兜底）",
+			"upload_id", u.ID, "staging_dir", u.StagingDir, "error", err)
+		return
+	}
+	// 顺手把路径清空，让"staging_dir 非空 ⇒ 盘上可能还有残留"这条不变量成立：
+	// GC 的兜底那趟据此只需要处理"崩在中间"的少数情况，运维查残留也只看一个字段。
+	// 清不动不影响结果（目录已经没了），下一轮 GC 会再清一次。
+	if err := s.Store.ClearUploadStagingDir(ctx, u.ID); err != nil {
+		s.Log.Warn("清空上传暂存路径失败", "upload_id", u.ID, "error", err)
+	}
 }
 
 // ---- 内部实现 ----
@@ -1313,7 +1457,16 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 				return nil
 			}
 		} else {
-			maxDiff := raw.Storage.DefaultMaxDiffDisks
+			// 共享数量取**用户在这次上传里填的**（随清单持久化），只有他没填才回退配置默认值
+			// —— 与 RepoService.Create 同一套口径。
+			//
+			// ⚠️ 这里曾经无条件取配置默认值、从不看清单：于是本机目录上传建出来的库，共享数量
+			// 恒为 storage.default_max_diff_disks（默认 50），用户在同一张表单里填的数字被静默
+			// 丢掉（真实反馈："设置共享数量大于0时会变成50"）。
+			maxDiff := rec.MaxDiffDisks
+			if maxDiff <= 0 {
+				maxDiff = raw.Storage.DefaultMaxDiffDisks
+			}
 			if maxDiff <= 0 {
 				maxDiff = 50
 			}
@@ -1322,12 +1475,11 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 				Mode:         mode,
 				OwnerID:      u.UserID,
 				MaxDiffDisks: maxDiff,
-				// 共享磁盘限制取自本次上传会话的建库选项（随清单持久化，见 uploadManifestRecord）；
-				// 独享库没有差异盘，这个值对它没有对象，归零免得详情页显示一个不起作用的配置。
-				DiffDiskLimitBytes: limitForMode(mode, rec.DiffDiskLimitBytes),
-				QuotaBytes:         rec.QuotaBytes,
-				// 建库期间是"上传中"而不是 active：母盘还没建出来，此时挂载只会得到
-				// disk.not_ready。任务结束时会置为 active（见 runUploadComplete）。
+				QuotaBytes:   rec.QuotaBytes,
+				// 建库期间是 importing（界面「写入中」）而不是 active：母盘还没建出来，
+				// 此时挂载只会得到 disk.not_ready。走到这里数据已经收完，长活是写盘
+				// —— 界面不能显示成"上传中"（见 runUploadComplete 的说明）。
+				// 任务结束时会置为 active（见 runUploadComplete）。
 				State: domain.RepoStateImporting,
 			}
 			if mode == domain.RepoModeShared {
@@ -1873,17 +2025,19 @@ func normalizeManifest(m domain.UploadManifest) ([]domain.ManifestEntry, int, in
 
 // uploadManifestRecord 是持久化到 uploads.manifest 的清单记录。
 //
-// 除文件清单外还携带建库选项（repo_mode / storage_id / quota_bytes /
-// diff_disk_limit_bytes / client_os）：uploads 表没有这些列，而"完成建库"是异步任务
-// （读不到创建时的请求参数），因此随清单一起持久化在同一个 JSON 里，供 runUploadComplete 使用。
+// 除文件清单外还携带建库选项（repo_mode / storage_id / quota_bytes / client_os）：
+// uploads 表没有这些列，而"完成建库"是异步任务（读不到创建时的请求参数），
+// 因此随清单一起持久化在同一个 JSON 里，供 runUploadComplete 使用。
 type uploadManifestRecord struct {
 	Root       string                 `json:"root"`
 	Files      []domain.ManifestEntry `json:"files"`
 	RepoMode   string                 `json:"repo_mode,omitempty"`
 	StorageID  string                 `json:"storage_id,omitempty"`
 	QuotaBytes int64                  `json:"quota_bytes,omitempty"`
-	// DiffDiskLimitBytes 共享磁盘限制（0=不限制），建出来的库按它给差异盘记账。
-	DiffDiskLimitBytes int64 `json:"diff_disk_limit_bytes,omitempty"`
+	// MaxDiffDisks 共享数量（差异盘上限，0=用户没填）：建库时写进库配置。
+	//
+	// 必须随清单存下来：建库是**异步任务**，那一刻读不到创建会话时的请求参数。
+	MaxDiffDisks int `json:"max_diff_disks,omitempty"`
 	// ClientOS 将使用该库的客户端操作系统，决定建盘格式（见 domain.ClientOS）。
 	// 留空按默认（windows → NTFS）。
 	ClientOS string `json:"client_os,omitempty"`
@@ -1904,7 +2058,7 @@ func marshalManifest(rec uploadManifestRecord) (string, error) {
 // 把已经上传的数据对到别的文件上（第一个块的字节会落进第二个文件）。复用旧会话时
 // 只有选项跟着本次请求走，文件列表一个字都不能动。
 func manifestWithOptions(rec *uploadManifestRecord, repoMode, storageID string,
-	quotaBytes, diffDiskLimitBytes int64, clientOS domain.ClientOS) (string, error) {
+	quotaBytes int64, maxDiffDisks int, clientOS domain.ClientOS) (string, error) {
 	if rec == nil {
 		return "", apperr.InvalidParam("manifest")
 	}
@@ -1912,7 +2066,7 @@ func manifestWithOptions(rec *uploadManifestRecord, repoMode, storageID string,
 	next.RepoMode = repoMode
 	next.StorageID = storageID
 	next.QuotaBytes = quotaBytes
-	next.DiffDiskLimitBytes = diffDiskLimitBytes
+	next.MaxDiffDisks = maxDiffDisks
 	next.ClientOS = string(clientOS)
 	return marshalManifest(next)
 }

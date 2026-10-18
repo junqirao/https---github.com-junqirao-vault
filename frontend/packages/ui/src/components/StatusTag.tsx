@@ -23,9 +23,15 @@ const TONE_BY_VALUE: Record<string, Tone> = {
   pending: 'processing',
   running: 'processing',
   creating: 'processing',
-  // 上传中（本地目录上传建库还没结束）：与 creating 同为进行中，但语义是"数据还在传"。
+  // 写入中（服务端把已上传的数据写进新母盘）：与 creating 同为进行中，但这是条长活
+  // —— 源目录多大就要写多大的盘，30G 的库要几十分钟。
   importing: 'processing',
+  // 上传中（本机代理还在传数据，服务端此时还没有这条库记录）：只出现在占位库上，
+  // 取值由 repoStateValue 给出，见 uploadView.tsx。
+  uploading: 'processing',
   sealing: 'processing',
+  // 上传递交的活被本机按下暂停：不是错误、也不是"正在推进"，属于"需要你回来看一眼"。
+  paused: 'warning',
   mounting: 'processing',
   releasing: 'processing',
   derived: 'processing',

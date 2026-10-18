@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Button, Card, Col, Input, Pagination, Progress, Row, Segmented, Skeleton, Space, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
@@ -35,6 +35,13 @@ export interface RepoListProps {
    * 可选：管理端看的是服务端全量库，本机上传与它无关，不传即不出现上传中的条目。
    */
   onOpenUpload?: (uploadId: string) => void
+  /**
+   * 打开「导入母盘」页：把存储根里已存在的 VHDX 文件原地接管成存储库。
+   *
+   * 可选，且只在管理端出现：这是换服务端时的迁移入口（见 DiskImport），
+   * 用户端没有存储根的概念，放它只会让人误以为能"导入别人的盘"。
+   */
+  onImport?: () => void
 }
 
 /**
@@ -84,6 +91,26 @@ function storeView(view: RepoViewMode): void {
     // 忽略：偏好没记住不是错误，不值得打扰用户。
   }
 }
+
+/**
+ * 「中间态」：库会**自己往下走**、不需要人管的状态（建库中 / 写母盘中 / 加封中 / 删除中）。
+ *
+ * error 刻意不算：它不会自己好，等人动手修的状态盯着轮询只是白耗请求。
+ */
+const PENDING_REPO_STATES: ReadonlyArray<RepoDTO['state']> = [
+  'creating',
+  'importing',
+  'sealing',
+  'deleting'
+]
+
+/**
+ * 列表里还有中间态时的自动刷新间隔。
+ *
+ * 5s 是"标签该消失时基本立刻就消失"与"别把列表当心跳打"之间的取中：这段窗口本身是分钟级的
+ * （写母盘 30G 几十分钟起步），刷新只是去接一个迟早会发生的状态变化。
+ */
+const PENDING_REFRESH_MS = 5000
 
 /**
  * 用户端分组区块标题：标题 + 数量在左，`extra`（形态切换）贴右。
@@ -345,7 +372,7 @@ function RepoListSkeleton({ viewMode }: { viewMode: RepoViewMode }): JSX.Element
 }
 
 /** 存储库列表：管理端表格；用户端卡片/列表两种形态（可切换 + 分组分页）。 */
-export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload }: RepoListProps): JSX.Element {
+export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImport }: RepoListProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const { user } = useAuth()
@@ -399,6 +426,56 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload }: RepoL
     () => (isSuperAdmin || !onOpenUpload ? [] : agent.uploads.filter(isActiveUpload)),
     [agent.uploads, isSuperAdmin, onOpenUpload]
   )
+
+  /**
+   * 列表里还有"没走完"的库吗 —— 有就自己盯着刷新，直到一个都不剩。
+   *
+   * 为什么必须自动刷（真实反馈："上传完成后要去掉上传中这个标签"）：那张「上传中」卡是
+   * **客户端合成**的占位库（服务端此刻还没有这条记录，见 uploadPlaceholderRepo），它变成真库、
+   * 以及真库从「写入中」变成正常，全都只发生在服务端，而且都是后台异步发生的（建库任务是队列里
+   * 的另一次请求、写母盘几十分钟）—— 没有任何事件会推到这个页面上。于是不手点刷新的人会一直
+   * 看着一枚早就该消失的标签（在新建页发起上传、随后切到列表页时尤其明显：那里的收尾刷新随
+   * 表单卸载一起没了）。
+   *
+   * 两头一起看：
+   *   - 服务端侧：列表里有 creating / importing / sealing / deleting 的库（见 PENDING_REPO_STATES），
+   *     它们自己会往下走；
+   *   - 本机侧：还有进行中的上传 —— 包括**重传覆盖**（那时库仍是 active，只看状态会漏），以及
+   *     刚够到「建库中」那一帧（服务端的库记录还没出现，全靠占位卡顶着）。
+   */
+  const hasPendingRepos = useMemo(
+    () =>
+      activeUploads.length > 0 ||
+      (reposQuery.data?.items ?? []).some((repo) => PENDING_REPO_STATES.includes(repo.state)),
+    [activeUploads, reposQuery.data]
+  )
+
+  // 中间态存在期间按固定节拍重取。
+  //
+  // 用 effect + setInterval 而不是 useQuery 的 refetchInterval：这条判据要读的正是**这次查询的
+  // 结果**（列表里有没有中间态的库），写成 refetchInterval 就得绕回上一轮渲染的值；这样子写也
+  // 与本页复用缓存那个轮询器（见上面的 refreshCache）一个模样。卸载即停，不留后台心跳。
+  const refetchRepos = reposQuery.refetch
+  useEffect(() => {
+    if (!hasPendingRepos) return
+    const timer = window.setInterval(() => void refetchRepos(), PENDING_REFRESH_MS)
+    return () => window.clearInterval(timer)
+  }, [hasPendingRepos, refetchRepos])
+
+  // 上传刚收工的那一拍**立刻**补一次：真库记录正是这一刻才在服务端出现的，而列表手里还是旧快照。
+  // 不补的话，占位卡先消失、真库要等下一拍轮询才回来 —— 中间那几秒列表里空着一块，看着像库被
+  // 弄丢了。判据用"活跃集合里少了人"：只在上传真正结束时触发一次，不跟着进度事件走（进度事件
+  // 每秒都有，跟着它走就等于每秒打一次列表接口）。
+  const activeUploadIds = useMemo(
+    () => activeUploads.map((upload) => upload.upload_id || upload.local_dir),
+    [activeUploads]
+  )
+  const lastActiveIds = useRef(activeUploadIds)
+  useEffect(() => {
+    const finished = lastActiveIds.current.some((id) => !activeUploadIds.includes(id))
+    lastActiveIds.current = activeUploadIds
+    if (finished) void refetchRepos()
+  }, [activeUploadIds, refetchRepos])
 
   const entries = useMemo<RepoListEntry[]>(() => {
     const items = reposQuery.data?.items ?? []
@@ -537,6 +614,9 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload }: RepoL
             onChange={(event) => setKeyword(event.target.value)}
           />
           <Button onClick={() => void reposQuery.refetch()}>{t('common.refresh')}</Button>
+          {/* 导入放在「新建」左边：它是低频的迁移动作，位置上与主操作区分开，
+              免得日常建库时手滑点进来。 */}
+          {isSuperAdmin && onImport ? <Button onClick={onImport}>{t('repo.import')}</Button> : null}
           <Button type="primary" onClick={onCreate}>
             {t('common.create')}
           </Button>

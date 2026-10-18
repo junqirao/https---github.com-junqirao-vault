@@ -56,8 +56,10 @@ type sysDepsInstallRequest struct {
 // handleInstallSystemDeps 提交"按需安装系统依赖"任务（仅超级管理员）。
 //
 // 为什么是异步任务而不是"装完再返回"：装包要拉软件源、解包，动辄几十秒到几分钟，
-// 同步等待只会让前端"点一下卡住"，还要顶着 HTTP 超时。这里立刻返回 202 + 任务对象，
-// 前端轮询 GET /v1/jobs/{id} 直到终态（与其它长任务一致），随后刷新 /v1/system/deps。
+// 同步等待只会让前端"点一下卡住"，还要顶着 HTTP 超时。这里立刻返回 202 + 任务对象
+// （含初始 state/progress），后续进度由事件流推送（SSE 的 job 事件：服务端 → 代理 →
+// 界面，见 internal/job/worker.go 的 OnProgress 与 hooks/useJobProgress），
+// 到终态后刷新 /v1/system/deps。**不要**让界面轮询 GET /v1/jobs/{id}：那会把访问日志刷满。
 //
 // 与 GET 的权限差异是刻意的：读是只读探测、任何登录用户都该知道"缺了什么、怎么补"；
 // 而装包会**改动宿主机且影响整台机器**，因此只放给超级管理员，并受 platform.auto_install
@@ -370,6 +372,62 @@ func (r *Router) handleDeleteOrphan(w http.ResponseWriter, req *http.Request) {
 	if p, err := r.principal(req); err == nil {
 		r.deps.App.Audit(req.Context(), p.UserID, "system.orphan_delete",
 			"file:"+res.Path, "freed_bytes="+strconv.FormatInt(res.FreedBytes, 10), domain.AuditResultOK)
+	}
+	r.writeJSON(w, http.StatusOK, res)
+}
+
+// handleScanDiskImports 扫描可导入的已有磁盘（仅超级管理员）。
+//
+// 与「孤儿磁盘」页面扫的是同一批文件（见 app.ScanDiskImports），目的却相反：孤儿页面处理
+// "不要的"（删除），这里处理"要的"（原地接管成存储库）。返回**全部** .vhdx（含已登记的），
+// 因为管理员要确认的是"我搬过来的那几块盘是不是都在这儿"，而不是"哪些是多余的"。
+func (r *Router) handleScanDiskImports(w http.ResponseWriter, req *http.Request) {
+	scan, err := r.deps.App.ScanDiskImports(req.Context())
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusOK, scan)
+}
+
+// diskImportRequest 是导入已有磁盘的请求体。
+type diskImportRequest struct {
+	// OwnerID 归属用户（必填）：迁移后原主人在新机器上不一定存在，由管理员指定。
+	OwnerID string `json:"owner_id"`
+	// Items 要导入的磁盘（路径 + 可覆盖的名称/备注/容量）。
+	Items []app.DiskImportItem `json:"items"`
+}
+
+// handleImportDisks 原地接管一批磁盘文件（仅超级管理员）。
+//
+// 这是"把文件变成可用存储库"的不可逆操作（用户立刻就能挂载它），因此逐条留审计；
+// 服务端会重新校验每个路径仍在生效存储根的 disks 下、且尚未登记 ——
+// 页面清单是扫描那一刻的快照，期间可能已有别的任务接管或删除了某个文件。
+func (r *Router) handleImportDisks(w http.ResponseWriter, req *http.Request) {
+	var body diskImportRequest
+	if err := r.decodeJSON(req, &body); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	actor := ""
+	if p, err := r.principal(req); err == nil {
+		actor = p.UserID
+	}
+	res, err := r.deps.App.ImportDisks(req.Context(), actor, app.DiskImportInput{
+		OwnerID: body.OwnerID,
+		Items:   body.Items,
+	})
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	if actor != "" {
+		// 逐条记账而不是记一条汇总：审计要回答的是"哪块盘是谁接管的"，
+		// 一条 "imported=5" 事后追不回任何具体文件。
+		for _, it := range res.Imported {
+			r.deps.App.Audit(req.Context(), actor, "system.disk_import", "file:"+it.Path,
+				"repo_id="+it.RepoID+" name="+it.Name, domain.AuditResultOK)
+		}
 	}
 	r.writeJSON(w, http.StatusOK, res)
 }

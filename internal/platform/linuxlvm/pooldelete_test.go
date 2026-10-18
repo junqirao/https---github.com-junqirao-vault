@@ -216,7 +216,10 @@ func TestDeletePoolRejectsDefaultPool(t *testing.T) {
 	m := newPoolManager()
 
 	// 池名、卷组名两种给法都要挡住（只给卷组名 = 连卷组一起删，同样会带走默认池）。
-	for _, tc := range []struct{ vg, pool string; rmVG bool }{
+	for _, tc := range []struct {
+		vg, pool string
+		rmVG     bool
+	}{
 		{"vg0", "vault", false},
 		{"vg0", "", true},
 	} {

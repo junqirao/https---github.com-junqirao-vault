@@ -124,6 +124,8 @@ const (
 	CodeScanTooLarge = "agent.scan_too_large"
 	// CodeUploadFailed 本地目录分块上传/建库失败（500，args.stage 指明阶段）。
 	CodeUploadFailed = "agent.upload_failed"
+	// CodeUploadResumeUnavailable 指定的上传任务无法续跑（本机的续传记录已失效，或源目录已不存在）（409）。
+	CodeUploadResumeUnavailable = "agent.upload_resume_unavailable"
 )
 
 // errTokenInvalid 本地令牌校验失败。
@@ -281,6 +283,18 @@ func errScanTooLarge(fileCount int, totalBytes int64) *apperr.Error {
 // errUploadFailed 本地目录上传/建库失败，stage 指明失败阶段。
 func errUploadFailed(stage string, cause error) *apperr.Error {
 	e := apperr.New(CodeUploadFailed, http.StatusInternalServerError).WithArg("stage", stage)
+	if cause != nil {
+		e = e.WithCause(cause)
+	}
+	return e
+}
+
+// errUploadResumeUnavailable 指定的上传任务无法续跑（续传记录已失效 / 源目录已不存在）。
+//
+// 409 而不是 404：任务**还在**（就在列表里，用户刚点的是它），只是没法接着传了 ——
+// 前端据此提示"重新发起一次上传"，而不是"任务不存在"。
+func errUploadResumeUnavailable(cause error) *apperr.Error {
+	e := apperr.New(CodeUploadResumeUnavailable, http.StatusConflict)
 	if cause != nil {
 		e = e.WithCause(cause)
 	}

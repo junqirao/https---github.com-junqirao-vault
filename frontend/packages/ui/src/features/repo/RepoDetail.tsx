@@ -15,14 +15,7 @@ import type { ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
 import { pickMountUsage, repoUsageLoading, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { spacing } from '../../tokens/palette'
-import {
-  CAPACITY_UNIT,
-  capacityNormalize,
-  capacityValueProps,
-  formatBytes,
-  formatTime,
-  repoUsage
-} from '../../utils/format'
+import { formatTime, repoUsage } from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
@@ -43,8 +36,8 @@ interface EditValues {
   group?: string
   quota_bytes?: number
   max_diff_disks?: number
-  /** 共享磁盘限制：每块差异盘允许的容量（字节，表单按 M 录入）；0 = 不限制。 */
-  diff_disk_limit_bytes?: number
+  /** 说明备注：随母盘元数据一起迁移，换机器后「导入磁盘」能认出这是谁家的盘。 */
+  note?: string
 }
 
 const PARENT_ACTIONS: ParentAction[] = [
@@ -158,7 +151,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       name: target.name,
       group: target.group,
       max_diff_disks: target.max_diff_disks,
-      diff_disk_limit_bytes: target.diff_disk_limit_bytes
+      note: target.note
     })
     setError(null)
     setEditOpen(true)
@@ -240,6 +233,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                   <Descriptions.Item label={t('common.id')}>{repo?.id ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label={t('field.mode')}>{repo ? repoModeLabel(repo.mode) : '-'}</Descriptions.Item>
                   <Descriptions.Item label={t('field.group')}>{repo?.group || '-'}</Descriptions.Item>
+                  <Descriptions.Item label={t('field.note')} span={2}>
+                    {repo?.note || '-'}
+                  </Descriptions.Item>
                   <Descriptions.Item label={t('common.status')}>
                     {repo ? <StatusTag group="repo" value={repo.state} /> : '-'}
                   </Descriptions.Item>
@@ -259,16 +255,6 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                     </div>
                   </Descriptions.Item>
                   <Descriptions.Item label={t('field.maxDiffDisks')}>{repo?.max_diff_disks ?? '-'}</Descriptions.Item>
-                  {/* 共享磁盘限制 = 每块差异盘（每个共享者手里那块盘）允许的容量，也是它计入配额的
-                      量；0 表示不限制（按母盘容量整份记账）。独享库没有差异盘，不摆这一项 ——
-                      摆出来只会让人以为它在这个库上起了什么作用。 */}
-                  {repo?.mode === 'shared' ? (
-                    <Descriptions.Item label={t('field.diffDiskLimit')}>
-                      {repo.diff_disk_limit_bytes > 0
-                        ? formatBytes(repo.diff_disk_limit_bytes)
-                        : t('common.unlimited')}
-                    </Descriptions.Item>
-                  ) : null}
                   <Descriptions.Item label={t('common.createdAt')}>{formatTime(repo?.created_at)}</Descriptions.Item>
                 </Descriptions>
               </SectionCard>
@@ -322,28 +308,13 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
           <Form.Item name="group" label={t('field.group')}>
             <Input maxLength={64} />
           </Form.Item>
+          {/* 备注写在母盘旁边的元数据文件里跟着盘走：换服务端把 disks/ 拷过去后，
+              导入页面就能直接告诉管理员"这是财务的 Win10 母盘，别删"。 */}
+          <Form.Item name="note" label={t('field.note')} extra={t('repo.noteHint')}>
+            <Input.TextArea maxLength={512} rows={2} showCount />
+          </Form.Item>
           <Form.Item name="max_diff_disks" label={t('field.maxDiffDisks')}>
             <InputNumber min={0} style={{ width: '100%' }} />
-          </Form.Item>
-          {/* 共享磁盘限制：改了它，库里已有的差异盘会一起按新值重新记账（服务端同步刷新），
-              所以在这里改是"立刻生效"，不用等盘被回收重建。独享库没有差异盘，禁用。 */}
-          <Form.Item
-            name="diff_disk_limit_bytes"
-            label={t('field.diffDiskLimit')}
-            extra={
-              repo?.mode === 'exclusive'
-                ? t('repo.create.diffDiskLimitExclusive')
-                : t('repo.create.diffDiskLimitHint')
-            }
-            getValueProps={capacityValueProps}
-            normalize={capacityNormalize}
-          >
-            <InputNumber
-              min={0}
-              disabled={repo?.mode === 'exclusive'}
-              addonAfter={CAPACITY_UNIT}
-              style={{ width: '100%' }}
-            />
           </Form.Item>
         </Form>
       </Modal>

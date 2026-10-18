@@ -29,7 +29,12 @@ import (
 //	    0=按 size_bytes 计）。差异盘只装差异数据、实际写入很少，按母盘容量整份记账会把
 //	    用户配额吃光，因此记账口径独立于 size_bytes —— size_bytes 仍必须等于母盘容量，
 //	    客户端要靠它按容量匹配本地 iSCSI 盘（见 docs/implementation.md 5.17 共享磁盘限制）。
-const currentSchemaVersion = 7
+//	8 → 移除"共享磁盘限制"：那两列只是个记账口径，既改变不了差异盘的物理大小（虚拟容量
+//	    必须等于母盘），也不能限制单卷的物理增长（见 platform/linuxlvm 的 checkWatermark
+//	    注释），界面上却摆着一个看起来能限制的输入框。配额口径回到"按标称容量计"。
+//	    两列**保留**（不做 DROP COLUMN：方言差异 + 降级回旧版本会缺列），
+//	    本次迁移把存量值清零，代码不再读写。
+const currentSchemaVersion = 8
 
 // Migrate 建表并记录 schema 版本。
 //
@@ -79,6 +84,20 @@ func (s *Store) Migrate(ctx context.Context) error {
 		_ = tx.Rollback()
 		return err
 	}
+	// 版本 8 起"共享磁盘限制"已移除，配额口径回到 size_bytes（见 currentSchemaVersion 的
+	// 版本历史）。两列保留在表里但不再读写，这里把存量值清零 —— 留着旧值只会让排查的人
+	// 以为它还在起作用。
+	if applied < 8 {
+		for _, stmt := range []string{
+			`UPDATE repositories SET diff_disk_limit_bytes = 0 WHERE diff_disk_limit_bytes <> 0`,
+			`UPDATE disks SET accounted_bytes = 0 WHERE accounted_bytes <> 0`,
+		} {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("store: 清空已废弃的记账列失败: %w", err)
+			}
+		}
+	}
 	if _, err := tx.ExecContext(ctx,
 		tx.Rebind("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)"),
 		currentSchemaVersion, nowMillis()); err != nil {
@@ -87,6 +106,13 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: 提交迁移失败: %w", err)
+	}
+	if applied < 8 {
+		// 口径从 accounted_bytes 回到 size_bytes 后已用量必须立刻重算：不重算的话
+		// 界面上还是旧口径算出来的小值，要等下一轮对账才收敛（用户会看到"已用"自己往上跳）。
+		if _, err := s.RecomputeUsage(ctx); err != nil {
+			return err
+		}
 	}
 	return nil
 }

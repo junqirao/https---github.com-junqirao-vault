@@ -71,12 +71,6 @@ type CreateRepoInput struct {
 	SizeBytes int64
 	// MaxDiffDisks 差异盘上限；0 表示使用配置默认值。
 	MaxDiffDisks int
-	// DiffDiskLimitBytes 共享磁盘限制：本库每块差异盘**允许**的容量，
-	// 也是这块盘计入配额的量；0 表示不限制（沿用"等于母盘容量"的老口径）。
-	//
-	// 差异盘只装差异数据、实际写入很少，按母盘容量整份记账会把共享者的配额
-	// 一次吃光（见 domain.Repository.DiffDiskLimitBytes）。
-	DiffDiskLimitBytes int64
 	// QuotaBytes 应用层配额；0 表示不限。
 	QuotaBytes int64
 	// Group 分组标签，写入 meta.group。
@@ -98,9 +92,12 @@ type UpdateRepoInput struct {
 	Name         *string
 	QuotaBytes   *int64
 	MaxDiffDisks *int
-	// DiffDiskLimitBytes 共享磁盘限制；0 表示不限制。
-	DiffDiskLimitBytes *int64
-	Group              *string
+	Group        *string
+	// Note 说明备注（自由文本，可为空串表示清空）。
+	//
+	// 它同时会写进母盘的元数据 sidecar（见 app/diskmeta.go）：迁移到别的服务端后，
+	// "这是财务的 Win10 母盘，别删"这类信息只能靠它带过去。
+	Note *string
 }
 
 // AllocateInput 是创建分配的入参。
@@ -149,14 +146,6 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 		// 不设上限的话一次误填就能把服务端占住几十分钟。
 		return nil, nil, apperr.InvalidParam("max_diff_disks")
 	}
-	// 共享磁盘限制：负数没有含义（0 本身就是"不限制"）。
-	//
-	// 不校验"必须 ≤ 库容量"：容量在创建这会可能还没定（按源目录自动算），而且填得比容量还大
-	// 本来就等于"不限制"，按容量夹住即可（见 diffDiskAccountedBytes），没必要为它拒一次建库。
-	if in.DiffDiskLimitBytes < 0 {
-		return nil, nil, apperr.InvalidParam("diff_disk_limit_bytes")
-	}
-	limit := limitForMode(in.Mode, in.DiffDiskLimitBytes)
 	if in.Mode != domain.RepoModeShared {
 		// 独享模式没有差异盘，"共享数量"无意义；静默归零而不是报错（老客户端仍会带这个字段）。
 		share = 0
@@ -245,14 +234,13 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 		}
 
 		r := &domain.Repository{
-			Name:               name,
-			Mode:               in.Mode,
-			OwnerID:            ownerID,
-			MaxDiffDisks:       maxDiff,
-			DiffDiskLimitBytes: limit,
-			QuotaBytes:         in.QuotaBytes,
-			State:              state,
-			Meta:               meta,
+			Name:         name,
+			Mode:         in.Mode,
+			OwnerID:      ownerID,
+			MaxDiffDisks: maxDiff,
+			QuotaBytes:   in.QuotaBytes,
+			State:        state,
+			Meta:         meta,
 		}
 		if in.Mode == domain.RepoModeShared {
 			cond := domain.ParentIdle
@@ -363,19 +351,12 @@ func (s *RepoService) Update(ctx context.Context, id string, in UpdateRepoInput)
 			}
 			r.MaxDiffDisks = *in.MaxDiffDisks
 		}
-		if in.DiffDiskLimitBytes != nil {
-			if *in.DiffDiskLimitBytes < 0 {
-				return apperr.InvalidParam("diff_disk_limit_bytes")
-			}
-			r.DiffDiskLimitBytes = *in.DiffDiskLimitBytes
-			// 账是按各盘自己的 accounted_bytes 算的，所以改完限制必须把库里所有差异盘一起刷：
-			// 不刷的话老盘仍按旧值占配额，用户改完限制界面上一点变化都看不到。
-			if err := tx.SyncRepoDiffDiskAccounting(ctx, r.ID, r.DiffDiskLimitBytes); err != nil {
-				return err
-			}
-		}
 		if in.Group != nil {
 			r.Meta.Group = strings.TrimSpace(*in.Group)
+		}
+		if in.Note != nil {
+			// 说明备注存在 RepoMeta 里，并且会跟着母盘的 sidecar 一起迁移（见 diskmeta.go）。
+			r.Meta.Note = strings.TrimSpace(*in.Note)
 		}
 		if err := tx.UpdateRepository(ctx, r); err != nil {
 			return err
@@ -392,6 +373,8 @@ func (s *RepoService) Update(ctx context.Context, id string, in UpdateRepoInput)
 	if updated, err := s.Store.GetRepository(ctx, id); err == nil {
 		out = updated
 	}
+	// 名称/分组/备注都写在母盘的 sidecar 上（迁移后靠它认人），改完必须同步过去。
+	s.refreshRepoMeta(ctx, out)
 	s.audit(ctx, "", "repo.update", "repo:"+id, "", domain.AuditResultOK)
 	return out, nil
 }
@@ -631,39 +614,6 @@ func (s *RepoService) PermFor(ctx context.Context, repo *domain.Repository, user
 	return m.Perm, nil
 }
 
-// accountedCapacity 返回一块盘计入配额的容量：盘上有 accounted_bytes 就用它，否则用标称容量。
-//
-// ⚠️ 必须与 store.accountedUsageSQL 的口径逐字一致：这里算出来的数会立刻加进 used_bytes，
-// 几秒后对账又用那条 SQL 重算一遍，两边不一致账就会来回漂（用户看到已用自己往上跳）。
-func accountedCapacity(sizeBytes, accountedBytes int64) int64 {
-	if accountedBytes > 0 {
-		return accountedBytes
-	}
-	return sizeBytes
-}
-
-// limitForMode 把共享磁盘限制归一到"这个模式下真正有意义"的值：独享库没有差异盘，
-// 留着它只会让人以为在起作用（详情页会把这个配置显示出来），所以一律归零。
-func limitForMode(mode domain.RepoMode, limit int64) int64 {
-	if mode != domain.RepoModeShared || limit < 0 {
-		return 0
-	}
-	return limit
-}
-
-// diffDiskAccountedBytes 返回派生出的一块差异盘该记的 accounted_bytes：
-// 库配了"共享磁盘限制"（>0）就按限制值，否则 0（表示按标称容量 = 母盘容量计）。
-//
-// 限制值不小于母盘容量时同样返回 0：差异盘再涨也涨不过母盘容量，此时"限制"与"不限制"
-// 是同一件事；留 0 还能避免记出一个比这块盘本身还大的账。
-func diffDiskAccountedBytes(repo *domain.Repository, parentSize int64) int64 {
-	limit := repo.DiffDiskLimitBytes
-	if limit <= 0 || limit >= parentSize {
-		return 0
-	}
-	return limit
-}
-
 // Allocate 创建分配。共享模式创建差异盘（异步），独享模式复用已有单盘。
 //
 // 本方法只落库 + 提交任务，耗时操作全部交给 Job。
@@ -848,10 +798,9 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			}
 			// 版本必须与母盘一致：母盘做过维护（版本 +1）后，旧版本的池位盘不能复用。
 			if idle != nil && idle.ParentVersion == repo.ParentVersion {
-				// 用量口径：池位盘被分出去就按它自己的**记账容量**计费 —— 池位盘在建库时就按
-				// 当时的共享磁盘限制写好了 accounted_bytes，所以这里与派生路径、对账三者一致
-				// （见 store.accountedUsageSQL）。
-				need := accountedCapacity(idle.SizeBytes, idle.AccountedBytes)
+				// 用量口径：池位盘被分出去就按它的标称容量计费（与派生路径、对账三者一致，
+				// 见 store.accountedUsageSQL）。
+				need := idle.SizeBytes
 				if err := checkQuota(repo.QuotaBytes, repo.UsedBytes, need); err != nil {
 					return err
 				}
@@ -900,10 +849,9 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			return err
 		}
 
-		// 配额：按这块差异盘的**记账容量**计费（共享磁盘限制，见 diffDiskAccountedBytes），
-		// 建盘期间就已经计上，防止并发分配在同一瞬间超卖。
-		accounted := diffDiskAccountedBytes(repo, parent.SizeBytes)
-		need := accountedCapacity(parent.SizeBytes, accounted)
+		// 配额：按差异盘的标称容量（= 母盘容量）计费，建盘期间就已经计上，
+		// 防止并发分配在同一瞬间超卖。
+		need := parent.SizeBytes
 		if err := checkQuota(repo.QuotaBytes, repo.UsedBytes, need); err != nil {
 			return err
 		}
@@ -935,11 +883,8 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			ParentID:      &parent.ID,
 			ParentVersion: repo.ParentVersion,
 			SizeBytes:     parent.SizeBytes,
-			// 记账容量与 size_bytes 分开：size_bytes 必须是母盘容量（客户端按容量匹配本地盘），
-			// 而配额按共享磁盘限制算（见 domain.Disk.AccountedBytes）。
-			AccountedBytes: accounted,
-			VHDType:        domain.VHDTypeDifferencing,
-			State:          domain.DiskStateCreating,
+			VHDType:       domain.VHDTypeDifferencing,
+			State:         domain.DiskStateCreating,
 			// 差异盘是母盘的快照，分区表与文件系统都继承自母盘，标记必须跟着母盘走。
 			FileSystem: parent.FileSystemOrDefault(),
 		}
@@ -1273,6 +1218,9 @@ func (s *RepoService) TransitionParent(ctx context.Context, repoID string, actio
 		if err := s.refreshParentFingerprint(ctx, repo); err != nil {
 			s.Log.Warn("重算母盘指纹失败", "repo_id", repo.ID, "error", err)
 		}
+		// 母盘内容变了（版本 +1）→ 盘上的元数据标签也要跟上：迁移回来的库若带着
+		// 过期的 parent_version，判别"这个差异盘属于哪一代母盘"就没有依据（见 diskmeta.go）。
+		s.refreshRepoMeta(ctx, repo)
 	default:
 		if err := s.Store.SetParentCondition(ctx, repo.ID, to, false); err != nil {
 			return err
@@ -1388,6 +1336,38 @@ func (s *RepoService) stopTempShare(ctx context.Context, repo *domain.Repository
 	}
 	s.Log.Info("已撤销母盘临时共享", "repo_id", repo.ID, "operator", operatorID)
 	return nil
+}
+
+// refreshRepoMeta 重写该库磁盘上的元数据 sidecar（库名称/分组/备注或母盘版本变化后调用）。
+//
+// 两个调用点：母盘维护完成（版本 +1）与编辑存储库（改名/改备注）。
+// 两处都必须调 —— 否则盘上的标签会一直停留在旧值，迁移过去看到的是"上一个名字"。
+//
+// 必须**重新查一次库**：调用点手里的 repo 是变更之前取的对象（ParentVersion 还是旧值、
+// Name 还是旧名），照它写 sidecar 等于把陈旧值贴到盘上。
+// 失败只告警：sidecar 只影响迁移时的可读性，不影响维护/编辑本身是否成功。
+func (s *RepoService) refreshRepoMeta(ctx context.Context, repo *domain.Repository) {
+	if repo == nil || s.Disk == nil {
+		return
+	}
+	if fresh, err := s.Store.GetRepository(ctx, repo.ID); err == nil {
+		repo = fresh
+	}
+	disks, err := s.Store.ListDisksByRepo(ctx, repo.ID)
+	if err != nil {
+		s.Log.Warn("更新库元数据时列出磁盘失败，跳过更新元数据文件", "repo_id", repo.ID, "error", err)
+		return
+	}
+	for i := range disks {
+		d := &disks[i]
+		// 只给"独立存在的盘"贴标签：差异盘属于一次分配，迁移时不该被单独认领
+		// （见 DiskImportKindDiff），它的 sidecar 也就没有意义。
+		if d.Kind == domain.DiskKindDiff || !s.Disk.Exists(d.VHDXPath) {
+			continue
+		}
+		// src 传 nil：这些变更都没有改变盘的来历，沿用 sidecar 里原有的源信息。
+		writeDiskMetaForDisk(s.Log, repo, d, nil)
+	}
 }
 
 // refreshParentFingerprint 重算并写回母盘内容指纹。

@@ -615,13 +615,16 @@ POST /agent/fs/scan
   # 不返回完整文件清单（可能几十万条；清单只在代理内部使用）。
 
 POST /agent/uploads/start
-  ↓ {local_dir, repo_name, repo_mode?, storage_id?, quota_bytes?, source_mode?,
-     server_key?, server_url?}
+  ↓ {local_dir, repo_name, repo_mode?, storage_id?, quota_bytes?, max_diff_disks?,
+     source_mode?, server_key?, server_url?}
   ↑ 202 {upload:UploadState}
   # local_dir 必须是非空绝对路径且存在、是目录。
   # repo_mode："shared"（默认）| "exclusive"。
   # storage_id 省略时由服务端按可用空间自动选根；给定时校验该存储存在且启用。
   # quota_bytes 省略/0 表示不限。
+  # max_diff_disks 共享数量（差异盘上限）：省略/0 表示用户没填，由服务端回退配置默认值。
+  # 这些建库选项都随上传会话清单持久化、建库时写进库配置；断线续传/重启恢复时按续传记录原样带回
+  # （缺一项就等于把用户填的配置静默丢掉，见 uploadResumeRecord）。
   # source_mode："copy"（默认）| "move"；move 仅在建库成功后删除本地源目录。
   # server_key / server_url 指明把库建到**哪台**服务端；都省略时按主服务端兜底（老客户端）。
   # 存储 ID 只对"它所属的那台服务端"有意义：给了标识却匹配不上 → 404 agent.server_unknown。
@@ -672,7 +675,15 @@ UploadState = {
 
 - **顺序**：扫描（生成 manifest，按相对路径升序排序，该顺序即字节流顺序）
   → `POST /v1/uploads` 建会话 → 按 `missing_chunks` 并发 4 路 PUT → `POST /complete`
-  → 轮询 `GET /v1/jobs/{id}` 直到终态 → 成功则按名称反查 `repo_id`。
+  → 等建库任务到终态（进度靠事件推送，必要时查 `GET /v1/jobs/{id}`）→ 成功则按名称反查 `repo_id`。
+- **建库进度靠事件推送，不轮询**：`POST /complete` 之后的建库（拷入虚拟盘）动辄几分钟到几十分钟，
+  代理**不再每 2 秒查一次** `GET /v1/jobs/{id}`（那会让服务端访问日志被同一件事的流水刷满）。
+  服务端进度变化时经已有的 SSE 长连接推 `event: job`
+  （`{job_id, type, ref_id, state, progress}`，见 `cmd/vault-server/main.go` 的 `jobs.OnProgress`），
+  代理按 `job_id` 分发给正在等这个任务的调用方（`internal/agent/sse.go` 的 `jobWatch`）。
+  查询只在两处发生：**进入等待时查一次**（事件是变化驱动的，不查就只能一直显示 0%），
+  以及**事件沉默超过 30s 时兜底查一次**（多实例、断线重连漏事件、服务端不支持该事件时够用）；
+  收到终态事件后再查一次以取回权威对象（失败原因、摘要）。
 - **分块**：从本地文件按**全局偏移量**读取 `[index*8MiB, min(...))` 区间拼成一个 8MiB 缓冲
   （可跨多个文件，用 `sync.Pool` 复用），计算 SHA256（小写 hex）后 PUT；请求头 `X-Chunk-SHA256` 必填，
   除最后一块外必须恰好 8MiB。
@@ -852,12 +863,23 @@ GET /agent/events
      event: heartbeat   data: {at, allocation_id, server_key}  # 可用于界面上展示"在线"
      event: download    data: DownloadState              # 磁盘下载进度/开始/完成/失败/取消
      event: upload      data: UploadState                # 本地目录上传建库进度/开始/完成/失败/取消
-```
+     event: job         data: {job_id, type, ref_id, state, progress}
+                       # **服务端**任务进度/终态（装依赖、建库…），由代理从服务端 SSE
+                       # （GET /v1/system/events，topic job）原样转发。按 job_id 归属：
+                       # 同一时刻可能有别的客户端在跑任务，界面必须自己筛选。
+                       # 存在意义：界面过去靠每 1.5s 轮询 GET /v1/jobs/{id} 拿进度，
+                       # 服务端访问日志被同一件事刷满；进度是变化驱动的，没变化一条都不发。
+                       # ⚠️ 尽力而为：代理缓冲满会丢、代理与服务端断链期间完全没有，
+                       # 因此订阅方必须能兜底查一次（前端见 hooks/useJobProgress）。
+     ```
 
-进度类事件（`update` / `web_update` / `download` / `upload`）统一按"有时间闸门"节流：
-**最快每 200ms 推一次，且距上次推送 ≥500ms 必推**（慢速传输也有心跳式更新），
-位于两者之间时需累计新增 ≥1MiB 才推。每个订阅者缓冲 256 条，满时丢弃**最旧**的一条
-（保留最新进度比保留全部历史更重要），发布方绝不阻塞。
+     进度类事件（`update` / `web_update` / `download` / `upload`）统一按"有时间闸门"节流：
+     **最快每 200ms 推一次，且距上次推送 ≥500ms 必推**（慢速传输也有心跳式更新），
+     位于两者之间时需累计新增 ≥1MiB 才推。每个订阅者缓冲 256 条，满时丢弃**最旧**的一条
+     （保留最新进度比保留全部历史更重要），发布方绝不阻塞。
+
+     `job` 不在这一组里：它的节流发生在**服务端**（写库成功后按变化推一次，见
+     internal/job/worker.go 的 ReporterFunc），代理只是转发，不做二次节流。
 
 ## 服务端连通性测试（供"修改服务端地址"用）
 
@@ -989,6 +1011,6 @@ POST /agent/shutdown       ↑ {ok:true}   # 托盘"退出"使用；代理会先
 | `agent.scan_empty` | 本地目录为空（没有可上传的常规文件）（409） |
 | `agent.scan_too_large` | 本地目录超出扫描上限（413，args.file_count / args.total_bytes / args.max_files / args.max_bytes） |
 | `agent.upload_failed` | 本地目录上传建库失败（500，args.stage 指明阶段，如 read_local / attempts_exhausted / job） |
-| `system.invalid_param` | 参数非法（400，args.field 指明字段，如 target_dir / file_name / default_download_dir / download_connections / path / local_dir / repo_name / repo_mode / source_mode / quota_bytes） |
+| `system.invalid_param` | 参数非法（400，args.field 指明字段，如 target_dir / file_name / default_download_dir / download_connections / path / local_dir / repo_name / repo_mode / source_mode / quota_bytes / max_diff_disks） |
 | `disk.not_found` | 磁盘不存在（404，来自服务端，会原样透传到 `DownloadState.error`） |
 | `disk.not_parent` | 该磁盘不是母盘，不支持内容下载（409，来自服务端） |

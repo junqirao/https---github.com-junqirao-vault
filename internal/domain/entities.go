@@ -123,6 +123,12 @@ type RepoMeta struct {
 	Group string `json:"group,omitempty"`
 	// ClientConfig 面向客户端的附加配置。
 	ClientConfig map[string]any `json:"client_config,omitempty"`
+	// Note 说明备注（自由文本）。
+	//
+	// 存在的意义是**迁移**：母盘搬到另一台服务端后，"这是财务的 Win10 母盘，别删"
+	// 这类信息只能靠人写下来。它随母盘的 sidecar（见 app/diskmeta.go）一起走，
+	// 导入时原样恢复，所以放在这里而不是另开一列（无需为文本框做双库迁移）。
+	Note string `json:"note,omitempty"`
 
 	// Pool 标记该库是"池化共享库"：建库时已按 MaxDiffDisks（共享数量）预创建了差异盘池。
 	//
@@ -190,18 +196,6 @@ type Repository struct {
 	// 之后每个分配占用池中的一块。两者合并成一个字段，避免"预创建 5 个但上限 3 个"
 	// 这类自相矛盾的配置。
 	MaxDiffDisks int `db:"max_diff_disks" json:"max_diff_disks"`
-	// DiffDiskLimitBytes 共享磁盘限制：本库派生出来的每一块差异盘**允许**的容量，
-	// 也是它计入配额的量。0=不限制，即沿用"等于母盘容量"的老口径。
-	//
-	// 为什么需要它：差异盘只装"相对母盘的差异"，实际写入往往只有几十兆，
-	// 但按母盘容量整份记账会把共享者的配额一次吃光（30G 的库分给 5 个人 =
-	// 每人扣 30G）。给一个够用的小值，配额就只按这个小值占。
-	//
-	// ⚠️ 它**不改变**差异盘的实际大小：VHDX 差异盘的最大尺寸必须等于父盘，
-	// Linux thin snapshot 也不能指定小于 origin 的 virtualsize（见
-	// platform/linuxlvm/thin.go 的 CreateDiff 注释）。所以这是一个"允许多少"的
-	// 记账与准入口径，不是物理限额；盘挂出去仍然是母盘那么大的卷。
-	DiffDiskLimitBytes int64 `db:"diff_disk_limit_bytes" json:"diff_disk_limit_bytes"`
 	// QuotaBytes 应用层配额（母盘占用由 owner 独担，见 docs/implementation.md 13.2-⑧）。
 	//
 	// 存量老数据的兼容字段：新建库已经不再写它（界面也不再收集，见 RepoService.Create
@@ -262,11 +256,6 @@ type Disk struct {
 	// ⚠️ 差异盘上它必须等于母盘容量（客户端按容量匹配本地 iSCSI 盘，
 	// 见 agent 的 DiskSizeBytes），**不要**拿它当"这块共享盘允许用多少"。
 	SizeBytes int64 `db:"size_bytes" json:"size_bytes"`
-	// AccountedBytes 该盘计入配额的容量；0=按 SizeBytes 计。
-	//
-	// 差异盘专用：共享库设了共享磁盘限制时写在这里（见 Repository.DiffDiskLimitBytes），
-	// SizeBytes 仍是母盘容量（客户端要靠它匹配盘），而配额按这个小值算。
-	AccountedBytes int64 `db:"accounted_bytes" json:"accounted_bytes"`
 	// PhysicalBytes 实际占用，由监控任务定期采样。
 	PhysicalBytes int64     `db:"physical_bytes" json:"physical_bytes"`
 	VHDType       VHDType   `db:"vhd_type" json:"vhd_type"`

@@ -28,12 +28,12 @@ type MountSpec struct {
 	ServerName       string `json:"server_name"`
 	// RepoName 存储库名称：客户端用它命名挂载点（盘符模式的卷标、目录模式的目录名，
 	// 见 docs 3.4.5 与客户端 mountAt）。服务端是库名的权威来源，随参数一并下发。
-	RepoName  string `json:"repo_name,omitempty"`
-	TargetIQN string `json:"target_iqn"`
-	PortalAddress    string `json:"portal_address"`
-	PortalPort       int    `json:"portal_port"`
-	AuthMode         string `json:"auth_mode"`
-	ChapUser         string `json:"chap_user,omitempty"`
+	RepoName      string `json:"repo_name,omitempty"`
+	TargetIQN     string `json:"target_iqn"`
+	PortalAddress string `json:"portal_address"`
+	PortalPort    int    `json:"portal_port"`
+	AuthMode      string `json:"auth_mode"`
+	ChapUser      string `json:"chap_user,omitempty"`
 	// ChapSecret 仅本次下发，不落盘到客户端配置。
 	ChapSecret       string `json:"chap_secret,omitempty"`
 	DiskSizeBytes    int64  `json:"disk_size_bytes"`

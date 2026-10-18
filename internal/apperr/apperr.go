@@ -218,6 +218,21 @@ func OrphanDeleteFailed() *Error {
 	return New("system.orphan_delete_failed", http.StatusInternalServerError)
 }
 
+// ---- system：导入已有磁盘（把 disks/ 下已存在的 .vhdx 原地接管为存储库，见 app/diskimport.go）----
+
+// DiskImportEmpty 没有选择任何要导入的磁盘。
+func DiskImportEmpty() *Error {
+	return New("system.disk_import_empty", http.StatusBadRequest)
+}
+
+// DiskImportOwnerInvalid 指定的归属用户不存在或已停用。
+//
+// 单独一个码而不是 InvalidParam：这是"选了个人但这个人不能用"，
+// 界面要提示的是"换一个归属用户"，与字段格式错误是两回事。
+func DiskImportOwnerInvalid() *Error {
+	return New("system.disk_import_owner_invalid", http.StatusBadRequest)
+}
+
 // ---- platform ----
 
 // PlatformUnsupported 当前平台后端不具备该能力（如 Windows 上的 LVM 池管理）。

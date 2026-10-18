@@ -4,7 +4,7 @@
  * 严格对齐 docs/agent-api.md（v1 契约），字段名沿用下划线风格。
  * **绝不包含** lease 的 CHAP 密钥与会话令牌。
  */
-import type { Role } from './types'
+import type { JobState, Role } from './types'
 
 export type AgentMountMode = 'letter' | 'directory'
 export type AgentMountStatus = 'mounting' | 'mounted' | 'unmounting' | 'error' | 'revoked'
@@ -774,12 +774,12 @@ export interface StartUploadInput {
   storage_id?: string
   quota_bytes?: number
   /**
-   * 共享磁盘限制：建出来的库每块差异盘允许的容量（字节）；省略/0 表示不限制。
+   * 共享数量（差异盘上限）；省略/0 表示用户没填，由服务端回退配置默认值。
    *
-   * 服务端会把它随上传会话的清单一起存下来（见 uploadManifestRecord），上传结束建库时生效 ——
-   * 所以上传建库这条路径也能带上它，不必等服务端建完库再进详情页改。
+   * 随上传会话的清单存下来，建库时生效 —— 不传的话这条路径建出来的库会静默用配置默认值
+   * （默认 50），用户在同一个表单里填的数字被丢掉（真实反馈："设置共享数量大于0时会变成50"）。
    */
-  diff_disk_limit_bytes?: number
+  max_diff_disks?: number
   source_mode: 'copy' | 'move'
   /**
    * 把库建到**哪台**服务端（二选一即可）。
@@ -789,6 +789,33 @@ export interface StartUploadInput {
    */
   server_key?: string
   server_url?: string
+}
+
+/**
+ * 服务端任务进度（本地事件流 `event: job` 的载荷）。
+ *
+ * 与挂载阶段同源：服务端的任务推进时经 SSE（`GET /v1/system/events`，topic `job`）推给代理，
+ * 代理原样转发给渲染层（见 internal/agent/sse.go 的 localJobEventType）。
+ *
+ * 为什么要它：界面过去靠**每 1.5s 轮询** `GET /v1/jobs/{id}` 拿"一键安装系统依赖"这类任务的
+ * 进度，每次都在服务端访问日志里留一行（真实反馈："上传时会因为客户端拉上传状态而刷屏服务
+ * 日志"——同一类问题）。进度是**变化驱动**的：没变化一条都不发。
+ *
+ * ⚠️ 与 `JobDTO`（`GET /v1/jobs/{id}`）只差主键名：事件里是 `job_id`（服务端事件契约），
+ * DTO 里是 `id`。其余字段同义，因此两边可以按"同一件事"合并显示。
+ *
+ * 事件是**尽力而为**的：代理侧缓冲满会丢、代理与服务端断链期间什么都收不到。所以订阅方
+ * 不能假设一定收到终态事件，必须自带兜底查询（见 hooks/useJobProgress）。
+ */
+export interface AgentJobState {
+  job_id: string
+  /** 任务类型（install_deps / upload_complete …），旧版服务端可能不带。 */
+  type?: string
+  /** 任务指向的对象（如存储库 ID），旧版服务端可能不带。 */
+  ref_id?: string
+  state: JobState
+  /** 0~100。 */
+  progress: number
 }
 
 /** 事件流（GET /agent/events）解析结果。 */
@@ -818,4 +845,11 @@ export type AgentEvent =
   | { type: 'web_update'; web_update: WebUpdateState }
   | { type: 'download'; download: DownloadState }
   | { type: 'upload'; upload: UploadState }
+  /**
+   * 服务端任务进度（建库、装依赖等）。
+   *
+   * 一条事件只更新 `job_id` 那一个任务：同一时刻可能有别的客户端在跑建库任务，界面必须
+   * 自己按 job_id 筛选（见 useAgent 的 jobs 快照与 useJobProgress）。
+   */
+  | { type: 'job'; job: AgentJobState }
   | { type: 'heartbeat'; at: number; allocation_id?: string; server_key?: string }

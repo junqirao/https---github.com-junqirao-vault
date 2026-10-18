@@ -255,12 +255,12 @@ func TestDeletePoolRejectsBadInput(t *testing.T) {
 // TestVolumeOnPool：判据本身（哪个卷会被这次删除带走）单独钉一遍。
 func TestVolumeOnPool(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		poolRef   string
-		ref       string
-		vg        string
-		thinPool  string
-		want      bool
+		name     string
+		poolRef  string
+		ref      string
+		vg       string
+		thinPool string
+		want     bool
 	}{
 		{"目标池上的卷", "vg1/pool1", "/dev/mapper/vg1-pool1_a", "vg1", "pool1", true},
 		{"同 VG 别的池的卷", "vg1/pool2", "/dev/mapper/vg1-pool2_a", "vg1", "pool1", false},

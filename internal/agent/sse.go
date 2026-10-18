@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -244,6 +245,110 @@ func (a *Agent) runServerEvents(ctx context.Context, key string) {
 // 并由 mount_phase_test.go 的合约测试钉住。
 const serverMountEventType = "mount"
 
+// serverJobEventType 是服务端**任务事件**的 SSE 事件名（即 topic）。
+//
+// 与 cmd/vault-server/main.go 里 jobs.OnProgress / jobs.OnFinished 用的 topic 同名（"job"），
+// 两者形状一致（job_id/type/ref_id/state/progress）；同样是跨进程的线上契约，改要两端一起改。
+const serverJobEventType = "job"
+
+// jobEventBuffer 是单个订阅者的进度事件缓冲：装得下"突发几条"就够 —— 满了宁可丢，
+// 也不能阻塞事件流读取（见 jobWatch 的注释）。
+const jobEventBuffer = 8
+
+// localJobEventType 是推给**渲染层**的任务事件名（本地事件流 GET /agent/events 的 topic）。
+//
+// 与服务端的 serverJobEventType 同名（都是 "job"）但用途不同：那条是代理↔服务端的线上契约，
+// 这条是代理↔界面的本地契约。刻意同名 + 同形状，是为了让"同一件事"在两侧长得一样，
+// 边界（主进程转发、渲染层解析）不需要再翻译一次。
+const localJobEventType = "job"
+
+// jobEvent 是任务事件在两个方向上的共同形状（服务端推来的 data，也就是转发给界面的 data）。
+//
+// 字段名沿用服务端那一版（job_id 而不是 serverJob 的 id）：这个形状是**线上契约**，
+// 不是内部 DTO —— 由 job_event_test.go 钉住。
+type jobEvent struct {
+	JobID    string `json:"job_id"`
+	Type     string `json:"type"`
+	RefID    string `json:"ref_id"`
+	State    string `json:"state"`
+	Progress int    `json:"progress"`
+}
+
+// jobWatch 是"服务端建库任务进度"的订阅中心。
+//
+// 为什么需要它：建库（JobUploadComplete）动辄几分钟到几十分钟，而进度过去靠代理**每 2 秒**
+// 轮询一次 GET /v1/jobs/{id} —— 服务端访问日志因此被同一件事的流水刷满（真实反馈："上传时
+// 会因为客户端拉上传状态而刷屏服务日志"）。服务端本来就在推 job 事件，代理接住即可：进度
+// 有变化才推送，没变化一条请求都不发。
+//
+// 投递是**尽力而为**的（订阅通道满了就丢掉这一条）：进度是幂等快照，丢一条只会晚一次刷新，
+// 而阻塞在这里会拖住整条事件流读取协程 —— 那代价大得多。因此订阅方必须自带兜底查询
+// （见 waitUploadJob），丢事件不会让等待方卡死。
+//
+// 所有方法都对 nil 接收者安全：零值 Agent（测试里常见）不会因此 panic，只是退化为纯兜底轮询。
+type jobWatch struct {
+	mu   sync.Mutex
+	subs map[string]map[int]chan serverJob
+	next int
+}
+
+// newJobWatch 构造订阅中心。
+func newJobWatch() *jobWatch {
+	return &jobWatch{subs: make(map[string]map[int]chan serverJob)}
+}
+
+// subscribe 订阅某个任务的事件，返回订阅 ID（交给 unsubscribe）与接收通道。
+func (w *jobWatch) subscribe(jobID string) (int, <-chan serverJob) {
+	if w == nil || strings.TrimSpace(jobID) == "" {
+		return 0, nil
+	}
+	ch := make(chan serverJob, jobEventBuffer)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.subs == nil {
+		w.subs = make(map[string]map[int]chan serverJob)
+	}
+	w.next++
+	id := w.next
+	if w.subs[jobID] == nil {
+		w.subs[jobID] = make(map[int]chan serverJob)
+	}
+	w.subs[jobID][id] = ch
+	return id, ch
+}
+
+// unsubscribe 退订（幂等）。
+func (w *jobWatch) unsubscribe(jobID string, id int) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	subs := w.subs[jobID]
+	if subs == nil {
+		return
+	}
+	delete(subs, id)
+	if len(subs) == 0 {
+		delete(w.subs, jobID)
+	}
+}
+
+// publish 把一条任务事件投给该任务的订阅者（尽力而为，见类型注释）。
+func (w *jobWatch) publish(j serverJob) {
+	if w == nil || strings.TrimSpace(j.ID) == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, ch := range w.subs[j.ID] {
+		select {
+		case ch <- j:
+		default:
+		}
+	}
+}
+
 // handleServerEvent 处理某台服务端发来的单条事件。
 //
 // key 是事件来源服务端：分配 ID 全局唯一（UUID），因此这里不需要按来源过滤，只用它做日志与事件
@@ -292,8 +397,33 @@ func (a *Agent) handleServerEvent(key, eventType string, data json.RawMessage) {
 		// setPhase 只对"本机正处于 mounting"的分配生效：其它客户端的挂载、已经结束或
 		// 从未开始的挂载都会被忽略，不会凭空造出一条状态。
 		a.engine.setPhase(allocationID, phase)
+	case serverJobEventType:
+		// 任务的进度/终态（见 job.Worker.OnProgress / OnFinished）走两条路：
+		//   ① 交给正在等这个任务的订阅者（waitUploadJob，上传建库用）；
+		//   ② 原样广播给渲染层（本地事件流 event: job），替代界面过去的 1.5s 轮询。
+		//
+		// 这是"上传/装依赖时不再刷屏服务端日志"的关键一环：进度变化由服务端推来，代理与界面
+		// 都不必再定时轮询 GET /v1/jobs/{id}。
+		var payload jobEvent
+		_ = json.Unmarshal(data, &payload)
+		jobID := strings.TrimSpace(payload.JobID)
+		if jobID == "" {
+			// 没有 job_id 就不知道是谁的任务，投给谁都是错的。
+			return
+		}
+		payload.JobID = jobID
+		payload.State = strings.TrimSpace(payload.State)
+		a.jobWatch.publish(serverJob{
+			ID:       payload.JobID,
+			Type:     payload.Type,
+			RefID:    payload.RefID,
+			State:    payload.State,
+			Progress: payload.Progress,
+		})
+		// 尽力而为：渲染层没订阅或缓冲满时丢弃（见 EventHub）。
+		a.hub.Publish(Event{Type: localJobEventType, Data: payload})
 	default:
-		// 其余事件（任务进度、租约变更等）对代理无动作需求：权威状态以心跳与显式查询为准。
+		// 其余事件（租约变更等）对代理无动作需求：权威状态以心跳与显式查询为准。
 		a.logger.Debug("忽略服务端事件", "type", eventType)
 	}
 }

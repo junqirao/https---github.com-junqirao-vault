@@ -30,8 +30,16 @@ const (
 	uploadChunkConcurrency = 4
 	// uploadMaxAttempts 单块最大尝试次数（含首次）。
 	uploadMaxAttempts = 5
-	// uploadJobPollInterval 建库任务轮询间隔。
-	uploadJobPollInterval = 2 * time.Second
+	// uploadJobFallbackInterval 建库任务状态的**兜底**查询间隔。
+	//
+	// 进度以服务端推来的 SSE 事件为准（见 jobWatch 与 sse.go 的 job 分支）：进度变化才推送，
+	// 没变化一条请求都不发 —— 这治的正是"上传时客户端每 2 秒拉一次状态、把服务端访问日志刷满"
+	// （真实反馈）。这条定时查询只负责兜底：多实例部署（事件是进程内广播，未必收得到）、
+	// 事件流断线重连漏事件、服务端版本不支持 job 事件。
+	//
+	// 取 30 秒：最坏情况下界面进度每 30 秒才动一次、终态最多晚 30 秒被发现，换来日志噪音
+	// 降到原来的 1/15。事件通道正常时它根本不触发（见 waitUploadJob 的沉默判定）。
+	uploadJobFallbackInterval = 30 * time.Second
 	// uploadChunkTimeout 单次分块 PUT 的超时（8MiB 在慢链路上可能较久）。
 	uploadChunkTimeout = 5 * time.Minute
 	// uploadsFileName 续传记录文件名（位于代理数据目录）。
@@ -77,21 +85,21 @@ const (
 
 // UploadState 是单个"本地目录 → 存储库"上传任务的状态（对外契约类型）。
 type UploadState struct {
-	UploadID      string `json:"upload_id"`
-	RepoName      string `json:"repo_name"`
-	LocalDir      string `json:"local_dir"`
-	State         string `json:"state"`
+	UploadID string `json:"upload_id"`
+	RepoName string `json:"repo_name"`
+	LocalDir string `json:"local_dir"`
+	State    string `json:"state"`
 	// Paused 为 true 表示用户把这个上传暂停了（State 不变，仍是 uploading）。
 	//
 	// 为什么不把暂停做成一个 UploadStatus 取值：暂停说的是"任务还在，只是停住了"，阶段
 	// 并没有变。把它塞进 State，每一个读 State 的地方（是否进行中、能否取消、标签文案）
 	// 都得多认一个取值，而它们要的答案一个字都没变。
-	Paused     bool `json:"paused,omitempty"`
-	TotalFiles int  `json:"total_files"`
-	TotalBytes    int64  `json:"total_bytes"`
-	UploadedBytes int64  `json:"uploaded_bytes"`
-	ChunkTotal    int    `json:"chunk_total"`
-	ChunkDone     int    `json:"chunk_done"`
+	Paused        bool  `json:"paused,omitempty"`
+	TotalFiles    int   `json:"total_files"`
+	TotalBytes    int64 `json:"total_bytes"`
+	UploadedBytes int64 `json:"uploaded_bytes"`
+	ChunkTotal    int   `json:"chunk_total"`
+	ChunkDone     int   `json:"chunk_done"`
 	// FilesTotal / FilesDone 是"已逐个校验通过的文件"进度（M 与 N）。
 	//
 	// 为什么在字节与分块之外再报一对文件计数：分块数只说明"字节搬了多少"，用户真正关心的是
@@ -151,10 +159,11 @@ type uploadStartRequest struct {
 	StorageID string `json:"storage_id"`
 	// QuotaBytes 应用层配额；0=不限。
 	QuotaBytes int64 `json:"quota_bytes"`
-	// DiffDiskLimitBytes 共享磁盘限制：建出来的库每块差异盘允许的容量；0=不限。
+	// MaxDiffDisks 共享数量（差异盘上限）；0=用户没填，由服务端回退配置默认值。
 	//
-	// 透传给服务端（随上传会话清单持久化），建库时写进库配置。
-	DiffDiskLimitBytes int64 `json:"diff_disk_limit_bytes"`
+	// 透传给服务端（随上传会话清单持久化），建库时写进库配置。与 RepoService.Create 的
+	// 同名入参同义：>0 表示"用户明确要这么多共享位"。
+	MaxDiffDisks int `json:"max_diff_disks"`
 	// SourceMode copy | move；留空默认 copy。move 仅在服务端建库成功后删除本地源目录。
 	SourceMode string `json:"source_mode"`
 	// ServerKey / ServerURL 指明把库建到**哪台**服务端（多服务端下应带上）。
@@ -201,6 +210,14 @@ type uploadTask struct {
 	// submitted 为 true 表示"完成建库任务已提交"（job 可能已在跑）：
 	// 此时**不得**再调用服务端 DELETE（会删掉正在被 job 使用的暂存目录）。
 	submitted bool
+	// restored 为 true 表示这条任务是**重启前留下的**：凭 uploads.json 里的续传记录摆回列表，
+	// 等用户按「继续」（见 uploadManager.restoreTasks）。
+	//
+	// 它与 paused 的区别正是"还有没有 goroutine 在传"：paused 的任务只是被闸门挡住
+	// （gate / cancel 都在，runUpload 还在跑），restored 的任务根本没有 goroutine ——
+	// 所以「继续」不能走 resume()（那要 close(gate)，对 nil 闸门会 panic），
+	// 必须重新起一次传输（见 Agent.resumeRestoredUpload）。
+	restored bool
 }
 
 func newUploadManager(resumePath string) *uploadManager {
@@ -208,6 +225,57 @@ func newUploadManager(resumePath string) *uploadManager {
 		tasks:  make(map[string]*uploadTask),
 		resume: newUploadResumeStore(resumePath),
 	}
+}
+
+// restoreTasks 把续传记录回填成"待继续"的可见任务，返回回填的条数（代理启动时调用一次）。
+//
+// 为什么必须有这一步：任务只活在内存里，而续传记录本来就落了盘 —— 关掉应用（代理随之退出）
+// 再打开，GET /agent/uploads 曾经返回空，于是"我的存储库"里那条"上传中"**整行消失**：
+// 那一刻服务端只有未完成的上传会话与已传分块（建库任务还没提交，所以连库记录都没有），
+// 列表里既没有库、也没有上传，用户看到的是"我的上传不见了，还点不到继续"（真实反馈：
+// "一个任务上传中的，我关掉应用之后就再没有展示那个记录了"）。
+//
+// 回填的一律是**暂停态**：不自动接着传 —— 用户可能正是为了停它才关的应用，也可能换了网络，
+// 要接着传得自己按「继续」（见 resumeRestoredUpload，那里会重新扫描并只补缺的分块）。
+func (m *uploadManager) restoreTasks() int {
+	restored := 0
+	for _, rec := range m.resume.all() {
+		// 记录不全的（半个写入、手工改坏）宁可忽略：摆一条点不动的任务比不摆更糟。
+		if rec.UploadID == "" || rec.RepoName == "" || strings.TrimSpace(rec.LocalDir) == "" {
+			continue
+		}
+		// 见 uploadResumeRecord.Phase：那一刻服务端已经有这个库了，列表里是普通的"建库中"行。
+		if rec.Phase == UploadStateCompleting {
+			continue
+		}
+		key := strings.ToLower(rec.LocalDir)
+		m.mu.Lock()
+		_, exists := m.tasks[key]
+		if !exists {
+			m.tasks[key] = &uploadTask{
+				restored: true,
+				paused:   true,
+				state: UploadState{
+					UploadID:      rec.UploadID,
+					RepoName:      rec.RepoName,
+					LocalDir:      rec.LocalDir,
+					State:         UploadStateUploading,
+					Paused:        true,
+					TotalBytes:    rec.TotalBytes,
+					TotalFiles:    rec.TotalFiles,
+					FilesTotal:    rec.FilesTotal,
+					UploadedBytes: rec.UploadedBytes,
+					FilesDone:     rec.FilesDone,
+					StartedAt:     rec.StartedAt,
+				},
+			}
+		}
+		m.mu.Unlock()
+		if !exists {
+			restored++
+		}
+	}
+	return restored
 }
 
 func (t *uploadTask) snapshot() UploadState {
@@ -264,16 +332,49 @@ func (t *uploadTask) pause() bool {
 }
 
 // resume 恢复已暂停的分块上传；不在暂停中返回 false（幂等）。
+//
+// **重启后留下的任务不走这里**（restored）：它没有闸门，close(nil) 会 panic。那句话的
+// 反面也成立 —— 凡是 restored 为 true 的任务都不会走到下面那句 close。
 func (t *uploadTask) resume() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if !t.paused {
+	if !t.paused || t.restored {
 		return false
 	}
 	t.paused = false
 	close(t.gate)
 	t.gate = nil
 	t.state.Paused = false
+	return true
+}
+
+// restoredTask 是否为"重启后待继续"的任务（没有 goroutine 在传）。
+func (t *uploadTask) restoredTask() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.restored
+}
+
+// claimResume 认领一个"重启后待继续"的任务：清掉待续标记与暂停标志，交给新的传输接管。
+//
+// 只清标记、**不碰 gate**：restored 的任务本来就没有闸门，也不该有 —— 它是靠重新起一次
+// runUpload 接着传的（见 Agent.resumeRestoredUpload）。已经被认领过时返回 false，
+// 免得连点两下「继续」并行起两个传输，把同一台服务端当成两份数据在写。
+func (t *uploadTask) claimResume() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.restored {
+		return false
+	}
+	t.restored = false
+	t.paused = false
+	t.gate = nil
+	// 重新扫描一遍本地目录（可能已经被用户动过），所以状态回到 scanning：
+	// 与一次全新上传的首帧一致，界面上的"已暂停"也据此翻回"传输中"。
+	t.state.State = UploadStateScanning
+	t.state.Paused = false
+	t.state.SpeedBytesPerSec = 0
+	t.state.EtaSeconds = 0
 	return true
 }
 
@@ -392,6 +493,9 @@ func (m *uploadManager) list() []UploadState {
 }
 
 // uploadResumeRecord 是持久化的续传记录（同一 local_dir + repo_name 唯一）。
+//
+// 它有两个用处：一是断线重传时复用服务端会话，二是**重启后把这条上传摆回列表**
+// （见 uploadManager.restoreTasks）—— 所以要能凭它原样重建一次启动入参。
 type uploadResumeRecord struct {
 	UploadID   string `json:"upload_id"`
 	LocalDir   string `json:"local_dir"`
@@ -399,13 +503,29 @@ type uploadResumeRecord struct {
 	TotalBytes int64  `json:"total_bytes"`
 	TotalFiles int    `json:"total_files"`
 	StartedAt  int64  `json:"started_at"`
+	// ServerKey 目标服务端：续传必须回到**同一台**（StorageID 只对那一台服务端有意义）。
+	// 老记录没有这个字段，按主服务端回退（与"请求没指定归属"时的既有口径一致）。
+	ServerKey  string `json:"server_key,omitempty"`
 	RepoMode   string `json:"repo_mode,omitempty"`
 	StorageID  string `json:"storage_id,omitempty"`
 	QuotaBytes int64  `json:"quota_bytes,omitempty"`
-	// DiffDiskLimitBytes 共享磁盘限制（0=不限），续传与重试时要原样带回去 ——
-	// 否则一次断线续传就把用户填的限制弄丢了。
-	DiffDiskLimitBytes int64  `json:"diff_disk_limit_bytes,omitempty"`
-	SourceMode         string `json:"source_mode,omitempty"`
+	// MaxDiffDisks 共享数量（0=用户没填）：续传与重试要原样带回，
+	// 否则一次断线续传就把用户填的数量弄丢了，建库时又落回配置默认值。
+	MaxDiffDisks int    `json:"max_diff_disks,omitempty"`
+	SourceMode   string `json:"source_mode,omitempty"`
+	// ---- 进度检查点（见 checkpoint）----
+	//
+	// 关掉应用再打开时，列表里那条"上传中（已暂停）"要能说出"上次传到哪了"：
+	// 从 0 起会让用户以为已经传上去的几十个 G 白费了。
+	UploadedBytes int64 `json:"uploaded_bytes,omitempty"`
+	FilesDone     int   `json:"files_done,omitempty"`
+	FilesTotal    int   `json:"files_total,omitempty"`
+	// Phase 是最后一次已知的阶段。
+	//
+	// 只用来决定"重启后还要不要把这条记录摆回列表"：completing 意味着字节已经传完、
+	// 建库任务已经提交，那一刻**服务端已经有这个库了**，列表里会以普通的"建库中"行出现 ——
+	// 再摆一条"上传中（已暂停）"就是同一个库两行，还会给出一个「继续」把同一份数据重传一遍。
+	Phase string `json:"phase,omitempty"`
 }
 
 // uploadResumeStore 负责续传记录的读写（<DataDir>/uploads.json，原子替换写盘）。
@@ -454,6 +574,37 @@ func (s *uploadResumeStore) save(rec uploadResumeRecord) error {
 		s.records = append(s.records, rec)
 	}
 	return s.persistLocked()
+}
+
+// all 返回全部续传记录的副本（代理启动时据此把"待继续"的任务摆回列表）。
+func (s *uploadResumeStore) all() []uploadResumeRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]uploadResumeRecord, len(s.records))
+	copy(out, s.records)
+	return out
+}
+
+// checkpoint 更新一条**已存在**记录的进度（没有这条记录就什么都不做）。
+//
+// 与 save 分开是刻意的：save 是"会话定了"这种低频事件、整条覆盖；checkpoint 在传输过程中
+// 被反复调用，只动进度四件套，免得把入参（模式 / 存储 ID / 配额 / 限制）写丢。
+// 四个值都没变化时不落盘：写盘是同步 + 原子替换（见 persistLocked），空转不值得。
+func (s *uploadResumeStore) checkpoint(dir, repoName, phase string, uploaded int64, filesDone, filesTotal int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.records {
+		r := &s.records[i]
+		if !strings.EqualFold(r.LocalDir, dir) || r.RepoName != repoName {
+			continue
+		}
+		if r.Phase == phase && r.UploadedBytes == uploaded && r.FilesDone == filesDone && r.FilesTotal == filesTotal {
+			return nil
+		}
+		r.Phase, r.UploadedBytes, r.FilesDone, r.FilesTotal = phase, uploaded, filesDone, filesTotal
+		return s.persistLocked()
+	}
+	return nil
 }
 
 // remove 删除一条续传记录并落盘（幂等）。
@@ -534,8 +685,8 @@ func (a *Agent) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, apperr.InvalidParam("quota_bytes"))
 		return
 	}
-	if req.DiffDiskLimitBytes < 0 {
-		a.writeError(w, apperr.InvalidParam("diff_disk_limit_bytes"))
+	if req.MaxDiffDisks < 0 {
+		a.writeError(w, apperr.InvalidParam("max_diff_disks"))
 		return
 	}
 	req.RepoMode = mode
@@ -549,6 +700,10 @@ func (a *Agent) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, errServerUnknown())
 		return
 	}
+	// 解析结果写回请求：续传记录要带着它落盘，重启后再按「继续」才能回到**同一台**
+	// （见 uploadResumeRecord.ServerKey）。请求里给的可能是实例 ID、或者干脆没给（走主服务端），
+	// 而记录里必须是解析后的规范 key。
+	req.ServerKey = serverKey
 	// 无会话或会话不可用时明确报错，绝不静默失败。
 	client, err := a.serverClientFor(serverKey)
 	if err != nil {
@@ -603,6 +758,11 @@ func (a *Agent) handleCancelUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if a.uploads.cancel(uploadID) {
 		a.logger.Info("已请求取消上传", "upload_id", uploadID)
+	} else if task, ok := a.uploads.find(uploadID); ok && task.restoredTask() {
+		// 重启前留下的任务：没有 goroutine 可停，取消的三件事（放弃服务端会话、删续传记录、
+		// 把任务置终态）得在这里自己做完（见 cancelRestoredUpload）。漏掉的话，这条记录会
+		// 一直躺在 uploads.json 里，界面上那行"已暂停"既取消不掉也传不完。
+		a.cancelRestoredUpload(task)
 	}
 	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -620,13 +780,24 @@ func (a *Agent) handlePauseUpload(w http.ResponseWriter, r *http.Request) {
 	task, ok := a.uploads.find(uploadID)
 	if ok && task.pause() {
 		a.logger.Info("已暂停上传", "upload_id", uploadID)
+		// 暂停是"用户主动停下来"的天然断点：进度立刻落一次检查点，
+		// 免得这一刻关掉应用，下次打开看到的进度比实际传上去的旧一截。
+		a.checkpointUpload(task)
 		// 立刻把 paused 推给界面：不然按钮要等下一次进度事件才翻成"继续"。
 		a.publishUpload(task)
 	}
 	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleResumeUpload 恢复已暂停的分块上传（幂等：不存在 / 未暂停也返回 ok）。
+// handleResumeUpload 继续指定 upload_id 的上传（幂等：不存在 / 没在暂停也返回 ok）。
+//
+// 两种"继续"不是一回事，必须分开走：
+//   - 运行中被暂停的：worker 还活着、只是被闸门挡住 —— 打开闸门即可（task.resume）；
+//   - **重启前留下的**（restored）：根本没有 worker —— 要重新扫描目录、用同一套入参重新
+//     建/续会话、把缺的分块补上（resumeRestoredUpload）。
+//
+// 后者失败时**必须报错**（源目录没了、本机还没登录服务端等）：静默返回 ok 的话，用户点了
+// 「继续」却什么都没发生，那条"已暂停"会一直挂在那里。
 func (a *Agent) handleResumeUpload(w http.ResponseWriter, r *http.Request) {
 	uploadID := strings.TrimSpace(r.PathValue("upload_id"))
 	if uploadID == "" {
@@ -634,11 +805,133 @@ func (a *Agent) handleResumeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task, ok := a.uploads.find(uploadID)
-	if ok && task.resume() {
-		a.logger.Info("已恢复上传", "upload_id", uploadID)
-		a.publishUpload(task)
+	if ok {
+		switch {
+		case task.restoredTask():
+			if err := a.resumeRestoredUpload(task); err != nil {
+				a.writeError(w, err)
+				return
+			}
+		case task.resume():
+			a.logger.Info("已恢复上传", "upload_id", uploadID)
+			a.publishUpload(task)
+		}
 	}
 	a.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// ---- 重启前留下的任务（restored）----
+
+// checkpointUpload 把"传到哪了"写进续传记录。
+//
+// 存在的理由：关掉应用再打开时，列表里那条"上传中（已暂停）"要能接着报进度，而不是从 0 起
+// —— 从 0 起会让用户以为已经传上去的几十个 G 白费了。
+//
+// 调用点都刻意选在**稀疏**的时刻（见 uploadProgress.push 的闸门、暂停、提交建库）：
+// 写盘是同步 + 原子替换，跟着 200ms 一次的界面推送走会把磁盘打成筛子。
+func (a *Agent) checkpointUpload(task *uploadTask) {
+	if task == nil {
+		return
+	}
+	s := task.snapshot()
+	if s.UploadID == "" || s.LocalDir == "" || s.RepoName == "" {
+		return
+	}
+	err := a.uploads.resume.checkpoint(s.LocalDir, s.RepoName, s.State, s.UploadedBytes, s.FilesDone, s.FilesTotal)
+	if err != nil {
+		// 检查点写不下去不该影响传输本身：下一次闸门到点会再试一次。
+		a.logger.Debug("写入续传进度检查点失败", "local_dir", s.LocalDir, "error", err)
+	}
+}
+
+// resumeRestoredUpload 把"重启后待继续"的任务重新交给 runUpload 接着传。
+//
+// 和"运行中任务的 resume"是两件事：那个只是打开闸门（worker 还活着），这个要凭续传记录里的
+// 入参重新起一次 —— 重新扫描目录 → ensureUploadSession 复用服务端会话 → 只补缺的分块
+// （见 ensureUploadSession 的复用路径），所以上次已经传上去的字节不会被重传。
+func (a *Agent) resumeRestoredUpload(task *uploadTask) error {
+	snap := task.snapshot()
+	rec, ok := a.uploads.resume.find(snap.LocalDir, snap.RepoName)
+	if !ok || rec.UploadID == "" {
+		return errUploadResumeUnavailable(nil)
+	}
+	// 目标服务端必须先定下来：存储 ID 只对它所属的那台有意义，续传绝不能落到别台去。
+	serverKey := a.store.ResolveKey(rec.ServerKey, "")
+	if serverKey == "" {
+		return errServerUnknown()
+	}
+	client, err := a.serverClientFor(serverKey)
+	if err != nil {
+		return err
+	}
+	dir, err := validateAbsDir(rec.LocalDir, "local_dir")
+	if err != nil {
+		return errUploadResumeUnavailable(err)
+	}
+	if info, statErr := os.Stat(dir); statErr != nil || !info.IsDir() {
+		// 源目录被删掉或挪走了。注意这不是"正常结束"：move 语义下服务端建库成功时，
+		// 续传记录已经跟着删掉了，所以还留着记录的目录只可能是被用户动过 —— 明说，别静默。
+		return errUploadResumeUnavailable(statErr)
+	}
+	if !task.claimResume() {
+		// 已经被另一次点击认领（或任务已结束）：当幂等成功，别再起第二个传输。
+		return nil
+	}
+	req := uploadStartRequest{
+		LocalDir:     dir,
+		RepoName:     rec.RepoName,
+		RepoMode:     rec.RepoMode,
+		StorageID:    rec.StorageID,
+		QuotaBytes:   rec.QuotaBytes,
+		MaxDiffDisks: rec.MaxDiffDisks,
+		SourceMode:   rec.SourceMode,
+		ServerKey:    rec.ServerKey,
+	}
+	ctx, cancel := context.WithCancel(a.bgContext())
+	task.setCancel(cancel)
+	a.logger.Info("继续重启前未完成的上传", "upload_id", snap.UploadID, "local_dir", dir, "repo_name", rec.RepoName)
+	a.publishUpload(task)
+	safeGo(a.logger, "upload_run", func() { a.runUpload(ctx, task, client, req, dir) })
+	return nil
+}
+
+// cancelRestoredUpload 取消一条"重启后待继续"的任务。
+//
+// 没有 goroutine 可停，所以把取消该做的三件事自己做完：尽力放弃服务端会话（清掉暂存）、
+// 删掉续传记录、把任务置 canceled（界面据此把这一行从"上传中"撤下来）。漏做的话，这条记录
+// 会一直躺在 uploads.json 里，界面上那行既取消不掉也传不完。
+func (a *Agent) cancelRestoredUpload(task *uploadTask) {
+	snap := task.snapshot()
+	uploadID := snap.UploadID
+	rec, ok := a.uploads.resume.find(snap.LocalDir, snap.RepoName)
+	if ok {
+		if uploadID == "" {
+			uploadID = rec.UploadID
+		}
+		if uploadID != "" {
+			if key := a.store.ResolveKey(rec.ServerKey, ""); key != "" {
+				client, err := a.serverClientFor(key)
+				if err != nil {
+					a.logger.Warn("取不到服务端连接，放弃上传会话延后由服务端 GC 清理",
+						"upload_id", uploadID, "error", err)
+				} else {
+					ctx, cancel := context.WithTimeout(a.bgContext(), 15*time.Second)
+					if err := client.AbortUpload(ctx, uploadID); err != nil {
+						a.logger.Warn("放弃服务端上传会话失败（服务端将在 24h 后 GC 清理）", "upload_id", uploadID, "error", err)
+					}
+					cancel()
+				}
+			}
+		}
+		_ = a.uploads.resume.remove(snap.LocalDir, snap.RepoName)
+	}
+	task.update(func(s *UploadState) {
+		s.State = UploadStateCanceled
+		s.Error = ""
+		s.FinishedAt = time.Now().UnixMilli()
+	})
+	a.publishUpload(task)
+	a.logger.Info("已取消重启前未完成的上传", "local_dir", snap.LocalDir, "upload_id", uploadID)
 }
 
 // ---- 上传执行 ----
@@ -713,13 +1006,13 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		manifest.Files = append(manifest.Files, uploadManifestEntry{Path: e.Rel, Size: e.Size, Mtime: e.Mtime})
 	}
 	sess, err := client.CreateUpload(ctx, createUploadRequest{
-		RepoName:           req.RepoName,
-		Mode:               req.SourceMode,
-		Manifest:           manifest,
-		RepoMode:           req.RepoMode,
-		StorageID:          req.StorageID,
-		QuotaBytes:         req.QuotaBytes,
-		DiffDiskLimitBytes: req.DiffDiskLimitBytes,
+		RepoName:     req.RepoName,
+		Mode:         req.SourceMode,
+		Manifest:     manifest,
+		RepoMode:     req.RepoMode,
+		StorageID:    req.StorageID,
+		QuotaBytes:   req.QuotaBytes,
+		MaxDiffDisks: req.MaxDiffDisks,
 	})
 	if err != nil {
 		return nil, err
@@ -740,8 +1033,8 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		QuotaBytes: req.QuotaBytes,
 		// 与 quota_bytes 一样随记录留存：这几个建库选项是"这次上传要建什么样的库"的
 		// 全部信息，记录里缺一项，将来从记录重建请求时就会静默丢一项配置。
-		DiffDiskLimitBytes: req.DiffDiskLimitBytes,
-		SourceMode:         req.SourceMode,
+		MaxDiffDisks: req.MaxDiffDisks,
+		SourceMode:   req.SourceMode,
 	})
 	// 服务端可能并没有新建会话：它会在上传开始时清掉同名残骸，并把与本地内容一致的
 	// 未完成会话直接还给我们（本地没有记录、或记录已失效时走的就是这条路）。
@@ -915,6 +1208,9 @@ func (a *Agent) completeUpload(ctx context.Context, client *serverClient, task *
 	}
 	task.markSubmitted()
 	task.update(func(s *UploadState) { s.JobID = jobID })
+	// 提交这一刻把 Phase 落成 completing：建库任务一提交，服务端就有这个库了，
+	// 重启后不该再把这条记录摆回"上传中"（见 uploadResumeRecord.Phase）。
+	a.checkpointUpload(task)
 	a.publishUpload(task)
 	a.logger.Info("已提交建库任务，等待完成", "upload_id", plan.uploadID, "job_id", jobID)
 
@@ -959,36 +1255,100 @@ func (a *Agent) completeUpload(ctx context.Context, client *serverClient, task *
 	return nil
 }
 
-// waitUploadJob 轮询 GET /v1/jobs/{id} 直到终态，并把建库进度透传给任务状态。
+// waitUploadJob 等到建库任务到终态，并把建库进度透传给任务状态。
+//
+// 事件驱动 + 兜底查询：
+//   - 正常情况下靠服务端推来的 job 事件（见 jobWatch）拿到进度与终态，代理**不发任何请求**；
+//   - 只在"事件沉默"（超过 uploadJobFallbackInterval 没收到该任务的任何事件）时才查一次
+//     GET /v1/jobs/{id}。过去是无条件每 2 秒查一次，一个 10 分钟的建库任务会在服务端访问日志
+//     里留下 300 行"同一件事"的流水（真实反馈："上传时会因为客户端拉上传状态而刷屏服务日志"）。
+//
+// 先查一次是必要的：事件是"变化驱动"的，而此刻的当前状态没有任何变化可触发 —— 不查就会一直
+// 显示 0%，直到下一次进度推进。
 func (a *Agent) waitUploadJob(ctx context.Context, client *serverClient, task *uploadTask, jobID string) (*serverJob, error) {
 	if strings.TrimSpace(jobID) == "" {
 		return nil, errUploadFailed("complete", errors.New("服务端未返回 job_id"))
 	}
+
+	subID, events := a.jobWatch.subscribe(jobID)
+	defer a.jobWatch.unsubscribe(jobID, subID)
+
+	j, err := a.pollUploadJob(ctx, client, task, jobID)
+	if err != nil {
+		return nil, err
+	}
+	if uploadJobFinished(j) {
+		return j, nil
+	}
+
+	// lastEventAt 记最近一次收到事件的时间：兜底查询只在"事件沉默"时发。
+	lastEventAt := time.Now()
+	ticker := time.NewTicker(uploadJobFallbackInterval)
+	defer ticker.Stop()
+
 	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		j, err := client.Job(ctx, jobID)
-		if err != nil {
-			return nil, err
-		}
-		a.reportBuildProgress(task, j)
-		switch j.State {
-		case "succeeded", "failed", "cancelled":
-			return j, nil
-		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(uploadJobPollInterval):
+		case ev, ok := <-events:
+			if !ok {
+				// 订阅通道被关闭（理论上不会发生，防御性处理）：退化成纯兜底轮询。
+				events = nil
+				continue
+			}
+			lastEventAt = time.Now()
+			a.reportBuildProgress(task, &ev)
+			if !uploadJobFinished(&ev) {
+				continue
+			}
+			// 事件里的终态只当"该去看结果了"的信号：调用方要的是完整任务（失败原因、摘要），
+			// 所以再查一次拿权威对象 —— 这一刻任务已经结束，这次查询不影响等待时长。
+			// 查不到（服务端刚重启/任务被清理）就继续等，不凭事件凭空造终态。
+			if done, err := a.pollUploadJob(ctx, client, task, jobID); err == nil && uploadJobFinished(done) {
+				return done, nil
+			}
+		case <-ticker.C:
+			if time.Since(lastEventAt) < uploadJobFallbackInterval {
+				// 这期间一直有事件：事件通道是活的，这一次查询没必要发（"不刷屏"的关键）。
+				continue
+			}
+			j, err := a.pollUploadJob(ctx, client, task, jobID)
+			if err != nil {
+				return nil, err
+			}
+			if uploadJobFinished(j) {
+				return j, nil
+			}
 		}
 	}
 }
 
+// pollUploadJob 查一次建库任务状态，并把进度透传给任务（服务端错误原样上抛）。
+func (a *Agent) pollUploadJob(ctx context.Context, client *serverClient, task *uploadTask, jobID string) (*serverJob, error) {
+	j, err := client.Job(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	a.reportBuildProgress(task, j)
+	return j, nil
+}
+
+// uploadJobFinished 判定建库任务是否已到终态（取值与服务端 job.State 一致）。
+func uploadJobFinished(j *serverJob) bool {
+	if j == nil {
+		return false
+	}
+	switch j.State {
+	case "succeeded", "failed", "cancelled":
+		return true
+	}
+	return false
+}
+
 // reportBuildProgress 把服务端建库任务的进度写进上传状态，并在变化时推给界面。
 //
-// 只在数值真的变了才推：轮询每两秒一次，而建库任务的进度粒度是 1%（拷入阶段每两秒采样一次），
-// 无脑推送只会让前端白白重渲染。
+// 只在数值真的变了才推：进度来自服务端事件（变化驱动）+ 兜底查询，而建库任务的进度粒度是
+// 1%（拷入阶段每两秒采样一次），无脑推送只会让前端白白重渲染。
 func (a *Agent) reportBuildProgress(task *uploadTask, j *serverJob) {
 	if task == nil || j == nil || j.Progress <= 0 {
 		return
@@ -1104,7 +1464,22 @@ type uploadProgress struct {
 	verified map[string]struct{}
 	// currentFile 是当前正在处理中的文件（最近开始读取/上传的那一个）。
 	currentFile string
+	// ckptAt / ckptVal 是续传记录进度检查点的闸门基线（时刻 + 累计字节）。
+	//
+	// 检查点必须比界面推送（最快 200ms 一次）**粗得多**：push 每完成一个分块就被调一次，
+	// 而落盘是同步 + 原子替换，跟着推送走会把磁盘和 uploads.json 的 mtime 打成筛子。
+	ckptAt  time.Time
+	ckptVal int64
 }
+
+// 续传记录进度检查点的落盘门槛：攒够这么多字节、或者过了这么久，才把"传到哪了"写一次。
+//
+// 取这个量级是为了"重启后看到的进度不落后太多"与"别频繁写盘"之间的折中：最坏情况落后
+// 32MiB，而不是 0 —— 0 会让用户以为已经传上去的几十个 G 白费了。
+const (
+	uploadCheckpointInterval = 30 * time.Second
+	uploadCheckpointBytes    = 32 << 20
+)
 
 func newUploadProgress(a *Agent, task *uploadTask) *uploadProgress {
 	return &uploadProgress{
@@ -1131,6 +1506,10 @@ func (p *uploadProgress) reset(total, uploaded int64, done, filesDone, filesCap 
 	p.filesDone = filesDone
 	p.filesCap = filesCap
 	p.verified = make(map[string]struct{})
+	// 基线变了，检查点也得跟着换基线：ckptVal 从**新的**起点算，ckptAt 清零让紧接着的
+	// 这次 push 立刻写一条检查点 —— 续传开始没多久就断电，也不该退回到上一次的旧进度。
+	p.ckptAt = time.Time{}
+	p.ckptVal = uploaded
 	p.mu.Unlock()
 	p.push(true)
 }
@@ -1190,12 +1569,18 @@ func (p *uploadProgress) push(force bool) {
 		speed       float64
 		filesDone   int
 		currentFile string
+		checkpoint  bool
 	)
 	if ok {
 		p.sample(now, uploaded)
 		speed = p.speed
 		filesDone = p.filesDone
 		currentFile = p.currentFile
+		// 进度检查点（见 ckptAt / uploadCheckpointInterval）：攒够了才落盘一次。
+		if now.Sub(p.ckptAt) >= uploadCheckpointInterval || uploaded-p.ckptVal >= uploadCheckpointBytes {
+			p.ckptAt, p.ckptVal = now, uploaded
+			checkpoint = true
+		}
 	}
 	p.mu.Unlock()
 	if !ok {
@@ -1214,6 +1599,10 @@ func (p *uploadProgress) push(force bool) {
 		s.EtaSeconds = etaSeconds(total, uploaded, speed)
 	})
 	p.a.hub.Publish(Event{Type: "upload", Data: state})
+	// 写检查点放在状态更新之后：写下去的就是界面此刻看到的那个数。
+	if checkpoint {
+		p.a.checkpointUpload(p.task)
+	}
 }
 
 // sampleMinInterval 是两次速率采样之间的最小间隔。

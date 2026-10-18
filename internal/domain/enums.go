@@ -48,12 +48,18 @@ const (
 	// 该状态下拒绝分配与挂载：池还没建好，让用户分配只会得到"没盘可用"，
 	// 而挂载会退回到"边挂边等建盘"的慢路径（那正是本状态想消除的体验）。
 	RepoStateCreating RepoState = "creating"
-	// RepoStateImporting 上传中：本地目录上传的数据正在写入暂存、校验并构建母盘。
+	// RepoStateImporting 写入中：上传的数据已经收完，正在构建母盘（把暂存里的整棵树写进新盘）。
 	//
-	// 与 creating（异步预创建差异盘池）的区别是"数据都还没收完"：母盘要么不存在、
-	// 要么是不可用的半成品。和 creating 一样必须拒绝挂载与分配 —— 卡片上要能一眼看出
-	// 这个库还没准备好。此前上传期间库被直接写成 active，列表里显示正常、点挂载才报
-	// disk.not_ready，用户完全看不出它正在建。
+	// 界面显示「写入中」而不是「上传中」：这个库记录要到"数据都收完了、建库任务开跑"才存在
+	// （见 UploadService.ensureRepoForUpload），写「上传中」会让人以为数据还在传、白等一场
+	// —— 源目录多大就要写多大的盘，30G 的库几十分钟起步（真实反馈："写入母盘这个过程状态
+	// 展示要展示写入中，如果上传中的话可能会造成误会"）。还在传数据的那一帧由客户端合成的
+	// 占位库表达，标签取值另有口径（见前端 repoStateValue）。
+	//
+	// 与 creating（异步预创建差异盘池）的区别是"母盘还没建出来"：要么不存在、要么是不可用的
+	// 半成品。和 creating 一样必须拒绝挂载与分配 —— 卡片上要能一眼看出这个库还没准备好。
+	// 此前上传期间库被直接写成 active，列表里显示正常、点挂载才报 disk.not_ready，
+	// 用户完全看不出它正在建。
 	RepoStateImporting RepoState = "importing"
 	RepoStateActive    RepoState = "active"
 	RepoStateSealing   RepoState = "sealing"

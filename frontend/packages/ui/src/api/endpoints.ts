@@ -16,6 +16,9 @@ import type {
   CreateUserResponse,
   DeviceReleaseReportDTO,
   DiskDTO,
+  DiskImportRequestDTO,
+  DiskImportResultDTO,
+  DiskImportScanDTO,
   EstimatePoolSizeRequest,
   EstimatePoolSizeResponse,
   FsBrowseResult,
@@ -80,8 +83,10 @@ export class VaultApi extends ApiClient {
   /**
    * 按需安装系统依赖（仅超级管理员）。
    *
-   * 立刻返回 202 + 任务对象，装包在服务端后台跑（同步等待会顶到 HTTP 超时）：
-   * 调用方拿到 job.id 后轮询 getJob() 直到终态，再刷新 systemDeps()。
+   * 立刻返回 202 + 任务对象（含初始 state/progress），装包在服务端后台跑（同步等待会顶到 HTTP
+   * 超时）：后续进度由代理的事件流推送（`job` 事件，见 hooks/useJobProgress），到终态再刷新
+   * systemDeps()。**不要**为此轮询 getJob()：那会把服务端访问日志刷满。
+   * getJob() 只作为兜底（事件沉默过久时查一次）。
    */
   installSystemDeps(key: string): Promise<JobDTO> {
     return this.request<JobDTO>('POST', '/v1/system/deps/install', { key })
@@ -167,6 +172,26 @@ export class VaultApi extends ApiClient {
    */
   deleteOrphan(path: string): Promise<OrphanDeleteResultDTO> {
     return this.request<OrphanDeleteResultDTO>('POST', '/v1/system/orphans/delete', { path })
+  }
+
+  /**
+   * 现扫一遍可导入的磁盘文件（仅超级管理员）。
+   *
+   * 与孤儿扫描扫的是同一批文件，但**全部** .vhdx 都会返回（含已登记的）：
+   * 导入页面要回答的是"我那几块盘是不是都搬过来了"，藏起已登记的就没法确认。
+   */
+  scanDiskImports(): Promise<DiskImportScanDTO> {
+    return this.request<DiskImportScanDTO>('GET', '/v1/system/disks/import/scan')
+  }
+
+  /**
+   * 原地接管一批磁盘文件（仅超级管理员）。
+   *
+   * 只登记记录，**不复制、不移动**文件本身：迁移时几十 GB 的母盘拷一次就够了。
+   * 逐条返回成功/跳过/失败，单块盘读不出来不会连累其余。
+   */
+  importDisks(body: DiskImportRequestDTO): Promise<DiskImportResultDTO> {
+    return this.request<DiskImportResultDTO>('POST', '/v1/system/disks/import', body)
   }
 
   // ---- 平台存储池（LVM thin pool / dm-cache；仅超级管理员，Windows 返回 501） ----

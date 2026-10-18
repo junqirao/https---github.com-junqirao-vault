@@ -55,7 +55,7 @@ var sqliteSchema = []string{
 		parent_version        INTEGER NOT NULL DEFAULT 0,
 		parent_condition      TEXT,
 		max_diff_disks        INTEGER NOT NULL DEFAULT 50,
-		diff_disk_limit_bytes INTEGER NOT NULL DEFAULT 0,
+		diff_disk_limit_bytes INTEGER NOT NULL DEFAULT 0, -- 已废弃：schema v8 起不再读写，见 migrate.go
 		quota_bytes           INTEGER NOT NULL DEFAULT 0,
 		used_bytes            INTEGER NOT NULL DEFAULT 0,
 		state                 TEXT NOT NULL,
@@ -75,7 +75,7 @@ var sqliteSchema = []string{
 		parent_version      INTEGER NOT NULL DEFAULT 0,
 		content_fingerprint TEXT NOT NULL DEFAULT '',
 		size_bytes          INTEGER NOT NULL,
-		accounted_bytes     INTEGER NOT NULL DEFAULT 0,
+		accounted_bytes     INTEGER NOT NULL DEFAULT 0, -- 已废弃：schema v8 起不再读写，见 migrate.go
 		physical_bytes      INTEGER NOT NULL DEFAULT 0,
 		vhd_type            TEXT NOT NULL,
 		state               TEXT NOT NULL,
@@ -304,7 +304,7 @@ var mysqlSchema = []string{
 		parent_version        INT NOT NULL DEFAULT 0,
 		parent_condition      VARCHAR(32) NULL,
 		max_diff_disks        INT NOT NULL DEFAULT 50,
-		diff_disk_limit_bytes BIGINT NOT NULL DEFAULT 0,
+		diff_disk_limit_bytes BIGINT NOT NULL DEFAULT 0, -- 已废弃：schema v8 起不再读写，见 migrate.go
 		quota_bytes           BIGINT NOT NULL DEFAULT 0,
 		used_bytes            BIGINT NOT NULL DEFAULT 0,
 		state                 VARCHAR(32) NOT NULL,
@@ -324,7 +324,7 @@ var mysqlSchema = []string{
 		parent_version      INT NOT NULL DEFAULT 0,
 		content_fingerprint VARCHAR(255) NOT NULL DEFAULT '',
 		size_bytes          BIGINT NOT NULL,
-		accounted_bytes     BIGINT NOT NULL DEFAULT 0,
+		accounted_bytes     BIGINT NOT NULL DEFAULT 0, -- 已废弃：schema v8 起不再读写，见 migrate.go
 		physical_bytes      BIGINT NOT NULL DEFAULT 0,
 		vhd_type            VARCHAR(32) NOT NULL,
 		state               VARCHAR(32) NOT NULL,

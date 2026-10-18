@@ -1,4 +1,4 @@
-import type { CSSProperties, MouseEvent } from 'react'
+import type { CSSProperties, MouseEvent, ReactNode } from 'react'
 import { useCallback, useState } from 'react'
 import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
 import { InfoCircleOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
@@ -23,7 +23,7 @@ import {
   useRepoMount,
   type RepoMountController
 } from './RepoMount'
-import { isPlaceholderRepoId, uploadPercent } from './uploadView'
+import { isPlaceholderRepoId, repoStateValue, uploadPercent } from './uploadView'
 
 export interface RepoCardProps {
   repo: RepoDTO
@@ -34,7 +34,8 @@ export interface RepoCardProps {
    * 该库正在上传时的实时进度（`repo` 可能是服务端记录，也可能是列表合成的占位库）。
    *
    * 卡片上**只留与上传有关的两样**：
-   *   - **上传进度条**（见 RepoUploadProgress）：占住建库进度条那个位置，写"已传 / 总量"
+   *   - **上传进度**（见 RepoProgress）：**就报在「已用」那一格里**（同一个元素、同一个位置，
+ *     写"已传 / 总量"与条内百分比），不另起一条进度条 —— 用量那一格此刻本来也没有数可报；
    *     与条内百分比（真实反馈一路是："上传中的库就不展示进度条了" → 又"进度条加回去，
    *     改为上传进度，上面展示进度 xx GB/yy GB"）。速度/剩余/当前文件/分块仍然不上卡片：
    *     那些数字每两秒变一次，混在一片库卡里又挤又吵，完整进度在「上传任务」页；
@@ -121,19 +122,84 @@ export function RepoMountDot({ controller }: { controller: RepoMountController }
 function RepoTagRow({
   repo,
   controller,
+  upload,
   style
 }: {
   repo: RepoDTO
   controller: RepoMountController
+  upload?: UploadState
   style?: CSSProperties
 }): JSX.Element {
   return (
     <Space size={spacing.xs} wrap style={style}>
       {/* 占位库（服务端还没有这条记录）拿不到模式，宁可不显示也不猜：见 uploadPlaceholderRepo。 */}
       {isPlaceholderRepoId(repo.id) ? null : <Tag>{repoModeLabel(repo.mode)}</Tag>}
-      {repo.state === 'active' ? null : <StatusTag group="repo" value={repo.state} />}
+      {/* 取值按"这个库现在到底在干什么"来定：服务端记录在 importing 时是**写母盘**（写入中），
+          占位库（服务端还没记录）才是**传数据**（上传中）—— 见 repoStateValue。 */}
+      {repo.state === 'active' ? null : <StatusTag group="repo" value={repoStateValue(repo, upload)} />}
+      {/* 暂停是**本机**按下的一枚标志（upload.paused），不在服务端状态里：服务端那边这个库照旧
+          在"建"着 —— 所以它不会自己出现在上面那枚状态标签里，必须单独说一句。不说的话，一行里
+          能看见的只有按钮文案从「暂停」变成「继续」，扫一眼列表根本看不出哪几块停了
+          （真实反馈："暂停状态下要在外面展示状态"）。 */}
+      {upload?.paused ? <StatusTag group="repo" value="paused" /> : null}
       <RepoMountStateTag controller={controller} />
     </Space>
+  )
+}
+
+/**
+ * 用量 / 进度**共用的那一块**：一行"左边标签 + 右边数值"，下面一条 UsageBar。
+ *
+ * 为什么要抽这个外框：上传中的库**不再另起一条进度条**，而是把这一块的内容换成
+ * "进度 + 已传 / 总量"（见 RepoUsage 的 upload 分支）。位置、宽度、行高、条的粗细、
+ * 百分数的画法全部由这一处决定 —— 于是上传中的那一行在列表里与别的行严丝合缝地对齐，
+ * 不会因为"多了一条进度条"而高出一截（真实反馈："我是指的复用存储用量那块的逻辑，
+ * 不是让你另起一个啊"）。
+ *
+ * 左右两侧的文字样式也归这里管：调用方只给文字，不给字号 —— 「已用」和「进度」两句话
+ * 必须长得一模一样，那正是同一个位置换了个数据源而已。
+ */
+function RepoMeter({
+  label,
+  hint,
+  value,
+  percent,
+  muted,
+  loading,
+  color,
+  style
+}: {
+  /** 左侧标签（「已用」/「进度」）。 */
+  label: string
+  /** 标签的悬浮说明；不传则标签不可悬浮。 */
+  hint?: string
+  /** 右侧数值（用量是「已用 / 上限」，上传是「已传 / 总量」）。 */
+  value: ReactNode
+  percent: number
+  muted?: boolean
+  loading?: boolean
+  /** 填充色覆盖（上传进度必须一路蓝到底，见 UsageBar 的 color）。 */
+  color?: string
+  style?: CSSProperties
+}): JSX.Element {
+  return (
+    <div style={style}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
+        {hint ? (
+          <Tooltip title={hint}>
+            <Typography.Text type="secondary" style={{ fontSize: fontSize.sm, cursor: 'help' }}>
+              {label}
+            </Typography.Text>
+          </Tooltip>
+        ) : (
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+            {label}
+          </Typography.Text>
+        )}
+        <Typography.Text style={{ fontSize: fontSize.sm }}>{value}</Typography.Text>
+      </div>
+      <UsageBar percent={percent} muted={muted} loading={loading} color={color} />
+    </div>
   )
 }
 
@@ -155,11 +221,16 @@ function RepoTagRow({
  * **刚挂上时那个 `-` 换成转圈**（真实反馈："挂载磁盘后要马上更新容量信息，更新的时候要有
  * loading 状态在进度条和 - 上"）：这一刻不是"不知道"，是"正在读"（见 useAgent 的
  * awaitMountUsage / repoUsageLoading）—— 用户刚点完挂载，看到 `-` 只会以为没挂上。
+ *
+ * **正在上传这一份时，这一格改报上传进度**（`upload` 有值，见 RepoProgress）：那一行还没有
+ * 可算的用量（占位库连容量都还没有），但这块地方不能空着、更不能另找地方再插一条 ——
+ * 同一格换数据源，行高列宽与别的库一致（真实反馈同 RepoMeter）。
  */
 function RepoUsage({
   repo,
   usage,
   loading = false,
+  upload,
   style
 }: {
   repo: RepoDTO
@@ -167,30 +238,23 @@ function RepoUsage({
   usage?: AgentMountVolumeUsage
   /** 实测用量正在取数（见 RepoMountController 的 usageLoading）：`-` 与条都改成转圈。 */
   loading?: boolean
+  /** 本机正在上传这个库：这一格改报上传进度。 */
+  upload?: UploadState
   style?: CSSProperties
 }): JSX.Element {
   const { t } = useI18n()
+  if (upload) return <RepoProgress upload={upload} style={style} />
   const { percent, usedText, totalText, measured } = repoUsage(repo, usage, true)
   return (
-    <div style={style}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
-        {measured ? (
-          <Tooltip title={t('repo.usedLocalHint')}>
-            <Typography.Text type="secondary" style={{ fontSize: fontSize.sm, cursor: 'help' }}>
-              {t('repo.used')}
-            </Typography.Text>
-          </Tooltip>
-        ) : (
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-            {t('repo.used')}
-          </Typography.Text>
-        )}
-        <Typography.Text style={{ fontSize: fontSize.sm }}>
-          <UsageValueText usedText={usedText} totalText={totalText} loading={loading} />
-        </Typography.Text>
-      </div>
-      <UsageBar percent={percent} muted={!measured} loading={loading} />
-    </div>
+    <RepoMeter
+      label={t('repo.used')}
+      hint={measured ? t('repo.usedLocalHint') : undefined}
+      value={<UsageValueText usedText={usedText} totalText={totalText} loading={loading} />}
+      percent={percent}
+      muted={!measured}
+      loading={loading}
+      style={style}
+    />
   )
 }
 
@@ -359,9 +423,13 @@ function RepoUploadActions({ upload }: { upload: UploadState }): JSX.Element {
  * 因此整块动作区都要拦住冒泡。
  *
  * 上传中的**占位库**（服务端还没有这条记录，见 uploadPlaceholderRepo）没有可用的 id：
- * 「详情」会导航到一个不存在的库、 「配置」保存时会把补丁打到不存在的库上，所以这两个入口
- * 对占位库都不渲染 —— 动作区不至于空掉：上传中的条目换成「暂停 / 继续」+「取消」
- * （见 RepoUploadActions），不是上传中的照旧画挂载按钮。
+ * 「详情」会导航到一个不存在的库、「配置」保存时会把补丁打到不存在的库上。但这两个入口
+ * **照样画、只是置灰** —— 少画两个按钮会让这一行的动作区短一截，跟别的行对不齐
+ * （真实反馈："详情和挂载设置按钮不要不展示，这样会导致对不齐"）。做法与「监控」入口
+ * 未挂载时一致：看不了就置灰，位置留着，顺手也告诉用户"这东西存在，只是现在还点不了"。
+ *
+ * 挂载按钮那一位则换成「暂停 / 继续」+「取消」（见 RepoUploadActions）——upstream 的库此刻
+ * 挂不了，但两个动作的**尺寸与位置**照旧占着原来那一档。
  */
 function RepoActions({
   repo,
@@ -391,28 +459,33 @@ function RepoActions({
         ...style
       }}
     >
-      {showDetail && !placeholder ? (
-        <Tooltip title={t('repo.card.detail')}>
-          <Button
-            type="text"
-            size="small"
-            icon={<InfoCircleOutlined />}
-            aria-label={t('repo.card.detail')}
-            onClick={() => onOpen(repo.id)}
-          />
+      {showDetail ? (
+        <Tooltip title={placeholder ? t('repo.uploadNotReady') : t('repo.card.detail')}>
+          {/* 置灰的按钮不派发鼠标事件，Tooltip 得靠外层这层 span 才挂得住。 */}
+          <span style={{ display: 'inline-block' }}>
+            <Button
+              type="text"
+              size="small"
+              icon={<InfoCircleOutlined />}
+              aria-label={t('repo.card.detail')}
+              disabled={placeholder}
+              onClick={() => onOpen(repo.id)}
+            />
+          </span>
         </Tooltip>
       ) : null}
-      {placeholder ? null : (
-        <Tooltip title={t('repo.settings.title')}>
+      <Tooltip title={placeholder ? t('repo.uploadNotReady') : t('repo.settings.title')}>
+        <span style={{ display: 'inline-block' }}>
           <Button
             type="text"
             size="small"
             icon={<SettingOutlined />}
             aria-label={t('repo.settings.title')}
+            disabled={placeholder}
             onClick={() => onConfigure(repo)}
           />
-        </Tooltip>
-      )}
+        </span>
+      </Tooltip>
       {/* 监控入口放在「设置」右侧：它开的是一个普通指标弹窗。
           必须留在动作区里 —— antd Modal 走 React portal，但合成事件仍沿 React 组件树冒泡，
           若把弹窗挂在标题行（Card 子树内），点弹窗里任何位置都会冒泡到整卡的
@@ -430,8 +503,9 @@ function RepoActions({
  * 只在 state=creating 且拿到进度时有意义：建库是个几十秒到几分钟的异步过程，
  * 只显示"建库中"三个字，用户无法区分"在建"和"卡住了"。
  *
- * **本机正在上传这一份时不走这里**：那一刻卡片上要的是上传进度（见 RepoUploadProgress），
- * 两张条同处一个位置，由调用方二选一 —— 看别人的库建到哪一步的人没有上传任务，仍然是这一条。
+ * **本机正在上传这一份时不走这里**：那一刻卡片上要的是上传进度，它报在「已用」那一格里
+ * （见 RepoUsage 的 upload 分支 / RepoProgress）。一行里只留一条进度，不叠两条；
+ * 看别人的库建到哪一步的人没有上传任务，仍然是这一条。
  */
 function RepoPrepareProgress({ repo }: { repo: RepoDTO }): JSX.Element | null {
   const { t } = useI18n()
@@ -462,38 +536,28 @@ function RepoPrepareProgress({ repo }: { repo: RepoDTO }): JSX.Element | null {
 }
 
 /**
- * 上传进度：本机正在上传这个库时，卡片上要看得见"传到哪了"。
+ * 上传进度：本机正在上传这个库时，**用用量那一格**报"传到哪了"（见 RepoMeter）。
  *
- * 外观与建库进度条同款（同样一行"左说明 + 右数字"、同样一条 small 进度条、同样的上边距）：
- * 两条条在同一位置接力（传完换成建库进度），用户眼里是一件事在往前走，不该中途换张脸。
+ * 就是一块 RepoMeter，只换三样：标签「进度」、数值"已传 / 总量"、颜色一路蓝 ——
+ * 位置、宽度、条的形状、百分数的画法全部与「已用」那一块共用，所以上传中的行和别的行
+ * 在列表里长得一模一样（真实反馈："进度条我是指的复用存储用量那块的逻辑，不是让你另起一个"）。
  *
- * 三处刻意的取舍（真实反馈："进度条加回去，改一下逻辑，改为上传进度，上面展示的是进度
- * xx GB/yy GB；进度条里面也展示百分比和原来的样式一致，但是不变色，都蓝色就行"）：
+ * 两处刻意的取舍（真实反馈："上面展示的是进度 xx GB/yy GB；进度条里面也展示百分比和原来的
+ * 样式一致，但是不变色，都蓝色就行"）：
  *   - 上面那行左边是「进度」、右边是"已传 / 总量"：只给百分比看不出还剩多少 GB；
- *   - 百分比交给进度条自己画（antd 在 small 尺寸下就画在**条内**），不再另拼一行文字；
- *   - **不传 status、不变色**：完成变绿、失败变红会让卡片之间跳色，而这条要回答的只有
- *     "还在不在动" —— 蓝色从头到尾最好读。
+ *   - **不变色**（color 固定主色蓝）：完成变绿、失败变红会让卡片之间跳色，而这条要回答的
+ *     只有"还在不在动"，且「传到 90%」并不是「盘快满了」那种告警（见 UsageBar 的 color）。
  */
-function RepoUploadProgress({ upload }: { upload: UploadState }): JSX.Element {
+function RepoProgress({ upload, style }: { upload: UploadState; style?: CSSProperties }): JSX.Element {
   const { t } = useI18n()
   return (
-    <div style={{ marginTop: spacing.sm }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-          {t('repo.card.progress')}
-        </Typography.Text>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-          {`${formatBytes(upload.uploaded_bytes)} / ${formatBytes(upload.total_bytes)}`}
-        </Typography.Text>
-      </div>
-      <Progress
-        percent={uploadPercent(upload)}
-        size="small"
-        strokeColor={palette.accent}
-        trailColor={palette.neutralFill}
-        style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-      />
-    </div>
+    <RepoMeter
+      label={t('repo.card.progress')}
+      value={`${formatBytes(upload.uploaded_bytes)} / ${formatBytes(upload.total_bytes)}`}
+      percent={uploadPercent(upload)}
+      color={palette.accent}
+      style={style}
+    />
   )
 }
 
@@ -544,8 +608,10 @@ function useRepoCardClick(
  *   - 「配置」图标 + 挂载按钮 = 这个库在本机怎么挂 / 挂上或卸下。
  *
  * 上传中的库**就用这套渲染**，不另起一套（真实反馈："上传中状态的存储库的卡片或列表不要
- * 展示那么多东西，和原有展示逻辑一样，只是状态标签不同"）—— 标签行多出「上传中」，
- * 进度条与动作区换成上传那两件（见 RepoUploadProgress / RepoUploadActions），其余零件照旧。
+ * 展示那么多东西，和原有展示逻辑一样，只是状态标签不同"、"我所有的设计就是想让这个上传中的
+ * 状态和其他保持一致的展示，但是复用元素"）—— 标签行多出「上传中」（暂停时再加「已暂停」），
+ * 「已用」那一格改报上传进度（见 RepoProgress），挂载按钮那一档换成「暂停 / 继续」+「取消」
+ * （见 RepoUploadActions）；其余零件（圆点 / 模式标签 / 发布时间信息 / 详情与配置图标）照旧。
  */
 export function RepoCard(props: RepoCardProps): JSX.Element {
   return <RepoMountCard {...props} />
@@ -573,34 +639,45 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
             {repo.name}
           </Typography.Text>
         </div>
-        {/* 占位库没有服务端 id，进详情页只会 404（见 RepoActions 同一处理）。 */}
-        {isPlaceholderRepoId(repo.id) ? null : (
-          <Tooltip title={t('repo.card.detail')}>
+        {/* 占位库（服务端还没有这条记录）没有服务端 id，进详情页只会 404（见 RepoActions
+            同一处理）—— 但入口**照样占位、只是置灰**：不画它，这张卡的标题行就比别人少一个
+            图标，与其它的卡长得不一样（见 RepoActions 里同一处说明）。 */}
+        <Tooltip title={isPlaceholderRepoId(repo.id) ? t('repo.uploadNotReady') : t('repo.card.detail')}>
+          <span style={{ display: 'inline-block', flexShrink: 0 }}>
             <Button
               type="text"
               size="small"
               icon={<InfoCircleOutlined />}
               aria-label={t('repo.card.detail')}
+              disabled={isPlaceholderRepoId(repo.id)}
               onClick={(event) => {
                 event.stopPropagation()
                 onOpen(repo.id)
               }}
             />
-          </Tooltip>
-        )}
+          </span>
+        </Tooltip>
       </div>
 
-      <RepoTagRow repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
+      <RepoTagRow
+        repo={repo}
+        controller={mountController}
+        upload={upload}
+        style={{ marginTop: spacing.sm }}
+      />
+      {/* 用量那一格：上传中的库由它改报上传进度（见 RepoUsage 的 upload 分支）。
+          位置、宽度、形状都不变，所以卡片高度不会跳。 */}
       <RepoUsage
         repo={repo}
         usage={mountController.usage}
         loading={mountController.usageLoading}
+        upload={upload}
         style={{ marginTop: spacing.md }}
       />
 
-      {/* 进度块（二选一）：上传中的库画上传进度（已传字节 + 条内百分比），其余画建库进度 ——
-          两张条同处一个位置，传完接力过去，卡片高度不会跳。 */}
-      {upload ? <RepoUploadProgress upload={upload} /> : <RepoPrepareProgress repo={repo} />}
+      {/* 建库进度条只在**没有**本机上传时出现：上传中的库，进度已经由上面那一格在报了，
+          再画一条就是同一件事说两遍，还会把这张卡撑得比别的卡高。 */}
+      {upload ? null : <RepoPrepareProgress repo={repo} />}
 
       <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
 
@@ -624,7 +701,9 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
  * 与网格形态共用同一批零件（状态圆点/标签行/用量/次要信息/动作），只换排版，
  * 因此两种形态下看到的状态与可执行的动作**完全一致**（不会切个视图就少一个按钮）。
  *
- * 上传中的库同样走这一套（只多一个「上传中」标签，进度条与动作区换成上传那两件），见 RepoCard。
+ * 上传中的库同样走这一套：标签行多一个「上传中」（暂停时再加「已暂停」），**用量那一格**改报
+ * 上传进度（原地换数据源，左栏不会多出一条进度、行高与别的行一致），挂载按钮那一档换成
+ * 「暂停 / 继续」+「取消」；详情与配置两个入口照画、只是在占位库上置灰（见 RepoActions）。
  */
 export function RepoRow(props: RepoCardProps): JSX.Element {
   return <RepoMountRow {...props} />
@@ -650,20 +729,25 @@ function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onCon
               {repo.name}
             </Typography.Text>
             <span style={{ flexShrink: 0 }}>
-              <RepoTagRow repo={repo} controller={mountController} />
+              <RepoTagRow repo={repo} controller={mountController} upload={upload} />
             </span>
           </div>
-          {upload ? <RepoUploadProgress upload={upload} /> : <RepoPrepareProgress repo={repo} />}
+          {/* 建库进度条只在**没有**本机上传时出现（与卡片同一处判断）：上传中的库，进度由右边
+              那一格在报。左栏于是始终只有"名称行 + 次要信息行"，上传中的行与别的行等高，
+              名字、条、次要信息三样都横向对齐。 */}
+          {upload ? null : <RepoPrepareProgress repo={repo} />}
           <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.xxs }} />
         </div>
 
         {/* 用量固定宽度：多行之间进度条与数值才能对齐着扫。这个宽度同时就是条的长度
             （窄了条短得像条线、填充比例看不出来），且容得下「已用」+ 最宽的一条文案
-            （"- / 1000 MB" 这样的"已用 / 上限"）。 */}
+            （"- / 1000 MB" 这样的"已用 / 上限"）；上传进度复用同一格，所以两条数值也
+            落在同一条竖线上。 */}
         <RepoUsage
           repo={repo}
           usage={mountController.usage}
           loading={mountController.usageLoading}
+          upload={upload}
           style={{ flex: '0 0 auto', width: 240 }}
         />
 

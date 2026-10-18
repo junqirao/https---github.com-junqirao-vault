@@ -186,8 +186,9 @@ func freeBytesOf(path string) (uint64, bool) {
 // 都会被拒（ERROR_ACCESS_DENIED）。它们不属于本次复制的内容，统计时必须整棵跳过：
 // 否则一次**已经成功**的复制会在校验阶段因为"打不开目标盘的系统目录"被判失败
 // （真实事故：本地目录上传建库连续 3 次重试，全部挂在 copytree_dst 的
-//  `open G:\System Volume Information: Access is denied`，而上层的
-//  dstFiles < srcFiles 容忍度根本没机会生效，因为遍历先报错了）。
+//
+//	`open G:\System Volume Information: Access is denied`，而上层的
+//	dstFiles < srcFiles 容忍度根本没机会生效，因为遍历先报错了）。
 var volumeReservedDirs = map[string]bool{
 	"system volume information": true, // NTFS 的"系统卷信息"目录
 	"$recycle.bin":              true, // 卷根回收站

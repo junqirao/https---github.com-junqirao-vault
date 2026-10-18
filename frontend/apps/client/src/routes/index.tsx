@@ -4,6 +4,7 @@ import {
   AboutPage,
   AuditList,
   ClientSettings,
+  DiskImport,
   EmptyState,
   JobList,
   LeaseList,
@@ -201,9 +202,14 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
               onCreate={() => navigate('/admin/repos/new')}
               // 详情「返回」靠这个来源回到管理端列表（见 RepoDetailRoute）。
               onOpen={(repoId) => navigate(`/repos/${repoId}`, { state: { from: '/admin/repos' } })}
+              // 迁移入口：把存储根里已有的 VHDX 原地接管成存储库（见 DiskImport）。
+              onImport={() => navigate('/admin/repos/import')}
             />
           }
         />
+        {/* 导入是独立一页而非弹窗：要选的项、要核对的容量、要看的失败明细都比较多，
+            弹窗里做这些事只会让人反复取消重来。 */}
+        <Route path="repos/import" element={<DiskImport onBack={() => navigate('/admin/repos')} />} />
         <Route
           path="repos/new"
           element={

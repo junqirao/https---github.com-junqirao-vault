@@ -186,9 +186,11 @@ export function RepoCreateForm({
         storage_id: values.storage_id || undefined,
         // 不传 quota_bytes：库没有"配额"，建库只需要**容量**（容量即它占用的配额）。
         //
-        // 但共享磁盘限制要传：它随上传会话的清单一起存下来，服务端在上传结束建库时写进库配置，
-        // 不传的话这条路径建出来的库会丢掉用户填的限制（服务端建库那条路径是直接建库，不存在这个问题）。
-        diff_disk_limit_bytes: values.diff_disk_limit_bytes,
+        // 但共享数量要传：它随上传会话的清单一起存下来，服务端在上传结束建库时写进库配置 ——
+        // 不传的话这条路径建出来的库会丢掉用户填的值（服务端建库那条路径是直接建库、参数当场
+        // 生效，不存在这个问题）。共享数量曾经就是这么丢的：无论填几，建出来的库都是配置默认值
+        // 50（真实反馈："设置共享数量大于0时会变成50"）。
+        max_diff_disks: values.max_diff_disks,
         source_mode: 'copy',
         // 存储 ID 只对**它所属的那台**服务端有意义：多服务端下必须说清建到哪台。
         server_key: active?.key,
@@ -219,7 +221,7 @@ export function RepoCreateForm({
           <Form
             form={form}
             layout="vertical"
-            initialValues={{ mode: 'shared', max_diff_disks: 1, diff_disk_limit_bytes: 0 }}
+            initialValues={{ mode: 'shared', max_diff_disks: 1 }}
             onValuesChange={(changed, values) => {
               setExclusive(values.mode === 'exclusive')
               autoFillName(changed)
@@ -343,33 +345,6 @@ export function RepoCreateForm({
                 </Form.Item>
               </Col>
               <Col span={12}>
-                {/*
-                  共享磁盘限制 = 每块差异盘（每个共享者手里那块盘）**允许**的容量，也是它计入配额的量。
-                  差异盘只装差异数据、实际写入往往只有几十兆，按母盘容量整份记账会把共享者的配额
-                  一次吃光（30G 的库分给 5 个人 = 每人扣 30G），所以这里默认 0（不限制）、
-                  想省配额的人填一个够用的小值即可。
-
-                  单位与容量字段一致（M，见 CAPACITY_UNIT / capacityValueProps）：同一个表单里
-                  两个容量输入框不该用两种单位。
-                */}
-                <Form.Item
-                  name="diff_disk_limit_bytes"
-                  label={t('field.diffDiskLimit')}
-                  extra={
-                    exclusive ? t('repo.create.diffDiskLimitExclusive') : t('repo.create.diffDiskLimitHint')
-                  }
-                  getValueProps={capacityValueProps}
-                  normalize={capacityNormalize}
-                >
-                  <InputNumber
-                    min={0}
-                    disabled={exclusive}
-                    addonAfter={CAPACITY_UNIT}
-                    style={{ width: '100%' }}
-                  />
-                </Form.Item>
-              </Col>
-              <Col span={12}>
                 <Form.Item name="source_dir" label={t('field.sourceDirOptional')}>
                   <SourceDirPicker onValidityChange={setSourceDirValid} />
                 </Form.Item>
@@ -419,7 +394,6 @@ function buildCreatePayload(values: RepoFormValues, source: SourceDirValue | und
     storage_id: values.storage_id,
     size_bytes: values.size_bytes,
     max_diff_disks: values.max_diff_disks,
-    diff_disk_limit_bytes: values.diff_disk_limit_bytes,
     group: values.group
   }
   if (source?.kind === 'server' && source.path) payload.source_dir = source.path

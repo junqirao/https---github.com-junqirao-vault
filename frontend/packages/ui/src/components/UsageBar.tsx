@@ -58,6 +58,14 @@ export interface UsageBarProps {
    * 看到一条灰到底的空条只会以为没挂上，看到一个转圈才知道再等一下就有数。
    */
   loading?: boolean
+  /**
+   * 指定填充色，跳过"按占比分档"（见 usageColor）。
+   *
+   * 给的是**不是用量**的那条：上传进度复用了这块元素（同一个位置、同一条条、同一个居中百分数），
+   * 但"传到 85%"不是"盘快满了"——它必须一路蓝到底，不能被分档染成橙/红，
+   * 否则一行里会跳出与库健康度无关的告警色（真实反馈："进度条不变色，都蓝色就行"）。
+   */
+  color?: string
   style?: CSSProperties
 }
 
@@ -88,13 +96,13 @@ export interface UsageBarProps {
  *   - 置灰（muted，未挂载本机）：只剩这条灰轨道本身，把位置占住；
  *   - 取数中（loading，刚挂上、还在量）：灰轨道 + 一个转圈。
  */
-export function UsageBar({ percent, muted = false, loading = false, style }: UsageBarProps): JSX.Element {
+export function UsageBar({ percent, muted = false, loading = false, color, style }: UsageBarProps): JSX.Element {
   // 取数中与置灰一样：不填、不写数 —— 这一刻没有数字可填，填 0 或写 "0%" 都会被读成
   // "一个字节没用"（而 loading 只在"本来要写 `-`"时才会为真，见 props 的说明）。
   const blank = muted || loading
   const clamped = blank ? 0 : Math.min(100, Math.max(0, Math.round(percent)))
   // 空条的颜色给轨道色：不留"该是什么档"的悬念，也不必让分档函数去操心一个没画出来的颜色。
-  const strokeColor = blank ? palette.neutralFill : usageColor(clamped)
+  const strokeColor = blank ? palette.neutralFill : (color ?? usageColor(clamped))
   return (
     <div style={{ position: 'relative', lineHeight: 0, marginTop: spacing.xxs, ...style }}>
       {/* size 只给 height：line 形态下传单个数字是"宽高都设成它"（条会变成 16px 长的方块），

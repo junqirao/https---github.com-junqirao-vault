@@ -13,7 +13,10 @@ export interface ListResponse<T> {
 export type Role = 'super_admin' | 'user'
 export type Permission = 'read' | 'mount' | 'manage'
 export type RepoMode = 'shared' | 'exclusive'
-// importing：本地目录上传建库还没结束（数据在传/母盘在建），与 creating 一样不可挂载。
+// importing：母盘正在写入（数据已收完、建库任务在建盘），界面显示「写入中」，与 creating
+// 一样不可挂载。注意它**不代表数据还在传**：这个库记录要到"数据都收完了、建库任务开跑"才存在。
+// 还在传数据的那一帧是界面合成的占位库，标签取值另算（见 features/repo/uploadView.tsx 的
+// repoStateValue）。
 export type RepoState = 'creating' | 'importing' | 'active' | 'sealing' | 'deleting' | 'error'
 export type ParentCondition = 'idle' | 'derived' | 'temp_shared' | 'maintenance'
 export type DiskKind = 'parent' | 'diff' | 'standalone'
@@ -92,21 +95,19 @@ export interface RepoDTO {
    */
   share_count: number
   max_diff_disks: number
-  /**
-   * 共享磁盘限制：本库每块差异盘（也就是每个共享者手里那块盘）**允许**的容量，
-   * 也是它计入配额的量；0 表示不限制（按母盘容量整份记账）。
-   *
-   * 注意它不是"这块盘有多大"：盘挂出去仍然是母盘容量（客户端按容量匹配本地盘），
-   * 这个值管的是"按多少计费"—— 差异盘只装差异数据，按母盘容量整份扣会把共享者的
-   * 配额一次吃光（30G 的库分给 5 个人 = 每人扣 30G）。
-   */
-  diff_disk_limit_bytes: number
   quota_bytes: number
   /** 库容量：建库时设定的容量（那块盘的 VHDX 标称容量），服务端读时派生。 */
   capacity_bytes: number
   used_bytes: number
   state: RepoState
   group?: string
+  /**
+   * 说明备注（自由文本）。
+   *
+   * 主要用途是迁移：它会写进母盘旁边的元数据文件跟着盘走，换服务端后「导入磁盘」
+   * 能一眼看出"这是财务的 Win10 母盘，别删"。
+   */
+  note?: string
   client_config?: Record<string, unknown>
   /** 是否为池化共享库：建库时已把差异盘池建好并发布，分配即用（挂载免等）。 */
   pool: boolean
@@ -726,8 +727,6 @@ export interface CreateRepoRequest {
   source_dir?: string
   size_bytes?: number
   max_diff_disks?: number
-  /** 共享磁盘限制：每块差异盘允许的容量（单位字节，表单按 M 录入）；0/缺省表示不限制。 */
-  diff_disk_limit_bytes?: number
   quota_bytes?: number
   group?: string
 }
@@ -736,9 +735,9 @@ export interface UpdateRepoRequest {
   name?: string
   quota_bytes?: number
   max_diff_disks?: number
-  /** 共享磁盘限制；0 表示不限制。改了它，库里已有的差异盘会一起按新值重新记账。 */
-  diff_disk_limit_bytes?: number
   group?: string
+  /** 说明备注；传空串表示清空。它会随母盘元数据一起迁移。 */
+  note?: string
 }
 
 export interface ParentActionRequest {
@@ -825,4 +824,170 @@ export interface OrphanDeleteResultDTO {
   path: string
   /** 释放的字节数。 */
   freed_bytes: number
+}
+
+// ---- 导入已有母盘（管理端；仅超级管理员） ----
+
+/** 导入候选的分类（与后端 app.DiskImportKind* 一致）。 */
+export type DiskImportKind = 'parent' | 'standalone' | 'diff' | 'other'
+
+/** 不可导入/失败的原因码（与后端 app.DiskImportSkip 与 DiskImportFail 两组常量一致）。 */
+export type DiskImportSkipReason =
+  | 'already_registered'
+  | 'diff_disk'
+  | 'path_invalid'
+  | 'not_found'
+  | 'meta_unreadable'
+  | 'capacity_invalid'
+  | 'create_failed'
+
+/** 建议容量的来源（与后端 app.DiskImportCapacity* 一致），决定界面对这个数字的信赖程度。 */
+export type DiskImportCapacitySource = 'meta' | 'manual' | 'file'
+
+/** sidecar 里记录的"这块盘是怎么来的"。 */
+export interface DiskMetaSourceDTO {
+  /** empty | dir | import。 */
+  kind?: string
+  /** 建库时使用的服务端源目录（本机路径，迁移后可能已不存在）。 */
+  dir?: string
+  /** 建库时设置的库分组标签。 */
+  group?: string
+  /** 原服务端上的存储库 ID（迁移后新库会得到新 ID，这里保留原值供对照）。 */
+  repo_id?: string
+  /** 生成它的机器名。 */
+  host?: string
+  /** 建库时间（毫秒）。 */
+  at?: number
+}
+
+/**
+ * 母盘旁的同名元数据文件（`base.vhdx.meta.json`）的内容。
+ *
+ * 它是"出厂标签"：真正的源仍是服务端数据库，但盘被拷到另一台机器上时就只剩它了。
+ * 因此这里每个字段都是人/别的机器能直接读懂的裸值。
+ */
+export interface DiskMetaFileDTO {
+  schema: number
+  app?: string
+  /** 存储库名称（迁移后要恢复的首要信息）。 */
+  name?: string
+  /** 说明备注。 */
+  note?: string
+  repo_id?: string
+  mode?: string
+  kind?: string
+  /** 该盘面向的客户端操作系统（windows / linux）。 */
+  client_os?: string
+  /** 盘内分区上的文件系统（ntfs / ext4）。 */
+  file_system?: string
+  /**
+   * 盘的**标称容量**（VHDX VirtualSize）。
+   *
+   * ⚠️ 导入时最关键的字段：客户端按容量精确匹配本地 iSCSI 盘，差一个字节就找不到盘。
+   */
+  capacity_bytes?: number
+  vhd_type?: string
+  parent_version?: number
+  max_diff_disks?: number
+  source?: DiskMetaSourceDTO
+  written_at?: number
+  updated_at?: number
+}
+
+/** GET /v1/system/disks/import/scan 的一项候选。 */
+export interface DiskImportCandidateDTO {
+  /** 磁盘文件绝对路径（导入时原样回传）。 */
+  path: string
+  /** 所属存储根。 */
+  root: string
+  kind: DiskImportKind
+  /** **文件大小**（不是盘的标称容量；VHDX 稀疏，通常小于容量）。 */
+  size_bytes: number
+  modified_at: number
+  /** 元数据文件路径（无论存不存在都给，便于提示"去哪里补元数据"）。 */
+  meta_path?: string
+  /** 读到的元数据（没有 sidecar 时为 null）。 */
+  meta?: DiskMetaFileDTO | null
+  /** sidecar 存在但读不出来时的原因。 */
+  meta_error?: string
+  /** 数据库里已有这条路径（导入时会被跳过）。 */
+  registered: boolean
+  /** 可导入（未登记 + 不是差异盘 + 元数据可读 + 有容量）。 */
+  importable: boolean
+  /** 不可导入时的原因码。 */
+  skip_reason?: DiskImportSkipReason
+  /** 建议的存储库名称（界面预填、可改）。 */
+  suggested_name: string
+  /** 建议的标称容量。 */
+  suggested_capacity_bytes: number
+  capacity_source: DiskImportCapacitySource
+}
+
+/** GET /v1/system/disks/import/scan 的响应：一次现扫的结果。 */
+export interface DiskImportScanDTO {
+  at: number
+  /** 本次覆盖的存储根。 */
+  roots: string[]
+  /** 扫过的 .vhdx 文件数（含已登记与不可导入的）。 */
+  checked: number
+  /** 其中可导入的数量。 */
+  importable_count: number
+  /** 全部候选（含已登记与差异盘：界面要解释"它为什么被跳过"）。 */
+  candidates: DiskImportCandidateDTO[]
+  /** 未能扫描的位置说明，原样展示。 */
+  skipped?: string[]
+}
+
+/** 一条导入请求。 */
+export interface DiskImportItemDTO {
+  path: string
+  /** 存储库名称；留空则用元数据里的名称，再退到父目录名。 */
+  name?: string
+  /** 说明备注；留空则用元数据里的备注。 */
+  note?: string
+  /** 标称容量；留空（0）则用元数据里的容量，再退到文件大小。 */
+  capacity_bytes?: number
+}
+
+/** POST /v1/system/disks/import 的请求体。 */
+export interface DiskImportRequestDTO {
+  /** 归属用户（迁移后原主人在新机器上不一定存在，由管理员显式指定）。 */
+  owner_id: string
+  items: DiskImportItemDTO[]
+}
+
+/** 一条导入成功的结果。 */
+export interface ImportedDiskDTO {
+  path: string
+  repo_id: string
+  name: string
+  mode: string
+  kind: string
+  capacity_bytes: number
+  /** 容量是**按文件大小估的**（可能偏小 → 客户端可能匹配不到盘）。 */
+  capacity_estimated: boolean
+}
+
+/** 一条被跳过的结果。 */
+export interface DiskImportSkipDTO {
+  path: string
+  code: DiskImportSkipReason
+}
+
+/** 一条失败的结果。 */
+export interface DiskImportFailureDTO {
+  path: string
+  code: DiskImportSkipReason
+  detail?: string
+}
+
+/**
+ * POST /v1/system/disks/import 的响应。
+ *
+ * 逐条返回而不是"全成或全败"：迁移时几十块盘里有一块读不出来，不该让其余全部陪葬。
+ */
+export interface DiskImportResultDTO {
+  imported: ImportedDiskDTO[]
+  skipped: DiskImportSkipDTO[]
+  failed: DiskImportFailureDTO[]
 }

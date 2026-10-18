@@ -4,8 +4,9 @@ import { Alert, App, Button, Space, Typography } from 'antd'
 import { useEffect, useState } from 'react'
 
 import { useApi } from '../api/provider'
-import type { JobState, SysDepsItem } from '../api/types'
+import type { JobDTO, SysDepsItem } from '../api/types'
 import { useErrorNotifier } from '../hooks/useErrorNotifier'
+import { isJobTerminal, useJobProgress } from '../hooks/useJobProgress'
 import { useI18n } from '../i18n'
 import { spacing } from '../tokens/palette'
 
@@ -45,20 +46,6 @@ function signatureOf(items: SysDepsItem[]): string {
     .join(',')
 }
 
-/**
- * 任务是否已到终态。
- *
- * 与 JobList 的状态集合一致：pending / running 之外都算终态。
- * 轮询必须**由终态而非次数**来停：装包时长取决于软件源与包大小，
- * 用"最多轮询 N 次"会在慢网络上把还在正常安装的任务判成失败。
- */
-function isJobTerminal(state: JobState | undefined): boolean {
-  return state === 'succeeded' || state === 'failed' || state === 'cancelled'
-}
-
-/** 轮询间隔：本地装包通常几秒到几十秒，1.5s 足够跟手又不至于刷屏。 */
-const JOB_POLL_MS = 1500
-
 export interface SystemDepsBannerProps {
   /**
    * 当前用户能否触发"一键安装"。
@@ -80,7 +67,8 @@ export interface SystemDepsBannerProps {
  * 一轮轮询（60s）内横幅自动消失，不需要重启服务端。
  *
  * 对**能靠装包解决**的缺项（当前就是 targetcli 这类命令行工具）额外给一个"安装"按钮：
- * 走 POST /v1/system/deps/install 提交后台任务，前端轮询任务到终态后刷新探测结果。
+ * 走 POST /v1/system/deps/install 提交后台任务，任务进度由服务端经代理的事件流推来
+ * （见 useJobProgress），到终态后刷新探测结果。
  * 之所以不在这儿直接同步等待：装包要拉软件源、解包，动辄几十秒到几分钟，同步只会顶到 HTTP 超时。
  */
 export function SystemDepsBanner({ canInstall = false }: SystemDepsBannerProps): JSX.Element | null {
@@ -91,10 +79,10 @@ export function SystemDepsBanner({ canInstall = false }: SystemDepsBannerProps):
   const { message } = App.useApp()
   const [dismissed, setDismissed] = useState<string[]>(readDismissed)
 
-  // 正在安装的项 + 它的任务 ID：按钮的 loading 与轮询都挂在这上面。
+  // 正在安装的项 + 它的任务（202 响应里带回的初始快照）：按钮的 loading 与进度都挂在这上面。
   // 同时只允许一个：装包会改动整台宿主机，后端也用宿主机级锁把并发安装串行化了，
   // 前端再并行提交只会让用户看到两个必然互相阻塞的进度。
-  const [pending, setPending] = useState<{ key: string; title: string; jobId: string } | null>(null)
+  const [pending, setPending] = useState<{ key: string; title: string; job: JobDTO } | null>(null)
 
   const { data } = useQuery({
     queryKey: ['system-deps'],
@@ -108,20 +96,21 @@ export function SystemDepsBanner({ canInstall = false }: SystemDepsBannerProps):
   const install = useMutation({
     // 把 item 一起带进 onSuccess：横幅会随探测结果重渲染，届时按 key 反查会拿到 undefined。
     mutationFn: async (item: SysDepsItem) => ({ item, job: await api.installSystemDeps(item.key) }),
-    onSuccess: ({ item, job }) => setPending({ key: item.key, title: item.title, jobId: job.id }),
+    onSuccess: ({ item, job }) => setPending({ key: item.key, title: item.title, job }),
     // 提交就被拒（未开启自动安装 / 非 root / 无包管理器）走这里：服务端返回的是稳定错误码，
     // 按 code 本地化后能直接告诉用户"是权限还是配置"，不用去翻服务端日志。
     onError: (err) => notifyError(err)
   })
 
-  const jobQuery = useQuery({
-    queryKey: ['job', pending?.jobId ?? ''],
-    queryFn: () => api.getJob(pending?.jobId ?? ''),
-    enabled: Boolean(pending),
-    refetchInterval: (query) => (isJobTerminal(query.state.data?.state) ? false : JOB_POLL_MS)
-  })
+  // 任务进度来自代理事件流（event: job）：提交时 202 已经把初始快照带回来了，所以正常情况下
+  // 整个安装过程对服务端是**零请求**（过去是每 1.5s 查一次 GET /v1/jobs/{id}，服务端访问日志
+  // 被同一件事刷满）；只有事件沉默过久才兜底查一次。
+  const job = useJobProgress(
+    pending?.job.id,
+    pending ? { state: pending.job.state, progress: pending.job.progress } : null
+  )
 
-  const jobState = jobQuery.data?.state
+  const jobState = job?.state
   useEffect(() => {
     if (!pending || !isJobTerminal(jobState)) return
     if (jobState === 'succeeded') {
@@ -196,9 +185,9 @@ export function SystemDepsBanner({ canInstall = false }: SystemDepsBannerProps):
                       {t(installing ? 'system.deps.installing' : 'system.deps.install')}
                     </Button>
                   ) : null}
-                  {installing && jobQuery.data ? (
+                  {installing && job ? (
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      {t('system.deps.install_progress', { percent: jobQuery.data.progress })}
+                      {t('system.deps.install_progress', { percent: job.progress })}
                     </Typography.Text>
                   ) : null}
                 </Space>

@@ -37,8 +37,8 @@ type IscsiTarget struct {
 	// ActualIQN 平台侧实际用于连接的 IQN（Windows 会改写目标名）。
 	// 下发或对账时读回一次即持久化，后续挂载直接复用，避免每次挂载都读回。
 	ActualIQN string `db:"actual_iqn" json:"actual_iqn,omitempty"`
-	CreatedAt int64 `db:"created_at" json:"created_at"`
-	UpdatedAt int64 `db:"updated_at" json:"updated_at"`
+	CreatedAt int64  `db:"created_at" json:"created_at"`
+	UpdatedAt int64  `db:"updated_at" json:"updated_at"`
 }
 
 // IQN 返回完整的 iSCSI 限定名。

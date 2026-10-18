@@ -526,9 +526,9 @@ func runServe(configPath *string, migrateOnly *bool) int {
 		SysDepsProbe: plat.SysDepsProbe,
 		// 系统依赖按需安装（前端"安装"按钮 → 后台任务）：Linux 注入，Windows 为 nil。
 		SysDepsInstall: plat.SysDepsInstall,
-		Tokens:       cert.NewTokenStore(security.EnrollmentTokenTTL.Std()),
-		Sessions:     app.NewSessionStore(security.SessionTTL.Std()),
-		Events:       eventSinkAdapter{hub: events},
+		Tokens:         cert.NewTokenStore(security.EnrollmentTokenTTL.Std()),
+		Sessions:       app.NewSessionStore(security.SessionTTL.Std()),
+		Events:         eventSinkAdapter{hub: events},
 	})
 	application.RegisterJobHandlers()
 
@@ -632,19 +632,38 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	startTicker("reconcile", 5*time.Minute, func(ctx context.Context) error {
 		return application.Reconcile(ctx)
 	})
-	// 上传暂存 GC：清理超过 24h 未完成的上传会话与暂存目录（见 5.10 步骤 ⑥）。
+	// 上传暂存 GC：清理超过 24h 没有动静的未完成会话，以及已结束会话残留的暂存目录
+	// （见 5.10 步骤 ⑥）。后者是兜底：正常完成时收尾就删了，但"没删成"（目录被占用、
+	// 进程正好退出、老版本只在 move 模式删）留下的目录不兜就永远不落 —— 那不是小数目，
+	// 一台服务器上能攒出几百 G。
 	startTicker("upload_gc", 30*time.Minute, func(ctx context.Context) error {
 		n, err := application.Uploads().GCStaleUploads(ctx)
 		if err != nil {
 			return err
 		}
 		if n > 0 {
-			log.Info("已清理过期上传会话", "count", n)
+			log.Info("已回收上传暂存", "count", n)
 		}
 		return nil
 	})
 
 	// ---- 13) HTTP 服务 ----
+	// 进度也走同一条 SSE 通道：客户端（本地代理）据此实时显示建库进度，不必再每 2 秒轮询
+	// GET /v1/jobs/{id} —— 那种轮询会让服务端访问日志被"同一件事"的流水刷满（真实反馈：
+	// "上传时会因为客户端拉上传状态而刷屏服务日志"）。
+	//
+	// 只在进度**变化**时触发（见 job.Worker 的 Reporter），频率与进度推进同阶：一个建库任务
+	// 通常每分钟几条，而不是每分钟 30 条。SSE 长连接本身不产生访问日志。
+	jobs.OnProgress(func(j *domain.Job, percent int) {
+		events.Publish(api.Event{Type: "job", Data: map[string]any{
+			"job_id":   j.ID,
+			"type":     string(j.Type),
+			"ref_id":   j.RefID,
+			"state":    string(j.State),
+			"progress": percent,
+		}})
+	})
+
 	jobs.OnFinished(func(j *domain.Job) {
 		events.Publish(api.Event{Type: "job", Data: map[string]any{
 			"job_id":   j.ID,

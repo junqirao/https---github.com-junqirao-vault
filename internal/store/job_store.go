@@ -438,14 +438,18 @@ func (s *Store) DeleteUpload(ctx context.Context, id string) error {
 	return mustAffect(res, apperr.UploadNotFound().WithArg("id", id))
 }
 
-// ListStaleUploads 列出创建时间早于 cutoff 且尚未完成的会话，供 GC 清理暂存目录。
+// ListStaleUploads 列出**最后有动静**早于 cutoff 且尚未完成的会话，供 GC 清理暂存目录。
 //
-// 已 complete 的会话不在此列（其暂存由完成流程负责回收）。
+// 已 complete 的会话不在此列（其暂存由完成流程负责回收，残留另有 ListFinishedUploadsWithStaging 兜底）。
+//
+// 判定用 updated_at 而不是 created_at：每收到一个分块都会刷新它（见 AddUploadReceived），
+// 也就是"这个会话还有人在喂"。按 created_at 算的话，一个大目录传了一整天、刚过 24h 还在传，
+// 它的暂存目录会被 GC 从**正在进行的上传**脚下删掉 —— 用户看到的是"传到一半突然全失败"。
 func (s *Store) ListStaleUploads(ctx context.Context, cutoff int64, limit int) ([]domain.Upload, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	query := `SELECT ` + uploadCols + ` FROM uploads WHERE created_at < ? AND state <> ? ORDER BY created_at LIMIT ?`
+	query := `SELECT ` + uploadCols + ` FROM uploads WHERE updated_at < ? AND state <> ? ORDER BY updated_at LIMIT ?`
 	var rows []struct {
 		ID            string `db:"id"`
 		UserID        string `db:"user_id"`
@@ -473,6 +477,63 @@ func (s *Store) ListStaleUploads(ctx context.Context, cutoff int64, limit int) (
 		})
 	}
 	return out, nil
+}
+
+// UploadStagingRemnant 是一条"会话已结束、但暂存路径还挂着"的记录（GC 回收用）。
+//
+// 只带 GC 需要的两个字段：整条 uploads 行的映射（含几十 MB 的 manifest）在这个流程里
+// 毫无用处，而它每次扫描都要查一批。
+type UploadStagingRemnant struct {
+	ID         string
+	StagingDir string
+}
+
+// ListFinishedUploadsWithStaging 列出已结束（complete/aborted）但暂存路径还没清空的会话。
+//
+// 用途：兜底回收残留的暂存目录（见 UploadService.gcLeftoverStaging）。正常完成时
+// runUploadComplete 自己就会删，这里兜的是"那一次没删成"：目录被占用、进程正好退出、
+// 或者某个版本只在 move 模式删 —— 后者会让**默认 copy 模式**的每一次上传都留下一整棵树，
+// 用户服务器上"staging 占了几百 G"就是这么来的。
+//
+// 两个关键细节：
+//   - 用 updated_at 判定（"最后有动静"）而不是 created_at，给刚完成的会话留一段宽限期：
+//     完成流程是"先标记 complete、再删目录"，两动作之间有个很短的窗口，没有宽限期就可能
+//     两边同时对着同一棵树 RemoveAll；
+//   - 调用方回收成功后会清空 staging_dir（见 ClearUploadStagingDir），这条会话便**离开本
+//     查询的窗口**。否则 LIMIT 每轮都是同一批（它们的目录早就不存在了），后面的永远轮不上。
+func (s *Store) ListFinishedUploadsWithStaging(ctx context.Context, cutoff int64, limit int) ([]UploadStagingRemnant, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	var rows []struct {
+		ID         string `db:"id"`
+		StagingDir string `db:"staging_dir"`
+	}
+	query := `SELECT id, staging_dir FROM uploads
+		WHERE staging_dir <> '' AND state IN (?, ?) AND updated_at < ?
+		ORDER BY updated_at LIMIT ?`
+	if err := s.q.SelectContext(ctx, &rows, s.q.Rebind(query),
+		domain.UploadStateComplete, domain.UploadStateAborted, cutoff, limit); err != nil {
+		return nil, fmt.Errorf("store: 查询待回收的暂存目录失败: %w", err)
+	}
+	out := make([]UploadStagingRemnant, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, UploadStagingRemnant{ID: r.ID, StagingDir: r.StagingDir})
+	}
+	return out, nil
+}
+
+// ClearUploadStagingDir 清空一条会话的暂存路径（GC 确认目录已回收后调用）。
+//
+// 刻意**不动 updated_at**：那一列的语义是"这个会话最后有上传活动"（GC 的过期判定、
+// "5 分钟内还被喂过分块"的判定都读它），不是通用的行修改时间。
+// 幂等：行已经不在时静默返回（GC 与其它清理路径可能同时收尾同一条会话）。
+func (s *Store) ClearUploadStagingDir(ctx context.Context, id string) error {
+	if _, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE uploads SET staging_dir = '' WHERE id = ?`), id); err != nil {
+		return fmt.Errorf("store: 清空上传暂存路径失败: %w", err)
+	}
+	return nil
 }
 
 // ---------- upload chunks ----------
