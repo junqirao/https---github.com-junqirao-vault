@@ -785,6 +785,10 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 			"allocation_id", allocationID, "error", err)
 	}
 
+	// ④c 清理发起端残留：本系统"用一次删一次"——删掉该目标的发现缓存；若没有别的挂载还在用
+	// 同一个门户，连门户一起删（门户上挂着「已发现目标」缓存，不删就会越积越多）。
+	e.cleanupInitiatorEntries(ctx, ms)
+
 	// ⑤ 回写 release（失败不影响本地已卸载的事实）。
 	// 发给**这条件挂载所属的那台**服务端（见 Agent.mountClient）：拿 A 的租约去 B 上释放，
 	// B 只会告诉你"没这条租约"，而 A 那边要到租约自然过期才回收。
@@ -800,6 +804,51 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 	e.a.hub.Publish(Event{Type: "unmount", Data: map[string]any{"allocation_id": allocationID}})
 	e.a.logger.Info("卸载完成", "allocation_id", allocationID, "mount_path", ms.MountPath)
 	return nil
+}
+
+// cleanupInitiatorEntries 卸载后清理发起端里这条挂载留下的条目（尽力而为）。
+//
+// 只做两件事：
+//   - 删掉该目标的发现/持久缓存（RemoveTarget；部分系统无此 cmdlet 时空操作）；
+//   - 若**没有别的挂载**还在用同一个门户，删掉门户 —— 门户上挂着「已发现目标」缓存，
+//     不删就会在 iSCSI 发起程序里越积越多（真实反馈："一大堆没用的死连接，用一次删一次"）。
+//
+// 全部尽力而为：失败只记日志，绝不阻塞卸载（卸载的关键步骤在前面已经完成）。
+func (e *mountEngine) cleanupInitiatorEntries(ctx context.Context, ms MountState) {
+	if iqn := strings.TrimSpace(ms.TargetIQN); iqn != "" {
+		if err := e.a.iscsi.RemoveTarget(ctx, iqn); err != nil {
+			e.a.logger.Warn("清理 iSCSI 发现缓存失败（继续卸载）", "target_iqn", iqn, "error", err)
+		}
+	}
+	host, port, ok := splitPortal(ms.Portal)
+	if !ok {
+		return
+	}
+	// 别的挂载还在用同一个门户：不能删（删了会把它们的连接一起拆掉）。
+	for _, other := range e.a.store.ListMounts() {
+		if other.AllocationID == ms.AllocationID {
+			continue
+		}
+		if h, p, ok := splitPortal(other.Portal); ok && h == host && p == port {
+			return
+		}
+	}
+	if err := e.a.iscsi.RemovePortal(ctx, host, port); err != nil {
+		e.a.logger.Warn("移除 iSCSI 门户失败（继续卸载）", "portal", ms.Portal, "error", err)
+	}
+}
+
+// splitPortal 解析 "host:port" 形式的门户；格式不对时 ok=false。
+func splitPortal(portal string) (string, int, bool) {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(portal))
+	if err != nil || strings.TrimSpace(host) == "" {
+		return "", 0, false
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 {
+		return "", 0, false
+	}
+	return host, port, true
 }
 
 // disconnectSession 断开 iSCSI 会话；遇到 0xefff0040（会话上仍有在线设备）时补一次磁盘

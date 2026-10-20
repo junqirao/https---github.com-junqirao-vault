@@ -15,12 +15,13 @@ import type { JobDTO, ParentAction, RepoDTO, UpdateRepoRequest } from '../../api
 import { pickMountUsage, repoUsageLoading, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { isJobTerminal, useJobProgress } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
-import { useServerConfig } from '../../hooks/useServerConfig'
+
 import { spacing } from '../../tokens/palette'
 import { formatTime, repoUsage } from '../../utils/format'
 import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
+import { RepoParentFiles } from './RepoParentFiles'
 import { RepoMountActions, useRepoMount } from './RepoMount'
 import { RepoGroupSelect } from './RepoGroupSelect'
 import { RepoMountSettingsPanel } from './RepoMountSettings'
@@ -179,47 +180,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parentJob, parentProgress?.state, t])
 
-  // 维护态下服务端会为母盘建一个临时占位分配（user_id=@temp）：本地管理员可以据此
-  // 把母盘临时挂到本机读写，更新内容后再退出维护。
-  const { active } = useServerConfig()
-  const allocationsQuery = useQuery({
-    queryKey: ['repo-allocations', repoId],
-    queryFn: () => api.listAllocations(repoId),
-    // 不加 maintenance 条件：进入维护后要立刻能看到 @temp 占位分配，靠 enabled 从 false
-    // 翻到 true 的时机太容易错过（父盘状态还没刷回来的那一拍按钮就是灰的）。
-    enabled: Boolean(repoQuery.data)
-  })
-  const tempAllocation = allocationsQuery.data?.items.find(
-    (item) => item.user_id === '@temp' && item.state !== 'released'
-  )
-  const parentMount = (agent.state?.mounts ?? []).find(
-    (item) => item.allocation_id === tempAllocation?.id
-  )
-  const parentMounted = Boolean(parentMount && parentMount.state === 'mounted')
-  const parentMountMutation = useMutation({
-    mutationFn: async () => {
-      if (parentMount) {
-        await agent.unmount({ allocation_id: parentMount.allocation_id })
-        return
-      }
-      if (!tempAllocation) throw new Error(t('repo.maintenance.parentNotReady'))
-      await agent.mount({
-        allocation_id: tempAllocation.id,
-        // 母盘临时挂载默认用盘符：维护时管理员要直接打开这块盘改内容，盘符最直观。
-        mount_mode: 'letter',
-        repo_id: repoId,
-        repo_name: repoQuery.data?.name,
-        server_key: active?.key,
-        server_url: active?.baseUrl
-      })
-    },
-    onSuccess: () => {
-      // 母盘挂/卸会改磁盘状态与分配，磁盘 tab 与分配列表都要跟着刷新。
-      refresh()
-      void queryClient.invalidateQueries({ queryKey: ['leases'] })
-    },
-    onError: (err) => setError(err)
-  })
+  // 维护态的母盘文件管理改由服务端本地挂载 + 文件 API 完成（见 RepoParentFiles），
+  // 不再把母盘通过 iSCSI 挂到客户端，因此这里没有 @temp 分配/挂载逻辑。
 
   const resizeMutation = useMutation({
     mutationFn: (sizeBytes: number) => api.resizeParentDisk(repoId, sizeBytes),
@@ -388,14 +350,6 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                 <Space wrap>
                   <Button
                     size="small"
-                    loading={parentMountMutation.isPending || allocationsQuery.isLoading}
-                    disabled={!parentMount && !tempAllocation}
-                    onClick={() => parentMountMutation.mutate()}
-                  >
-                    {parentMounted ? t('repo.maintenance.unmountParent') : t('repo.maintenance.mountParent')}
-                  </Button>
-                  <Button
-                    size="small"
                     onClick={() => {
                       const currentGb = Math.ceil((repo?.capacity_bytes ?? 0) / (1024 * 1024 * 1024))
                       resizeForm.setFieldsValue({ size_gb: currentGb + 1 })
@@ -489,6 +443,16 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                   key: 'members',
                   label: t('repo.detail.members'),
                   children: <RepoMembers repoId={repoId} isSuperAdmin={isSuperAdmin} />
+                }
+              ]
+            : []),
+          // 维护态下直接管理母盘文件：服务端本地挂载 + 文件 API（不再挂到客户端）。
+          ...(isMaintenance && canManage
+            ? [
+                {
+                  key: 'parentFiles',
+                  label: t('repo.parentFiles.tab'),
+                  children: <RepoParentFiles repoId={repoId} />
                 }
               ]
             : []),

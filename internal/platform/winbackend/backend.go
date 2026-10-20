@@ -227,12 +227,55 @@ func (b *Backend) MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, 
 	return files, bytes, nil
 }
 
+// MountVolume 在服务端本地挂载 VHDX 的卷，返回盘符根（如 `E:\`）。
+//
+// 用于"维护态直接管理母盘文件"：不再把母盘通过 iSCSI 挂到客户端，改由服务端挂载后经
+// 文件 API 浏览/上传/下载/编辑 —— 链路短，也不受客户端 iSCSI 环境影响。
+// 失败时负责把已 attach 的 VHDX detach 掉，避免留下"已挂载但无句柄管理"的脏状态。
+func (b *Backend) MountVolume(ctx context.Context, ref, fileSystem string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", apperr.InvalidParam("ref")
+	}
+	if strings.TrimSpace(fileSystem) == "" {
+		fileSystem = "ntfs"
+	}
+	if _, err := b.VHD.Attach(ctx, ref, false); err != nil {
+		return "", err
+	}
+	attached := true
+	defer func() {
+		if attached {
+			if dErr := b.VHD.Detach(context.WithoutCancel(ctx), ref); dErr != nil {
+				b.log.Warn("挂载卷失败后卸载 VHDX 失败", "ref", ref, "error", dErr)
+			}
+		}
+	}()
+
+	// 刚 attach 完 Get-Disk 可能查不到，先刷新缓存（失败只告警）。
+	if err := b.Vol.UpdateHostStorageCache(ctx); err != nil {
+		b.log.Warn("刷新主机存储缓存失败", "error", err)
+	}
+	info, err := b.Vol.EnsureFormatted(ctx, ref, fileSystem, "")
+	if err != nil {
+		return "", err
+	}
+	if info.DriveLetter == "" {
+		return "", apperr.New("disk.format_failed", http.StatusInternalServerError).
+			WithArg("reason", "no_drive_letter")
+	}
+	attached = false
+	return info.DriveLetter + `:\`, nil
+}
+
+// UnmountVolume 取消服务端本地挂载（幂等）。
+func (b *Backend) UnmountVolume(ctx context.Context, ref, _ string) error {
+	return b.VHD.Detach(ctx, ref)
+}
+
 // SpaceUsageOf 返回路径所在卷的标识、文件系统与可用/总空间。
 func (b *Backend) SpaceUsageOf(ctx context.Context, path string) (*domain.VolumeSpace, error) {
 	return b.Vol.SpaceUsageOf(ctx, path)
-}
-
-// FileSystemOf 返回路径所在卷的文件系统名。
+} // FileSystemOf 返回路径所在卷的文件系统名。
 func (b *Backend) FileSystemOf(ctx context.Context, path string) (string, error) {
 	return b.Vol.FileSystemOf(ctx, path)
 }

@@ -1086,13 +1086,15 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 ```
 进入维护：POST /v1/repos/{id}/parent/actions {action:"maintenance"}
   ① 前置校验：parent_condition = IDLE（临时共享需先撤销）
-  ② 为母盘建立临时 iSCSI 目标与占位分配（user_id=@temp，读写），并置
-     parent_condition = 'MAINTENANCE'：立即禁止新的分配与挂载
-  ③ 管理员可在客户端把这块母盘**临时挂载到本地**读写，更新内容
-     （清理差异盘 / 拷入新版本文件等）
+  ② 只置 parent_condition = 'MAINTENANCE'：立即禁止新的分配与挂载。
+     **不再建 @temp 占位分配 / 母盘临时 iSCSI 目标**（旧的"挂到客户端"链路已移除）
+  ③ 管理员在详情页「母盘文件」里直接浏览/上传/下载/新建/重命名/删除/编辑：
+     - 服务端把母盘卷**本地挂载**（Windows=attach VHDX 取盘符；Linux=激活 LV 并挂到临时目录）
+     - 文件 API 作用域严格限制在挂载根内（拒绝 `..`/绝对路径/符号链接逃逸）
+     - 首次访问懒挂载；退出维护时卸载
   ④ 可扩容母盘：POST /v1/repos/{id}/parent/resize {size_bytes}
      - 仅维护态；只扩不缩
-     - 要求没有差异盘、没有在线客户端（母盘未挂载）
+     - 要求没有差异盘、没有在线客户端
      - 平台侧：Windows=Resize-VHD，Linux=lvextend；完成后重算母盘指纹
 
 清理差异盘（维护态内，异步）：POST /v1/repos/{id}/parent/cleanup-diffs
@@ -1105,15 +1107,16 @@ IQN         = iqn.2026-01.com.vault:{target_name}
   ④ 任务失败可重试：每次尝试重新列出仍存在的差异盘，不会重复处理已删盘
 
 退出维护：POST /v1/repos/{id}/parent/actions {action:"finish_maintenance"}
-  ① 请求内只做**快**的两件事：把母盘临时挂载的在线租约标记为 revoked（SSE 推 revoke
-     指令，客户端据此卸载并展示原因），以及状态机校验（ActiveLeases 归零）
-  ② 入队 JobParentTeardown（异步、可重试）：拆母盘临时 iSCSI 目标并清理占位分配
-     —— 拆除要走多次 PowerShell（解映射/停用/删除，实测 30~60 秒，卡住时更久），
-        同步做会超过客户端 20s 超时（真实反馈："退出不了维护状态 / network.timeout"）
-  ③ 任务完成后：parent_version += 1 → 重算 content_fingerprint → 刷新盘上元数据 →
-     parent_condition = 'IDLE'（此后母盘又可正常派生差异盘）
-  - 撤销临时共享（action:"unshare"）走同一套异步拆除
-  - 返回 202 + JobDTO；界面用任务进度展示（见 useJobProgress）
+  ① 请求内先撤租约（SSE 推 revoke 指令，客户端据此卸载并展示原因）+ 状态机校验
+  ② **卸载服务端本地的母盘挂载**（幂等、尽力而为）：挂载还在时母盘 VHDX 被本机占用，
+     派生差异盘会共享冲突
+  ③ **同步改状态**（纯 DB/本地动作）：parent_version += 1 → 重算 content_fingerprint →
+     刷新盘上元数据 → parent_condition = 'IDLE'
+     —— 状态迁移**不依赖 iSCSI**：否则平台一卡用户就"结束不了维护"（真实反馈）
+  ④ 再入队 JobParentTeardown（**尽力而为**、不改变状态）：清理**历史遗留**的 @temp 目标/分配。
+     新的维护态不再建临时目标，这一步通常为幂等空跑
+   - 撤销临时共享（action:"unshare"）同一套
+   - 返回 200 + RepoDTO；后台清理任务可在「任务」页查看/取消
 ```
 
 **清理差异盘（维护态内的异步任务）是危险操作，必须强调**
@@ -1180,8 +1183,19 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 ③ Disconnect-IscsiTarget -NodeAddress <iqn>
    └ device_in_use（0xefff0040）时补一次 Offline 后**重试**（最多 3 次、间隔 2s）
 ④ Unregister-IscsiSession（可选，去除持久化）
-⑤ POST /v1/leases/{id}/release → 服务端标记 released
+⑤ 清理发起端残留（"用一次删一次"）：
+   - Remove-IscsiTarget：删掉该目标的发现/持久缓存（部分系统无此 cmdlet 时空操作）
+   - 若**没有别的挂载**还在用同一个门户 → Remove-IscsiTargetPortal：连门户一起删
+     （门户上挂着「已发现目标」缓存，不删就会在发起程序里越积越多）
+⑥ POST /v1/leases/{id}/release → 服务端标记 released
 ```
+
+> **发起端"用一次删一次"**：卸载后不留门户与发现缓存，否则 iSCSI 发起程序里会越积越多
+> （真实反馈："一大堆没用的死连接"，且未开客户端时资源管理器枚举 iSCSI 设备会变慢）。
+> 另外，代理**启动时**会做一次残留清理（`initiator_prune_sessions.ps1`）：把短名以
+> `vault-` / `vcache-` 开头、但已不在挂载记录里的会话与收藏目标清掉，并**删除没有任何会话在用的
+> 门户**（门户是「已发现目标」缓存的容器，不删它 `Get-IscsiTarget` 就会一直留着历史目标）。
+> 只动本系统命名的目标与无用门户，绝不碰用户自己配的 iSCSI。
 
 > **① 必须在 ② 之前（真实事故）**：`Set-Disk -IsOffline $true` 一生效，盘符/目录就立刻从系统里
 > 消失，此时再 `Remove-PartitionAccessPath` 只会失败，卸载中断在第 ① 步。用户看到的现象是
@@ -1736,7 +1750,8 @@ Dismount-VHD -Path $vhdx
 > 而不是当场重下发：重下发是多次 PowerShell（几十秒），会被 60s 对账预算中途掐断，而
 > **杀掉正在执行的 iSCSI cmdlet 会把 WinTarget 的 WMI 提供程序留在坏状态**，之后所有目标操作
 > 都会挂死（真实事故：母盘发布 / 退出维护任务一直卡着）。修复任务走 worker（无对账预算）、
-> 按目标锁与挂载串行，脚本能完整跑完；幂等键按 5 分钟分桶，避免对持续故障的目标刷任务。
+> 按目标锁与挂载串行，脚本能完整跑完；幂等键按 5 分钟分桶，且**同一目标的修复刚失败过会进入
+> 30 分钟冷却**（避免平台真坏时每轮对账都入队、任务一直重复一直失败）。
 > 旧命名目标的清理也复用同一份平台列表，不再额外枚举一次。
 
 ### 5.12 任务系统（Job）
@@ -1770,6 +1785,7 @@ Dismount-VHD -Path $vhdx
 | --- | --- | --- |
 | 进程 | Windows：`CreateMutexW` 命名互斥体 `Global\VaultServer`；Linux：`flock` 锁文件 | 服务端单实例 |
 | 资源 | 按 `disk_id` 的进程内互斥锁 | 防止同盘并发操作 |
+| 等锁 | `Keyed.LockContext(ctx, key)`：等待期间 ctx 被取消即放弃获取 | 任务/请求被取消后不再排在卡死的锁后面（真实事故：任务卡几个小时都在执行中，其实是等锁） |
 | DB | 事务 + `SELECT ... FOR UPDATE`（PG）/ `BEGIN IMMEDIATE`（SQLite） | 防止分配超卖 |
 | 文件 | 操作前 `CreateFile` with share mode=0 试探 | 探测 VHDX 是否被占用 |
 | 客户端 | 同机单实例 + 每个 mount_point 互斥 | 防止重复挂载 |

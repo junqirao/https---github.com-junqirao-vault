@@ -81,6 +81,12 @@ const (
 	ScriptInitiatorUnregister = "initiator_unregister.ps1"
 	// ScriptInitiatorRemoveTarget 清理已发现的 iSCSI 目标缓存。
 	ScriptInitiatorRemoveTarget = "initiator_remove_target.ps1"
+	// ScriptInitiatorRemovePortal 移除 iSCSI 目标门户（连同其「已发现目标」缓存）。
+	//
+	// 用于"用一次删一次"：卸载后不留门户与发现缓存，避免发起程序里越积越多。
+	ScriptInitiatorRemovePortal = "initiator_remove_portal.ps1"
+	// ScriptInitiatorPruneSessions 清理发起端里属于本系统、但已无对应挂载的残留会话与持久目标。
+	ScriptInitiatorPruneSessions = "initiator_prune_sessions.ps1"
 	// ScriptVHDResetDiskIdentifier 重置 VHDX 磁盘标识（Set-VHD -ResetDiskIdentifier）。
 	ScriptVHDResetDiskIdentifier = "vhd_reset_disk_identifier.ps1"
 	// ScriptVHDOptimize 回收 VHDX 空间（Retrim / Compact）。

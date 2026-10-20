@@ -205,6 +205,31 @@ func (a *Agent) finishInterruptedUnmounts(ctx context.Context) {
 	wg.Wait()
 }
 
+// pruneOrphanInitiatorSessions 清理 iSCSI 发起端里属于本系统、但已经没有对应挂载记录的残留。
+//
+// 为什么需要：进程中途被杀 / 卸载失败会把会话留在发起端，它会一直重连（界面上就是一堆
+// "死连接"），越积越多（真实反馈："iSCSI 发起程序里一大堆没用的死连接，用一次删一次"）。
+// 保留清单 = 当前仍在挂载记录里的目标 IQN；脚本只动短名以 vault- / vcache- 开头的目标，
+// 绝不碰用户自己配的 iSCSI。
+//
+// 尽力而为：失败只记日志，不影响启动。
+func (a *Agent) pruneOrphanInitiatorSessions(ctx context.Context) {
+	keep := make([]string, 0, 4)
+	for _, ms := range a.store.ListMounts() {
+		if iqn := strings.TrimSpace(ms.TargetIQN); iqn != "" {
+			keep = append(keep, iqn)
+		}
+	}
+	removed, err := a.iscsi.PruneSessions(ctx, keep)
+	if err != nil {
+		a.logger.Warn("清理 iSCSI 残留会话失败", "error", err)
+		return
+	}
+	if removed > 0 {
+		a.logger.Info("已清理 iSCSI 残留会话/收藏目标", "count", removed)
+	}
+}
+
 // restoreRecordedMounts 依据本地状态文件中记录的分配，尽力恢复挂载（并发上限 2）。
 //
 // 注意语义：服务端没有「本机应挂载哪些分配」的清单接口，因此这里只能恢复本代理上次运行

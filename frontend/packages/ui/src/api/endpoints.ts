@@ -1,4 +1,5 @@
-import { ApiClient } from './client'
+import { ApiClient, buildQuery } from './client'
+import { businessErrorFrom } from './errors'
 import type {
   AllocationDTO,
   AuditDTO,
@@ -41,6 +42,7 @@ import type {
   OrphanDeleteResultDTO,
   OrphanScanDTO,
   ParentAction,
+  ParentFileListingDTO,
   PoolDeleteRequest,
   PoolDeleteResult,
   RepoDTO,
@@ -359,6 +361,76 @@ export class VaultApi extends ApiClient {
     })
   }
 
+  // ---- 维护态母盘文件管理（服务端本地挂载，不经过 iSCSI） ----
+
+  listParentFiles(id: string, path: string): Promise<ParentFileListingDTO> {
+    return this.request<ParentFileListingDTO>('GET', `/v1/repos/${encodeURIComponent(id)}/parent/files`, undefined, {
+      path
+    })
+  }
+
+  readParentText(id: string, path: string): Promise<{ content: string }> {
+    return this.request<{ content: string }>(
+      'GET',
+      `/v1/repos/${encodeURIComponent(id)}/parent/files/text`,
+      undefined,
+      { path }
+    )
+  }
+
+  writeParentText(id: string, path: string, content: string): Promise<void> {
+    return this.request<void>('PUT', `/v1/repos/${encodeURIComponent(id)}/parent/files/text`, { path, content })
+  }
+
+  deleteParentEntry(id: string, path: string): Promise<void> {
+    return this.request<void>('DELETE', `/v1/repos/${encodeURIComponent(id)}/parent/files`, undefined, { path })
+  }
+
+  mkdirParent(id: string, path: string): Promise<void> {
+    return this.request<void>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/files/dir`, { path })
+  }
+
+  moveParentEntry(id: string, from: string, to: string): Promise<{ path: string }> {
+    return this.request<{ path: string }>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/files/move`, {
+      from,
+      to
+    })
+  }
+
+  /**
+   * 上传/覆盖母盘中的一个文件（请求体即文件内容）。
+   *
+   * 二进制内容不能走 JSON 封装的 request()，直接用 fetch 携带同一份令牌。
+   */
+  async uploadParentFile(id: string, path: string, file: Blob): Promise<{ path: string; size: number }> {
+    const res = await fetch(this.parentFileContentURL(id, path), {
+      method: 'PUT',
+      headers: this.authHeaders(),
+      body: file
+    })
+    if (!res.ok) throw await binaryError(res)
+    return (await res.json()) as { path: string; size: number }
+  }
+
+  /** 下载母盘文件为 Blob（调用方负责触发浏览器下载）。 */
+  async downloadParentFile(id: string, path: string): Promise<Blob> {
+    const res = await fetch(this.parentFileContentURL(id, path), { headers: this.authHeaders() })
+    if (!res.ok) throw await binaryError(res)
+    return res.blob()
+  }
+
+  private parentFileContentURL(id: string, path: string): string {
+    const { baseUrl } = this.config()
+    return `${baseUrl.replace(/\/$/, '')}/v1/repos/${encodeURIComponent(id)}/parent/files/content${buildQuery({
+      path
+    })}`
+  }
+
+  private authHeaders(): Record<string, string> {
+    const { token } = this.config()
+    return token ? { Authorization: `Bearer ${token}` } : {}
+  }
+
   copyRepo(id: string, newRepoName: string): Promise<JobDTO> {
     return this.request<JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/copy`, { new_repo_name: newRepoName })
   }
@@ -486,4 +558,15 @@ export class VaultApi extends ApiClient {
   cancelJob(id: string): Promise<JobDTO> {
     return this.request<JobDTO>('POST', `/v1/jobs/${encodeURIComponent(id)}/cancel`)
   }
+}
+
+/** 把二进制接口的错误响应转成携带业务码的 ApiError（与 JSON 接口同一套）。 */
+async function binaryError(res: Response): Promise<Error> {
+  let payload: unknown
+  try {
+    payload = await res.json()
+  } catch {
+    payload = undefined
+  }
+  return businessErrorFrom(res.status, payload)
 }

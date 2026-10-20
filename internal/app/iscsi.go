@@ -485,6 +485,12 @@ type repairTargetPayload struct {
 	Reason   string `json:"reason,omitempty"`
 }
 
+// targetRepairCooldown 是"同一目标修复失败后"的冷却期：期间对账不再重复入队修复任务。
+//
+// 避免平台/服务真的坏掉时每轮对账都入队一次、任务一直重复一直失败（真实反馈）。
+// 修好平台后最多等这么久就会自动重试；急用可直接重新挂载（走 Publish 路径）。
+const targetRepairCooldown = 30 * time.Minute
+
 // enqueueTargetRepair 把"重新下发该目标"排进任务队列（对账发现平台侧缺失 / 启用不符时）。
 //
 // 为什么不在对账里同步做：重下发是多次 PowerShell（几十秒），会被 60s 对账预算中途掐断；
@@ -492,9 +498,17 @@ type repairTargetPayload struct {
 // 目标操作都会挂死（真实事故：母盘发布 / 退出维护任务一直卡着）。走 worker 则没有对账预算，
 // 脚本能完整跑完，且按目标锁与挂载路径串行。
 //
-// 幂等键按 5 分钟分桶：同一轮对账内不重复入队，下一轮仍会重试，避免对持续故障的目标刷任务。
+// 先查状态再入队：同一目标的修复刚失败过就跳过（冷却期），避免持续故障时刷任务。
+// 幂等键按 5 分钟分桶，同一轮对账内不重复入队。
 func (s *IscsiService) enqueueTargetRepair(ctx context.Context, t *domain.IscsiTarget, reason string) {
 	if s.Jobs == nil || t == nil || t.ID == "" {
+		return
+	}
+	if last, err := s.Store.GetLatestJobByRef(ctx, t.ID); err == nil && last != nil &&
+		last.Type == domain.JobRepairTarget && last.State == domain.JobStateFailed &&
+		last.FinishedAt > 0 && time.Since(time.UnixMilli(last.FinishedAt)) < targetRepairCooldown {
+		s.Log.Warn("该目标的修复任务刚失败过，进入冷却期，暂不重复入队",
+			"target", t.TargetName, "finished_at", last.FinishedAt)
 		return
 	}
 	bucket := strconv.FormatInt(time.Now().Unix()/300, 10)
@@ -787,7 +801,10 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	}
 	awaitDiskMs := time.Since(started).Milliseconds()
 
-	unlock := s.Locks.Acquire(lock.TargetKey(target.TargetName))
+	unlock, lockErr := s.Locks.LockContext(ctx, lock.TargetKey(target.TargetName))
+	if lockErr != nil {
+		return nil, lockErr
+	}
 	defer unlock()
 	// 拿到锁后重读一次下发记账：target 是锁外读的快照，而"预创建"（JobCreateDiff 结尾的
 	// prePublishTarget）可能刚下发过同一份期望状态并写回指纹 —— 不重读就会把这次挂载的
@@ -933,7 +950,11 @@ func (s *IscsiService) TeardownTarget(ctx context.Context, t *domain.IscsiTarget
 	if t == nil {
 		return
 	}
-	unlock := s.Locks.Acquire(lock.TargetKey(t.TargetName))
+	unlock, lockErr := s.Locks.LockContext(ctx, lock.TargetKey(t.TargetName))
+	if lockErr != nil {
+		s.Log.Warn("拆除目标前等锁被取消，跳过本轮", "target", t.TargetName, "error", lockErr)
+		return
+	}
 	defer unlock()
 	_ = s.teardownTargetLocked(ctx, t.TargetName, t.IQN(s.iqnPrefix()), opt)
 }
@@ -947,7 +968,11 @@ func (s *IscsiService) TeardownTargetByShortName(ctx context.Context, shortName 
 	if shortName == "" {
 		return
 	}
-	unlock := s.Locks.Acquire(lock.TargetKey(shortName))
+	unlock, lockErr := s.Locks.LockContext(ctx, lock.TargetKey(shortName))
+	if lockErr != nil {
+		s.Log.Warn("拆除目标前等锁被取消，跳过本轮", "target", shortName, "error", lockErr)
+		return
+	}
 	defer unlock()
 	iqn := (&domain.IscsiTarget{TargetName: shortName}).IQN(s.iqnPrefix())
 	_ = s.teardownTargetLocked(ctx, shortName, iqn, opt)
@@ -962,11 +987,52 @@ func (s *IscsiService) TeardownOrphanTarget(ctx context.Context, name string) er
 	if name == "" {
 		return nil
 	}
-	unlock := s.Locks.Acquire(lock.TargetKey(name))
+	unlock, lockErr := s.Locks.LockContext(ctx, lock.TargetKey(name))
+	if lockErr != nil {
+		return lockErr
+	}
 	defer unlock()
 	// 跳过停用：删除本身就会带走会话，而对账预算只有 60s、一次 PowerShell 要 15-20 秒
 	// （真实事故：大批孤儿时日志刷屏 context deadline exceeded），多一步必然删不动。
 	return s.teardownTargetLocked(ctx, name, name, TeardownOptions{skipDisable: true})
+}
+
+// TeardownDiskTargets 拆除**映射到指定磁盘**的全部 iSCSI 目标，并删掉它们的记录。
+//
+// 用途：派生差异盘前，母盘必须先在平台上解除映射 —— 母盘 VHDX 仍被 iSCSI 目标服务打开时，
+// 创建差异盘会以共享冲突失败（真实反馈："退出维护没删掉服务端 iscsi target，导致没法创建
+// 差异盘"）。维护态退出的临时目标清理是异步、尽力而为的，可能还没跑完，甚至因平台卡住而失败，
+// 因此派生路径自己再兜一次底。
+//
+// 全部尽力而为：平台拆除失败只记日志（残留由对账的孤儿目标清理接手）；记录照删，避免对账
+// 又把"目标缺失"当成需要修复而重建它。
+func (s *IscsiService) TeardownDiskTargets(ctx context.Context, diskID string) {
+	diskID = strings.TrimSpace(diskID)
+	if s.Iscsi == nil || diskID == "" {
+		return
+	}
+	targets, err := s.Store.ListIscsiTargetsByDisk(ctx, diskID)
+	if err != nil {
+		s.Log.Warn("列出磁盘的 iSCSI 目标失败（派生差异盘前）", "disk_id", diskID, "error", err)
+		return
+	}
+	for i := range targets {
+		t := &targets[i]
+		s.Log.Info("派生差异盘前拆除母盘 iSCSI 目标",
+			"disk_id", diskID, "target", t.TargetName, "applied_at", t.AppliedAt)
+		s.TeardownTarget(ctx, t, TeardownOptions{})
+		if t.AllocationID != nil {
+			if alloc, aErr := s.Store.GetAllocation(ctx, *t.AllocationID); aErr == nil &&
+				alloc.UserID == domain.TempAllocationUserID {
+				if err := deleteAllocationIfExists(ctx, s.Store, *t.AllocationID); err != nil {
+					s.Log.Warn("清理母盘临时占位分配失败", "allocation_id", *t.AllocationID, "error", err)
+				}
+			}
+		}
+		if err := s.Store.DeleteIscsiTarget(ctx, t.ID); err != nil && !isNotFound(err) {
+			s.Log.Warn("删除母盘 iSCSI 目标记录失败", "target", t.TargetName, "error", err)
+		}
+	}
 }
 
 // teardownTargetLocked 是目标拆除的唯一实现：解映射（可选）→ 停用 → 删除 → 清指纹。

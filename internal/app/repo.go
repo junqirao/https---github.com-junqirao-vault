@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 
@@ -35,6 +36,20 @@ type RepoService struct {
 	IscsiSvc *IscsiService
 	// Leases 用于维护态退出/撤销共享前撤销在线租约（通知客户端断开）；App 装配时回填。
 	Leases *LeaseService
+
+	// parentMountMu / parentMounts 记录"维护态下母盘卷在服务端本地的挂载"（进程内）。
+	//
+	// 为什么存内存：挂载是随进程建立的文件系统视图（Windows 的 VHDX attach 句柄、
+	// Linux 的临时挂载点），服务端重启后由平台/内核清理；这里只用于"同一进程内幂等复用
+	// 与退出维护时卸载"。
+	parentMountMu sync.Mutex
+	parentMounts  map[string]parentVolumeMount
+}
+
+// parentVolumeMount 是一条"母盘卷已挂载到服务端本地"的记录。
+type parentVolumeMount struct {
+	root string
+	ref  string
 }
 
 // parentIDOf 取库的母盘 ID；没有母盘（独享库或数据异常）时返回空串。
@@ -1121,9 +1136,9 @@ func (s *RepoService) ReleaseAllocation(ctx context.Context, allocationID string
 //
 // 所有迁移都必须经 domain.TransitionRequest.Validate 判定。
 //
-// 返回值：**退出维护 / 撤销临时共享**改为异步（返回 202 任务，见 runParentTeardown）——
-// 它们要拆母盘临时 iSCSI 目标（多次 PowerShell，30~60 秒起），同步做会让客户端 20s 超时、
-// 用户"退出不了维护状态"（真实反馈：network.timeout）。其余动作仍同步完成，返回 nil 任务。
+// 返回值：始终返回 nil 任务（**全部同步完成**）。退出维护 / 撤销临时共享只在请求内做
+// 快动作（撤租约 + 改状态），平台侧目标清理交给一个**尽力而为**的异步任务，不再阻塞状态迁移
+// —— 否则 iSCSI 一卡，用户就"结束不了维护状态"（真实反馈）。
 func (s *RepoService) TransitionParent(ctx context.Context, repoID string, action ParentAction, operatorID string) (*domain.Job, error) {
 	repo, err := s.Store.GetRepository(ctx, repoID)
 	if err != nil {
@@ -1160,7 +1175,7 @@ func (s *RepoService) TransitionParent(ctx context.Context, repoID string, actio
 	}
 
 	// 退出维护 / 撤销共享：**先**给在线客户端推断开指令（只改租约并推事件，很快），
-	// 让状态机校验里的 ActiveLeases 归零；真正的目标拆除交给异步任务（见下）。
+	// 让状态机校验里的 ActiveLeases 归零。
 	asyncTeardown := action == ParentActionUnshare || action == ParentActionFinishMaint
 	if asyncTeardown {
 		if target, tErr := s.Store.GetIscsiTargetByName(ctx, tempTargetName(repo.ID)); tErr == nil && target != nil {
@@ -1184,7 +1199,12 @@ func (s *RepoService) TransitionParent(ctx context.Context, repoID string, actio
 	}
 
 	if asyncTeardown {
-		return s.enqueueParentTeardown(ctx, repo, action, operatorID)
+		// **先改状态，再尽力清理目标**：改状态是纯 DB/本地动作，快且必成功；
+		// 平台清理可能因 iSCSI 卡住而失败，绝不能让它挡住"结束维护"。
+		if err := s.endParentShare(ctx, repo, action == ParentActionFinishMaint, action, operatorID); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
 
 	switch action {
@@ -1193,10 +1213,8 @@ func (s *RepoService) TransitionParent(ctx context.Context, repoID string, actio
 			return nil, err
 		}
 	case ParentActionMaintenance:
-		// 维护态要能临时挂载母盘到本地（读写更新内容）：先把母盘目标建好，再置维护态。
-		if err := s.publishParentTarget(ctx, repo, false); err != nil {
-			return nil, err
-		}
+		// 维护态不再把母盘通过 iSCSI 挂到客户端：改为**服务端本地挂载 + 页面文件管理**
+		// （见 ParentMount）。这里只改状态，不建临时目标、不建 @temp 占位分配。
 		if err := s.Store.SetParentCondition(ctx, repo.ID, to, false); err != nil {
 			return nil, err
 		}
@@ -1217,33 +1235,74 @@ func (s *RepoService) TransitionParent(ctx context.Context, repoID string, actio
 	return nil, nil
 }
 
+// endParentShare 把库从临时共享 / 维护态改回 idle，并**尽力而为**地入队目标清理。
+//
+// 顺序刻意是"先改状态、再入队清理"：改状态是纯 DB/本地动作，快且必成功；平台清理可能因
+// iSCSI 卡住而失败/超时，绝不能让它挡住"结束维护"（真实反馈：无法结束维护状态）。
+func (s *RepoService) endParentShare(ctx context.Context, repo *domain.Repository, bumpVersion bool, action ParentAction, operatorID string) error {
+	if bumpVersion {
+		// 退出维护：先把服务端本地的母盘挂载卸掉（幂等、尽力而为），再改状态。
+		// 挂载还在时母盘 VHDX 被本机占用，派生差异盘会共享冲突。
+		s.UnmountParentVolume(ctx, repo.ID)
+	}
+	if err := s.Store.SetParentCondition(ctx, repo.ID, domain.ParentIdle, bumpVersion); err != nil {
+		return err
+	}
+	if bumpVersion {
+		if err := s.refreshParentFingerprint(ctx, repo); err != nil {
+			s.Log.Warn("重算母盘指纹失败", "repo_id", repo.ID, "error", err)
+		}
+		// 母盘内容变了（版本 +1）→ 盘上的元数据标签也要跟上。
+		s.refreshRepoMeta(ctx, repo)
+	}
+	s.enqueueParentTeardown(ctx, repo, action, operatorID)
+	s.audit(ctx, operatorID, "repo.parent."+string(action), "repo:"+repo.ID,
+		"-> "+string(domain.ParentIdle), domain.AuditResultOK)
+	s.emit("repo", map[string]any{
+		"action":           string(action),
+		"repo_id":          repo.ID,
+		"parent_condition": string(domain.ParentIdle),
+		"operator_id":      operatorID,
+	})
+	return nil
+}
+
 // parentTeardownPayload 是"异步拆除母盘临时目标"任务的入参。
 type parentTeardownPayload struct {
 	RepoID     string `json:"repo_id"`
 	OperatorID string `json:"operator_id,omitempty"`
 }
 
-// enqueueParentTeardown 把"退出维护 / 撤销共享"的目标拆除排进任务队列。
+// enqueueParentTeardown 把母盘临时目标的**尽力清理**排进任务队列（不阻塞状态迁移）。
 //
-// 锁键用目标键：与挂载路径（RequestMount → Publish）串行化，避免拆除与下发在同一目标上并发。
+// 先查状态再操作：没有临时目标记录就直接返回（平台上本来就没有可清理的对象，不必入队）。
+// 锁键用目标键：与挂载路径（RequestMount → Publish）串行化，避免清理与下发在同一目标上并发。
 // 幂等键带随机串：失败后"再点一次"要用新任务（固定键会在 MySQL 上直接返回旧的失败任务）。
-func (s *RepoService) enqueueParentTeardown(ctx context.Context, repo *domain.Repository, action ParentAction, operatorID string) (*domain.Job, error) {
+func (s *RepoService) enqueueParentTeardown(ctx context.Context, repo *domain.Repository, action ParentAction, operatorID string) {
+	name := tempTargetName(repo.ID)
+	target, err := s.Store.GetIscsiTargetByName(ctx, name)
+	if err != nil || target == nil {
+		return
+	}
 	payload := parentTeardownPayload{RepoID: repo.ID, OperatorID: operatorID}
 	j, _, err := s.Jobs.EnqueueWith(ctx, domain.JobParentTeardown, repo.ID,
 		"parent_teardown:"+repo.ID+":"+uuid.NewString(),
-		lock.TargetKey(tempTargetName(repo.ID)), payload)
+		lock.TargetKey(name), payload)
 	if err != nil {
-		return nil, err
+		// 入队失败不影响"已退出维护"：平台残留由对账的孤儿目标清理接手。
+		s.Log.Warn("入队母盘目标清理任务失败（不影响退出）", "repo_id", repo.ID, "error", err)
+		return
 	}
 	s.audit(ctx, operatorID, "repo.parent."+string(action)+".requested", "repo:"+repo.ID,
 		"job="+j.ID, domain.AuditResultOK)
-	return j, nil
 }
 
-// runParentTeardown 是 JobParentTeardown 的实现：拆除母盘临时目标并把库改回 idle。
+// runParentTeardown 是 JobParentTeardown 的实现：**尽力**清理母盘临时目标（不动 parent_condition）。
 //
-// 幂等：库已不在 temp_shared / maintenance（被别的路径改回 idle、或已删除）时直接空跑；
-// 重试时 releaseParentTarget 本身也幂等（目标不存在视为成功）。
+// 状态（idle）已在请求里改好，这里只负责：撤掉可能还在的租约 → 拆平台目标 → 清 DB 记录。
+// 因此它不改变库状态，也不因平台失败而"卡住维护状态"；平台残留由对账的孤儿目标清理接手。
+//
+// 幂等：没有目标记录（已被清理、或从未建过）时直接空跑。
 func (s *RepoService) runParentTeardown(ctx context.Context, j *domain.Job, rep job.Reporter) error {
 	var p parentTeardownPayload
 	if err := decodePayload(j.Payload, &p); err != nil {
@@ -1256,38 +1315,16 @@ func (s *RepoService) runParentTeardown(ctx context.Context, j *domain.Job, rep 
 		}
 		return err
 	}
-	cond := repo.Condition()
-	if cond != domain.ParentTempShared && cond != domain.ParentMaintenance {
+	target, err := s.Store.GetIscsiTargetByName(ctx, tempTargetName(repo.ID))
+	if err != nil || target == nil {
 		return nil
 	}
-	rep.Progress(5)
+	rep.Progress(10)
 	if err := s.releaseParentTarget(ctx, repo); err != nil {
 		return err
 	}
-	rep.Progress(70)
-	if cond == domain.ParentMaintenance {
-		// 退出维护：母盘版本 +1（bumpVersion=true），并重算指纹、刷新盘上元数据 ——
-		// 与原先的同步实现同一口径。
-		if err := s.Store.SetParentCondition(ctx, repo.ID, domain.ParentIdle, true); err != nil {
-			return err
-		}
-		if err := s.refreshParentFingerprint(ctx, repo); err != nil {
-			s.Log.Warn("重算母盘指纹失败", "repo_id", repo.ID, "error", err)
-		}
-		s.refreshRepoMeta(ctx, repo)
-	} else {
-		if err := s.Store.SetParentCondition(ctx, repo.ID, domain.ParentIdle, false); err != nil {
-			return err
-		}
-	}
 	rep.Progress(100)
 	s.audit(ctx, p.OperatorID, "repo.parent.teardown.done", "repo:"+repo.ID, "", domain.AuditResultOK)
-	s.emit("repo", map[string]any{
-		"action":           "parent_teardown",
-		"repo_id":          repo.ID,
-		"parent_condition": string(domain.ParentIdle),
-		"operator_id":      p.OperatorID,
-	})
 	return nil
 }
 
@@ -1406,7 +1443,8 @@ func (s *RepoService) ResizeParentDisk(ctx context.Context, repoID string, sizeB
 
 // startTempShare 创建临时共享的占位分配与目标记录，并提交发布任务。
 func (s *RepoService) startTempShare(ctx context.Context, repo *domain.Repository, operatorID string) error {
-	if err := s.publishParentTarget(ctx, repo, true); err != nil {
+	// 临时只读共享要预下发目标：其它客户端随后自行连接，没有"挂载"这个显式动作来触发下发。
+	if err := s.publishParentTarget(ctx, repo, true, true); err != nil {
 		return err
 	}
 	if err := s.Store.SetParentCondition(ctx, repo.ID, domain.ParentTempShared, false); err != nil {
@@ -1416,11 +1454,13 @@ func (s *RepoService) startTempShare(ctx context.Context, repo *domain.Repositor
 	return nil
 }
 
-// publishParentTarget 创建（或复用）母盘临时目标与占位分配，并提交发布任务。
+// publishParentTarget 创建（或复用）母盘临时目标与占位分配；enqueue=true 时额外提交发布任务。
 //
 // readOnly=true 用于"临时只读共享"；false 用于维护态（管理员要读写母盘更新内容）。
-// 只负责把目标建好，不改变 parent_condition：调用方按语义设置 temp_shared / maintenance。
-func (s *RepoService) publishParentTarget(ctx context.Context, repo *domain.Repository, readOnly bool) error {
+// enqueue=false 用于维护态：**不预下发**，避免一个可能卡住的发布任务占着目标锁、把"挂载母盘"
+// 也堵住；目标改由挂载时按需下发（RequestMount → Publish）。
+// 只负责把记录建好，不改变 parent_condition：调用方按语义设置 temp_shared / maintenance。
+func (s *RepoService) publishParentTarget(ctx context.Context, repo *domain.Repository, readOnly bool, enqueue bool) error {
 	if repo.ParentDiskID == nil {
 		return apperr.New("repo.disk_missing", 500)
 	}
@@ -1470,10 +1510,12 @@ func (s *RepoService) publishParentTarget(ctx context.Context, repo *domain.Repo
 		if err := s.Store.UpdateIscsiTarget(ctx, existing); err != nil {
 			return err
 		}
-		payload := publishPayload{AllocationID: allocID}
-		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobPublish, allocID,
-			"publish:"+allocID, lock.TargetKey(name), payload); err != nil {
-			return err
+		if enqueue {
+			payload := publishPayload{AllocationID: allocID}
+			if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobPublish, allocID,
+				"publish:"+allocID, lock.TargetKey(name), payload); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -1504,24 +1546,12 @@ func (s *RepoService) publishParentTarget(ctx context.Context, repo *domain.Repo
 		return err
 	}
 
-	payload := publishPayload{AllocationID: alloc.ID}
-	if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobPublish, alloc.ID, "publish:"+alloc.ID, lock.TargetKey(name), payload); err != nil {
-		return err
+	if enqueue {
+		payload := publishPayload{AllocationID: alloc.ID}
+		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobPublish, alloc.ID, "publish:"+alloc.ID, lock.TargetKey(name), payload); err != nil {
+			return err
+		}
 	}
-	return nil
-}
-
-// stopTempShare 撤销临时共享：移除映射、停用并删除目标，清理占位记录。
-//
-// 全部动作幂等（目标不存在视为成功，见 5.6）。
-func (s *RepoService) stopTempShare(ctx context.Context, repo *domain.Repository, operatorID string) error {
-	if err := s.releaseParentTarget(ctx, repo); err != nil {
-		return err
-	}
-	if err := s.Store.SetParentCondition(ctx, repo.ID, domain.ParentIdle, false); err != nil {
-		return err
-	}
-	s.Log.Info("已撤销母盘临时共享", "repo_id", repo.ID, "operator", operatorID)
 	return nil
 }
 
@@ -1578,6 +1608,10 @@ func (s *RepoService) releaseParentTarget(ctx context.Context, repo *domain.Repo
 	// 同样是**短名**（tempTargetName），直接拿它去问平台必然 not_found —— 原来
 	// "解映射 + 停用 + 删除"三步全是空转，目标一直挂在平台上。没有磁盘路径时只拆
 	// 目标（映射随目标一起消失）。
+	//
+	// **一律尝试拆除**，不按 AppliedAt 跳过：teardownTargetLocked 失败时也会清掉下发记账，
+	// 于是"目标仍在平台上、AppliedAt 却已是 0"这种残留会永远被跳过 —— 母盘一直挂着映射，
+	// 派生差异盘必然共享冲突（真实反馈）。RemoveTarget 本身幂等（不存在即快速返回）。
 	if s.IscsiSvc != nil {
 		s.IscsiSvc.TeardownTarget(ctx, target, TeardownOptions{DetachDiskPath: diskPath})
 	} else if s.Iscsi != nil {
@@ -1588,7 +1622,7 @@ func (s *RepoService) releaseParentTarget(ctx context.Context, repo *domain.Repo
 			s.Log.Warn("清理临时分配记录失败", "allocation_id", *target.AllocationID, "error", err)
 		}
 	}
-	if err := s.Store.DeleteIscsiTarget(ctx, target.ID); err != nil {
+	if err := s.Store.DeleteIscsiTarget(ctx, target.ID); err != nil && !isNotFound(err) {
 		return err
 	}
 	return nil
@@ -1663,31 +1697,21 @@ func (s *RepoService) ReconcileTempShares(ctx context.Context) error {
 		if repo.Condition() != domain.ParentTempShared {
 			continue
 		}
-		name := tempTargetName(repo.ID)
-		// 平台未装配 iSCSI 后端时（例如单元测试）无从查询实际目标，
-		// 视作"服务端不存在该目标"：仅依据租约数决定是否收敛，避免 nil 解引用 panic。
-		var target *platform.TargetInfo
-		if s.Iscsi != nil {
-			if t, tErr := s.Iscsi.GetTarget(ctx, name); tErr == nil {
-				target = t
-			}
-		}
+		// 只依据"是否还有人连着"决定是否收敛，**不查平台**：一次平台查询就是一次 PowerShell
+		// （可能把 60s 对账预算吃光），而平台现状对"要不要撤销"没有决定性作用。
+		// 有在线租约就保持；否则改回 idle 并尽力清理目标（见 endParentShare）。
 		active, lErr := s.Store.CountActiveLeasesByRepo(ctx, repo.ID)
 		if lErr != nil {
 			return lErr
 		}
-
-		if target != nil && active > 0 {
-			// 仍有人连接：保持现状。
+		if active > 0 {
 			continue
 		}
-
-		if err := s.stopTempShare(ctx, repo, "system"); err != nil {
+		if err := s.endParentShare(ctx, repo, false, ParentActionUnshare, "system"); err != nil {
 			s.Log.Error("收敛临时共享失败", "repo_id", repo.ID, "error", err)
 			continue
 		}
-		s.audit(ctx, "system", "repo.temp_share.auto_reaped", "repo:"+repo.ID,
-			"target_exists="+boolText(target != nil), domain.AuditResultOK)
+		s.audit(ctx, "system", "repo.temp_share.auto_reaped", "repo:"+repo.ID, "", domain.AuditResultOK)
 	}
 	return nil
 }

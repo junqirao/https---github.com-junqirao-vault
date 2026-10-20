@@ -9,6 +9,7 @@
 package lock
 
 import (
+	"context"
 	"sort"
 	"sync"
 )
@@ -22,10 +23,16 @@ type Keyed struct {
 	items map[string]*refMutex
 }
 
+// refMutex 用容量为 1 的 channel 当互斥体（而不是 sync.Mutex），
+// 这样等锁可以**被 context 取消**：任务在等锁期间被取消时必须立刻退出，
+// 否则会一直占着 worker 与"running"状态（真实事故：任务卡几个小时都在执行中，
+// 其实只是排在另一把卡死的锁后面）。
 type refMutex struct {
-	mu   sync.Mutex
+	ch   chan struct{}
 	refs int
 }
+
+func newRefMutex() *refMutex { return &refMutex{ch: make(chan struct{}, 1)} }
 
 // NewKeyed 构造一个 Keyed 锁集合。
 func NewKeyed() *Keyed {
@@ -42,6 +49,24 @@ func (k *Keyed) Lock(key string) func() {
 	return k.Acquire(key)
 }
 
+// LockContext 获取单个键的锁；等待期间 ctx 被取消时返回错误且**不获取锁**。
+//
+// 用于任务执行器等"可能等很久"的场景：任务被取消后不该继续排在锁后面。
+func (k *Keyed) LockContext(ctx context.Context, key string) (func(), error) {
+	rm := k.reserve(key)
+	select {
+	case rm.ch <- struct{}{}:
+		return func() {
+			<-rm.ch
+			k.releaseRef(rm)
+		}, nil
+	case <-ctx.Done():
+		// 没拿到锁：只回退引用计数，不触碰 channel。
+		k.releaseRef(rm)
+		return nil, ctx.Err()
+	}
+}
+
 // Acquire 一次性获取多个键的锁。
 //
 // 内部对键排序后依序获取，从而避免不同调用方以不同顺序加锁造成死锁。
@@ -54,23 +79,28 @@ func (k *Keyed) Acquire(keys ...string) func() {
 	}
 	return func() {
 		for i := len(held) - 1; i >= 0; i-- {
-			held[i].mu.Unlock()
+			<-held[i].ch
 			k.releaseRef(held[i])
 		}
 	}
 }
 
-func (k *Keyed) acquireOne(key string) *refMutex {
+// reserve 在锁表里登记一次引用并返回对应的 refMutex（尚未获取锁）。
+func (k *Keyed) reserve(key string) *refMutex {
 	k.mu.Lock()
 	rm, ok := k.items[key]
 	if !ok {
-		rm = &refMutex{}
+		rm = newRefMutex()
 		k.items[key] = rm
 	}
 	rm.refs++
 	k.mu.Unlock()
+	return rm
+}
 
-	rm.mu.Lock()
+func (k *Keyed) acquireOne(key string) *refMutex {
+	rm := k.reserve(key)
+	rm.ch <- struct{}{}
 	return rm
 }
 

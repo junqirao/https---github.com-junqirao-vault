@@ -340,6 +340,10 @@ func (a *Agent) Start(ctx context.Context) (string, error) {
 	safeGo(a.logger, "finish_unmounts", func() {
 		defer a.wg.Done()
 		a.finishInterruptedUnmounts(a.baseCtx)
+		// 收尾之后再清理发起端里的残留：用"当前仍在挂载"的记录作为保留清单，
+		// 把上次进程崩溃/卸载失败留下的死会话与收藏目标清掉（真实反馈："发起程序里
+		// 一大堆没用的死连接，用一次删一次"）。
+		a.pruneOrphanInitiatorSessions(a.baseCtx)
 	})
 
 	// 启动即预检本机 iSCSI 发起端（只读）：不就绪时界面会挂横幅，而不是等挂载失败才知道。

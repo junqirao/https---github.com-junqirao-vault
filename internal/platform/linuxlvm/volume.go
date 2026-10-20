@@ -81,6 +81,62 @@ func (m *Manager) EnsureFormatted(ctx context.Context, ref, fileSystem, label st
 	return &platform.Volume{Device: dev, FileSystem: strings.ToUpper(fs), SizeBytes: size}, nil
 }
 
+// MountVolume 在服务端本地挂载该虚拟磁盘的卷，返回可读写的临时目录。
+//
+// 用于"维护态直接管理母盘文件"：不再把母盘通过 iSCSI 挂到客户端，改由服务端挂载后经
+// 文件 API 浏览/上传/下载/编辑 —— 链路短，也不受客户端 iSCSI 环境影响。
+// 与 MountAndCopy 的区别：这里**保持挂载**，由调用方在退出维护时 UnmountVolume。
+func (m *Manager) MountVolume(ctx context.Context, ref, fileSystem string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", apperr.InvalidParam("ref")
+	}
+	if strings.TrimSpace(fileSystem) == "" {
+		fileSystem = "ext4"
+	}
+	fs, err := diskFileSystem(fileSystem)
+	if err != nil {
+		return "", err
+	}
+	// EnsureFormatted 内部会激活 LV、建好分区；已有文件系统时不会覆盖。
+	vol, err := m.EnsureFormatted(ctx, ref, fileSystem, "")
+	if err != nil {
+		return "", err
+	}
+	// 进程重启后内核里的挂载仍在（Windows 的 attach 句柄随进程消失，Linux 不会）：
+	// 复用现有挂载点，避免同一设备被挂两次。
+	if mp, mpErr := mountPointOf(vol.Device); mpErr == nil && mp != "" {
+		m.logger.Info("母盘卷已挂载，复用现有挂载点", "ref", ref, "mountpoint", mp)
+		return mp, nil
+	}
+	mnt, err := os.MkdirTemp("", "vault-parent-")
+	if err != nil {
+		return "", apperr.New(CodeMountFailed, http.StatusInternalServerError).WithCause(err)
+	}
+	if err := m.mountVolume(ctx, vol.Device, fs, mnt); err != nil {
+		_ = os.Remove(mnt)
+		return "", err
+	}
+	m.logger.Info("已挂载母盘卷（服务端本地）", "ref", ref, "mountpoint", mnt, "file_system", fs)
+	return mnt, nil
+}
+
+// UnmountVolume 卸载 MountVolume 的临时挂载点（幂等）。
+func (m *Manager) UnmountVolume(ctx context.Context, _ string, root string) error {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return nil
+	}
+	// 用 WithoutCancel：即使请求 ctx 已取消也要尽力卸载，避免留下脏挂载。
+	if _, err := m.run(context.WithoutCancel(ctx), "umount", root); err != nil {
+		// 未挂载/已卸载视为成功。
+		m.logger.Debug("卸载母盘临时挂载点失败（可能本就未挂载）", "mountpoint", root, "err", err.Error())
+	}
+	if err := os.Remove(root); err != nil && !os.IsNotExist(err) {
+		m.logger.Debug("删除母盘临时挂载目录失败", "mountpoint", root, "err", err.Error())
+	}
+	return nil
+}
+
 // MountAndCopy 一次性完成"激活 → 分区 → 格式化 → 递归拷入 sourceDir 内容 → 校验 → 卸载"。
 //
 // 校验口径与项目既有 CopyTree 一致：目标侧文件数/字节数不得少于源，否则 platform.copy_failed。

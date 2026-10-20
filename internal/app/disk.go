@@ -586,6 +586,11 @@ func (s *DiskService) ensureDiffDisk(ctx context.Context, disk, parent *domain.D
 	rep.Progress(20)
 
 	if !s.Disk.Exists(disk.VHDXPath) {
+		// 母盘必须先在平台上解除映射：母盘 VHDX 仍被 iSCSI 目标打开时，创建差异盘会以
+		// 共享冲突失败（维护态退出的目标清理是异步、尽力而为的，可能还没跑完）。
+		if s.IscsiSvc != nil {
+			s.IscsiSvc.TeardownDiskTargets(ctx, parent.ID)
+		}
 		if err := s.createDiffWithRetry(ctx, disk.VHDXPath, parent.VHDXPath); err != nil {
 			return err
 		}

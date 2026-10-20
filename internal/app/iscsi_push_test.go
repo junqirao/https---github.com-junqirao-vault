@@ -314,6 +314,66 @@ func TestReconcileTargetsRebuildsMissingTargetWithSingleScan(t *testing.T) {
 	}
 }
 
+// TestTeardownDiskTargetsRemovesTargetAndAllocation 锁定"派生差异盘前先拆母盘目标"：
+// 维护态退出的目标清理是异步、尽力而为的，派生路径必须自己兜底 —— 否则母盘仍被 iSCSI 目标
+// 打开，创建差异盘会以共享冲突失败（真实反馈："退出维护没删掉服务端 iscsi target"）。
+func TestTeardownDiskTargetsRemovesTargetAndAllocation(t *testing.T) {
+	ctx := context.Background()
+	backend := newFakeIscsiBackend()
+	svc := newPushTestService(t, backend)
+	st := svc.Store
+
+	repoID := seedRepo(t, st)
+	parent := &domain.Disk{
+		RepoID:    repoID,
+		Kind:      domain.DiskKindParent,
+		VHDXPath:  filepath.Join("C:", "vault", "parent.vhdx"),
+		SizeBytes: 1 << 30,
+		State:     domain.DiskStateReady,
+	}
+	if err := st.CreateDisk(ctx, parent); err != nil {
+		t.Fatalf("建母盘失败：%v", err)
+	}
+	alloc := &domain.Allocation{
+		RepoID: repoID,
+		DiskID: parent.ID,
+		UserID: domain.TempAllocationUserID,
+		State:  domain.AllocationStateAllocated,
+	}
+	if err := st.CreateAllocation(ctx, alloc); err != nil {
+		t.Fatalf("建占位分配失败：%v", err)
+	}
+	diskID := parent.ID
+	allocID := alloc.ID
+	target := &domain.IscsiTarget{
+		TargetName:     "vault-9999-temp",
+		DiskID:         &diskID,
+		AllocationID:   &allocID,
+		Purpose:        domain.PurposeTempParent,
+		AuthMode:       domain.AuthModeNone,
+		Enabled:        true,
+		DesiredEnabled: true,
+	}
+	if err := st.CreateIscsiTarget(ctx, target); err != nil {
+		t.Fatalf("建目标记录失败：%v", err)
+	}
+	if _, err := svc.pushTarget(ctx, target, true); err != nil {
+		t.Fatalf("下发目标失败：%v", err)
+	}
+
+	svc.TeardownDiskTargets(ctx, parent.ID)
+
+	if _, err := st.GetIscsiTarget(ctx, target.ID); !isNotFound(err) {
+		t.Fatalf("派生前应删除母盘目标记录，err=%v", err)
+	}
+	if _, err := st.GetAllocation(ctx, alloc.ID); !isNotFound(err) {
+		t.Fatalf("派生前应清理 @temp 占位分配，err=%v", err)
+	}
+	if _, err := backend.GetTarget(ctx, svc.targetIQN(target)); err == nil {
+		t.Fatal("平台侧目标应已被拆除")
+	}
+}
+
 // TestPushTargetForgetsAfterRemove 目标被拆除后必须丢弃记账：
 // 否则下次"以为已下发过"而跳过，目标就永远建不回来。
 func TestPushTargetForgetsAfterRemove(t *testing.T) {

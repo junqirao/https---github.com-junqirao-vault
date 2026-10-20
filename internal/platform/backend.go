@@ -160,6 +160,16 @@ type VolumeBackend interface {
 	// onCopy 用于上报拷入过程的字节进度（可为 nil，见 CopyProgressFunc）。
 	MountAndCopy(ctx context.Context, ref, sourceDir, fileSystem, label string, onCopy CopyProgressFunc) (files int, bytes int64, err error)
 
+	// MountVolume 在**服务端本地**挂载该虚拟磁盘的卷，返回可直接读写的本地目录。
+	//
+	// Windows：Attach VHDX 并返回盘符根（如 `E:\`）；
+	// Linux：激活 LV 并把数据分区挂到临时目录。
+	// 调用方不再需要时调用 UnmountVolume（幂等）。
+	MountVolume(ctx context.Context, ref, fileSystem string) (root string, err error)
+
+	// UnmountVolume 卸载 MountVolume 返回的本地目录（Windows 按 ref Detach；Linux umount + 删目录）。
+	UnmountVolume(ctx context.Context, ref, root string) error
+
 	// SpaceUsageOf 返回路径所在卷的标识、文件系统与可用/总空间。
 	SpaceUsageOf(ctx context.Context, path string) (*domain.VolumeSpace, error)
 

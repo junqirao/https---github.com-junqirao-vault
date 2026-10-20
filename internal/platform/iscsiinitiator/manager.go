@@ -360,3 +360,56 @@ func (m *Manager) RemoveTarget(ctx context.Context, targetIQN string) error {
 	m.logger.Info("已清理 iSCSI 目标缓存", "target_iqn", targetIQN, "action", result.Action)
 	return nil
 }
+
+// RemovePortal 移除 iSCSI 目标门户（连同它的「已发现目标」缓存）。幂等、尽力而为。
+//
+// 用途：本系统"用一次删一次"——卸载后不留门户与发现缓存，避免 iSCSI 发起程序里越积越多
+// （真实反馈："iSCSI 发起程序里一大堆没用的死连接"）。门户上仍有活动会话时会失败，由调用方
+// 保证"没有别的挂载在用同一门户"。
+func (m *Manager) RemovePortal(ctx context.Context, address string, port int) error {
+	if strings.TrimSpace(address) == "" {
+		return apperr.InvalidParam("portal_address")
+	}
+	if port <= 0 {
+		port = DefaultPortalPort
+	}
+	params := []winps.Param{
+		winps.String("PortalAddress", address),
+		winps.String("PortalPort", strconv.Itoa(port)),
+	}
+	var result struct {
+		Action string `json:"action"`
+	}
+	if err := m.ps.RunScriptJSON(ctx, winps.ScriptInitiatorRemovePortal, params, &result); err != nil {
+		return err
+	}
+	m.logger.Info("已移除 iSCSI 门户", "address", address, "port", port, "action", result.Action)
+	return nil
+}
+
+// PruneSessions 清理发起端里属于本系统、但已无对应挂载的残留会话、持久目标与无用门户，
+// 返回清理条数。
+//
+// keep 是"当前仍在挂载的目标 IQN"保留清单。只动短名以 vault- / vcache- 开头的目标，
+// 绝不碰用户自己配的 iSCSI；门户只删"没有任何会话在用"的（见 initiator_prune_sessions.ps1）。
+func (m *Manager) PruneSessions(ctx context.Context, keep []string) (int, error) {
+	if keep == nil {
+		keep = []string{}
+	}
+	param, err := winps.JSONParam("KeepJson", keep)
+	if err != nil {
+		return 0, apperr.InvalidParam("keep")
+	}
+	var result struct {
+		Removed           int `json:"removed"`
+		PersistentRemoved int `json:"persistent_removed"`
+		PortalsRemoved    int `json:"portals_removed"`
+	}
+	if err := m.ps.RunScriptJSON(ctx, winps.ScriptInitiatorPruneSessions, []winps.Param{param}, &result); err != nil {
+		return 0, err
+	}
+	m.logger.Info("已清理 iSCSI 残留",
+		"removed", result.Removed, "persistent_removed", result.PersistentRemoved,
+		"portals_removed", result.PortalsRemoved, "keep", len(keep))
+	return result.Removed + result.PersistentRemoved + result.PortalsRemoved, nil
+}

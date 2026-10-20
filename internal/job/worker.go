@@ -244,8 +244,12 @@ func (w *Worker) Cancel(ctx context.Context, jobID string) error {
 		w.clearCancelRequest(jobID)
 		return nil
 	case j.State == domain.JobStateRunning:
-		// 已被领取但还没登记 running：留给 runOne 开跑前拦下（它读的是同一张表）。
-		w.log.Info("取消请求已登记（任务即将开跑）", "job_id", jobID)
+		// DB 说 running，但执行器里没有它的取消函数：要么还在"被领取 → 登记 running"的窗口里，
+		// 要么是上次进程留下的孤儿任务。两种情况下 runOne 开跑前都会查 cancelRequested，
+		// 因此直接置为 cancelled 是安全的 —— 也**必须**这么做：否则用户点了取消没反应
+		// （真实反馈："取消不了任务"）。刻意**保留** cancelRequested，让 runOne 能拦下它。
+		w.log.Info("任务未在执行器内，直接置为已取消", "job_id", jobID)
+		w.finish(ctx, j, domain.JobStateCancelled, "已取消")
 		return nil
 	default:
 		w.log.Info("取消排队中的任务", "job_id", jobID)
@@ -363,11 +367,21 @@ func (w *Worker) runOne(ctx context.Context, j *domain.Job) {
 	}
 	defer cancelJob()
 	defer w.endJob(j.ID)
+	defer w.clearCancelRequest(j.ID)
 
 	// 按 lock_key 串行：同一资源（如同一磁盘）的操作不能并发。
+	//
+	// 用**可取消的等锁**：任务在等锁期间被取消时必须立刻退出，否则会一直占着 worker 与
+	// "running" 状态（真实事故：任务卡几个小时都在执行中，其实只是排在另一把卡死的锁后面）。
 	var release func()
 	if j.LockKey != "" {
-		release = w.locks.Lock(j.LockKey)
+		r, lockErr := w.locks.LockContext(jobCtx, j.LockKey)
+		if lockErr != nil {
+			w.log.Warn("任务在等待锁时被取消", "job_id", j.ID, "type", j.Type)
+			w.finish(ctx, j, domain.JobStateCancelled, "已取消")
+			return
+		}
+		release = r
 	}
 	defer func() {
 		if release != nil {
@@ -375,9 +389,9 @@ func (w *Worker) runOne(ctx context.Context, j *domain.Job) {
 		}
 	}()
 
-	// 等锁期间可能被取消：拿到锁后再确认一次，避免白跑一段（也避免锁被取消的任务占着）。
+	// 拿到锁后再确认一次：等锁期间可能被取消，避免白跑一段（也避免锁被取消的任务占着）。
 	if jobCtx.Err() != nil {
-		w.log.Warn("任务在等待锁期间被取消", "job_id", j.ID, "type", j.Type)
+		w.log.Warn("任务在拿到锁后被取消", "job_id", j.ID, "type", j.Type)
 		w.finish(ctx, j, domain.JobStateCancelled, "已取消")
 		return
 	}

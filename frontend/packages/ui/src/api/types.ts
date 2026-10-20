@@ -239,6 +239,22 @@ export interface JobDTO {
   last_error?: string
 }
 
+/** 维护态母盘文件列表中的一项（服务端本地挂载后读取）。 */
+export interface ParentFileEntryDTO {
+  name: string
+  /** 相对母盘挂载根的路径，统一用 "/" 分隔（根为 "/"）。 */
+  path: string
+  is_dir: boolean
+  size: number
+  modified_at: number
+}
+
+/** 维护态母盘某个目录的列表。 */
+export interface ParentFileListingDTO {
+  path: string
+  items: ParentFileEntryDTO[]
+}
+
 export interface AuditDTO {
   id: string
   user_id: string

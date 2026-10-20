@@ -53,9 +53,10 @@ func TestCleanupDiffsRequiresMaintenance(t *testing.T) {
 	}
 }
 
-// TestMaintenancePublishesAndReleasesParentTarget 锁定维护态的母盘临时挂载流程：
-// 进入维护要建出 @temp 占位分配与目标；退出维护要拆掉目标与分配，并回到 idle。
-func TestMaintenancePublishesAndReleasesParentTarget(t *testing.T) {
+// TestMaintenanceNoLongerProvisionsParentTarget 锁定新的母盘管理方式：
+// 进入维护**不再**建 @temp 占位分配与临时 iSCSI 目标（改由服务端本地挂载 + 文件 API，
+// 见 ParentMount），退出维护直接回到 idle，不依赖 iSCSI。
+func TestMaintenanceNoLongerProvisionsParentTarget(t *testing.T) {
 	ctx := context.Background()
 	st := openAppTestStore(t)
 	repoID, _ := seedRepoWithOwner(t, st)
@@ -89,48 +90,25 @@ func TestMaintenancePublishesAndReleasesParentTarget(t *testing.T) {
 	if repo.Condition() != domain.ParentMaintenance {
 		t.Fatalf("进入维护后条件 = %s", repo.Condition())
 	}
-	target, err := st.GetIscsiTargetByName(ctx, tempTargetName(repoID))
-	if err != nil || target == nil {
-		t.Fatalf("维护态应建出母盘临时目标，err=%v", err)
+	if _, err := st.GetIscsiTargetByName(ctx, tempTargetName(repoID)); !isNotFound(err) {
+		t.Fatalf("维护态不应再建母盘临时目标，err=%v", err)
 	}
 	allocs, err := st.ListAllocationsByRepo(ctx, repoID)
 	if err != nil {
 		t.Fatalf("列出分配失败：%v", err)
 	}
-	tempCount := 0
 	for i := range allocs {
 		if allocs[i].UserID == domain.TempAllocationUserID {
-			tempCount++
+			t.Fatal("维护态不应再建 @temp 占位分配")
 		}
 	}
-	if tempCount != 1 {
-		t.Fatalf("@temp 占位分配应有 1 条，实际 %d", tempCount)
-	}
 
-	// 退出维护现在是异步任务：拆目标（多次 PowerShell）不放在 HTTP 请求里，
-	// 避免客户端 20s 超时。这里手动跑一次任务，验证最终状态。
-	finishJob, err := svc.TransitionParent(ctx, repoID, ParentActionFinishMaint, "op")
-	if err != nil {
+	if _, err := svc.TransitionParent(ctx, repoID, ParentActionFinishMaint, "op"); err != nil {
 		t.Fatalf("退出维护失败：%v", err)
-	}
-	if finishJob == nil || finishJob.Type != domain.JobParentTeardown {
-		t.Fatalf("退出维护应返回 parent_teardown 任务，实际 %+v", finishJob)
-	}
-	if err := svc.runParentTeardown(ctx, finishJob, job.ReporterFunc(func(int) {})); err != nil {
-		t.Fatalf("执行退出维护任务失败：%v", err)
 	}
 	repo, _ = st.GetRepository(ctx, repoID)
 	if repo.Condition() != domain.ParentIdle {
 		t.Fatalf("退出维护后条件 = %s，期望 idle", repo.Condition())
-	}
-	if _, err := st.GetIscsiTargetByName(ctx, tempTargetName(repoID)); !isNotFound(err) {
-		t.Fatalf("退出维护后母盘临时目标应已删除，err=%v", err)
-	}
-	allocs, _ = st.ListAllocationsByRepo(ctx, repoID)
-	for i := range allocs {
-		if allocs[i].UserID == domain.TempAllocationUserID {
-			t.Fatal("退出维护后 @temp 占位分配应已清理")
-		}
 	}
 }
 
