@@ -622,6 +622,15 @@ POST /agent/fs/scan
   # 文件数 > 200000 或总字节 > 2TiB → 413 agent.scan_too_large（args 含上限与实测值）。
   # 不返回完整文件清单（可能几十万条；清单只在代理内部使用）。
 
+POST /agent/fs/manifest
+  ↓ {path, hash:bool}
+  ↑ {path, file_count, total_bytes, warnings:[string],
+     entries:[{path, size, hash?}]}
+  # 与 /agent/fs/scan 同一套遍历与上限；额外返回**完整清单**供"上传核对"使用。
+  # hash=true 时对每个文件计算 SHA-256（耗时与总字节数成正比；读失败记入 warnings 并
+  # 返回空 hash，服务端退化为只比大小）；hash=false 只遍历元数据。
+  # entries[].path 是相对 path 的斜杠路径。
+
 POST /agent/uploads/start
   ↓ {local_dir, repo_name, repo_mode?, storage_id?, quota_bytes?, max_diff_disks?,
      source_mode?, server_key?, server_url?}
@@ -756,9 +765,11 @@ POST  /agent/group-mounts
 ```
 
 `group_mounts` 是**按存储库分组名**保存的本地挂载配置（分组名来自服务端
-`repo.meta.group`）。`use_for_repos=true` 时，组内库挂载会用这套配置**覆盖**各自的
-`repo_mounts` 配置；为 false 时组内库各用各的配置，分组配置只作为默认值保留。
-挂载时分组名可由挂载请求的 `repo_group` 或服务端下发的 MountSpec `repo_group` 提供。
+`repo.meta.group`）。**只有按分组批量挂载**（`POST /agent/mount` 带
+`use_group_config=true`，即卡片上的「挂载分组」）且 `use_for_repos=true` 时，组内库才用
+这套配置**覆盖**各自的 `repo_mounts`；单库挂载（卡片/详情页挂载、自动挂载、启动恢复）
+**一律用该库自己的配置**，即使请求里带着 `repo_group`。`use_for_repos=false` 时组内库
+各用各的配置，分组配置只作为默认值保留。
 
 `repo_mounts` 是**每个存储库各自独立**的挂载偏好（形态 / 目录 / 启动后自动挂载），
 没有条目的库跟随 `default_mount_mode`、`default_mount_dir` 与 `auto_mount` 的兜底默认值；

@@ -337,7 +337,12 @@ const (
 	// 中途掐断；而**杀掉正在执行的 iSCSI cmdlet 会把 WinTarget 的 WMI 提供程序留在坏状态**，
 	// 之后所有目标操作都会挂死（真实事故：母盘发布 / 退出维护任务一直卡着）。改走 worker：
 	// 无对账预算、按目标锁串行，脚本能完整跑完。见 IscsiService.runRepairTarget。
-	JobRepairTarget   JobType = "repair_target"
+	JobRepairTarget JobType = "repair_target"
+	// JobVerifyDiff 上传核对：从母盘派生一块**临时**差异盘，在服务端挂载后逐个文件与
+	// 客户端清单（路径/大小/SHA-256）对比，列出缺失/多余/内容不同的文件。
+	//
+	// 临时盘不登记、不计配额，任务结束即删除；结果写到临时 JSON 供界面查询。
+	JobVerifyDiff     JobType = "verify_diff"
 	JobCompact        JobType = "compact"
 	JobReconcile      JobType = "reconcile"
 	JobDeleteDisk     JobType = "delete_disk"

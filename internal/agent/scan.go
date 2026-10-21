@@ -1,6 +1,9 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -45,6 +48,103 @@ type scanResult struct {
 	TotalFiles int
 	TotalBytes int64
 	Warnings   []string
+}
+
+// fsManifestRequest 是 POST /agent/fs/manifest 的请求体。
+type fsManifestRequest struct {
+	Path string `json:"path"`
+	// Hash 为 true 时对每个文件计算 SHA-256（耗时与总字节数成正比）。
+	Hash bool `json:"hash"`
+}
+
+// fsManifestEntry 是交给服务端做上传核对的一项。
+type fsManifestEntry struct {
+	Path string `json:"path"`
+	Size int64  `json:"size"`
+	// Hash 为空表示没算/算失败：服务端退化为只比大小，避免误报“内容不同”。
+	Hash string `json:"hash,omitempty"`
+}
+
+// handleFSManifest 扫描本地目录并返回**完整清单**（可选带 SHA-256），
+// 供服务端从母盘差异盘里逐文件核对上传结果。
+func (a *Agent) handleFSManifest(w http.ResponseWriter, r *http.Request) {
+	var req fsManifestRequest
+	if err := decodeJSON(r, &req); err != nil {
+		a.writeError(w, err)
+		return
+	}
+	res, err := scanLocalDir(req.Path)
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	entries := make([]fsManifestEntry, 0, len(res.Entries))
+	var keptFiles int
+	var keptBytes int64
+	for _, e := range res.Entries {
+		// 与 service 端 walkVerifyRoot 一致：卷根系统元数据不算上传内容。
+		if isVerifyRootMetadata(e.Rel) {
+			continue
+		}
+		hash := ""
+		if req.Hash {
+			h, hErr := hashLocalFile(e.Abs)
+			if hErr != nil {
+				res.Warnings = append(res.Warnings, "hash_failed:"+e.Rel)
+			} else {
+				hash = h
+			}
+		}
+		entries = append(entries, fsManifestEntry{Path: e.Rel, Size: e.Size, Hash: hash})
+		keptFiles++
+		keptBytes += e.Size
+	}
+	warnings := res.Warnings
+	if warnings == nil {
+		warnings = []string{}
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{
+		"path":        res.Root,
+		"file_count":  keptFiles,
+		"total_bytes": keptBytes,
+		"entries":     entries,
+		"warnings":    warnings,
+	})
+}
+
+// hashLocalFile 计算文件的 SHA-256（十六进制）。
+func hashLocalFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// isVerifyRootMetadata 与 app 端同名函数保持一致：卷根上由格式化/挂载产生的系统元数据
+// （$RECYCLE.BIN / System Volume Information / lost+found 等）不算上传内容。
+func isVerifyRootMetadata(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	first := rel
+	if i := strings.IndexByte(rel, '/'); i >= 0 {
+		first = rel[:i]
+	}
+	switch strings.ToLower(first) {
+	case "$recycle.bin", "system volume information", "lost+found":
+		return true
+	}
+	if !strings.Contains(rel, "/") {
+		switch strings.ToLower(rel) {
+		case "pagefile.sys", "hiberfil.sys", "swapfile.sys", "dumpstack.log.tmp":
+			return true
+		}
+	}
+	return false
 }
 
 // handleFSScan 扫描本地目录，返回文件数/总字节与告警（不返回完整清单）。

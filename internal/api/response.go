@@ -87,7 +87,12 @@ func apperrConflict(code string) error {
 
 // decodeJSON 解析请求体；空体视为零值结构。
 func (r *Router) decodeJSON(req *http.Request, dst any) error {
-	dec := json.NewDecoder(io.LimitReader(req.Body, maxRequestBodyBytes))
+	return r.decodeJSONLimit(req, dst, maxRequestBodyBytes)
+}
+
+// decodeJSONLimit 与 decodeJSON 相同，但允许指定请求体上限（大清单接口用）。
+func (r *Router) decodeJSONLimit(req *http.Request, dst any, limit int64) error {
+	dec := json.NewDecoder(io.LimitReader(req.Body, limit))
 	if err := dec.Decode(dst); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil

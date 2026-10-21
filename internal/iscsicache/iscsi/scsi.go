@@ -11,6 +11,9 @@ import (
 const (
 	SCSITestUnitReady      uint8 = 0x00
 	SCSIRequestSense       uint8 = 0x03
+	SCSIFormatUnit         uint8 = 0x04
+	SCSIRead6              uint8 = 0x08
+	SCSIWrite6             uint8 = 0x0a
 	SCSIInquiry            uint8 = 0x12
 	SCSIModeSelect6        uint8 = 0x15
 	SCSIModeSense6         uint8 = 0x1a
@@ -18,16 +21,23 @@ const (
 	SCSIReadCapacity10     uint8 = 0x25
 	SCSIRead10             uint8 = 0x28
 	SCSIWrite10            uint8 = 0x2a
+	SCSIWriteVerify10      uint8 = 0x2e
 	SCSISynchronizeCache10 uint8 = 0x35
 	SCSIWriteSame10        uint8 = 0x41
 	SCSIUnmap              uint8 = 0x42
+	SCSISanitize           uint8 = 0x48
 	SCSIModeSelect10       uint8 = 0x55
 	SCSIModeSense10        uint8 = 0x5a
 	SCSIRead16             uint8 = 0x88
+	SCSICompareAndWrite    uint8 = 0x89
 	SCSIWrite16            uint8 = 0x8a
+	SCSIWriteAtomic16      uint8 = 0x8c
+	SCSIWriteVerify16      uint8 = 0x8e
 	SCSIWriteSame16        uint8 = 0x93
 	SCSIServiceActionIn16  uint8 = 0x9e
 	SCSIReportLuns         uint8 = 0xa0
+	SCSIWrite12            uint8 = 0xaa
+	SCSIWriteVerify12      uint8 = 0xae
 )
 
 // Sense keys.
@@ -245,6 +255,44 @@ func ParseReadWrite(cdb []byte) (ReadWriteParams, error) {
 		return p, fmt.Errorf("iscsi: not a READ/WRITE CDB (0x%02x)", cdb[0])
 	}
 	return p, nil
+}
+
+// ParseWriteRange 解析所有会**写入介质**的 CDB，返回起始 LBA 与块数（用于失效读缓存）。
+//
+// 覆盖 READ/WRITE 家族里真正落盘的那些命令：WRITE(6/10/12/16)、WRITE AND VERIFY、
+// WRITE ATOMIC(16)、COMPARE AND WRITE。少认一种，缓存就会在写后继续返回旧数据
+// （真实故障：某些程序"写完立刻读回"时打不开）。WRITE SAME/UNMAP 的范围形态不同，
+// 由各自解析器处理；FORMAT UNIT/SANITIZE 直接整盘失效。
+func ParseWriteRange(cdb []byte) (lba uint64, blocks uint32, ok bool) {
+	if len(cdb) < 6 {
+		return 0, 0, false
+	}
+	switch cdb[0] {
+	case SCSIWrite6:
+		lba = uint64(cdb[1]&0x1f)<<16 | uint64(binary.BigEndian.Uint16(cdb[2:4]))
+		blocks = uint32(cdb[4])
+		if blocks == 0 {
+			blocks = 256 // SBC：0 表示 256 块
+		}
+		return lba, blocks, true
+	case SCSIWrite10, SCSIWriteVerify10:
+		if len(cdb) < 10 {
+			return 0, 0, false
+		}
+		return uint64(binary.BigEndian.Uint32(cdb[2:6])), uint32(binary.BigEndian.Uint16(cdb[7:9])), true
+	case SCSIWrite12, SCSIWriteVerify12:
+		if len(cdb) < 12 {
+			return 0, 0, false
+		}
+		return uint64(binary.BigEndian.Uint32(cdb[2:6])), binary.BigEndian.Uint32(cdb[6:10]), true
+	case SCSIWrite16, SCSIWriteVerify16, SCSIWriteAtomic16, SCSICompareAndWrite:
+		if len(cdb) < 16 {
+			return 0, 0, false
+		}
+		return binary.BigEndian.Uint64(cdb[2:10]), binary.BigEndian.Uint32(cdb[10:14]), true
+	default:
+		return 0, 0, false
+	}
 }
 
 // InquiryParams describes an INQUIRY CDB.

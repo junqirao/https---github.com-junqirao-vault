@@ -1089,9 +1089,17 @@ IQN         = iqn.2026-01.com.vault:{target_name}
   ② 只置 parent_condition = 'MAINTENANCE'：立即禁止新的分配与挂载。
      **不再建 @temp 占位分配 / 母盘临时 iSCSI 目标**（旧的"挂到客户端"链路已移除）
   ③ 管理员在详情页「母盘文件」里直接浏览/上传/下载/新建/重命名/删除/编辑：
+     - **前置：维护态且已无差异盘**（有差异盘时改母盘会让它们基于旧基线；前端不展示页签，
+       接口也返回 `repo.parent_files_requires_cleanup`）
      - 服务端把母盘卷**本地挂载**（Windows=attach VHDX 取盘符；Linux=激活 LV 并挂到临时目录）
      - 文件 API 作用域严格限制在挂载根内（拒绝 `..`/绝对路径/符号链接逃逸）
      - 首次访问懒挂载；退出维护时卸载
+     - 编辑走**显式「编辑」按钮**（单击文件名不会打开编辑器，避免大文件把页面撑爆；
+       超过 **20 MB** 禁用在线编辑，只能下载后本地改）；编辑器为 CodeMirror 6
+     - 首行固定「上一级目录」，行支持**拖拽移动**：拖到目录行/面包屑/上一级目录即移动进去
+       （禁止移入自身/子目录）
+     - 支持**剪切 / 复制 / 粘贴**：剪切=移动；复制在服务端**递归拷贝**，同名自动生成
+       `name (copy)`（目录同样递归）
   ④ 可扩容母盘：POST /v1/repos/{id}/parent/resize {size_bytes}
      - 仅维护态；只扩不缩
      - 要求没有差异盘、没有在线客户端
@@ -1710,6 +1718,57 @@ Dismount-VHD -Path $vhdx
   ⚠️ **行为变化**：改动前 `source_dir` 只校验"绝对路径 + 存在"，任意本地目录都可用；
   改动后**默认仍兼容**（所有存储根可用），但**存储根之外**的目录（如未纳入 source_roots 的 `D:\Games`）
   会被拒绝——要使用这类目录，请显式写入 `storage.source_roots`。
+
+### 5.10.1 上传核对（Diff）
+
+**要解决的问题**：用户怀疑"上传过去的游戏有问题"（打不开、文件缺失、内容损坏），需要一种**不改动现有库**
+的方式，把"服务端盘里到底是什么"与"本地目录里是什么"逐文件比出来。
+
+流程（客户端清单 → 服务端临时差异盘 → 逐文件对比）：
+
+```
+① 客户端选目录，代理生成清单
+   POST /agent/fs/manifest  {path, hash:bool}
+   → {entries:[{path,size,hash?}], file_count, total_bytes, warnings}
+   # hash=true 时本地逐个文件算 SHA-256；读失败退化为空 hash（服务端只比大小）
+
+② 客户端把清单交给服务端（异步任务）
+   POST /v1/repos/{id}/diff
+   body: {directory, mode:'size'|'hash', files:[{path,size,hash?}]}
+   → 202 JobDTO (type=verify_diff)
+   # 清单落临时文件（不塞进 jobs 表），文件数上限 100000，请求体上限 32MiB
+
+③ 服务端任务 runVerifyDiff
+   a. 从**母盘**派生一块临时差异盘：verify/<repoID>/<uuid>.vhdx
+      - **不登记 disks、不计配额**，也**不创建 iSCSI 目标**（只给服务端自己挂载）
+      - 刻意放在存储根 verify/ 而不是 disks/：孤儿扫描会把 disks/ 下没有 DB 记录的
+        VHDX 移进 meta/orphan，核对可能跑很久，绝不能被它搬走
+   b. 服务端本地挂载（MountVolume 会复用差异盘继承来的分区表/文件系统，不会格式化）
+   c. 遍历挂载根：路径统一转成 "/" 分隔；hash 模式计算 SHA-256
+   d. 与清单对比，分类：
+      - missing   本地有、盘里没有（最典型的"没传上去"）
+      - extra     盘里有、本地没有
+      - different 两边都有但 size 不同（reason=size）或 size 相同而 SHA-256 不同（reason=hash）
+   e. 结果写临时 result.json；任务结束（成功/失败）都在 defer 里卸卷 + 删临时差异盘
+
+④ 客户端取结果
+   GET /v1/repos/{id}/diff/result?job=<jobID>
+   → {same, missing[], extra[], different[], local_files, disk_files, bytes, warnings, truncated}
+   # 只允许读 type=verify_diff 且 RefID=该库 的任务，避免跨库读取
+```
+
+**模式取舍**：
+
+| 模式 | 比较内容 | 能发现 | 代价 |
+| --- | --- | --- | --- |
+| `size` | 路径 + 大小 | 缺失、截断、大小不对 | 只遍历元数据，秒级 |
+| `hash` | 路径 + 大小 + SHA-256 | 大小相同的位损坏 | 两端都要读完整个目录，分钟~小时级 |
+
+结果每类差异最多返回 5000 条（`verifyDiffMaxList`），超出时 `truncated=true`。读取失败/符号链接等
+不计入差异，只进 `warnings`——避免把"服务端读不了"误报成"上传坏了"。
+
+**为什么是"从母盘派生"而不是直接读母盘**：母盘在库 active 时不应被额外挂载/写入；差异盘是快照语义，
+读取期间的任何意外都落在临时盘上，删掉即无痕。也正因如此，核对完不需要"回滚"任何状态。
 
 ### 5.11 对账 Reconciler
 

@@ -194,5 +194,28 @@ func (r *Router) handleMoveParentEntry(w http.ResponseWriter, req *http.Request)
 	r.writeJSON(w, http.StatusOK, map[string]any{"path": to})
 }
 
+// handleCopyParentEntry 复制母盘里的文件或目录（目录递归复制；同名自动加 (copy)）。
+func (r *Router) handleCopyParentEntry(w http.ResponseWriter, req *http.Request) {
+	id := chi.URLParam(req, "id")
+	p, err := r.requireRepoPerm(req, id, domain.PermManage)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	var in parentFileMoveRequest
+	if err := r.decodeJSON(req, &in); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	to, err := r.deps.App.Repos().CopyParentEntry(req.Context(), id, in.From, in.To)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.deps.App.Audit(req.Context(), p.UserID, "repo.parent.file.copy", "repo:"+id,
+		"from="+in.From+" to="+to, domain.AuditResultOK)
+	r.writeJSON(w, http.StatusOK, map[string]any{"path": to})
+}
+
 // maxParentUploadBytes 是单次网页上传的上限（8 GiB）。更大的内容建议先下载/拷贝到磁盘再整体替换。
 const maxParentUploadBytes int64 = 8 << 30

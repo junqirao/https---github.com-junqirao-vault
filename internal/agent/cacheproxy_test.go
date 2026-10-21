@@ -313,8 +313,9 @@ func TestLocalConnectAuthKeepsCHAPWithCache(t *testing.T) {
 	}
 }
 
-// TestMountPrefForGroupOverride 分组配置开启 use_for_repos 时覆盖组内库自己的配置；
-// 关闭时仍用库自己的配置。
+// TestMountPrefForGroupOverride 锁定分组配置的生效范围：
+//   - **单库挂载**（UseGroupConfig=false）永远用库自己的配置，即使分组开了 use_for_repos；
+//   - **按分组批量挂载**（UseGroupConfig=true）且分组开了 use_for_repos 时，分组配置覆盖库配置。
 func TestMountPrefForGroupOverride(t *testing.T) {
 	s := newCacheTestStore(t)
 	if _, err := s.SetRepoMountPref("repo-a", RepoMountPref{
@@ -326,7 +327,10 @@ func TestMountPrefForGroupOverride(t *testing.T) {
 
 	aa := &Agent{logger: testLogger(), cfg: s}
 	aa.engine = &mountEngine{a: aa}
+	// 单库挂载：带分组名也不套用分组配置。
 	req := MountRequest{RepoID: "repo-a", RepoGroup: "games"}
+	// 分组批量挂载。
+	groupReq := MountRequest{RepoID: "repo-a", RepoGroup: "games", UseGroupConfig: true}
 
 	// 没有分组配置：用库自己的。
 	if pref, ok := aa.engine.mountPrefFor(req, nil); !ok || pref.MountMode != mountModeLetter {
@@ -339,24 +343,30 @@ func TestMountPrefForGroupOverride(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("写分组配置失败：%v", err)
 	}
-	if pref, _ := aa.engine.mountPrefFor(req, nil); pref.MountMode != mountModeLetter {
+	if pref, _ := aa.engine.mountPrefFor(groupReq, nil); pref.MountMode != mountModeLetter {
 		t.Fatalf("分组开关关闭时应使用库配置，实际 %q", pref.MountMode)
 	}
 
-	// 开关打开：分组配置覆盖库配置。
+	// 开关打开：只有分组批量挂载才套用；单库挂载仍用库配置。
 	if _, err := s.SetGroupMountPref("games", RepoMountPref{
 		MountMode: mountModeDirectory, UseForRepos: true,
 	}); err != nil {
 		t.Fatalf("写分组配置失败：%v", err)
 	}
-	if pref, ok := aa.engine.mountPrefFor(req, nil); !ok || pref.MountMode != mountModeDirectory {
-		t.Fatalf("分组开关开启时应使用分组配置，实际 %+v ok=%v", pref, ok)
+	if pref, ok := aa.engine.mountPrefFor(groupReq, nil); !ok || pref.MountMode != mountModeDirectory {
+		t.Fatalf("分组批量挂载应使用分组配置，实际 %+v ok=%v", pref, ok)
+	}
+	if pref, _ := aa.engine.mountPrefFor(req, nil); pref.MountMode != mountModeLetter {
+		t.Fatalf("单库挂载不应被分组配置覆盖，实际 %q", pref.MountMode)
 	}
 
-	// 分组名也可以只由服务端 MountSpec 下发。
+	// 分组名也可以只由服务端 MountSpec 下发（仅分组批量挂载时）。
 	spec := &MountSpec{RepoGroup: "games"}
-	if pref, _ := aa.engine.mountPrefFor(MountRequest{RepoID: "repo-a"}, spec); pref.MountMode != mountModeDirectory {
+	if pref, _ := aa.engine.mountPrefFor(MountRequest{RepoID: "repo-a", UseGroupConfig: true}, spec); pref.MountMode != mountModeDirectory {
 		t.Fatalf("MountSpec 里的分组应生效，实际 %q", pref.MountMode)
+	}
+	if pref, _ := aa.engine.mountPrefFor(MountRequest{RepoID: "repo-a"}, spec); pref.MountMode != mountModeLetter {
+		t.Fatalf("单库挂载不应使用 MountSpec 里的分组，实际 %q", pref.MountMode)
 	}
 }
 

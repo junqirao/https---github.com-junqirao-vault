@@ -151,6 +151,7 @@ func (s *DiskService) RegisterHandlers(w *job.Worker) {
 	w.Register(job.HandlerFunc{T: domain.JobDeleteDisk, F: s.runDeleteDisk})
 	w.Register(job.HandlerFunc{T: domain.JobReclaim, F: s.runReclaim})
 	w.Register(job.HandlerFunc{T: domain.JobCleanupDiffs, F: s.runCleanupDiffs})
+	w.Register(job.HandlerFunc{T: domain.JobVerifyDiff, F: s.runVerifyDiff})
 	w.Register(job.HandlerFunc{T: domain.JobCompact, F: s.runCompact})
 }
 

@@ -43,6 +43,8 @@ import type {
   OrphanScanDTO,
   ParentAction,
   ParentFileListingDTO,
+  VerifyDiffMode,
+  VerifyDiffResultDTO,
   PoolDeleteRequest,
   PoolDeleteResult,
   RepoDTO,
@@ -395,6 +397,36 @@ export class VaultApi extends ApiClient {
       from,
       to
     })
+  }
+
+  /** 复制文件/目录（递归；同名自动生成 `name (copy)`），返回实际写入的路径。 */
+  copyParentEntry(id: string, from: string, to: string): Promise<{ path: string }> {
+    return this.request<{ path: string }>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/files/copy`, {
+      from,
+      to
+    })
+  }
+
+  // ---- 上传核对（临时差异盘 + 客户端清单逐文件对比） ----
+
+  startVerifyDiff(
+    id: string,
+    input: {
+      directory: string
+      mode: VerifyDiffMode
+      files: { path: string; size: number; hash?: string }[]
+    }
+  ): Promise<JobDTO> {
+    return this.request<JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/diff`, input)
+  }
+
+  getVerifyDiffResult(id: string, jobId: string): Promise<VerifyDiffResultDTO> {
+    return this.request<VerifyDiffResultDTO>(
+      'GET',
+      `/v1/repos/${encodeURIComponent(id)}/diff/result`,
+      undefined,
+      { job: jobId }
+    )
   }
 
   /**

@@ -1,5 +1,5 @@
 import type { CSSProperties, MouseEvent, ReactNode } from 'react'
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
 import { InfoCircleOutlined, LinkOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
 import { useMutation } from '@tanstack/react-query'
@@ -698,23 +698,52 @@ function useOpenMountDir(controller: RepoMountController): () => void {
 }
 
 /**
- * 整卡点击的去处：上传中的库没有挂载目录（点下去只会得到一句"未挂载"），所以改去
- * 「上传任务」页看进度；其余情况仍是普通库的"打开挂载目录"。
+ * 整卡点击的去处：**单击打开挂载文件夹，双击进入详情**。
  *
- * 这里只管点击；上传带来的外观差异（进度条、暂停/取消按钮）都不在这里，见 RepoCardProps.upload。
+ * 双击会先触发两次 click，所以单击动作要延迟一小段再执行；双击到达时取消那次单击。
+ * 上传中的库没有挂载目录（点下去只会得到一句"未挂载"），单击仍去「上传任务」页。
+ *
+ * 详情仍保留一个显式的「详情」图标按钮（见 RepoMountCard），不依赖双击。
  */
-function useRepoCardClick(
+function useRepoCardInteractions(
   upload: UploadState | undefined,
   onOpenUpload: ((uploadId: string) => void) | undefined,
-  openMountDir: () => void
-): () => void {
-  return useCallback(() => {
-    if (upload && onOpenUpload) {
-      onOpenUpload(upload.upload_id)
+  openMountDir: () => void,
+  onOpen: () => void
+): { onClick: () => void; onDoubleClick: () => void } {
+  const timer = useRef<number | null>(null)
+
+  const clear = useCallback(() => {
+    if (timer.current !== null) {
+      window.clearTimeout(timer.current)
+      timer.current = null
+    }
+  }, [])
+
+  useEffect(() => () => clear(), [clear])
+
+  const onClick = useCallback(() => {
+    // 第二次 click 说明这是一次双击：取消待执行的单击动作，交给 onDoubleClick。
+    if (timer.current !== null) {
+      clear()
       return
     }
-    openMountDir()
-  }, [upload, onOpenUpload, openMountDir])
+    timer.current = window.setTimeout(() => {
+      timer.current = null
+      if (upload && onOpenUpload) {
+        onOpenUpload(upload.upload_id)
+        return
+      }
+      openMountDir()
+    }, 250)
+  }, [clear, upload, onOpenUpload, openMountDir])
+
+  const onDoubleClick = useCallback(() => {
+    clear()
+    onOpen()
+  }, [clear, onOpen])
+
+  return { onClick, onDoubleClick }
 }
 
 /**
@@ -741,12 +770,13 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
   const { t } = useI18n()
   const mountController = useRepoMount(repo, currentUserId)
   const openMountDir = useOpenMountDir(mountController)
-  const onClick = useRepoCardClick(upload, onOpenUpload, openMountDir)
+  const interactions = useRepoCardInteractions(upload, onOpenUpload, openMountDir, () => onOpen(repo.id))
 
   return (
     <Card
       hoverable
-      onClick={onClick}
+      onClick={interactions.onClick}
+      onDoubleClick={interactions.onDoubleClick}
       style={{ height: '100%' }}
       styles={{ body: { padding: spacing.md } }}
     >
@@ -832,12 +862,13 @@ export function RepoRow(props: RepoCardProps): JSX.Element {
 function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onConfigure }: RepoCardProps): JSX.Element {
   const mountController = useRepoMount(repo, currentUserId)
   const openMountDir = useOpenMountDir(mountController)
-  const onClick = useRepoCardClick(upload, onOpenUpload, openMountDir)
+  const interactions = useRepoCardInteractions(upload, onOpenUpload, openMountDir, () => onOpen(repo.id))
 
   return (
     <Card
       hoverable
-      onClick={onClick}
+      onClick={interactions.onClick}
+      onDoubleClick={interactions.onDoubleClick}
       styles={{ body: { padding: `${spacing.sm}px ${spacing.md}px` } }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: spacing.md, flexWrap: 'wrap' }}>

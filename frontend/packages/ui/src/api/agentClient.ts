@@ -29,6 +29,7 @@ import type {
   AgentSessionState,
   AgentState,
   DownloadState,
+  LocalManifestResult,
   LocalScanResult,
   ServerProbe,
   ServerSession,
@@ -640,6 +641,20 @@ export const agentApi = {
   /** 扫描本地目录（文件数 / 大小 / 跳过项）；目录过大或为空时返回明确错误。 */
   scanLocalDir(path: string): Promise<LocalScanResult> {
     return request<LocalScanResult>({ method: 'POST', path: '/agent/fs/scan', body: { path }, timeoutMs: 120000 })
+  },
+
+  /**
+   * 扫描本地目录并返回**完整清单**（可选 SHA-256），供服务端核对上传结果。
+   *
+   * 计算哈希要读完整个目录，超时给到 30 分钟；未请求哈希时只是遍历元数据，很快。
+   */
+  fsManifest(path: string, hash: boolean): Promise<LocalManifestResult> {
+    return request<LocalManifestResult>({
+      method: 'POST',
+      path: '/agent/fs/manifest',
+      body: { path, hash },
+      timeoutMs: 1800000
+    })
   },
 
   /** 启动本地目录上传：202 立即返回初始状态；进度经 upload 事件推送。 */

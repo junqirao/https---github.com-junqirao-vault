@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -16,7 +17,7 @@ import (
 )
 
 // parentTextLimit 是网页编辑器单文件读取/保存上限（超过请下载后用本地编辑器）。
-const parentTextLimit = 2 << 20 // 2 MiB
+const parentTextLimit = 20 << 20 // 20 MiB
 
 // ParentFileEntry 是母盘文件列表中的一项。
 type ParentFileEntry struct {
@@ -61,6 +62,10 @@ func (s *RepoService) ParentMount(ctx context.Context, repoID string) (string, e
 	parent, err := s.Store.GetDisk(ctx, *repo.ParentDiskID)
 	if err != nil {
 		return "", err
+	}
+	// 有差异盘时不允许碰母盘文件：改母盘会让所有差异盘基于"旧基线"。
+	if n, cErr := s.Store.CountDiffDisks(ctx, parent.ID); cErr == nil && n > 0 {
+		return "", apperr.RepoParentFilesRequiresCleanup(n)
 	}
 
 	// 整段持锁：挂载是命令级重活，不能让两个并发请求各 attach 一次。
@@ -305,6 +310,121 @@ func (s *RepoService) RenameParentEntry(ctx context.Context, repoID, from, to st
 			WithArg("reason", "rename").WithCause(err)
 	}
 	return cleanTo, nil
+}
+
+// CopyParentEntry 复制文件或目录（递归）。目标已存在时自动改名为 `name (copy)`、`name (copy 2)`…
+//
+// 返回实际写入的相对路径。与剪切（move）的区别：复制不删除源；同名粘贴是常态，
+// 所以这里不报冲突，而是生成一个不冲突的名字。
+func (s *RepoService) CopyParentEntry(ctx context.Context, repoID, from, to string) (string, error) {
+	root, err := s.ParentMount(ctx, repoID)
+	if err != nil {
+		return "", err
+	}
+	absFrom, _, err := resolveParentPath(root, from)
+	if err != nil {
+		return "", err
+	}
+	absTo, cleanTo, err := resolveParentPath(root, to)
+	if err != nil {
+		return "", err
+	}
+	if samePath(absFrom, root) {
+		return "", apperr.InvalidParam("path")
+	}
+	// 不能把目录复制进它自己或子目录（无限递归）；复制到"同一路径"是合法的，
+	// 由 uniqueParentCopyPath 自动改名成 `name (copy)`。
+	sep := string(filepath.Separator)
+	if !samePath(absFrom, absTo) &&
+		strings.HasPrefix(strings.ToLower(absTo)+sep, strings.ToLower(absFrom)+sep) {
+		return "", apperr.InvalidParam("path")
+	}
+	info, err := os.Lstat(absFrom)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", apperr.New(apperr.CodeNotFound, http.StatusNotFound).WithArg("path", from)
+		}
+		return "", apperr.New(apperr.CodeInternal, http.StatusInternalServerError).WithCause(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", apperr.InvalidParam("path")
+	}
+	absTo, cleanTo = uniqueParentCopyPath(absTo, cleanTo)
+	if err := os.MkdirAll(filepath.Dir(absTo), 0o755); err != nil {
+		return "", apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+			WithArg("reason", "mkdir").WithCause(err)
+	}
+	if err := copyParentTree(absFrom, absTo); err != nil {
+		return "", apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
+			WithArg("reason", "copy").WithCause(err)
+	}
+	return cleanTo, nil
+}
+
+// uniqueParentCopyPath 为已存在的目标生成不冲突的 `name (copy)` / `name (copy N)`。
+func uniqueParentCopyPath(abs, clean string) (string, string) {
+	if _, err := os.Lstat(abs); os.IsNotExist(err) {
+		return abs, clean
+	}
+	dir := path.Dir(clean)
+	base := path.Base(clean)
+	ext := path.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	for i := 1; i < 10000; i++ {
+		suffix := " (copy)"
+		if i > 1 {
+			suffix = fmt.Sprintf(" (copy %d)", i)
+		}
+		candidateClean := path.Join(dir, stem+suffix+ext)
+		candidateAbs := filepath.Join(filepath.Dir(abs), filepath.FromSlash(stem+suffix+ext))
+		if _, err := os.Lstat(candidateAbs); os.IsNotExist(err) {
+			return candidateAbs, candidateClean
+		}
+	}
+	return abs, clean
+}
+
+// copyParentTree 递归复制（不跟随符号链接）。
+func copyParentTree(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil // 跳过符号链接
+	}
+	if info.IsDir() {
+		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if err := copyParentTree(filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name())); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // ---- 路径与文件工具 ----

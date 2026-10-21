@@ -61,7 +61,14 @@ type MountRequest struct {
 	RepoName string `json:"repo_name"`
 	// RepoGroup 可选：存储库分组名。服务端 MountSpec 也会下发（见 RepoGroup 字段），
 	// 这里主要用于前端在服务端还没响应前就带上分组、以及旧服务端的兜底。
+	//
+	// 注意：它**只用于展示/记录**，不会让单库挂载套用分组配置 —— 见 UseGroupConfig。
 	RepoGroup string `json:"repo_group,omitempty"`
+	// UseGroupConfig 表示本次是**按分组批量挂载**（卡片上的「挂载分组」）。
+	//
+	// 只有它为 true 且该分组开了"使用分组配置"时，分组配置才覆盖组内库自己的配置；
+	// 单库挂载（卡片/详情页的挂载按钮、自动挂载、启动恢复）一律用该库自己的配置。
+	UseGroupConfig bool `json:"use_group_config,omitempty"`
 	// ServerKey / ServerURL 指明本次挂载归属的服务端（多服务端下二选一必填）。
 	//
 	// 挂载记录会记住这个归属：心跳、挂载点回写、租约释放都发给它（见 Agent.mountClient）。
@@ -383,12 +390,12 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	// v2 生效 IQN = 后端真实 IQN，与直连同名，故这里跳过生效侧，同名残留由下面单独处理。
 	e.disconnectStaleTargets(ctx, effectiveIQN, spec.TargetIQN, cacheTargetIQN(allocationID))
 	// v2 用后端真实 IQN：直连会话与代理会话**同名**，而 Connect 脚本的幂等判定只看 IQN
-	// （Test-SameTarget），残留的同名会话会让它直接判定"已连接"从而绕过代理，代理形同虚设
-	// （开没开缓存都一样）。因此只要走代理（cacheActive，含未开缓存的纯透传），就先显式断开
-	// 任何同名旧会话，确保随后的 Connect 一定经本机代理登录。
-	if cacheActive {
-		e.disconnectSameNameSession(ctx, effectiveIQN)
-	}
+	// （Test-SameTarget）。残留的同名会话有两个方向：
+	//   - 上一次走代理、这次要直连 → 残留的代理会话会让 Connect 报
+	//     "The target has already been logged in via an iSCSI session."（真实故障）；
+	//   - 上一次直连、这次要代理 → 残留的直连会话会让 Connect 判定"已连接"而绕过代理。
+	// 因此**无论哪种模式**，Connect 前都先显式断开同名残留 —— 这一步幂等，无会话时是空操作。
+	e.disconnectSameNameSession(ctx, effectiveIQN)
 	if err := e.a.iscsi.Connect(ctx, iscsiinitiator.ConnectOptions{
 		TargetIQN:     effectiveIQN,
 		PortalAddress: effectivePortalAddr,
@@ -1399,8 +1406,14 @@ func (e *mountEngine) groupPref(group string) (RepoMountPref, bool) {
 	return pref, ok
 }
 
-// groupOverride 返回本次挂载是否命中了"使用分组配置"的分组，以及那份配置。
+// groupOverride 返回本次挂载是否要套用"使用分组配置"的分组，以及那份配置。
+//
+// 只有**按分组批量挂载**（req.UseGroupConfig）才会套用：单库挂载即使带着分组名，
+// 也必须用该库自己的配置（真实反馈："没有优先用存储库本身的配置，而是优先用了分组的"）。
 func (e *mountEngine) groupOverride(req MountRequest, spec *MountSpec) (RepoMountPref, bool) {
+	if !req.UseGroupConfig {
+		return RepoMountPref{}, false
+	}
 	group := strings.TrimSpace(req.RepoGroup)
 	if group == "" && spec != nil {
 		group = strings.TrimSpace(spec.RepoGroup)

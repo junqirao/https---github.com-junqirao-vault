@@ -193,6 +193,10 @@ func (r *Router) routes() {
 		g.Delete("/v1/repos/{id}/parent/files", r.handleDeleteParentEntry)
 		g.Post("/v1/repos/{id}/parent/files/dir", r.handleMkdirParent)
 		g.Post("/v1/repos/{id}/parent/files/move", r.handleMoveParentEntry)
+		g.Post("/v1/repos/{id}/parent/files/copy", r.handleCopyParentEntry)
+		// 上传核对：临时差异盘 + 与客户端清单逐文件对比。
+		g.Post("/v1/repos/{id}/diff", r.handleStartVerifyDiff)
+		g.Get("/v1/repos/{id}/diff/result", r.handleVerifyDiffResult)
 		g.Post("/v1/repos/{id}/copy", r.handleCopyRepo)
 		g.Get("/v1/repos/{id}/disks", r.handleListRepoDisks)
 		g.Get("/v1/repos/{id}/iscsi", r.handleListRepoIscsi)

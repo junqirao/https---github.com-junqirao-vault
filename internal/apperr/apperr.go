@@ -373,6 +373,13 @@ func RepoResizeRequiresCleanup(diffCount int) *Error {
 	return New("repo.resize_requires_cleanup", http.StatusConflict).WithArg("diff_count", diffCount)
 }
 
+// RepoParentFilesRequiresCleanup 访问/编辑母盘文件前必须先清理差异盘。
+//
+// 有差异盘时改母盘会让所有差异盘基于"旧基线"，与它们的 parent_version 语义冲突。
+func RepoParentFilesRequiresCleanup(diffCount int) *Error {
+	return New("repo.parent_files_requires_cleanup", http.StatusConflict).WithArg("diff_count", diffCount)
+}
+
 // RepoQuotaExceeded 配额不足。
 func RepoQuotaExceeded(quotaBytes, usedBytes, needBytes int64) *Error {
 	return New("repo.quota_exceeded", http.StatusConflict).

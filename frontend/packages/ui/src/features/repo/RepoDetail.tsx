@@ -1,6 +1,5 @@
-import { useEffect, useState } from 'react'
-import { Alert, Button, Descriptions, Dropdown, Form, Input, InputNumber, Modal, Progress, Space, Tabs, message } from 'antd'
-import type { MenuProps } from 'antd'
+import { useEffect, useRef, useState } from 'react'
+import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Space, Tabs, message } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ConfirmDialog } from '../../components/ConfirmDialog'
@@ -18,10 +17,11 @@ import { useI18n } from '../../i18n'
 
 import { spacing } from '../../tokens/palette'
 import { formatTime, repoUsage } from '../../utils/format'
-import { parentActionLabel, parentConditionLabel, repoModeLabel } from '../../utils/labels'
+import { parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
 import { RepoParentFiles } from './RepoParentFiles'
+import { RepoVerifyDiff } from './RepoVerifyDiff'
 import { RepoMountActions, useRepoMount } from './RepoMount'
 import { RepoGroupSelect } from './RepoGroupSelect'
 import { RepoMountSettingsPanel } from './RepoMountSettings'
@@ -61,13 +61,32 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const [parentJob, setParentJob] = useState<JobDTO | null>(null)
   // 维护态「扩容母盘」弹窗。
   const [resizeOpen, setResizeOpen] = useState(false)
+  // 上传核对弹窗。
+  const [verifyOpen, setVerifyOpen] = useState(false)
   const [resizeForm] = Form.useForm<{ size_gb: number }>()
   const [editForm] = Form.useForm<EditValues>()
   const [copyForm] = Form.useForm<{ new_repo_name: string }>()
 
+  // 防误触：从列表点进详情的那一下如果紧跟第二次点击（双击/手速快），可能正好落在
+  // 刚出现的「返回」上，表现为"点进去就跳回上一页"。挂载后极短时间内的返回一律忽略。
+  const mountedAt = useRef(Date.now())
+  const goBack = (): void => {
+    if (Date.now() - mountedAt.current < 500) return
+    onBack()
+  }
+
   const repoQuery = useQuery({
     queryKey: ['repo', repoId],
     queryFn: () => api.getRepo(repoId)
+  })
+
+  // 「母盘文件」页签的前置条件：维护态 + **已无差异盘**。
+  // 有差异盘时改母盘会让它们基于旧基线，因此页签与接口都必须拒绝（见 ParentMount）。
+  // 与「磁盘」tab 共用同一 query key，清理完成后自动刷新。
+  const disksQuery = useQuery({
+    queryKey: ['repo-disks', repoId],
+    queryFn: () => api.listRepoDisks(repoId),
+    enabled: repoQuery.data?.parent_condition === 'maintenance'
   })
 
   // 概览里的「已用」也要是本机实测值（见下面 repoUsage 的说明）：页面在时按 10s 轮询。
@@ -242,22 +261,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     setEditOpen(true)
   }
 
-  // 临时共享仍是独立动作（与维护态互斥），用一个小下拉承载；维护态进入/退出则合成一个按钮。
-  const tempShareMenu: MenuProps | null =
-    repo?.mode === 'shared' && (repo.parent_condition === 'idle' || repo.parent_condition === 'temp_shared')
-      ? {
-          items: [
-            repo.parent_condition === 'idle'
-              ? { key: 'temp_share', label: parentActionLabel('temp_share') }
-              : { key: 'unshare', label: parentActionLabel('unshare') }
-          ],
-          onClick: ({ key }) => {
-            setError(null)
-            parentMutation.mutate(key as ParentAction)
-          }
-        }
-      : null
   const isMaintenance = repo?.parent_condition === 'maintenance'
+  const diffCount = (disksQuery.data?.items ?? []).filter((disk) => disk.kind === 'diff').length
+  const parentFilesReady = isMaintenance && canManage && diffCount === 0
   const toggleMaintenance = (): void => {
     setError(null)
     parentMutation.mutate(isMaintenance ? 'finish_maintenance' : 'maintenance')
@@ -274,7 +280,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
           {repo && repo.permission !== 'read' ? (
             <RepoDetailMountActions repo={repo} currentUserId={currentUserId} />
           ) : null}
-          <Button onClick={onBack}>{t('common.back')}</Button>
+          <Button onClick={goBack}>{t('common.back')}</Button>
           {/* 管理类操作只对能管理这个库的人展示（非库所有者点详情只能看）。 */}
           {canManage ? (
             <>
@@ -309,10 +315,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                   ) : null}
                 </Space>
               ) : null}
-              {tempShareMenu ? (
-                <Dropdown menu={tempShareMenu} disabled={parentRunning}>
-                  <Button loading={parentMutation.isPending || parentRunning}>{t('repo.parent.title')}</Button>
-                </Dropdown>
+              {repo?.mode === 'shared' && repo?.parent_disk_id ? (
+                <Button onClick={() => setVerifyOpen(true)}>{t('repo.verifyDiff.button')}</Button>
               ) : null}
               <Button
                 onClick={() => {
@@ -346,6 +350,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
           description={
             <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
               <span>{t('repo.maintenance.bannerHint')}</span>
+              {isMaintenance && canManage && diffCount > 0 ? (
+                <span>{t('repo.parentFiles.needCleanup', { count: diffCount })}</span>
+              ) : null}
               {canManage ? (
                 <Space wrap>
                   <Button
@@ -447,7 +454,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               ]
             : []),
           // 维护态下直接管理母盘文件：服务端本地挂载 + 文件 API（不再挂到客户端）。
-          ...(isMaintenance && canManage
+          // 只有**已无差异盘**时才开放：有差异盘时改母盘会让它们基于旧基线。
+          ...(parentFilesReady
             ? [
                 {
                   key: 'parentFiles',
@@ -567,6 +575,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
           </Form>
         </Space>
       </Modal>
+
+      <RepoVerifyDiff repoId={repoId} open={verifyOpen} onClose={() => setVerifyOpen(false)} />
     </PageShell>
   )
 }

@@ -40,6 +40,9 @@ type pending struct {
 	length int
 	buf    []byte
 	got    int
+	// invGen 是观察到该读命令时的缓存失效代号（见 Cache.InvalidationGen）。
+	// 回填时若代号已变，说明期间发生过写，读到的可能是写前数据，整段回填作废。
+	invGen uint64
 }
 
 // session is one initiator TCP connection spliced to one backend connection.
@@ -56,13 +59,18 @@ type session struct {
 
 	digests digestFlags
 
-	// outMu serialises every write to the initiator and guards offset/lastStat/
-	// expCmd/maxCmd, which the T→I pump shares with the injected answers.
+	// outMu serialises every write to the initiator and guards lastStat/expCmd/
+	// maxCmd, which the T→I pump shares with the injected answers.
+	//
+	// offset 用原子量而不是 outMu：I→T 泵每转一条命令都要读它，而 outMu 在 T→I
+	// 泵 flush 时会跨 socket 写持有；在 I→T 侧抢这把锁会把命令转发卡在响应之后。
+	// 它只增不减，原子读足够（旧实现直接读普通字段，与注入侧的 ++ 构成数据竞争，
+	// 并发读命中时可能读到旧值，导致转发给后端的 CmdSN 少减一次而乱序）。
 	outMu    sync.Mutex
-	offset   uint32 // commands answered locally == injected Data-In sequences
-	lastStat uint32 // last StatSN the initiator was sent
-	expCmd   uint32 // latest ExpCmdSN the initiator was told
-	maxCmd   uint32 // latest MaxCmdSN the initiator was told
+	offset   atomic.Uint32 // commands answered locally == injected Data-In sequences
+	lastStat uint32        // last StatSN the initiator was sent
+	expCmd   uint32        // latest ExpCmdSN the initiator was told
+	maxCmd   uint32        // latest MaxCmdSN the initiator was told
 
 	// tiBatch 是 initiator 方向唯一的写出口：T→I 泵转发的帧与本地代答的 Data-In
 	// 都先并入它再写出。两者都在 outMu 下追加，所以来源不同的字节永远不会交错，
@@ -188,7 +196,7 @@ func (s *session) pumpIT() {
 		}
 		s.observeDataOut(f)
 		if !s.handleCommandIT(f) {
-			rewriteIT(&f.hdr, s.offset)
+			rewriteIT(&f.hdr, s.offset.Load())
 			s.tgt.stats.passthrough.Add(1)
 			if err := batch.append(f); err != nil {
 				return
@@ -245,7 +253,7 @@ func (s *session) pumpTI() {
 		}
 		s.collectTI(f)
 		s.outMu.Lock()
-		rewriteTI(&f.hdr, s.offset)
+		rewriteTI(&f.hdr, s.offset.Load())
 		s.captureTargetSeq(&f.hdr)
 		err = s.tiBatch.append(f)
 		if err == nil && fr.r.Buffered() == 0 {
@@ -304,8 +312,14 @@ func (s *session) handleCommandIT(f *frame) bool {
 		if len(cdb) >= 2 && cdb[1] == 0x10 { // READ CAPACITY(16)
 			s.watchCapacity(f.hdr.ITT(), 32)
 		}
-	case iscsi.SCSIWrite10, iscsi.SCSIWrite16:
+	case iscsi.SCSIWrite10, iscsi.SCSIWrite16, iscsi.SCSIWrite6, iscsi.SCSIWrite12,
+		iscsi.SCSIWriteVerify10, iscsi.SCSIWriteVerify12, iscsi.SCSIWriteVerify16,
+		iscsi.SCSIWriteAtomic16, iscsi.SCSICompareAndWrite:
 		s.invalidateWrite(cdb)
+	case iscsi.SCSIFormatUnit, iscsi.SCSISanitize:
+		// 整盘写：FORMAT UNIT / SANITIZE 之后所有旧数据都作废，按范围算不出来，整盘清。
+		s.tgt.stats.writes.Add(1)
+		s.dropAll("destructive-command")
 	case iscsi.SCSIUnmap:
 		// UNMAP 的范围不在 CDB 里：它作为数据段随命令一起来（immediate data），
 		// 或者跟在后面的 Data-Out 载荷里。两种形态都要认。
@@ -391,6 +405,9 @@ func (s *session) handleRead(f *frame) bool {
 	// 扫描准入先于分配：被判定为顺序扫描的读既不回填也不该白分配一个大缓冲区。
 	scanned := t.scan.scan(off, length)
 	buf := readBufGet(int(length))
+	// 记录观察读命令时的失效代号：回填发生在响应到达之后，期间若有写命中这段范围，
+	// 读到的就是写前数据，不能进缓存（否则"写完立刻读回"会拿到旧内容）。
+	gen := c.InvalidationGen()
 	// L1 或 L2 全命中才本地代答：L2 命中的扇区会顺带提升进 L1（见 ReadCachedBoth）。
 	if c.ReadCachedBoth(off, buf) {
 		s.outMu.Lock()
@@ -414,15 +431,15 @@ func (s *session) handleRead(f *frame) bool {
 	// 由 worker 异步消费，此处绝不能归还池中。归还点在 fill 侧：install 完成后由
 	// FillObservedRelease 的 release 回调放回池子，没有回填成功的路径（表满、
 	// 状态失败、响应不全、无缓存绑定）也各自归还一次。
-	s.watchRead(f.hdr.ITT(), off, buf)
+	s.watchRead(f.hdr.ITT(), off, buf, gen)
 	return false
 }
 
 // watchRead registers a read whose Data-In sequence is teed into the cache once
 // it completes. buf is handed to the pending and filled from the response's
 // BufOffset-tagged segments.
-func (s *session) watchRead(itt uint32, off int64, buf []byte) {
-	if !s.registerPending(itt, &pending{kind: pendRead, off: off, length: len(buf), buf: buf}) {
+func (s *session) watchRead(itt uint32, off int64, buf []byte, gen uint64) {
+	if !s.registerPending(itt, &pending{kind: pendRead, off: off, length: len(buf), buf: buf, invGen: gen}) {
 		// The observation was dropped, so nothing will tee into the buffer: it
 		// goes straight back to the pool and the read is simply forwarded.
 		readBufPut(buf)
@@ -470,14 +487,11 @@ func (s *session) invalidateWrite(cdb []byte) {
 	if bs == 0 {
 		return
 	}
-	p, err := iscsi.ParseReadWrite(cdb)
-	if err != nil {
+	lba, blocks, ok := iscsi.ParseWriteRange(cdb)
+	if !ok || blocks == 0 {
 		return
 	}
-	length := int64(p.Blocks) * int64(bs)
-	if length <= 0 {
-		return
-	}
+	length := int64(blocks) * int64(bs)
 	// 字节计数在缓存判断之前：未开缓存的库走纯透传，同样要能报写吞吐。
 	t.stats.writeBytes.Add(length)
 	c := t.getCache()
@@ -489,7 +503,7 @@ func (s *session) invalidateWrite(cdb []byte) {
 	// 是等待在飞的 L2 回填落盘（fence）与遍历 L2 索引 —— 把它放在 I→T 泵里会直接
 	// 拖慢每一次写命令的转发。缓存在 L2 失效落地前用 l2InvN 门控读路径，保证读不会
 	// 从 L2 拿到刚被写入失效的旧扇区（见 Cache.InvalidateAsync）。
-	c.InvalidateAsync(int64(p.LBA)*int64(bs), length)
+	c.InvalidateAsync(int64(lba)*int64(bs), length)
 	t.stats.invalidations.Add(1)
 }
 
@@ -830,7 +844,7 @@ func (s *session) injectLocked(cmd *iscsi.BHS, data []byte) error {
 		return err
 	}
 	s.lastStat = statSN
-	s.offset++
+	s.offset.Add(1)
 	return nil
 }
 
@@ -928,7 +942,7 @@ func (s *session) finishPending(p *pending) {
 		// the last run it feeds has been installed, so a miss costs no allocation
 		// and no copy of the data into a second buffer.
 		buf := p.buf
-		c.FillObservedRelease(p.off, buf, func() { readBufPut(buf) })
+		c.FillObservedReleaseGen(p.off, buf, p.invGen, func() { readBufPut(buf) })
 	case pendInquirySerial, pendInquiryWWID:
 		if p.got < 4 {
 			return

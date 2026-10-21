@@ -89,6 +89,42 @@ func TestParentFilesCRUDAndTraversal(t *testing.T) {
 		t.Fatal("非空目录不应被删除")
 	}
 
+	// 复制文件：同名粘贴自动生成 "name (copy)"。
+	copied, err := svc.CopyParentEntry(ctx, repoID, "/boot/grub/grub.cfg", "/boot/grub/grub.cfg")
+	if err != nil {
+		t.Fatalf("复制文件失败：%v", err)
+	}
+	if copied == "/boot/grub/grub.cfg" {
+		t.Fatalf("同名复制应自动改名，实际 %q", copied)
+	}
+	if body, rErr := svc.ReadParentText(ctx, repoID, copied); rErr != nil || body != "world" {
+		t.Fatalf("复制后的内容 = %q, err=%v", body, rErr)
+	}
+	// 复制目录（递归）。
+	copiedDir, err := svc.CopyParentEntry(ctx, repoID, "/boot/grub", "/boot/grub2")
+	if err != nil {
+		t.Fatalf("复制目录失败：%v", err)
+	}
+	if body, rErr := svc.ReadParentText(ctx, repoID, copiedDir+"/grub.cfg"); rErr != nil || body != "world" {
+		t.Fatalf("目录复制后的文件内容 = %q, err=%v", body, rErr)
+	}
+
+	// 有差异盘时不允许访问母盘文件（改母盘会让差异盘基于旧基线）。
+	diff := &domain.Disk{
+		RepoID:    repoID,
+		Kind:      domain.DiskKindDiff,
+		VHDXPath:  filepath.Join("C:", "vault", "diff.vhdx"),
+		ParentID:  &parent.ID,
+		SizeBytes: parent.SizeBytes,
+		State:     domain.DiskStateReady,
+	}
+	if err := st.CreateDisk(ctx, diff); err != nil {
+		t.Fatalf("建差异盘失败：%v", err)
+	}
+	if _, err := svc.ListParentFiles(ctx, repoID, "/"); err == nil {
+		t.Fatal("有差异盘时不应允许访问母盘文件")
+	}
+
 	// 路径穿越必须被拒绝。
 	for _, bad := range []string{"../outside", "/../../etc/passwd", `..\..\windows`} {
 		if _, _, err := resolveParentPath(root, bad); err == nil {

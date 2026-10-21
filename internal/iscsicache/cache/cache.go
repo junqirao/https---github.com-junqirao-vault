@@ -235,6 +235,22 @@ type Cache struct {
 	// fill it feeds is rejected by the epoch check.
 	l2Gate sync.RWMutex
 
+	// invGate/invGen close the "read issued before a write, response filled after
+	// the invalidation" race.
+	//
+	// Per-shard epochs only reject a fill enqueued *before* the epoch bump. A read
+	// that was already in flight when a write invalidated its range finishes
+	// afterwards, so its tee is enqueued with the *new* epoch and would publish
+	// pre-write bytes. The proxy captures invGen when it observes the read; the
+	// fill is dropped if invGen changed by the time it is enqueued.
+	//
+	// invGate makes the check and the epoch capture atomic against an invalidation:
+	// a fill holds it for read across "check gen + capture shard epoch + enqueue",
+	// while invalidateL1 holds it for write across "bump gen + bump epochs". One of
+	// the two therefore always sees the other.
+	invGate sync.RWMutex
+	invGen  atomic.Uint64
+
 	// l2InvCh and l2InvWG implement InvalidateAsync: the L1 half of an
 	// invalidation runs synchronously on the caller, the L2 half is queued here
 	// and drained by l2InvWorker. They are nil/unused when the cache has no L2.
@@ -468,9 +484,14 @@ func (c *Cache) Drop() {
 	}
 	// Dropping a shard bumps its epoch, so a fill that was reading before the
 	// drop is rejected instead of re-populating what the drop just discarded.
+	// invGen covers the opposite order: a read observed before the drop whose
+	// tee arrives afterwards.
+	c.invGate.Lock()
+	c.invGen.Add(1)
 	for _, s := range c.shards {
 		s.drop()
 	}
+	c.invGate.Unlock()
 	if c.l2 != nil {
 		c.fence.wait(c.fence.target())
 		c.l2.Drop()
@@ -992,6 +1013,33 @@ func (c *Cache) FillObservedRelease(off int64, data []byte, release func()) {
 	rel.done()
 }
 
+// InvalidationGen returns the current invalidation generation.
+//
+// A caller that observed a read (the transparent proxy) should capture this at
+// command time and pass it to FillObservedReleaseGen, so a write that lands
+// while the read is still in flight cannot have its pre-write payload published.
+func (c *Cache) InvalidationGen() uint64 { return c.invGen.Load() }
+
+// FillObservedReleaseGen is FillObservedRelease for a read observed at
+// generation gen.
+//
+// If any invalidation happened since the read was observed, the observed bytes
+// may predate the write: the fill is dropped instead of publishing stale data.
+// Without this, a read issued just before a write (and answering just after its
+// invalidation) is teed with the *post-write* shard epoch and slips past the
+// per-shard epoch check.
+func (c *Cache) FillObservedReleaseGen(off int64, data []byte, gen uint64, release func()) {
+	c.invGate.RLock()
+	defer c.invGate.RUnlock()
+	if c.invGen.Load() != gen {
+		if release != nil {
+			release()
+		}
+		return
+	}
+	c.FillObservedRelease(off, data, release)
+}
+
 // StreamFill installs a read's payload into L1 while the read is being
 // forwarded, so populating the cache overlaps the transfer instead of running
 // after it. It is what lets a large cached read stream to the client and still
@@ -1413,6 +1461,12 @@ func (c *Cache) InvalidateAsync(off, length int64) {
 // (no I/O, no fence) and required for correctness, since it is what makes a read
 // that follows a write miss L1 rather than return pre-write data.
 func (c *Cache) invalidateL1(off, length int64) {
+	// invGate serialises this against FillObservedReleaseGen: a fill either
+	// captures its shard epochs before the bumps (and is then rejected) or sees
+	// the raised generation and is dropped. See Cache.invGate.
+	c.invGate.Lock()
+	defer c.invGate.Unlock()
+	c.invGen.Add(1)
 	end := off + length
 	for cur := off; cur < end; {
 		blk := uint64(cur / int64(c.blockSize))

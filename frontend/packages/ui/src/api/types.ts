@@ -255,6 +255,38 @@ export interface ParentFileListingDTO {
   items: ParentFileEntryDTO[]
 }
 
+/** 上传核对模式：size=只比大小；hash=大小 + SHA-256。 */
+export type VerifyDiffMode = 'size' | 'hash'
+
+/** 上传核对里的一条差异。 */
+export interface VerifyDiffEntryDTO {
+  path: string
+  local_size?: number
+  disk_size?: number
+  /** missing | extra | size | hash */
+  reason?: string
+}
+
+/** 上传核对结果（服务端从临时差异盘读取后与客户端清单对比）。 */
+export interface VerifyDiffResultDTO {
+  repo_id: string
+  directory: string
+  mode: VerifyDiffMode
+  same: number
+  /** 本地有、盘里没有。 */
+  missing: VerifyDiffEntryDTO[]
+  /** 盘里有、本地没有。 */
+  extra: VerifyDiffEntryDTO[]
+  /** 两边都有但大小/哈希不同。 */
+  different: VerifyDiffEntryDTO[]
+  local_files: number
+  disk_files: number
+  local_bytes: number
+  disk_bytes: number
+  warnings: string[]
+  truncated: boolean
+}
+
 export interface AuditDTO {
   id: string
   user_id: string

@@ -800,6 +800,23 @@ export interface LocalScanResult {
   warnings: string[]
 }
 
+/** POST /agent/fs/manifest 的清单项。 */
+export interface LocalManifestEntry {
+  path: string
+  size: number
+  /** SHA-256（十六进制）；未请求或读取失败时缺省（服务端只比大小）。 */
+  hash?: string
+}
+
+/** POST /agent/fs/manifest 的响应（上传核对用）。 */
+export interface LocalManifestResult {
+  path: string
+  file_count: number
+  total_bytes: number
+  entries: LocalManifestEntry[]
+  warnings: string[]
+}
+
 /** POST /agent/uploads/start 的请求体。 */
 export interface StartUploadInput {
   local_dir: string

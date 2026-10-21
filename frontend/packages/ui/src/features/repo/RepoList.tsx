@@ -520,6 +520,8 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
           repo_id: repo.id,
           repo_name: repo.name,
           repo_group: repo.group,
+          // 只有「挂载分组」这一入口才允许分组配置覆盖组内库自己的配置。
+          use_group_config: true,
           server_key: active?.key,
           server_url: active?.baseUrl
         })
@@ -706,6 +708,9 @@ function RepoGroupDetail({
 }): JSX.Element {
   const { t } = useI18n()
   const agent = useAgent()
+  // 防误触：进入分组的那一次点击如果是双击的第二下（或手速很快），会正好落在
+  // 刚出现的「返回」按钮上，表现为"一点进去就弹回总览"。这里忽略挂载后极短时间内的返回。
+  const mountedAt = useRef(Date.now())
   const repos = bucket.items.map((entry) => entry.repo)
   const { busy, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
   const mounts = agent.state?.mounts ?? []
@@ -716,7 +721,13 @@ function RepoGroupDetail({
   return (
     <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm, flexWrap: 'wrap' }}>
-        <Button icon={<ArrowLeftOutlined />} onClick={onBack}>
+        <Button
+          icon={<ArrowLeftOutlined />}
+          onClick={() => {
+            if (Date.now() - mountedAt.current < 500) return
+            onBack()
+          }}
+        >
           {t('repo.group.back')}
         </Button>
         <FolderOutlined style={{ color: palette.accent }} />
@@ -819,13 +830,6 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
     enabled: isSuperAdmin
   })
 
-  // 记忆的分组可能已经被改名/删空：这时落回总览，别停在一个不存在的分组里。
-  useEffect(() => {
-    if (isSuperAdmin || activeGroup === null || reposQuery.isLoading) return
-    const exists = (reposQuery.data?.items ?? []).some((repo) => groupKeyOf(repo) === activeGroup)
-    if (!exists) setActiveGroup(null)
-  }, [activeGroup, isSuperAdmin, reposQuery.data, reposQuery.isLoading, setActiveGroup])
-
   const ownerName = useMemo(() => {
     const map = new Map<string, string>()
     for (const item of usersQuery.data?.items ?? []) map.set(item.id, item.username)
@@ -915,6 +919,17 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
     if (!lowered) return merged
     return merged.filter((entry) => entry.repo.name.toLowerCase().includes(lowered))
   }, [reposQuery.data, keyword, activeUploads, user?.id])
+
+  // 记忆的分组可能已经被改名/删空：这时落回总览，别停在一个不存在的分组里。
+  //
+  // 用 entries（含**上传中的占位库**）判断，而不是只看服务端已存在的记录：
+  // 未分组的上传占位库同样属于「未分组」这个分组，只看服务端列表会把它误判成
+  // "分组不存在"，于是点进未分组又被立刻弹回总览。
+  useEffect(() => {
+    if (isSuperAdmin || activeGroup === null || reposQuery.isLoading) return
+    const exists = entries.some((entry) => groupKeyOf(entry.repo) === activeGroup)
+    if (!exists) setActiveGroup(null)
+  }, [activeGroup, isSuperAdmin, reposQuery.isLoading, entries, setActiveGroup])
 
   const columns = useMemo<TableColumnsType<RepoDTO>>(() => {
     const base: TableColumnsType<RepoDTO> = [

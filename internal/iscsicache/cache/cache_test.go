@@ -1131,6 +1131,43 @@ func TestFillObservedReleaseOwnership(t *testing.T) {
 	}
 }
 
+// TestFillObservedReleaseGenDropsAfterInvalidation pins the read/write race the
+// invalidation generation closes: a read observed before a write, whose tee
+// arrives after the invalidation, must not publish the pre-write bytes.
+func TestFillObservedReleaseGenDropsAfterInvalidation(t *testing.T) {
+	const bs, ss = 16 << 10, 4 << 10
+	c := newTestCache(t, testOpts{})
+
+	gen := c.InvalidationGen()
+	run := make([]byte, ss)
+	for i := range run {
+		run[i] = 0xAA
+	}
+	// The write lands while the read is still in flight.
+	c.Invalidate(0, bs)
+	var released atomic.Int64
+	c.FillObservedReleaseGen(0, run, gen, func() { released.Add(1) })
+	c.Wait()
+	if got := released.Load(); got != 1 {
+		t.Fatalf("过期回填的 buffer 应释放一次，实际 %d", got)
+	}
+	if c.ReadCached(0, make([]byte, ss)) {
+		t.Fatal("失效前观察到的读不应被回填（写完立刻读会拿到旧数据）")
+	}
+
+	// 代号未变时仍正常回填。
+	gen2 := c.InvalidationGen()
+	run2 := make([]byte, ss)
+	for i := range run2 {
+		run2[i] = 0xBB
+	}
+	c.FillObservedReleaseGen(0, run2, gen2, nil)
+	c.Wait()
+	if !c.ReadCached(0, make([]byte, ss)) {
+		t.Fatal("代号未变时应正常回填")
+	}
+}
+
 // TestInstallValidatedDropsWhatItCannotPlace pins the two ways a run is refused
 // before it is published: a stale epoch, and an offset that does not sit on a
 // sector boundary. Both must leave the entry untouched — the second one is also
