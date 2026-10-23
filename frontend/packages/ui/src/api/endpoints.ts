@@ -44,6 +44,7 @@ import type {
   ParentAction,
   ParentFileListingDTO,
   VerifyDiffMode,
+  VerifyDiffProgressDTO,
   VerifyDiffResultDTO,
   PoolDeleteRequest,
   PoolDeleteResult,
@@ -429,6 +430,16 @@ export class VaultApi extends ApiClient {
     )
   }
 
+  /** 细粒度进度：阶段、当前文件、已处理字节（界面 1s 轮询）。 */
+  getVerifyDiffProgress(id: string, jobId: string): Promise<VerifyDiffProgressDTO> {
+    return this.request<VerifyDiffProgressDTO>(
+      'GET',
+      `/v1/repos/${encodeURIComponent(id)}/diff/progress`,
+      undefined,
+      { job: jobId }
+    )
+  }
+
   /**
    * 上传/覆盖母盘中的一个文件（请求体即文件内容）。
    *
@@ -465,6 +476,20 @@ export class VaultApi extends ApiClient {
 
   copyRepo(id: string, newRepoName: string): Promise<JobDTO> {
     return this.request<JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/copy`, { new_repo_name: newRepoName })
+  }
+
+  /**
+   * 迁移存储库到另一个存储（异步任务，202）。
+   *
+   * 服务端先复制全部磁盘、再删除源文件；任务可中止（见 cancelRepoMove）。
+   */
+  moveRepo(id: string, storageId: string): Promise<JobDTO> {
+    return this.request<JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/move`, { storage_id: storageId })
+  }
+
+  /** 中止迁移：只清理目标侧半成品，源库保持可用。 */
+  cancelRepoMove(id: string): Promise<void> {
+    return this.request<void>('POST', `/v1/repos/${encodeURIComponent(id)}/move/cancel`)
   }
 
   listRepoDisks(id: string): Promise<ListResponse<DiskDTO>> {

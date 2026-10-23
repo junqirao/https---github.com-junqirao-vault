@@ -164,6 +164,8 @@ type uploadStartRequest struct {
 	// 透传给服务端（随上传会话清单持久化），建库时写进库配置。与 RepoService.Create 的
 	// 同名入参同义：>0 表示"用户明确要这么多共享位"。
 	MaxDiffDisks int `json:"max_diff_disks"`
+	// Preallocate 是否在建库时预创建差异盘与 iSCSI 目标（池位）。
+	Preallocate bool `json:"preallocate"`
 	// SourceMode copy | move；留空默认 copy。move 仅在服务端建库成功后删除本地源目录。
 	SourceMode string `json:"source_mode"`
 	// ServerKey / ServerURL 指明把库建到**哪台**服务端（多服务端下应带上）。
@@ -511,8 +513,10 @@ type uploadResumeRecord struct {
 	QuotaBytes int64  `json:"quota_bytes,omitempty"`
 	// MaxDiffDisks 共享数量（0=用户没填）：续传与重试要原样带回，
 	// 否则一次断线续传就把用户填的数量弄丢了，建库时又落回配置默认值。
-	MaxDiffDisks int    `json:"max_diff_disks,omitempty"`
-	SourceMode   string `json:"source_mode,omitempty"`
+	MaxDiffDisks int `json:"max_diff_disks,omitempty"`
+	// Preallocate 是否在建库时预创建差异盘与 iSCSI 目标；同样要随续传记录保留。
+	Preallocate bool   `json:"preallocate,omitempty"`
+	SourceMode  string `json:"source_mode,omitempty"`
 	// ---- 进度检查点（见 checkpoint）----
 	//
 	// 关掉应用再打开时，列表里那条"上传中（已暂停）"要能说出"上次传到哪了"：
@@ -884,6 +888,7 @@ func (a *Agent) resumeRestoredUpload(task *uploadTask) error {
 		StorageID:    rec.StorageID,
 		QuotaBytes:   rec.QuotaBytes,
 		MaxDiffDisks: rec.MaxDiffDisks,
+		Preallocate:  rec.Preallocate,
 		SourceMode:   rec.SourceMode,
 		ServerKey:    rec.ServerKey,
 	}
@@ -1013,6 +1018,7 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		StorageID:    req.StorageID,
 		QuotaBytes:   req.QuotaBytes,
 		MaxDiffDisks: req.MaxDiffDisks,
+		Preallocate:  req.Preallocate,
 	})
 	if err != nil {
 		return nil, err
@@ -1034,6 +1040,7 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		// 与 quota_bytes 一样随记录留存：这几个建库选项是"这次上传要建什么样的库"的
 		// 全部信息，记录里缺一项，将来从记录重建请求时就会静默丢一项配置。
 		MaxDiffDisks: req.MaxDiffDisks,
+		Preallocate:  req.Preallocate,
 		SourceMode:   req.SourceMode,
 	})
 	// 服务端可能并没有新建会话：它会在上传开始时清掉同名残骸，并把与本地内容一致的

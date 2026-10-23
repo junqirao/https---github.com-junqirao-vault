@@ -62,6 +62,11 @@ type CreateUploadInput struct {
 	// 于是本机目录上传建出来的库，共享数量恒等于配置默认值 —— 用户在同一个表单里填的
 	// 数字被静默丢掉（真实反馈："设置共享数量大于0时会变成50"）。
 	MaxDiffDisks int
+	// Preallocate 是否在建库时预创建差异盘与 iSCSI 目标（池位）。
+	//
+	// 与 MaxDiffDisks 配合：数量决定建几个池位，本字段决定是否在创建时就把它们建好。
+	// 老客户端不传时为 false（保持升级前"上传建库不预先创建"的行为）。
+	Preallocate bool
 	// ClientOS 可选：将使用该库的客户端操作系统（"windows"/"linux"，留空按 windows）。
 	//
 	// 决定建盘用的文件系统（见 domain.ClientOS），随清单持久化，建盘时生效。
@@ -237,6 +242,8 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 	if domain.RepoMode(repoMode) != domain.RepoModeShared {
 		share = 0
 	}
+	// 预分配只在共享库且数量 > 0 时有意义；独享库没有差异盘，静默归零。
+	preallocate := in.Preallocate && share > 0
 	// 客户端系统决定建盘用的文件系统（见 domain.ClientOS），留空按默认（Windows）。
 	clientOS, ok := domain.ParseClientOS(in.ClientOS)
 	if !ok {
@@ -255,6 +262,7 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 		StorageID:    storageID,
 		QuotaBytes:   in.QuotaBytes,
 		MaxDiffDisks: share,
+		Preallocate:  preallocate,
 		ClientOS:     string(clientOS),
 	})
 	if err != nil {
@@ -274,7 +282,7 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 	size := s.sizing().CalculateVHDXSize(totalBytes, 0)
 	if plan.reusable != nil {
 		return s.resumeUploadSession(ctx, plan, repoMode, storageID, in.QuotaBytes,
-			share, clientOS, size)
+			share, preallocate, clientOS, size)
 	}
 	guard, err := s.pickUploadGuard(ctx, storageID, size)
 	if err != nil {
@@ -593,7 +601,7 @@ func (s *UploadService) purgeRemnantRepo(ctx context.Context, repo *domain.Repos
 // agent 拿到的是同一个 upload_id 与"还缺哪几块"，于是已传完的部分不会重传；
 // 已逐文件校验通过的文件数也一并带上，免得界面上的进度从 0 重数。
 func (s *UploadService) resumeUploadSession(ctx context.Context, plan *uploadNamePlan, repoMode, storageID string,
-	quotaBytes int64, maxDiffDisks int, clientOS domain.ClientOS,
+	quotaBytes int64, maxDiffDisks int, preallocate bool, clientOS domain.ClientOS,
 	size int64) (*UploadSession, error) {
 	u := plan.reusable
 	guard, err := s.guardForUpload(ctx, u)
@@ -609,7 +617,7 @@ func (s *UploadService) resumeUploadSession(ctx context.Context, plan *uploadNam
 		return nil, err
 	}
 	manifestJSON, err := manifestWithOptions(rec, repoMode, storageID, quotaBytes,
-		maxDiffDisks, clientOS)
+		maxDiffDisks, preallocate, clientOS)
 	if err != nil {
 		return nil, err
 	}
@@ -1258,7 +1266,15 @@ func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, re
 	}
 	rep.Progress(35)
 
-	if err := s.Disks.buildVHDXFromSource(ctx, disk, treeDir, rep); err != nil {
+	// 母盘构建占 5%-65%，给后面的指纹计算、池位预创建留出进度空间。
+	buildRep := job.ReporterFunc(func(v int) { rep.Progress(5 + 60*v/100) })
+	if err := s.Disks.buildVHDXFromSource(ctx, disk, treeDir, buildRep); err != nil {
+		return err
+	}
+	rep.Progress(70)
+	// 勾选了"预分配"的共享库：母盘建好后，把差异盘池与 iSCSI 目标一并建好，
+	// 之后分配即用（与「新建存储库」直接建库那条路径保持同一行为）。
+	if err := s.prepareUploadPool(ctx, repo, disk, rep); err != nil {
 		return err
 	}
 	rep.Progress(95)
@@ -1439,6 +1455,15 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 		if existing != nil {
 			// 幂等复用：任务重试时不重复建库。
 			repo = existing
+			// 预分配是本次上传的选项：覆盖重建一个已有库时，池化标记要跟着这次勾选走
+			// （否则"上次没勾、这次勾了"会永远不建池，反过来会继续走回池语义）。
+			wantPool := mode == domain.RepoModeShared && rec.Preallocate
+			if repo.Meta.Pool != wantPool {
+				repo.Meta.Pool = wantPool
+				if err := tx.UpdateRepository(ctx, repo); err != nil {
+					return err
+				}
+			}
 			if existing.ParentDiskID != nil {
 				d, dErr := tx.GetDisk(ctx, *existing.ParentDiskID)
 				if dErr != nil {
@@ -1479,8 +1504,8 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 				// 建库期间是 importing（界面「写入中」）而不是 active：母盘还没建出来，
 				// 此时挂载只会得到 disk.not_ready。走到这里数据已经收完，长活是写盘
 				// —— 界面不能显示成"上传中"（见 runUploadComplete 的说明）。
-				// 任务结束时会置为 active（见 runUploadComplete）。
 				State: domain.RepoStateImporting,
+				Meta:  domain.RepoMeta{Pool: mode == domain.RepoModeShared && rec.Preallocate},
 			}
 			if mode == domain.RepoModeShared {
 				cond := domain.ParentIdle
@@ -1527,6 +1552,83 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 		return nil, nil, err
 	}
 	return repo, disk, nil
+}
+
+// prepareUploadPool 为"上传建库 + 勾选预分配"的共享库预创建差异盘池与 iSCSI 目标。
+//
+// 为什么放在上传完成的任务里而不是再派一个任务：母盘此时刚建好，后面的池位创建是
+// 同一条建库流水线的自然延续；直接复用 ensurePoolDiffDisk / EnsurePoolTarget 即可，
+// 而且任务重试天然幂等（按序号复用已有池位盘）。
+//
+// 独享库只有一块盘，没有差异盘；MaxDiffDisks=0（未勾选预分配）时直接跳过。
+func (s *UploadService) prepareUploadPool(
+	ctx context.Context, repo *domain.Repository, parent *domain.Disk, rep job.Reporter,
+) error {
+	if repo == nil || parent == nil || !repo.IsShared() || !repo.Meta.Pool {
+		return nil
+	}
+	count := repo.MaxDiffDisks
+	if count <= 0 {
+		return nil
+	}
+	if count > maxPreparedDisks {
+		return apperr.InvalidParam("max_diff_disks")
+	}
+
+	// 池化标记要落库：释放分配时据此走"原地重建回池"而不是删盘。
+	repo.Meta.Pool = true
+	if err := s.Store.SetRepositoryMetaState(ctx, repo.ID, repo.Meta, repo.State); err != nil {
+		return err
+	}
+	s.Repos.setRepoPrepare(ctx, repo.ID, &domain.RepoPrepare{
+		Phase: domain.RepoPhaseDiffs, Done: 0, Total: count,
+	})
+
+	disks := make([]*domain.Disk, 0, count)
+	for i := 0; i < count; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		idx := i
+		d, err := s.Disks.ensurePoolDiffDisk(ctx, repo, parent, idx,
+			job.ReporterFunc(func(v int) {
+				rep.Progress(70 + (15*idx+15*v/100)/count)
+			}))
+		if err != nil {
+			return err
+		}
+		disks = append(disks, d)
+		s.Repos.setRepoPrepare(ctx, repo.ID, &domain.RepoPrepare{
+			Phase: domain.RepoPhaseDiffs, Done: idx + 1, Total: count,
+		})
+		rep.Progress(70 + 15*(idx+1)/count)
+	}
+
+	s.Repos.setRepoPrepare(ctx, repo.ID, &domain.RepoPrepare{
+		Phase: domain.RepoPhaseTargets, Done: 0, Total: len(disks),
+	})
+	if s.Disks.IscsiSvc == nil {
+		s.Log.Warn("iSCSI 服务未装配，预分配池位只建盘不发布", "repo_id", repo.ID)
+		s.Repos.setRepoPrepare(ctx, repo.ID, nil)
+		rep.Progress(94)
+		return nil
+	}
+	for i, d := range disks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.Disks.IscsiSvc.EnsurePoolTarget(ctx, repo, d); err != nil {
+			return err
+		}
+		s.Repos.setRepoPrepare(ctx, repo.ID, &domain.RepoPrepare{
+			Phase: domain.RepoPhaseTargets, Done: i + 1, Total: len(disks),
+		})
+		rep.Progress(85 + 9*(i+1)/len(disks))
+	}
+	s.Repos.setRepoPrepare(ctx, repo.ID, nil)
+	s.audit(ctx, "", "repo.prepare.upload.done", "repo:"+repo.ID,
+		fmt.Sprintf("pool=%d", len(disks)), domain.AuditResultOK)
+	return nil
 }
 
 // uploadTargetGuard 解析建库应使用的目标根。
@@ -2038,6 +2140,8 @@ type uploadManifestRecord struct {
 	//
 	// 必须随清单存下来：建库是**异步任务**，那一刻读不到创建会话时的请求参数。
 	MaxDiffDisks int `json:"max_diff_disks,omitempty"`
+	// Preallocate 是否在建库时预创建差异盘与 iSCSI 目标（池位）。
+	Preallocate bool `json:"preallocate,omitempty"`
 	// ClientOS 将使用该库的客户端操作系统，决定建盘格式（见 domain.ClientOS）。
 	// 留空按默认（windows → NTFS）。
 	ClientOS string `json:"client_os,omitempty"`
@@ -2058,7 +2162,7 @@ func marshalManifest(rec uploadManifestRecord) (string, error) {
 // 把已经上传的数据对到别的文件上（第一个块的字节会落进第二个文件）。复用旧会话时
 // 只有选项跟着本次请求走，文件列表一个字都不能动。
 func manifestWithOptions(rec *uploadManifestRecord, repoMode, storageID string,
-	quotaBytes int64, maxDiffDisks int, clientOS domain.ClientOS) (string, error) {
+	quotaBytes int64, maxDiffDisks int, preallocate bool, clientOS domain.ClientOS) (string, error) {
 	if rec == nil {
 		return "", apperr.InvalidParam("manifest")
 	}
@@ -2067,6 +2171,7 @@ func manifestWithOptions(rec *uploadManifestRecord, repoMode, storageID string,
 	next.StorageID = storageID
 	next.QuotaBytes = quotaBytes
 	next.MaxDiffDisks = maxDiffDisks
+	next.Preallocate = preallocate
 	next.ClientOS = string(clientOS)
 	return marshalManifest(next)
 }

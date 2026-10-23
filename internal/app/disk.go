@@ -110,6 +110,12 @@ type prepareRepoPayload struct {
 type cleanupDiffsPayload struct {
 	RepoID       string `json:"repo_id"`
 	ParentDiskID string `json:"parent_disk_id"`
+	// OnlyOlderThan > 0 时只删除 parent_version **小于** 该值的差异盘。
+	//
+	// 用于"退出维护后自动清理"：版本刚 +1，此时旧盘全部作废；但清理是异步任务，
+	// 用户可能在它跑完前就重新挂载并派生了一块**新版本**的盘 —— 不能把新盘一起删了。
+	// 手动"清空差异盘"不带该字段（0），语义仍是删全部。
+	OnlyOlderThan int `json:"only_older_than,omitempty"`
 }
 
 // resetDiffPayload 是"释放后回池"任务（JobResetDiff）的入参。
@@ -222,6 +228,12 @@ func (s *DiskService) StartCopy(ctx context.Context, diskID, newRepoName, operat
 		// 差异盘按路径引用母盘，复制后链路失效，禁止复制。
 		return nil, apperr.InvalidParam("disk_id").WithArg("reason", "only_parent_can_be_copied")
 	}
+	if repo, rErr := s.Store.GetRepository(ctx, disk.RepoID); rErr == nil {
+		// 迁移、建库、写入中都不是稳定状态：复制会把任务正在改写的源盘翻一遍。
+		if repo.State != domain.RepoStateActive {
+			return nil, apperr.New("repo.state_invalid", 409).WithArg("state", string(repo.State))
+		}
+	}
 	if disk.Mounted {
 		return nil, apperr.DiskBusy()
 	}
@@ -271,6 +283,9 @@ func (s *DiskService) StartDelete(ctx context.Context, diskID, operatorID string
 	if disk.Mounted {
 		return nil, apperr.DiskBusy()
 	}
+	if repo, rErr := s.Store.GetRepository(ctx, disk.RepoID); rErr == nil && repo.State == domain.RepoStateMoving {
+		return nil, apperr.New("repo.move_in_progress", 409).WithArg("repo_id", disk.RepoID)
+	}
 	payload := deleteDiskPayload{DiskID: diskID}
 	// 删母盘用 RepoKey：派生差异盘会独占打开母盘，回收存储库的任务也用 RepoKey 删它，
 	// 三者必须串行，否则撞 platform.sharing_violation（同 runCreateDiff 的说明）。
@@ -297,6 +312,9 @@ func (s *DiskService) StartCompact(ctx context.Context, diskID string) (*domain.
 	}
 	if disk.Mounted {
 		return nil, apperr.DiskBusy()
+	}
+	if repo, rErr := s.Store.GetRepository(ctx, disk.RepoID); rErr == nil && repo.State == domain.RepoStateMoving {
+		return nil, apperr.New("repo.move_in_progress", 409).WithArg("repo_id", disk.RepoID)
 	}
 	if s.Disk != nil && !s.Disk.Exists(disk.VHDXPath) {
 		return nil, apperr.DiskNotFound().WithArg("id", diskID)
@@ -855,6 +873,23 @@ func (s *DiskService) runReclaim(ctx context.Context, j *domain.Job, rep job.Rep
 	return nil
 }
 
+// filterDiffsOlderThan 只保留 parent_version < version 的差异盘；version<=0 表示不筛选。
+//
+// 退出维护后的自动清理用它把"清理任务排队期间刚派生出来的新版本盘"排除在外，
+// 避免任务跑起来把用户刚挂上的新盘也删掉。
+func filterDiffsOlderThan(disks []domain.Disk, version int) []domain.Disk {
+	if version <= 0 {
+		return disks
+	}
+	older := make([]domain.Disk, 0, len(disks))
+	for _, d := range disks {
+		if d.ParentVersion < version {
+			older = append(older, d)
+		}
+	}
+	return older
+}
+
 // runCleanupDiffs 是 JobCleanupDiffs 的实现：维护态下清理该库全部差异盘。
 //
 // 顺序必须是"先通知客户端断开，再拆 iSCSI 目标，最后删盘文件"：
@@ -882,6 +917,8 @@ func (s *DiskService) runCleanupDiffs(ctx context.Context, j *domain.Job, rep jo
 	if err != nil {
 		return err
 	}
+	// 自动清理（退出维护）只处理旧版本：任务排队期间用户可能已经派生了新版本的盘。
+	disks = filterDiffsOlderThan(disks, p.OnlyOlderThan)
 	rep.Progress(3)
 
 	// ① 撤销该库所有在线租约：服务端把 kick 指令推给客户端，客户端主动卸载并展示原因。

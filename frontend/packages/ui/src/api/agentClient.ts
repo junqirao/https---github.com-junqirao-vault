@@ -30,6 +30,8 @@ import type {
   AgentState,
   DownloadState,
   LocalManifestResult,
+  LocalManifestStartResult,
+  LocalManifestStatus,
   LocalScanResult,
   ServerProbe,
   ServerSession,
@@ -644,16 +646,35 @@ export const agentApi = {
   },
 
   /**
-   * 扫描本地目录并返回**完整清单**（可选 SHA-256），供服务端核对上传结果。
+   * 启动本地目录清单生成（上传核对用）。立即返回 manifest_id，进度经
+   * GET /agent/fs/manifest/status 轮询；完成后用 /result 取完整清单。
    *
-   * 计算哈希要读完整个目录，超时给到 30 分钟；未请求哈希时只是遍历元数据，很快。
+   * 为什么拆成三段：算 1000GB 的 SHA-256 可能要几十分钟，同步请求期间界面只能干转圈。
    */
-  fsManifest(path: string, hash: boolean): Promise<LocalManifestResult> {
-    return request<LocalManifestResult>({
+  startManifest(path: string, hash: boolean): Promise<LocalManifestStartResult> {
+    return request<LocalManifestStartResult>({
       method: 'POST',
-      path: '/agent/fs/manifest',
+      path: '/agent/fs/manifest/start',
       body: { path, hash },
-      timeoutMs: 1800000
+      timeoutMs: 30000
+    })
+  },
+
+  /** 查询清单任务进度（扫描阶段含"当前正在看哪个文件"）。 */
+  manifestStatus(id: string): Promise<LocalManifestStatus> {
+    return request<LocalManifestStatus>({
+      method: 'GET',
+      path: `/agent/fs/manifest/status?id=${encodeURIComponent(id)}`,
+      timeoutMs: 30000
+    })
+  },
+
+  /** 取清单任务的完整结果（只在成功后可调用）。 */
+  manifestResult(id: string): Promise<LocalManifestResult> {
+    return request<LocalManifestResult>({
+      method: 'GET',
+      path: `/agent/fs/manifest/result?id=${encodeURIComponent(id)}`,
+      timeoutMs: 120000
     })
   },
 

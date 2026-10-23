@@ -369,6 +369,8 @@ type createUploadRequest struct {
 	QuotaBytes int64 `json:"quota_bytes,omitempty"`
 	// MaxDiffDisks 共享数量（差异盘上限）；0=用户没填，由服务端回退配置默认值。
 	MaxDiffDisks int `json:"max_diff_disks,omitempty"`
+	// Preallocate 是否在建库时预创建差异盘与 iSCSI 目标。
+	Preallocate bool `json:"preallocate,omitempty"`
 }
 
 // uploadSession 是创建上传会话的响应。
@@ -544,9 +546,6 @@ func (c *serverClient) FindRepoID(ctx context.Context, name string) (string, err
 	}
 	return "", nil
 }
-
-// allocationStateReleased 是服务端分配状态里"已释放"的取值（见 internal/domain AllocationState）。
-const allocationStateReleased = "released"
 
 // allocationItem 是 GET /v1/repos/{id}/allocations 的最小响应形状（只取筛选用得到的字段）。
 type allocationItem struct {

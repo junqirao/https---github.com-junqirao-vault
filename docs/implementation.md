@@ -847,7 +847,7 @@ CREATE TABLE audit_logs (
 | `TEMP_SHARED → IDLE` | 无 active lease | 撤销共享、删除 target |
 | `IDLE → MAINTENANCE` | 未临时共享 | 维护态：禁止新分配/挂载；允许在线旧连接存在，由"清理差异盘"负责断开 |
 | `MAINTENANCE` 内清理差异盘 | 必须是维护态 | 异步任务：先撤销在线租约（通知客户端断开），再拆 iSCSI 目标并删除全部差异盘 |
-| `MAINTENANCE → IDLE` | 无 active lease | `parent_version += 1`，重算指纹；若还有差异盘则保留 |
+| `MAINTENANCE → IDLE` | 无 active lease | `parent_version += 1`，重算指纹；同时入队清理**旧版本**差异盘（`only_older_than` 只删 `< 新版本` 的盘，避免误删清理期间刚派生的新盘） |
 
 > ⚠️ **禁止的迁移**：`TEMP_SHARED` 期间派生差异盘、`MAINTENANCE` 期间派生差异盘或新分配。
 >
@@ -1727,10 +1727,12 @@ Dismount-VHD -Path $vhdx
 流程（客户端清单 → 服务端临时差异盘 → 逐文件对比）：
 
 ```
-① 客户端选目录，代理生成清单
-   POST /agent/fs/manifest  {path, hash:bool}
-   → {entries:[{path,size,hash?}], file_count, total_bytes, warnings}
+① 客户端选目录，代理生成清单（**异步**，界面可看到当前文件）
+   POST /agent/fs/manifest/start  {path, hash:bool}  → 202 {manifest_id}
+   GET  /agent/fs/manifest/status?id=…              → {state, phase, done, total, bytes, current}
+   GET  /agent/fs/manifest/result?id=…              → {entries:[{path,size,hash?}], warnings}
    # hash=true 时本地逐个文件算 SHA-256；读失败退化为空 hash（服务端只比大小）
+   # 扫描/哈希阶段都有 done/bytes/current：否则 1000GB 目录只会让界面干转圈
 
 ② 客户端把清单交给服务端（异步任务）
    POST /v1/repos/{id}/diff
@@ -1755,6 +1757,15 @@ Dismount-VHD -Path $vhdx
    GET /v1/repos/{id}/diff/result?job=<jobID>
    → {same, missing[], extra[], different[], local_files, disk_files, bytes, warnings, truncated}
    # 只允许读 type=verify_diff 且 RefID=该库 的任务，避免跨库读取
+
+⑤ 进度（界面 1s 轮询）
+   GET /v1/repos/{id}/diff/progress?job=<jobID>
+   → {state, phase, message, current, done, total, bytes, total_bytes, error}
+   # phase: queued → prepare → create → mount → walk → compare → done
+   # 任务把进度原子写到临时 progress.json（200ms 节流）；任务表的状态是权威值，
+   # 失败/取消时即使文件停在 running 也按任务终态返回。
+   # walk 阶段在 hash 模式下每读 4MiB 就更新一次 current/bytes —— 单个 100GB 文件
+   # 也能看到字节在走，而不是"卡在一个文件名上不动"。
 ```
 
 **模式取舍**：
@@ -1788,7 +1799,7 @@ Dismount-VHD -Path $vhdx
 | 孤儿差异盘 | 不存在子盘 | 存在 | 告警，不自动删（可能数据丢失） |
 | 悬空分配 | `allocations` | - | 释放配额，通知用户 |
 | **母盘指纹** | `disks.content_fingerprint` | 实际 size+mtime+头部哈希 | 不一致 → **告警 + 停用所有子盘 target**（母盘被绕过改写，全部差异盘已不可信） |
-| **差异盘版本** | `disks.parent_version` | `repositories.parent_version` | 不一致 → 拒绝挂载并要求重新分配 |
+| **差异盘版本** | `disks.parent_version` | `repositories.parent_version` | 不一致 → 标记 `parent_version_mismatch`；挂载前的 `Allocate` 会自动作废旧盘（连同 iSCSI 目标）并重建，退出维护时也会异步清理旧版本盘 |
 | **DiskIdentifier 唯一性** | — | 抽样 `Get-VHD` 的 `DiskIdentifier` | 有重复 → 对复制产生的盘执行 `ResetDiskIdentifier` |
 
 **运行时机**：

@@ -32,9 +32,13 @@ type createRepoRequest struct {
 	//
 	// 用指针是为了区分"显式传 0"和"没传"：老客户端不传时按 ShareCount 处理，
 	// 显式传 0 表示明确不要预创建。
-	MaxDiffDisks *int   `json:"max_diff_disks"`
-	QuotaBytes   int64  `json:"quota_bytes"`
-	Group        string `json:"group"`
+	MaxDiffDisks *int `json:"max_diff_disks"`
+	// Preallocate 是否在创建时预创建差异盘与 iSCSI 目标（池位）。
+	//
+	// 指针用于兼容老客户端：不传时按"数量 > 0 就预创建"的老语义处理。
+	Preallocate *bool  `json:"preallocate"`
+	QuotaBytes  int64  `json:"quota_bytes"`
+	Group       string `json:"group"`
 	// StorageID 可选的目标存储 ID（留空则在所有启用存储中自动选根）。
 	StorageID string `json:"storage_id"`
 	// ClientOS 可选：将使用该库的客户端操作系统（windows | linux，留空按 windows）。
@@ -114,6 +118,11 @@ func (r *Router) handleCreateRepo(w http.ResponseWriter, req *http.Request) {
 	if in.MaxDiffDisks != nil && in.ShareCount == 0 {
 		share = *in.MaxDiffDisks
 	}
+	// 老客户端不传 preallocate：保持"填了共享数量就预创建"的老行为。
+	preallocate := share > 0
+	if in.Preallocate != nil {
+		preallocate = *in.Preallocate && share > 0
+	}
 
 	repo, disk, err := r.deps.App.Repos().Create(req.Context(), app.CreateRepoInput{
 		Name:         in.Name,
@@ -122,6 +131,7 @@ func (r *Router) handleCreateRepo(w http.ResponseWriter, req *http.Request) {
 		SourceDir:    in.SourceDir,
 		SizeBytes:    in.SizeBytes,
 		MaxDiffDisks: share,
+		Preallocate:  preallocate,
 		QuotaBytes:   in.QuotaBytes,
 		Group:        in.Group,
 		StorageID:    in.StorageID,
@@ -153,7 +163,12 @@ func (r *Router) handleGetRepo(w http.ResponseWriter, req *http.Request) {
 		r.writeError(w, req, err)
 		return
 	}
-	r.writeJSON(w, http.StatusOK, toRepoDTOWithPerm(repo, perm))
+	dto := toRepoDTOWithPerm(repo, perm)
+	// 详情页的「迁移」需要知道当前存储，才能把"原地不动"的选项藏掉。
+	if st, sErr := r.deps.App.Repos().StorageOf(req.Context(), repo); sErr == nil && st != nil {
+		dto.StorageID, dto.StorageName = st.ID, st.Name
+	}
+	r.writeJSON(w, http.StatusOK, dto)
 }
 
 // handleUpdateRepo 更新存储库。
@@ -412,6 +427,51 @@ func (r *Router) handleCopyRepo(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	r.writeJSON(w, http.StatusAccepted, toJobDTO(j))
+}
+
+// moveRepoRequest 是存储库迁移请求。
+type moveRepoRequest struct {
+	StorageID string `json:"storage_id"`
+}
+
+// handleMoveRepo 把存储库迁移到另一个存储（异步任务，202）。
+//
+// 采用"先复制、后删除"：任务可中止；中止只会清理目标侧半成品，源库保持可用。
+func (r *Router) handleMoveRepo(w http.ResponseWriter, req *http.Request) {
+	id := chi.URLParam(req, "id")
+	p, err := r.requireRepoPerm(req, id, domain.PermManage)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	var in moveRepoRequest
+	if err := r.decodeJSON(req, &in); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	j, err := r.deps.App.Repos().Move(req.Context(), id, in.StorageID, p.UserID)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusAccepted, toJobDTO(j))
+}
+
+// handleCancelRepoMove 中止存储库迁移。
+//
+// 单独的接口：通用任务取消只对超级管理员开放，而迁移是库管理者自己发起的操作。
+func (r *Router) handleCancelRepoMove(w http.ResponseWriter, req *http.Request) {
+	id := chi.URLParam(req, "id")
+	p, err := r.requireRepoPerm(req, id, domain.PermManage)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	if err := r.deps.App.Repos().CancelMove(req.Context(), id, p.UserID); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeNoContent(w)
 }
 
 // handleListRepoDisks 列出存储库下的磁盘。

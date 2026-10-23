@@ -54,6 +54,10 @@ type createUploadRequest struct {
 	// 与直接建库（POST /v1/repos）的 share_count/max_diff_disks 同义；这里随会话清单持久化，
 	// 因为建库是异步任务、那时读不到本次请求（见 uploadManifestRecord）。
 	MaxDiffDisks int `json:"max_diff_disks"`
+	// Preallocate 是否在建库时预创建差异盘与 iSCSI 目标（池位）。
+	//
+	// 指针用于兼容老客户端：不传时为 false（升级前上传建库从不预创建）。
+	Preallocate *bool `json:"preallocate"`
 	// ClientOS 将使用该库的客户端操作系统（windows | linux，留空按 windows）：
 	// 决定建盘用的文件系统并记在盘上（见 domain.ClientOS），建完之后不能改。
 	ClientOS string `json:"client_os"`
@@ -96,6 +100,10 @@ func (r *Router) handleCreateUpload(w http.ResponseWriter, req *http.Request) {
 	for _, f := range in.Manifest.Files {
 		files = append(files, domain.ManifestEntry{Path: f.Path, Size: f.Size, Mtime: f.Mtime, SHA256: f.SHA256})
 	}
+	preallocate := false
+	if in.Preallocate != nil {
+		preallocate = *in.Preallocate
+	}
 	session, err := r.deps.App.Uploads().CreateUpload(req.Context(), app.CreateUploadInput{
 		UserID:       p.UserID,
 		RepoName:     in.RepoName,
@@ -105,6 +113,7 @@ func (r *Router) handleCreateUpload(w http.ResponseWriter, req *http.Request) {
 		StorageID:    in.StorageID,
 		QuotaBytes:   in.QuotaBytes,
 		MaxDiffDisks: in.MaxDiffDisks,
+		Preallocate:  preallocate,
 		ClientOS:     in.ClientOS,
 	})
 	if err != nil {

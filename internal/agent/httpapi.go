@@ -70,7 +70,11 @@ func (a *Agent) localMux() http.Handler {
 
 	// 本地目录扫描与上传建库（后台异步，见 docs/agent-api.md「本地目录扫描与上传建库」）。
 	mux.HandleFunc("POST /agent/fs/scan", a.handleFSScan)
-	mux.HandleFunc("POST /agent/fs/manifest", a.handleFSManifest)
+	// 上传核对：清单生成是异步的（扫描/哈希可能跑很久），拆成 start/status/result，
+	// 界面据此持续展示阶段、文件数与"当前正在处理的文件"。
+	mux.HandleFunc("POST /agent/fs/manifest/start", a.handleStartManifest)
+	mux.HandleFunc("GET /agent/fs/manifest/status", a.handleManifestStatus)
+	mux.HandleFunc("GET /agent/fs/manifest/result", a.handleManifestResult)
 	mux.HandleFunc("POST /agent/uploads/start", a.handleUploadStart)
 	mux.HandleFunc("GET /agent/uploads", a.handleListUploads)
 	mux.HandleFunc("DELETE /agent/uploads/{upload_id}", a.handleCancelUpload)

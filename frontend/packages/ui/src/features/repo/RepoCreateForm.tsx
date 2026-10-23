@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Col, Form, Input, InputNumber, Progress, Row, Select, Space, Typography } from 'antd'
+import { Button, Checkbox, Col, Form, Input, InputNumber, Progress, Row, Select, Space, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ErrorNotice } from '../../components/ErrorNotice'
@@ -29,7 +29,11 @@ export interface RepoCreateFormProps {
 }
 
 /** 表单值：源目录由 SourceDirPicker 提供结构化取值。 */
-type RepoFormValues = Omit<CreateRepoRequest, 'source_dir'> & { source_dir?: SourceDirValue }
+type RepoFormValues = Omit<CreateRepoRequest, 'source_dir'> & {
+  source_dir?: SourceDirValue
+  /** 是否在建库时预创建差异盘与 iSCSI 目标（仅共享库有意义）。 */
+  preallocate?: boolean
+}
 
 /** 上传进行中的状态（可取消）。 */
 const ACTIVE_UPLOAD_STATES: readonly UploadStatus[] = ['scanning', 'creating', 'uploading', 'completing']
@@ -66,6 +70,9 @@ export function RepoCreateForm({
   // 用 onValuesChange 而不是 Form.useWatch：上传进行中表单会被进度面板替换掉，
   // 此时 useWatch 会去读一个"没有挂在任何 Form 上"的实例，开发模式会刷告警。
   const [exclusive, setExclusive] = useState(false)
+  // 「预分配」勾选状态：勾上才把数量传给服务端；取消勾选等于共享数量 0
+  // （差异盘在分配时派生、iSCSI 目标在挂载时现场下发）。默认不勾选，由用户显式开启。
+  const [preallocate, setPreallocate] = useState(false)
   const [error, setError] = useState<unknown>(null)
   const [sourceDirValid, setSourceDirValid] = useState(true)
   const [upload, setUpload] = useState<UploadState | null>(null)
@@ -187,11 +194,12 @@ export function RepoCreateForm({
         storage_id: values.storage_id || undefined,
         // 不传 quota_bytes：库没有"配额"，建库只需要**容量**（容量即它占用的配额）。
         //
-        // 但共享数量要传：它随上传会话的清单一起存下来，服务端在上传结束建库时写进库配置 ——
-        // 不传的话这条路径建出来的库会丢掉用户填的值（服务端建库那条路径是直接建库、参数当场
-        // 生效，不存在这个问题）。共享数量曾经就是这么丢的：无论填几，建出来的库都是配置默认值
-        // 50（真实反馈："设置共享数量大于0时会变成50"）。
-        max_diff_disks: values.max_diff_disks,
+        // 但预分配数量要传：它随上传会话的清单一起存下来，服务端在上传结束建库时写进库配置 ——
+        // 不传的话这条路径建出来的库会丢掉用户勾选的预分配（服务端建库那条路径是直接建库、
+        // 参数当场生效，不存在这个问题）。共享数量曾经就是这么丢的：无论填几，建出来的库
+        // 都是配置默认值 50（真实反馈："设置共享数量大于0时会变成50"）。
+        max_diff_disks: preallocateCount(values),
+        preallocate: values.mode === 'shared' && values.preallocate !== false,
         source_mode: 'copy',
         // 存储 ID 只对**它所属的那台**服务端有意义：多服务端下必须说清建到哪台。
         server_key: active?.key,
@@ -222,9 +230,10 @@ export function RepoCreateForm({
           <Form
             form={form}
             layout="vertical"
-            initialValues={{ mode: 'shared', max_diff_disks: 1 }}
+            initialValues={{ mode: 'shared', max_diff_disks: 1, preallocate: false }}
             onValuesChange={(changed, values) => {
               setExclusive(values.mode === 'exclusive')
+              setPreallocate(values.preallocate !== false)
               autoFillName(changed)
             }}
             style={{ maxWidth: 880 }}
@@ -326,25 +335,41 @@ export function RepoCreateForm({
                   <InputNumber min={0} addonAfter={CAPACITY_UNIT} style={{ width: '100%' }} />
                 </Form.Item>
               </Col>
-              <Col span={12}>
-                {/*
-                  这里**不问配额**：库没有"配额"这个概念 —— 这里填的是**容量**（VHDX 标称容量），
-                  而这个容量就是它占用的配额（从创建者的配额里扣除）。配额本身是**用户级**的策略值，
-                  由管理员在用户表单里设置；库这边只需要给出容量。
-                */}
-                {/*
-                  「共享数量」就是服务端的 max_diff_disks：它不只是"上限"，而是**建库时预创建几个池位**
-                  （几块差异盘 + 几个 iSCSI 目标）。名字必须以"预创建"为准 —— 叫"差异盘上限"时，
-                  连开发者都会以为填了只在超限时报错，于是填 0，结果每次挂载都要等服务端现场下发。
-                */}
-                <Form.Item
-                  name="max_diff_disks"
-                  label={t('field.shareCount')}
-                  extra={exclusive ? t('repo.create.shareCountExclusive') : t('repo.create.shareCountHint')}
-                >
-                  <InputNumber min={0} disabled={exclusive} style={{ width: '100%' }} />
-                </Form.Item>
-              </Col>
+              {/*
+                这里**不问配额**：库没有"配额"这个概念 —— 这里填的是**容量**（VHDX 标称容量），
+                而这个容量就是它占用的配额（从创建者的配额里扣除）。配额本身是**用户级**的策略值，
+                由管理员在用户表单里设置；库这边只需要给出容量。
+              */}
+              {/*
+                「预分配」= 服务端的"共享数量 / max_diff_disks > 0"：勾选后建库时同时
+                预创建差异盘与 iSCSI 目标（池位），等待分配；不勾选则分配时才派生差异盘、
+                挂载时现场下发目标。独享库没有差异盘，整块盘直接交给用户，因此不显示。
+              */}
+              {!exclusive ? (
+                <>
+                  <Col span={12}>
+                    <Form.Item
+                      name="preallocate"
+                      valuePropName="checked"
+                      extra={t('repo.create.preallocateHint')}
+                    >
+                      <Checkbox>{t('field.preallocate')}</Checkbox>
+                    </Form.Item>
+                  </Col>
+                  {preallocate ? (
+                    <Col span={12}>
+                      <Form.Item
+                        name="max_diff_disks"
+                        label={t('field.preallocateCount')}
+                        rules={[{ required: true }]}
+                        extra={t('repo.create.preallocateCountHint')}
+                      >
+                        <InputNumber min={1} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                  ) : null}
+                </>
+              ) : null}
               <Col span={12}>
                 <Form.Item name="source_dir" label={t('field.sourceDirOptional')}>
                   <SourceDirPicker onValidityChange={setSourceDirValid} />
@@ -394,11 +419,25 @@ function buildCreatePayload(values: RepoFormValues, source: SourceDirValue | und
     owner_id: values.owner_id,
     storage_id: values.storage_id,
     size_bytes: values.size_bytes,
-    max_diff_disks: values.max_diff_disks,
+    max_diff_disks: preallocateCount(values),
+    preallocate: values.mode === 'shared' && values.preallocate !== false,
     group: values.group
   }
   if (source?.kind === 'server' && source.path) payload.source_dir = source.path
   return payload
+}
+
+/**
+ * 计算要传给服务端的 max_diff_disks / 共享数量。
+ *
+ * 0 表示"不预分配"：独享库没有差异盘；共享库没勾选预分配时也传 0，服务端就只在
+ * 分配时派生差异盘、挂载时现场下发目标。勾选但数量留空按 1 处理，避免"勾了却没生效"。
+ */
+function preallocateCount(values: RepoFormValues): number {
+  if (values.mode !== 'shared' || values.preallocate === false) return 0
+  const count = Number(values.max_diff_disks ?? 1)
+  if (!Number.isFinite(count) || count <= 0) return 1
+  return Math.trunc(count)
 }
 
 /** 本地目录上传进度面板（替代表单区域，不跳转页面）。 */

@@ -533,24 +533,16 @@ func (a *Agent) repoMountRequest(ctx context.Context, client *serverClient, key,
 	}, nil
 }
 
-// ensureMyAllocation 返回我在该库里的可用分配，必要时先建一个。
+// ensureMyAllocation 确保我在该库里有**可挂载**的分配，返回其 ID。
 //
-// 服务端按库返回**全部**分配（含已释放的历史），所以这里必须自己筛：
-// 只认"我自己的、且 state != released"的记录。同一个用户在同一库里的可用分配应当只有一个，
-// 取第一个即可（重复分配是服务端异常，挂上其中一个也符合用户预期）。
+// 直接调服务端的 Allocate（幂等）而不是先 ListAllocations 再取第一条：
+//
+//   - 分配记录本身看不出差异盘的 parent_version。母盘做过维护（版本 +1）后，
+//     旧差异盘仍然躺在分配里；直接拿去 RequestMount 只会得到
+//     disk.parent_version_mismatch，而用户在界面上没有任何"删掉旧差异盘"的入口。
+//   - Allocate 的后台逻辑已经处理了这件事：发现同用户的分配所连差异盘版本对不上，
+//     就删掉旧分配、把旧差异盘（连同 iSCSI 目标）入队删除，再派生一块新盘。
 func (a *Agent) ensureMyAllocation(ctx context.Context, client *serverClient, repoID, userID string) (string, error) {
-	allocs, err := client.ListAllocations(ctx, repoID)
-	if err != nil {
-		return "", err
-	}
-	for _, item := range allocs {
-		if item.UserID != userID || item.State == allocationStateReleased {
-			continue
-		}
-		if id := strings.TrimSpace(item.ID); id != "" {
-			return id, nil
-		}
-	}
 	created, err := client.Allocate(ctx, repoID, userID)
 	if err != nil {
 		return "", err

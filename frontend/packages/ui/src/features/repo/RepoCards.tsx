@@ -2,13 +2,14 @@ import type { CSSProperties, MouseEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
 import { InfoCircleOutlined, LinkOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 
 import { StatusTag } from '../../components/StatusTag'
 import { UsageBar, UsageValueText } from '../../components/UsageBar'
 import { agentApi, createShortcut } from '../../api/agentClient'
 import type { AgentMountVolumeUsage, UploadState } from '../../api/agentTypes'
 import { translateError } from '../../api/errors'
+import { useApi } from '../../api/provider'
 import type { RepoDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
@@ -44,14 +45,14 @@ export interface RepoCardProps {
    *     此刻能做的只有"停一下"和"算了"（真实反馈："上传状态下的挂载按钮改成暂停，
    *     加一个取消按钮"）。
    *
-   * 它还决定**整卡点击去哪**：普通库点开本机挂载目录，而上传中的库根本没有目录可开
-   * （点下去只会得到一句"未挂载"），所以改去进度页。
+   * 它还决定**整卡点击去哪**：普通库单击进入详情，上传中的库根本没有详情可进
+   * （服务端还没有这条记录），所以改去进度页。
    *
    * 其余零件（状态圆点 / 标签行 / 用量 / 次要信息）一概照旧：它在列表里就是一张普通库卡，
    * 只是状态不同。
    */
   upload?: UploadState
-  /** 打开「上传任务」页；不传则整卡点击仍是普通库的行为（打开挂载目录）。 */
+  /** 打开「上传任务」页；不传则整卡点击仍是普通库的行为（进入详情）。 */
   onOpenUpload?: (uploadId: string) => void
 }
 
@@ -247,6 +248,7 @@ function RepoUsage({
   style?: CSSProperties
 }): JSX.Element {
   const { t } = useI18n()
+  if (repo.state === 'moving' && repo.move) return <RepoMoveProgress repo={repo} style={style} />
   if (upload) return <RepoProgress upload={upload} style={style} />
   const { percent, usedText, totalText, measured } = repoUsage(repo, usage, true)
   return (
@@ -480,6 +482,32 @@ function RepoUploadActions({ upload }: { upload: UploadState }): JSX.Element {
 }
 
 /**
+ * 迁移中的动作区：把挂载按钮换成「中止迁移」。
+ *
+ * 迁移期间库不可挂载（服务端同样会拒绝），能做的只有中止；中止只会清理目标侧
+ * 半成品并把库恢复为可用，不会丢源数据。
+ */
+function RepoMoveActions({ repo }: { repo: RepoDTO }): JSX.Element {
+  const api = useApi()
+  const { t } = useI18n()
+  const queryClient = useQueryClient()
+  const cancel = useMutation({
+    mutationFn: () => api.cancelRepoMove(repo.id),
+    onSuccess: () => {
+      message.success(t('repo.move.canceled'))
+      void queryClient.invalidateQueries({ queryKey: ['repos'] })
+      void queryClient.invalidateQueries({ queryKey: ['repo', repo.id] })
+    },
+    onError: (error) => message.error(translateError(error) || t('repo.move.cancelFailed'))
+  })
+  return (
+    <Button danger size="small" loading={cancel.isPending} onClick={() => cancel.mutate()}>
+      {t('repo.move.cancel')}
+    </Button>
+  )
+}
+
+/**
  * 右侧动作区：「详情」（列表形态才有）/「配置」/ 挂载按钮。
  *
  * 按钮一律靠右（marginLeft: auto），不被内容挤到左边；容器可点打开挂载目录，
@@ -556,7 +584,13 @@ function RepoActions({
       <RepoShortcutButton repoName={repo.name} controller={controller} />
       <RepoMonitorTag controller={controller} repoName={repo.name} />
       {/* 上传中的条目：挂载按钮换成「暂停 / 继续」+「取消」（见 RepoUploadActions）。 */}
-      {upload ? <RepoUploadActions upload={upload} /> : <RepoMountActions controller={controller} />}
+      {repo.state === 'moving' ? (
+        <RepoMoveActions repo={repo} />
+      ) : upload ? (
+        <RepoUploadActions upload={upload} />
+      ) : (
+        <RepoMountActions controller={controller} />
+      )}
     </div>
   )
 }
@@ -681,6 +715,38 @@ function RepoProgress({ upload, style }: { upload: UploadState; style?: CSSPrope
 }
 
 /**
+ * 迁移进度：复用「已用」那一格的排版，把数据源换成迁移快照（与上传进度同一处理）。
+ *
+ * 迁移期间库不可挂载，这一格本来也没有可算的用量；把进度放在原位置，卡片高度与
+ * 其它库一致，用户也不会以为进度是另一条独立的东西。
+ */
+function RepoMoveProgress({ repo, style }: { repo: RepoDTO; style?: CSSProperties }): JSX.Element {
+  const { t } = useI18n()
+  const move = repo.move
+  const total = move?.total_bytes ?? 0
+  const done = move?.bytes ?? 0
+  const percent =
+    total > 0
+      ? Math.min(100, Math.round((done / total) * 100))
+      : move && move.files_total > 0
+        ? Math.min(100, Math.round((move.files_done / move.files_total) * 100))
+        : 0
+  return (
+    <RepoMeter
+      label={t('repo.move.progress')}
+      value={
+        total > 0
+          ? `${formatBytes(done)} / ${formatBytes(total)}`
+          : `${move?.files_done ?? 0}/${move?.files_total ?? 0}`
+      }
+      percent={percent}
+      color={palette.accent}
+      style={style}
+    />
+  )
+}
+
+/**
  * 打开本机挂载目录（整卡的点击行为）。
  *
  * 原来的「打开目录」小按钮撤掉了（按用户要求把"点击卡片进详情"换成"打开文件"）；
@@ -698,12 +764,12 @@ function useOpenMountDir(controller: RepoMountController): () => void {
 }
 
 /**
- * 整卡点击的去处：**单击打开挂载文件夹，双击进入详情**。
+ * 整卡点击的去处：**单击进入详情，双击打开挂载文件夹**。
  *
  * 双击会先触发两次 click，所以单击动作要延迟一小段再执行；双击到达时取消那次单击。
  * 上传中的库没有挂载目录（点下去只会得到一句"未挂载"），单击仍去「上传任务」页。
  *
- * 详情仍保留一个显式的「详情」图标按钮（见 RepoMountCard），不依赖双击。
+ * 详情仍保留一个显式的「详情」图标按钮（见 RepoMountCard），不依赖单击。
  */
 function useRepoCardInteractions(
   upload: UploadState | undefined,
@@ -734,14 +800,19 @@ function useRepoCardInteractions(
         onOpenUpload(upload.upload_id)
         return
       }
-      openMountDir()
+      onOpen()
     }, 250)
-  }, [clear, upload, onOpenUpload, openMountDir])
+  }, [clear, upload, onOpenUpload, onOpen])
 
   const onDoubleClick = useCallback(() => {
     clear()
-    onOpen()
-  }, [clear, onOpen])
+    // 上传中的库没有挂载目录：双击仍进上传任务页，避免弹一句"未挂载"。
+    if (upload && onOpenUpload) {
+      onOpenUpload(upload.upload_id)
+      return
+    }
+    openMountDir()
+  }, [clear, upload, onOpenUpload, openMountDir])
 
   return { onClick, onDoubleClick }
 }
@@ -750,7 +821,7 @@ function useRepoCardInteractions(
  * 卡片形态（网格）：竖向排版，适合一眼扫过多块盘。
  *
  * 卡片上的动作分工（都能在这一张卡上完成，不必先进详情页）：
- *   - 整卡点击 = 打开文件（未挂载时如实提示；上传中的库进「上传任务」页）；
+ *   - 整卡单击 = 进入详情；双击 = 打开文件（未挂载时如实提示；上传中的库进「上传任务」页）；
  *   - 库名前的状态圆点 = 本机挂载状态一眼可辨；
  *   - 「详情」图标 = 进详情页（默认停在「设置」tab）；
  *   - 「配置」图标 + 挂载按钮 = 这个库在本机怎么挂 / 挂上或卸下。

@@ -44,6 +44,21 @@ func (r *Router) handleStartVerifyDiff(w http.ResponseWriter, req *http.Request)
 	r.writeJSON(w, http.StatusAccepted, toJobDTO(j))
 }
 
+// handleVerifyDiffProgress 返回核对任务的细粒度进度（阶段/当前文件/已处理字节）。
+func (r *Router) handleVerifyDiffProgress(w http.ResponseWriter, req *http.Request) {
+	id := chi.URLParam(req, "id")
+	if _, err := r.requireRepoPerm(req, id, domain.PermManage); err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	res, err := r.deps.App.Disks().GetVerifyDiffProgress(req.Context(), id, queryString(req, "job"))
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusOK, res)
+}
+
 // handleVerifyDiffResult 读取一次成功核对的结果。
 func (r *Router) handleVerifyDiffResult(w http.ResponseWriter, req *http.Request) {
 	id := chi.URLParam(req, "id")

@@ -17,7 +17,7 @@ export type RepoMode = 'shared' | 'exclusive'
 // 一样不可挂载。注意它**不代表数据还在传**：这个库记录要到"数据都收完了、建库任务开跑"才存在。
 // 还在传数据的那一帧是界面合成的占位库，标签取值另算（见 features/repo/uploadView.tsx 的
 // repoStateValue）。
-export type RepoState = 'creating' | 'importing' | 'active' | 'sealing' | 'deleting' | 'error'
+export type RepoState = 'creating' | 'importing' | 'active' | 'sealing' | 'moving' | 'deleting' | 'error'
 export type ParentCondition = 'idle' | 'temp_shared' | 'maintenance'
 export type DiskKind = 'parent' | 'diff' | 'standalone'
 export type DiskState = 'creating' | 'ready' | 'published' | 'deleting' | 'error'
@@ -80,6 +80,22 @@ export interface RepoPrepareDTO {
   error?: string
 }
 
+/** 存储库迁移进度快照（state=moving 期间存在）。 */
+export interface RepoMoveDTO {
+  /** 迁移任务 ID：用于订阅任务进度与中止。 */
+  job_id?: string
+  from_storage_id?: string
+  from_storage_name?: string
+  to_storage_id?: string
+  to_storage_name?: string
+  /** preparing（拆目标）/ copying（复制）/ finalizing（切换路径）。 */
+  phase?: string
+  files_done: number
+  files_total: number
+  bytes: number
+  total_bytes: number
+}
+
 export interface RepoDTO {
   id: string
   name: string
@@ -113,6 +129,11 @@ export interface RepoDTO {
   pool: boolean
   /** 建库进度：state=creating 时用于显示"正在派生差异盘 3/5"。 */
   prepare?: RepoPrepareDTO
+  /** 迁移进度：state=moving 时用于在卡片与详情里显示复制进度。 */
+  move?: RepoMoveDTO
+  /** 当前磁盘所在的存储（详情页迁移弹窗据此隐藏当前存储）。 */
+  storage_id?: string
+  storage_name?: string
   /**
    * **调用者自己**对这个库的有效权限（read | mount | manage）；老服务端不带这个字段。
    *
@@ -285,6 +306,23 @@ export interface VerifyDiffResultDTO {
   disk_bytes: number
   warnings: string[]
   truncated: boolean
+}
+
+/** 上传核对的细粒度进度（GET /v1/repos/{id}/diff/progress）。 */
+export interface VerifyDiffProgressDTO {
+  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  /** prepare | create | mount | walk | compare | done | queued */
+  phase: string
+  message?: string
+  /** 此刻正在读取的盘内文件（相对盘根）。 */
+  current?: string
+  /** 已读取的文件数。 */
+  done: number
+  /** 本地清单的文件数（作为参考总量）。 */
+  total: number
+  bytes: number
+  total_bytes: number
+  error?: string
 }
 
 export interface AuditDTO {
@@ -777,6 +815,8 @@ export interface CreateRepoRequest {
   source_dir?: string
   size_bytes?: number
   max_diff_disks?: number
+  /** 是否在建库时预创建差异盘与 iSCSI 目标（池位）；缺省按"数量 > 0 就预创建"的旧语义。 */
+  preallocate?: boolean
   quota_bytes?: number
   group?: string
 }

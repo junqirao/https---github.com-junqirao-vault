@@ -1,9 +1,6 @@
 package agent
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -48,82 +45,6 @@ type scanResult struct {
 	TotalFiles int
 	TotalBytes int64
 	Warnings   []string
-}
-
-// fsManifestRequest 是 POST /agent/fs/manifest 的请求体。
-type fsManifestRequest struct {
-	Path string `json:"path"`
-	// Hash 为 true 时对每个文件计算 SHA-256（耗时与总字节数成正比）。
-	Hash bool `json:"hash"`
-}
-
-// fsManifestEntry 是交给服务端做上传核对的一项。
-type fsManifestEntry struct {
-	Path string `json:"path"`
-	Size int64  `json:"size"`
-	// Hash 为空表示没算/算失败：服务端退化为只比大小，避免误报“内容不同”。
-	Hash string `json:"hash,omitempty"`
-}
-
-// handleFSManifest 扫描本地目录并返回**完整清单**（可选带 SHA-256），
-// 供服务端从母盘差异盘里逐文件核对上传结果。
-func (a *Agent) handleFSManifest(w http.ResponseWriter, r *http.Request) {
-	var req fsManifestRequest
-	if err := decodeJSON(r, &req); err != nil {
-		a.writeError(w, err)
-		return
-	}
-	res, err := scanLocalDir(req.Path)
-	if err != nil {
-		a.writeError(w, err)
-		return
-	}
-	entries := make([]fsManifestEntry, 0, len(res.Entries))
-	var keptFiles int
-	var keptBytes int64
-	for _, e := range res.Entries {
-		// 与 service 端 walkVerifyRoot 一致：卷根系统元数据不算上传内容。
-		if isVerifyRootMetadata(e.Rel) {
-			continue
-		}
-		hash := ""
-		if req.Hash {
-			h, hErr := hashLocalFile(e.Abs)
-			if hErr != nil {
-				res.Warnings = append(res.Warnings, "hash_failed:"+e.Rel)
-			} else {
-				hash = h
-			}
-		}
-		entries = append(entries, fsManifestEntry{Path: e.Rel, Size: e.Size, Hash: hash})
-		keptFiles++
-		keptBytes += e.Size
-	}
-	warnings := res.Warnings
-	if warnings == nil {
-		warnings = []string{}
-	}
-	a.writeJSON(w, http.StatusOK, map[string]any{
-		"path":        res.Root,
-		"file_count":  keptFiles,
-		"total_bytes": keptBytes,
-		"entries":     entries,
-		"warnings":    warnings,
-	})
-}
-
-// hashLocalFile 计算文件的 SHA-256（十六进制）。
-func hashLocalFile(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = f.Close() }()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // isVerifyRootMetadata 与 app 端同名函数保持一致：卷根上由格式化/挂载产生的系统元数据
@@ -181,6 +102,17 @@ func (a *Agent) handleFSScan(w http.ResponseWriter, r *http.Request) {
 //
 // 结果按 Rel 升序排序，该顺序即后续分块上传的字节流顺序（稳定且可复现）。
 func scanLocalDir(raw string) (*scanResult, error) {
+	return scanLocalDirWith(raw, nil)
+}
+
+// scanProgressFunc 是扫描过程中的进度回调（files/bytes 为累计值，rel 为当前文件）。
+type scanProgressFunc func(files int, bytes int64, rel string)
+
+// scanLocalDirWith 与 scanLocalDir 相同，额外在每个常规文件上回调一次进度。
+//
+// 上传核对要扫描 1000GB 级别的目录，没有"当前正在看哪个文件"的反馈，用户只能看着
+// 转圈；回调让代理侧能把进度持续暴露给界面（见 manifest.go）。
+func scanLocalDirWith(raw string, onFile scanProgressFunc) (*scanResult, error) {
 	root, err := validateAbsDir(raw, "path")
 	if err != nil {
 		return nil, err
@@ -238,6 +170,9 @@ func scanLocalDir(raw string) (*scanResult, error) {
 		})
 		res.TotalFiles++
 		res.TotalBytes += fi.Size()
+		if onFile != nil {
+			onFile(res.TotalFiles, res.TotalBytes, res.Entries[len(res.Entries)-1].Rel)
+		}
 		return nil
 	})
 	if walkErr != nil {

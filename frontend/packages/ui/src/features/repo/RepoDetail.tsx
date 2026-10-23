@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Space, Tabs, message } from 'antd'
+import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Select, Space, Tabs, message } from 'antd'
+import { ArrowLeftOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ConfirmDialog } from '../../components/ConfirmDialog'
@@ -16,7 +17,7 @@ import { isJobTerminal, useJobProgress } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
 
 import { spacing } from '../../tokens/palette'
-import { formatTime, repoUsage } from '../../utils/format'
+import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
@@ -63,6 +64,10 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const [resizeOpen, setResizeOpen] = useState(false)
   // 上传核对弹窗。
   const [verifyOpen, setVerifyOpen] = useState(false)
+  // 存储库迁移：目标存储选择弹窗 + 本次发起的迁移任务（用于跟踪进度与终态刷新）。
+  const [moveOpen, setMoveOpen] = useState(false)
+  const [moveStorageID, setMoveStorageID] = useState('')
+  const [moveJob, setMoveJob] = useState<JobDTO | null>(null)
   const [resizeForm] = Form.useForm<{ size_gb: number }>()
   const [editForm] = Form.useForm<EditValues>()
   const [copyForm] = Form.useForm<{ new_repo_name: string }>()
@@ -78,6 +83,13 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const repoQuery = useQuery({
     queryKey: ['repo', repoId],
     queryFn: () => api.getRepo(repoId)
+  })
+
+  // 迁移弹窗的目标存储列表：只在打开弹窗时拉，避免每次进详情都多一个请求。
+  const storagesQuery = useQuery({
+    queryKey: ['storages'],
+    queryFn: () => api.listStorages(),
+    enabled: moveOpen
   })
 
   // 「母盘文件」页签的前置条件：维护态 + **已无差异盘**。
@@ -220,6 +232,50 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     onError: (err) => setError(err)
   })
 
+  const moveMutation = useMutation({
+    mutationFn: (storageID: string) => api.moveRepo(repoId, storageID),
+    onSuccess: (job) => {
+      setMoveOpen(false)
+      setMoveStorageID('')
+      setMoveJob(job)
+      void queryClient.invalidateQueries({ queryKey: ['jobs'] })
+      refresh()
+    },
+    onError: (err) => setError(err)
+  })
+
+  const cancelMoveMutation = useMutation({
+    mutationFn: () => api.cancelRepoMove(repoId),
+    onSuccess: () => {
+      message.success(t('repo.move.canceled'))
+      refresh()
+    },
+    onError: (err) => setError(err)
+  })
+
+  // 迁移进度：进入详情时如果已经在迁移，靠 meta.move.job_id 接着跟；本次发起的任务用返回的 JobDTO。
+  const moveProgress = useJobProgress(repoQuery.data?.move?.job_id ?? moveJob?.id, moveJob)
+  useEffect(() => {
+    if (!moveJob || !isJobTerminal(moveProgress?.state)) return
+    if (moveProgress?.state === 'succeeded') message.success(t('repo.move.done'))
+    else if (moveProgress?.state === 'cancelled') message.info(t('repo.move.canceled'))
+    else message.error(t('repo.move.failed'))
+    setMoveJob(null)
+    refresh()
+    // refresh 只读 queryClient，不需要进依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moveJob, moveProgress?.state, t])
+
+  // 迁移期间 meta.move 的字节进度由任务持续写库：这里按固定节拍重取详情，
+  // 让进度条和阶段文案不需要等任务终态才更新。离开页面即停。
+  const repoMoving = repoQuery.data?.state === 'moving'
+  const refetchRepo = repoQuery.refetch
+  useEffect(() => {
+    if (!repoMoving) return
+    const timer = window.setInterval(() => void refetchRepo(), 3000)
+    return () => window.clearInterval(timer)
+  }, [repoMoving, refetchRepo])
+
   if (repoQuery.isLoading) return <LoadingState text={t('common.loading')} />
 
   const repo = repoQuery.data
@@ -262,6 +318,18 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   }
 
   const isMaintenance = repo?.parent_condition === 'maintenance'
+  // 刚发起的那一瞬间 repo 快照可能还是 active：以手头的任务状态补上，界面不要有一帧"看起来没反应"。
+  const isMoving =
+    repo?.state === 'moving' || (moveJob !== null && !isJobTerminal(moveProgress?.state))
+  const movePercent =
+    repo?.move && repo.move.total_bytes > 0
+      ? Math.min(100, Math.round((repo.move.bytes / repo.move.total_bytes) * 100))
+      : repo?.move && repo.move.files_total > 0
+        ? Math.min(100, Math.round((repo.move.files_done / repo.move.files_total) * 100))
+        : (moveProgress?.progress ?? 0)
+  const targetStorages = (storagesQuery.data?.items ?? []).filter(
+    (storage) => storage.enabled && storage.mounted && storage.id !== repo?.storage_id
+  )
   const diffCount = (disksQuery.data?.items ?? []).filter((disk) => disk.kind === 'diff').length
   const parentFilesReady = isMaintenance && canManage && diffCount === 0
   const toggleMaintenance = (): void => {
@@ -272,26 +340,26 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   return (
     <PageShell
       title={repo?.name ?? t('repo.detail.title')}
+      leading={<Button icon={<ArrowLeftOutlined />} onClick={goBack}>{t('repo.detail.back')}</Button>}
       extra={
         <>
           {/* 与列表卡片同一套"挂载/卸载"联动按钮：进了详情也不必退回列表才能挂载。
               库记录可能还没查回来（加载中/出错），此时不渲染。 */}
           {/* read 成员只能看：挂载/卸载后端都不放行，按钮就不摆出来。 */}
-          {repo && repo.permission !== 'read' ? (
+          {repo && repo.permission !== 'read' && !isMoving ? (
             <RepoDetailMountActions repo={repo} currentUserId={currentUserId} />
           ) : null}
-          <Button onClick={goBack}>{t('common.back')}</Button>
           {/* 管理类操作只对能管理这个库的人展示（非库所有者点详情只能看）。 */}
           {canManage ? (
             <>
-              <Button onClick={() => repo && openEdit(repo)} disabled={!repo}>
+              <Button onClick={() => repo && openEdit(repo)} disabled={!repo || isMoving}>
                 {t('common.edit')}
               </Button>
               {/* 进入 / 退出维护态合成一个按钮：文案与动作按当前母盘条件切换。 */}
               {repo?.mode === 'shared' ? (
                 <Button
                   loading={parentMutation.isPending || parentRunning}
-                  disabled={repo.parent_condition === 'temp_shared' || parentRunning}
+                  disabled={repo.parent_condition === 'temp_shared' || parentRunning || isMoving}
                   title={repo.parent_condition === 'temp_shared' ? t('repo.maintenance.unshareFirst') : undefined}
                   onClick={toggleMaintenance}
                 >
@@ -316,9 +384,12 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                 </Space>
               ) : null}
               {repo?.mode === 'shared' && repo?.parent_disk_id ? (
-                <Button onClick={() => setVerifyOpen(true)}>{t('repo.verifyDiff.button')}</Button>
+                <Button onClick={() => setVerifyOpen(true)} disabled={isMoving}>
+                  {t('repo.verifyDiff.button')}
+                </Button>
               ) : null}
               <Button
+                disabled={isMoving}
                 onClick={() => {
                   copyForm.setFieldsValue({ new_repo_name: `${repo?.name ?? 'repo'}-copy` })
                   setCopyOpen(true)
@@ -326,7 +397,22 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               >
                 {t('action.copy')}
               </Button>
-              <Button danger onClick={() => setDeleteOpen(true)}>
+              {/* 迁移放在「复制」之后：两者都是整库级动作，但迁移会移动原库本身。 */}
+              <Button
+                disabled={
+                  !repo ||
+                  repo.state !== 'active' ||
+                  (repo.mode === 'shared' && (repo.parent_condition ?? 'idle') !== 'idle')
+                }
+                onClick={() => {
+                  setMoveStorageID('')
+                  setError(null)
+                  setMoveOpen(true)
+                }}
+              >
+                {t('repo.move.button')}
+              </Button>
+              <Button danger disabled={isMoving} onClick={() => setDeleteOpen(true)}>
                 {t('common.delete')}
               </Button>
             </>
@@ -339,6 +425,50 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       {/* 只能看的库（非所有者 / read、mount 成员）说清楚为什么没有管理入口。 */}
       {repo && !canManage ? (
         <Alert type="info" showIcon message={t('repo.detail.readOnly')} style={{ marginBottom: spacing.md }} />
+      ) : null}
+      {/* 迁移横幅：复制期间库不可用，进度与中止入口都放在这里。 */}
+      {isMoving ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: spacing.md }}
+          message={t('repo.move.banner')}
+          description={
+            <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
+              <span>
+                {t('repo.move.bannerHint', {
+                  from: repo?.move?.from_storage_name || '-',
+                  to: repo?.move?.to_storage_name || '-'
+                })}
+              </span>
+              <Progress percent={movePercent} size="small" status="active" />
+              <Space wrap size={spacing.md}>
+                <span>
+                  {t('repo.move.bytes', {
+                    done: formatBytes(repo?.move?.bytes ?? 0),
+                    total: formatBytes(repo?.move?.total_bytes ?? 0)
+                  })}
+                </span>
+                <span>
+                  {t('repo.move.files', {
+                    done: String(repo?.move?.files_done ?? 0),
+                    total: String(repo?.move?.files_total ?? 0)
+                  })}
+                </span>
+                {canManage ? (
+                  <Button
+                    size="small"
+                    danger
+                    loading={cancelMoveMutation.isPending}
+                    onClick={() => cancelMoveMutation.mutate()}
+                  >
+                    {t('repo.move.cancel')}
+                  </Button>
+                ) : null}
+              </Space>
+            </Space>
+          }
+        />
       ) : null}
       {/* 维护态横幅：所有能看到这个库的人都该知道它当前不可用；清理入口只给能管理的人。 */}
       {isMaintenance ? (
@@ -504,7 +634,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
           </Form.Item>
           {/* 备注写在母盘旁边的元数据文件里跟着盘走：换服务端把 disks/ 拷过去后，
               导入页面就能直接告诉管理员"这是财务的 Win10 母盘，别删"。 */}
-          <Form.Item name="note" label={t('field.note')} extra={t('repo.noteHint')}>
+          <Form.Item name="note" label={t('field.note')}>
             <Input.TextArea maxLength={512} rows={2} showCount />
           </Form.Item>
           <Form.Item name="max_diff_disks" label={t('field.maxDiffDisks')}>
@@ -533,6 +663,50 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               <Input maxLength={64} />
             </Form.Item>
           </Form>
+        </Space>
+      </Modal>
+
+      <Modal
+        open={moveOpen}
+        title={t('repo.move.title')}
+        width={520}
+        centered
+        okText={t('common.confirm')}
+        cancelText={t('common.cancel')}
+        confirmLoading={moveMutation.isPending}
+        okButtonProps={{ disabled: !moveStorageID || targetStorages.length === 0 }}
+        onCancel={() => setMoveOpen(false)}
+        onOk={() => {
+          if (!moveStorageID) {
+            message.warning(t('repo.move.needTarget'))
+            return
+          }
+          moveMutation.mutate(moveStorageID)
+        }}
+      >
+        <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
+          <Alert type="warning" showIcon message={t('repo.move.desc')} />
+          {repo?.storage_name ? (
+            <Space>
+              <span>{t('repo.move.current')}</span>
+              <strong>{repo.storage_name}</strong>
+            </Space>
+          ) : null}
+          {targetStorages.length === 0 ? (
+            <Alert type="info" showIcon message={t('repo.move.noTargets')} />
+          ) : (
+            <Select
+              style={{ width: '100%' }}
+              placeholder={t('repo.move.targetPlaceholder')}
+              value={moveStorageID || undefined}
+              onChange={setMoveStorageID}
+              loading={storagesQuery.isLoading}
+              options={targetStorages.map((storage) => ({
+                value: storage.id,
+                label: `${storage.name} · ${storage.path}`
+              }))}
+            />
+          )}
         </Space>
       </Modal>
 

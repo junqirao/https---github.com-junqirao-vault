@@ -352,7 +352,7 @@ func TestManifestWithOptionsKeepsFileOrder(t *testing.T) {
 		},
 		RepoMode: "shared", StorageID: "", QuotaBytes: 0, ClientOS: "windows",
 	}
-	got, err := manifestWithOptions(rec, "exclusive", "st-9", 1<<30, 3, domain.ClientOSLinux)
+	got, err := manifestWithOptions(rec, "exclusive", "st-9", 1<<30, 3, true, domain.ClientOSLinux)
 	if err != nil {
 		t.Fatalf("manifestWithOptions 失败：%v", err)
 	}
@@ -361,7 +361,7 @@ func TestManifestWithOptionsKeepsFileOrder(t *testing.T) {
 		t.Fatalf("解析结果失败：%v", err)
 	}
 	if next.RepoMode != "exclusive" || next.StorageID != "st-9" || next.QuotaBytes != 1<<30 ||
-		next.MaxDiffDisks != 3 || next.ClientOS != "linux" {
+		next.MaxDiffDisks != 3 || !next.Preallocate || next.ClientOS != "linux" {
 		t.Fatalf("建库选项未按本次请求刷新：%+v", next)
 	}
 	if next.Root != rec.Root || len(next.Files) != len(rec.Files) {

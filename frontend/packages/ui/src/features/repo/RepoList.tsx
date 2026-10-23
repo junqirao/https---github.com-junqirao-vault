@@ -144,6 +144,9 @@ const PENDING_REPO_STATES: ReadonlyArray<RepoDTO['state']> = [
   'creating',
   'importing',
   'sealing',
+  // 迁移是后台任务，进度快照只落库、不会推到这个列表：动作期间按固定节拍重取，
+  // 用户的卡片才能跟着走进度并在完成时自动恢复成普通库。
+  'moving',
   'deleting'
 ]
 

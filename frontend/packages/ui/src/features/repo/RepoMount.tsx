@@ -192,14 +192,13 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     setError(null)
     setBusy(true)
     try {
-      let target = allocationId
-      if (!target) {
-        // 库主首次挂载：先按库的默认差异盘参数建立分配，再交给代理挂载。
-        const created = await api.allocate(repo.id, currentUserId)
-        target = created.id
-      }
+      // 每次都让服务端"确保分配"，而不是直接拿列表里的第一条：
+      // Allocate 是幂等的（已有可用分配就原样返回），而母盘维护后版本 +1 时，
+      // 它会自动作废旧差异盘（连同 iSCSI 目标）并重建 —— 否则这里会带着旧分配
+      // 去挂载，得到 disk.parent_version_mismatch，而界面没有删除旧差异盘的入口。
+      const target = await api.allocate(repo.id, currentUserId)
       await agent.mount({
-        allocation_id: target,
+        allocation_id: target.id,
         repo_id: repo.id,
         repo_name: repo.name,
         repo_group: repo.group,
@@ -212,7 +211,7 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
     } finally {
       setBusy(false)
     }
-  }, [active?.baseUrl, active?.key, agent, allocationId, api, currentUserId, invalidate, repo.id, repo.name, repo.group])
+  }, [active?.baseUrl, active?.key, agent, api, currentUserId, invalidate, repo.id, repo.name, repo.group])
 
   const unmountRepo = useCallback(async (): Promise<void> => {
     if (!mount) return

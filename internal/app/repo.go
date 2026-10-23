@@ -86,6 +86,12 @@ type CreateRepoInput struct {
 	SizeBytes int64
 	// MaxDiffDisks 差异盘上限；0 表示使用配置默认值。
 	MaxDiffDisks int
+	// Preallocate 是否在建库时同时预创建差异盘与 iSCSI 目标（池位）。
+	//
+	// 它与 MaxDiffDisks 分工：MaxDiffDisks 是**上限/池位数量**，Preallocate 是
+	// "要不要在创建时就把这些池位建好"。勾选后建库会先进入 creating，母盘、差异盘
+	// 与目标全部就绪后才转为 active，等待被分配。
+	Preallocate bool
 	// QuotaBytes 应用层配额；0 表示不限。
 	QuotaBytes int64
 	// Group 分组标签，写入 meta.group。
@@ -165,9 +171,9 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 		// 独享模式没有差异盘，"共享数量"无意义；静默归零而不是报错（老客户端仍会带这个字段）。
 		share = 0
 	}
-	// preparing：这次建库要不要顺手把差异盘池建好（共享模式 + 填了共享数量）。
+	// preparing：这次建库要不要顺手把差异盘池建好（共享模式 + 勾选了预分配 + 数量 > 0）。
 	// 后面的事务与任务派发都要用它，因此在事务外先算好。
-	preparing := in.Mode == domain.RepoModeShared && share > 0
+	preparing := in.Mode == domain.RepoModeShared && in.Preallocate && share > 0
 
 	raw := s.raw()
 	srcDir := strings.TrimSpace(in.SourceDir)
@@ -416,6 +422,11 @@ func (s *RepoService) Delete(ctx context.Context, id string) error {
 	repo, err := s.Get(ctx, id)
 	if err != nil {
 		return err
+	}
+	if repo.State == domain.RepoStateMoving {
+		// 迁移任务正在读写这些磁盘：此刻删记录会让任务把文件复制到一个已经不存在
+		// 的库上，或在事务里回写已删除的行。等迁移结束（或先中止）再删。
+		return apperr.New("repo.move_in_progress", 409).WithArg("repo_id", id)
 	}
 	active, err := s.Store.CountActiveLeasesByRepo(ctx, id)
 	if err != nil {
@@ -1068,6 +1079,9 @@ func (s *RepoService) ReleaseAllocation(ctx context.Context, allocationID string
 	if err != nil {
 		return err
 	}
+	if repo, rErr := s.Store.GetRepository(ctx, alloc.RepoID); rErr == nil && repo.State == domain.RepoStateMoving {
+		return apperr.New("repo.move_in_progress", 409).WithArg("repo_id", alloc.RepoID)
+	}
 
 	leases, err := s.Store.ListActiveLeasesByRepo(ctx, alloc.RepoID)
 	if err != nil {
@@ -1146,6 +1160,9 @@ func (s *RepoService) TransitionParent(ctx context.Context, repoID string, actio
 	}
 	if !repo.IsShared() {
 		return nil, apperr.New("repo.not_shared", 409).WithArg("mode", string(repo.Mode))
+	}
+	if repo.State == domain.RepoStateMoving {
+		return nil, apperr.New("repo.move_in_progress", 409).WithArg("repo_id", repoID)
 	}
 
 	var to domain.ParentCondition
@@ -1254,6 +1271,25 @@ func (s *RepoService) endParentShare(ctx context.Context, repo *domain.Repositor
 		}
 		// 母盘内容变了（版本 +1）→ 盘上的元数据标签也要跟上。
 		s.refreshRepoMeta(ctx, repo)
+
+		// 版本 +1 之后，所有基于旧版本的差异盘都会被 CanMount 拒绝（parent_version_mismatch）。
+		// 之前只把错误留给用户，而界面上又没有"删除旧差异盘"的入口，形成死局：
+		// 挂不上、也删不掉。这里自动把它们清掉（只删 < 新版本的，避免误删清理期间新派生的盘）。
+		//
+		// 分配路径（Allocate）也会对"旧版本分配"做同样的作废+重建，两者幂等；
+		// 入队失败不影响退出维护，用户重新挂载时仍会被 Allocate 自动修复。
+		if repo.ParentDiskID != nil {
+			payload := cleanupDiffsPayload{
+				RepoID:        repo.ID,
+				ParentDiskID:  *repo.ParentDiskID,
+				OnlyOlderThan: repo.ParentVersion + 1,
+			}
+			if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobCleanupDiffs, repo.ID,
+				"cleanup_diffs:"+repo.ID+":"+uuid.NewString(), lock.RepoKey(repo.ID), payload); err != nil {
+				s.Log.Warn("退出维护后自动清理旧差异盘入队失败（重新分配时会自动作废旧盘）",
+					"repo_id", repo.ID, "error", err)
+			}
+		}
 	}
 	s.enqueueParentTeardown(ctx, repo, action, operatorID)
 	s.audit(ctx, operatorID, "repo.parent."+string(action), "repo:"+repo.ID,
@@ -1334,6 +1370,7 @@ func (s *RepoService) RegisterHandlers(w *job.Worker) {
 		return
 	}
 	w.Register(job.HandlerFunc{T: domain.JobParentTeardown, F: s.runParentTeardown})
+	s.registerMoveHandler(w)
 }
 
 // CleanupDiffs 在维护态下清理该库全部差异盘（异步任务）。

@@ -63,8 +63,13 @@ const (
 	RepoStateImporting RepoState = "importing"
 	RepoStateActive    RepoState = "active"
 	RepoStateSealing   RepoState = "sealing"
-	RepoStateDeleting  RepoState = "deleting"
-	RepoStateError     RepoState = "error"
+	// RepoStateMoving 迁移中：正在把该库的磁盘文件从一个存储复制到另一个存储。
+	//
+	// 与 creating/importing 一样必须拒绝分配与挂载：复制期间源文件仍在使用，
+	// 让客户端读到一半切到目标文件会得到不一致的数据。迁移完成后恢复 active。
+	RepoStateMoving   RepoState = "moving"
+	RepoStateDeleting RepoState = "deleting"
+	RepoStateError    RepoState = "error"
 )
 
 // ParentCondition 母盘用途条件。
@@ -357,6 +362,11 @@ const (
 	// 池化存储库（见 RepoMeta.Pool）不用 JobDeleteDisk：把盘删掉池子就少一格，
 	// 下一次分配又要现建（用户重新回到"挂载要等很久"）。
 	JobResetDiff JobType = "reset_diff"
+	// JobMoveRepo 存储库迁移：把该库的全部磁盘复制到目标存储，复制完成后删除源文件。
+	//
+	// 采用"先复制、后删除"：复制期间源库仍然完整可回滚；中途取消只会清理目标侧的
+	// 半成品并把库恢复为 active，不会损坏源数据。
+	JobMoveRepo JobType = "move_repo"
 	// JobInstallDeps 按需安装系统依赖包（管理端"安装"按钮触发，见 app.InstallSysDeps）。
 	//
 	// 与其他任务的区别：它**不碰业务数据**，只调发行版包管理器装包（Linux 专有；

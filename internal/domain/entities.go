@@ -137,6 +137,31 @@ type RepoMeta struct {
 	Pool bool `json:"pool,omitempty"`
 	// Prepare 建库预创建的进度快照（state=creating 期间存在，供卡片展示"创建到哪一步"）。
 	Prepare *RepoPrepare `json:"prepare,omitempty"`
+	// Move 存储库迁移的进度快照（state=moving 期间存在）。
+	//
+	// 迁移是异步任务，卡片与详情页都要能看到"复制到哪了"；任务进度只是一个 0-100 的
+	// 数字，而库列表需要的是按库聚合的字节/文件进度，所以和 Prepare 一样落库。
+	Move *RepoMove `json:"move,omitempty"`
+}
+
+// RepoMove 是存储库迁移任务的进度快照。
+type RepoMove struct {
+	// JobID 当前迁移任务 ID（界面据此订阅任务事件，也可用于中止）。
+	JobID string `json:"job_id,omitempty"`
+	// FromStorageID / FromStorageName 源存储。
+	FromStorageID   string `json:"from_storage_id,omitempty"`
+	FromStorageName string `json:"from_storage_name,omitempty"`
+	// ToStorageID / ToStorageName 目标存储。
+	ToStorageID   string `json:"to_storage_id,omitempty"`
+	ToStorageName string `json:"to_storage_name,omitempty"`
+	// Phase 当前阶段：preparing（拆除目标）/ copying（复制文件）/ finalizing（切换路径）。
+	Phase string `json:"phase,omitempty"`
+	// FilesDone / FilesTotal 已复制完成的磁盘数 / 总数。
+	FilesDone  int `json:"files_done"`
+	FilesTotal int `json:"files_total"`
+	// Bytes / TotalBytes 已复制字节 / 总字节（用于卡片进度条）。
+	Bytes      int64 `json:"bytes"`
+	TotalBytes int64 `json:"total_bytes"`
 }
 
 // RepoPhase 建库预创建的阶段。

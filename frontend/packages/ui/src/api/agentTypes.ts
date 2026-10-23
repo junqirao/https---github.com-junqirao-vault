@@ -808,7 +808,32 @@ export interface LocalManifestEntry {
   hash?: string
 }
 
-/** POST /agent/fs/manifest 的响应（上传核对用）。 */
+/** POST /agent/fs/manifest/start 的响应。 */
+export interface LocalManifestStartResult {
+  manifest_id: string
+}
+
+/** GET /agent/fs/manifest/status 的响应（上传核对的本地清单进度）。 */
+export interface LocalManifestStatus {
+  manifest_id: string
+  state: 'running' | 'succeeded' | 'failed'
+  /** scan=扫描目录；hash=计算 SHA-256；done=完成。 */
+  phase: 'scan' | 'hash' | 'done'
+  /** 已处理文件数；扫描阶段是"已发现"的数量。 */
+  done: number
+  /** 文件总数；扫描阶段为 0（未知）。 */
+  total: number
+  /** 已处理字节数；扫描阶段是"已发现"的字节数。 */
+  bytes: number
+  /** 总字节数；扫描阶段为 0（未知）。 */
+  total_bytes: number
+  /** 此刻正在处理的文件（相对源目录的路径）。 */
+  current?: string
+  error_code?: string
+  error_message?: string
+}
+
+/** POST /agent/fs/manifest/result 的响应（上传核对用）。 */
 export interface LocalManifestResult {
   path: string
   file_count: number
@@ -831,6 +856,8 @@ export interface StartUploadInput {
    * （默认 50），用户在同一个表单里填的数字被丢掉（真实反馈："设置共享数量大于0时会变成50"）。
    */
   max_diff_disks?: number
+  /** 是否在建库时预创建差异盘与 iSCSI 目标（池位）。 */
+  preallocate?: boolean
   source_mode: 'copy' | 'move'
   /**
    * 把库建到**哪台**服务端（二选一即可）。

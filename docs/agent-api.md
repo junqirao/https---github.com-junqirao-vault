@@ -622,14 +622,27 @@ POST /agent/fs/scan
   # 文件数 > 200000 或总字节 > 2TiB → 413 agent.scan_too_large（args 含上限与实测值）。
   # 不返回完整文件清单（可能几十万条；清单只在代理内部使用）。
 
-POST /agent/fs/manifest
+上传核对的本机清单（异步任务；扫描/哈希 1000GB 级目录时界面靠它显示"当前正在处理的文件"）：
+
+```
+POST /agent/fs/manifest/start
   ↓ {path, hash:bool}
-  ↑ {path, file_count, total_bytes, warnings:[string],
-     entries:[{path, size, hash?}]}
-  # 与 /agent/fs/scan 同一套遍历与上限；额外返回**完整清单**供"上传核对"使用。
-  # hash=true 时对每个文件计算 SHA-256（耗时与总字节数成正比；读失败记入 warnings 并
-  # 返回空 hash，服务端退化为只比大小）；hash=false 只遍历元数据。
-  # entries[].path 是相对 path 的斜杠路径。
+  ↑ 202 {manifest_id}
+  # 与 /agent/fs/scan 同一套校验与上限；hash=true 时对每个文件计算 SHA-256。
+  # 立即返回，任务在后台跑。
+
+GET /agent/fs/manifest/status?id=<manifest_id>
+  ↑ {manifest_id, state:running|succeeded|failed, phase:scan|hash|done,
+     done, total, bytes, total_bytes, current?, error_code?, error_message?}
+  # 扫描阶段 total/total_bytes 为 0（总数未知），done/bytes 是"已发现"的数量；
+  # hash 阶段两者都是确定值。current 是此刻正在处理的文件（相对源目录的斜杠路径）。
+  # 建议 0.5~1s 轮询一次。
+
+GET /agent/fs/manifest/result?id=<manifest_id>
+  ↑ {path, file_count, total_bytes, warnings:[string], entries:[{path,size,hash?}]}
+  # 仅在 state=succeeded 后可用；否则 409。hash=false 时 entries[].hash 为空。
+  # 已完成的任务在内存里保留 15 分钟，之后自动回收。
+```
 
 POST /agent/uploads/start
   ↓ {local_dir, repo_name, repo_mode?, storage_id?, quota_bytes?, max_diff_disks?,

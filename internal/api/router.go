@@ -196,8 +196,12 @@ func (r *Router) routes() {
 		g.Post("/v1/repos/{id}/parent/files/copy", r.handleCopyParentEntry)
 		// 上传核对：临时差异盘 + 与客户端清单逐文件对比。
 		g.Post("/v1/repos/{id}/diff", r.handleStartVerifyDiff)
+		g.Get("/v1/repos/{id}/diff/progress", r.handleVerifyDiffProgress)
 		g.Get("/v1/repos/{id}/diff/result", r.handleVerifyDiffResult)
 		g.Post("/v1/repos/{id}/copy", r.handleCopyRepo)
+		// 存储库迁移：复制全部磁盘到另一个存储后删除源文件（异步、可中止）。
+		g.Post("/v1/repos/{id}/move", r.handleMoveRepo)
+		g.Post("/v1/repos/{id}/move/cancel", r.handleCancelRepoMove)
 		g.Get("/v1/repos/{id}/disks", r.handleListRepoDisks)
 		g.Get("/v1/repos/{id}/iscsi", r.handleListRepoIscsi)
 

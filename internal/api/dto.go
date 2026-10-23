@@ -140,9 +140,14 @@ type repoDTO struct {
 	// 点下去只会撞 403（真实反馈：非库所有者点详情只能看详情、不能管理）。
 	Permission string `json:"permission,omitempty"`
 	// Prepare 建库进度：state=creating 时前端据此显示"正在派生差异盘 3/5"。
-	Prepare   *repoPrepareDTO `json:"prepare,omitempty"`
-	CreatedAt int64           `json:"created_at"`
-	UpdatedAt int64           `json:"updated_at"`
+	Prepare *repoPrepareDTO `json:"prepare,omitempty"`
+	// Move 迁移进度：state=moving 时前端据此在卡片/详情里显示复制进度。
+	Move *repoMoveDTO `json:"move,omitempty"`
+	// StorageID / StorageName 该库磁盘当前所在的存储（详情页用于隐藏"当前存储"）。
+	StorageID   string `json:"storage_id,omitempty"`
+	StorageName string `json:"storage_name,omitempty"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
 }
 
 // repoPrepareDTO 是建库预创建的进度快照。
@@ -154,6 +159,20 @@ type repoPrepareDTO struct {
 	Done  int    `json:"done"`
 	Total int    `json:"total"`
 	Error string `json:"error,omitempty"`
+}
+
+// repoMoveDTO 是存储库迁移的进度快照（state=moving 期间存在）。
+type repoMoveDTO struct {
+	JobID           string `json:"job_id,omitempty"`
+	FromStorageID   string `json:"from_storage_id,omitempty"`
+	FromStorageName string `json:"from_storage_name,omitempty"`
+	ToStorageID     string `json:"to_storage_id,omitempty"`
+	ToStorageName   string `json:"to_storage_name,omitempty"`
+	Phase           string `json:"phase,omitempty"`
+	FilesDone       int    `json:"files_done"`
+	FilesTotal      int    `json:"files_total"`
+	Bytes           int64  `json:"bytes"`
+	TotalBytes      int64  `json:"total_bytes"`
 }
 
 func toRepoDTO(r *domain.Repository) repoDTO {
@@ -176,6 +195,14 @@ func toRepoDTO(r *domain.Repository) repoDTO {
 	if p := r.Meta.Prepare; p != nil {
 		dto.Prepare = &repoPrepareDTO{
 			Phase: string(p.Phase), Done: p.Done, Total: p.Total, Error: p.Error,
+		}
+	}
+	if m := r.Meta.Move; m != nil {
+		dto.Move = &repoMoveDTO{
+			JobID: m.JobID, FromStorageID: m.FromStorageID, FromStorageName: m.FromStorageName,
+			ToStorageID: m.ToStorageID, ToStorageName: m.ToStorageName, Phase: m.Phase,
+			FilesDone: m.FilesDone, FilesTotal: m.FilesTotal,
+			Bytes: m.Bytes, TotalBytes: m.TotalBytes,
 		}
 	}
 	return dto

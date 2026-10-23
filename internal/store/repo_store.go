@@ -158,6 +158,20 @@ func (s *Store) SetRepositoryState(ctx context.Context, id string, state domain.
 	return mustAffect(res, apperr.RepoNotFound().WithArg("id", id))
 }
 
+// SetRepositoryMetaState 只更新 meta 与 state 两列。
+//
+// 迁移任务会高频写进度快照（meta.move），不能整行回写 —— 那会把并发的改名、配额调整
+// 用任务启动时的旧快照覆盖掉。只写这两列既够用，也天然避开那类竞争。
+func (s *Store) SetRepositoryMetaState(ctx context.Context, id string, meta domain.RepoMeta, state domain.RepoState) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE repositories SET meta = ?, state = ?, updated_at = ? WHERE id = ?`),
+		toJSON(meta), string(state), nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新存储库元数据失败: %w", err)
+	}
+	return mustAffect(res, apperr.RepoNotFound().WithArg("id", id))
+}
+
 // GetRepository 按 ID 查询存储库。
 func (s *Store) GetRepository(ctx context.Context, id string) (*domain.Repository, error) {
 	var row repoRow
