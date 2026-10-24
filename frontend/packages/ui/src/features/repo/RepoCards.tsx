@@ -500,8 +500,16 @@ function RepoMoveActions({ repo }: { repo: RepoDTO }): JSX.Element {
     },
     onError: (error) => message.error(translateError(error) || t('repo.move.cancelFailed'))
   })
+  // 收尾阶段（路径已切换、正在重建目标/删除源文件）已经无法安全回滚，不再允许终止。
+  const finalizing = repo.move?.phase === 'finalizing'
   return (
-    <Button danger size="small" loading={cancel.isPending} onClick={() => cancel.mutate()}>
+    <Button
+      danger
+      size="small"
+      disabled={finalizing}
+      loading={cancel.isPending}
+      onClick={() => cancel.mutate()}
+    >
       {t('repo.move.cancel')}
     </Button>
   )

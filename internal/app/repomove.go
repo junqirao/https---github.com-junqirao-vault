@@ -52,6 +52,9 @@ type moveRepoEntry struct {
 	// 复制前必须先拆目标（平台会一直打开 VHDX/LV），否则复制/删除都会撞占用；
 	// 拆掉的记录由本字段决定是否在原位置重建。
 	PublishAfter bool `json:"publish_after,omitempty"`
+	// AlreadyCopied 源文件已不在、目标文件已存在：上一次迁移在"已复制、还没切库路径"
+	// 之间中断（例如旧版本只更新了路径字段却没落库）。本次直接复用目标文件，不再复制。
+	AlreadyCopied bool `json:"already_copied,omitempty"`
 }
 
 // moveRepoPayload 是 JobMoveRepo 的入参。
@@ -151,15 +154,25 @@ func (s *RepoService) Move(ctx context.Context, repoID, toStorageID, operatorID 
 			// 不参与搬运，更不能"复制到自己身上"。
 			continue
 		}
+		alreadyCopied := false
 		cp := s.moveCopyBytes(d)
+		if s.Disk != nil && !s.Disk.Exists(d.VHDXPath) {
+			// 上一次迁移已经复制完成、但库路径还没切过去就中断了（旧版本遗留）。
+			// 目标文件在就直接复用；两边都没有才是真的丢盘。
+			if !s.Disk.Exists(dst) {
+				return nil, apperr.DiskNotFound().WithArg("id", d.ID)
+			}
+			alreadyCopied, cp = true, 0
+		}
 		totalBytes += cp
 		entries = append(entries, moveRepoEntry{
-			DiskID:       d.ID,
-			SourceRef:    d.VHDXPath,
-			DestRef:      dst,
-			SizeBytes:    d.SizeBytes,
-			CopyBytes:    cp,
-			PublishAfter: s.diskHasEnabledTarget(ctx, d.ID),
+			DiskID:        d.ID,
+			SourceRef:     d.VHDXPath,
+			DestRef:       dst,
+			SizeBytes:     d.SizeBytes,
+			CopyBytes:     cp,
+			PublishAfter:  s.diskHasEnabledTarget(ctx, d.ID),
+			AlreadyCopied: alreadyCopied,
 		})
 	}
 	if len(entries) == 0 {
@@ -273,6 +286,7 @@ func (s *RepoService) runMoveRepo(ctx context.Context, j *domain.Job, rep job.Re
 		postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 		defer cancel()
 		s.afterMove(postCtx, p)
+		s.finishMove(postCtx, p.RepoID)
 		rep.Progress(100)
 		s.Log.Info("存储库迁移已在之前的尝试中完成，补齐收尾", "repo_id", p.RepoID)
 		return nil
@@ -325,6 +339,12 @@ func (s *RepoService) runMoveRepo(ctx context.Context, j *domain.Job, rep job.Re
 			return err
 		}
 		e := &p.Entries[i]
+		if e.AlreadyCopied {
+			// 源已不在、目标已在：上一次尝试其实已经复制完，只差切库路径。
+			move.FilesDone = i + 1
+			s.saveMoveProgress(ctx, p.RepoID, move)
+			continue
+		}
 		entryBase := copiedTotal
 		copied, err := s.copyMoveEntry(ctx, e, func(done int64) {
 			totalDone := entryBase + done
@@ -366,6 +386,7 @@ func (s *RepoService) runMoveRepo(ctx context.Context, j *domain.Job, rep job.Re
 	postCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 	defer cancel()
 	s.afterMove(postCtx, p)
+	s.finishMove(postCtx, p.RepoID)
 	rep.Progress(100)
 
 	s.audit(context.WithoutCancel(ctx), "", "repo.move.done", "repo:"+p.RepoID,
@@ -559,27 +580,36 @@ func allZero(b []byte) bool {
 	return true
 }
 
-// finalizeMove 在一个事务里把磁盘路径切到目标，并把库恢复为 active。
+// finalizeMove 在一个事务里把磁盘路径切到目标。
+//
+// 库状态仍保持 moving、meta.move 也保留：后面的收尾（重建目标、删除源文件）同样属于
+// 迁移过程，期间不能让客户端挂载到正在收尾的库上。全部做完后由 finishMove 恢复 active。
 func (s *RepoService) finalizeMove(ctx context.Context, p moveRepoPayload) error {
 	return s.Store.Tx(ctx, func(tx *store.Store) error {
-		repo, err := tx.LockRepository(ctx, p.RepoID)
-		if err != nil {
+		if _, err := tx.LockRepository(ctx, p.RepoID); err != nil {
 			return err
 		}
 		for i := range p.Entries {
-			d, err := tx.GetDisk(ctx, p.Entries[i].DiskID)
-			if err != nil {
-				return err
-			}
-			d.VHDXPath = p.Entries[i].DestRef
-			if err := tx.UpdateDisk(ctx, d); err != nil {
+			if err := tx.UpdateDiskPath(ctx, p.Entries[i].DiskID, p.Entries[i].DestRef); err != nil {
 				return err
 			}
 		}
-		repo.Meta.Move = nil
-		repo.State = domain.RepoStateActive
-		return tx.UpdateRepository(ctx, repo)
+		return nil
 	})
+}
+
+// finishMove 在收尾完成后把库恢复为 active，并清掉迁移进度快照。
+func (s *RepoService) finishMove(ctx context.Context, repoID string) {
+	repo, err := s.Store.GetRepository(ctx, repoID)
+	if err != nil {
+		s.Log.Warn("迁移收尾后读取存储库失败", "repo_id", repoID, "error", err)
+		return
+	}
+	repo.Meta.Move = nil
+	repo.State = domain.RepoStateActive
+	if err := s.Store.SetRepositoryMetaState(ctx, repoID, repo.Meta, repo.State); err != nil {
+		s.Log.Warn("迁移收尾后恢复存储库状态失败", "repo_id", repoID, "error", err)
+	}
 }
 
 // afterMove 是迁移成功后的收尾：重建目标、删除源、重写盘上的元数据标签。

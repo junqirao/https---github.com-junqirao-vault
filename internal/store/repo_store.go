@@ -583,6 +583,20 @@ func (s *Store) UpdateDiskState(ctx context.Context, id string, state domain.Dis
 	return mustAffect(res, apperr.DiskNotFound().WithArg("id", id))
 }
 
+// UpdateDiskPath 只更新磁盘的存储引用（迁移/搬迁用），不碰状态、指纹等其它字段。
+//
+// 单独一个方法而不是塞进 UpdateDisk：后者是"更新可变字段"的全量写回，调用点很多，
+// 顺手把路径也写回去容易在某个构造了空路径的对象上把记录打坏。
+func (s *Store) UpdateDiskPath(ctx context.Context, id, path string) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE disks SET vhdx_path = ?, updated_at = ? WHERE id = ?`),
+		path, nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新磁盘路径失败: %w", err)
+	}
+	return mustAffect(res, apperr.DiskNotFound().WithArg("id", id))
+}
+
 // UpdateDisk 覆盖更新磁盘的可变字段。
 func (s *Store) UpdateDisk(ctx context.Context, d *domain.Disk) error {
 	d.UpdatedAt = nowMillis()

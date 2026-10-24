@@ -351,7 +351,6 @@ export function RepoCreateForm({
                     <Form.Item
                       name="preallocate"
                       valuePropName="checked"
-                      extra={t('repo.create.preallocateHint')}
                     >
                       <Checkbox>{t('field.preallocate')}</Checkbox>
                     </Form.Item>
@@ -362,7 +361,6 @@ export function RepoCreateForm({
                         name="max_diff_disks"
                         label={t('field.preallocateCount')}
                         rules={[{ required: true }]}
-                        extra={t('repo.create.preallocateCountHint')}
                       >
                         <InputNumber min={1} style={{ width: '100%' }} />
                       </Form.Item>

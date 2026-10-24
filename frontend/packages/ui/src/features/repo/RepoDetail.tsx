@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Select, Space, Tabs, message } from 'antd'
+import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Select, Skeleton, Space, Tabs, Typography, message } from 'antd'
 import { ArrowLeftOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -11,12 +11,12 @@ import { SectionCard } from '../../components/SectionCard'
 import { StatusTag } from '../../components/StatusTag'
 import { UsageBar, UsageValueText } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
-import type { JobDTO, ParentAction, RepoDTO, UpdateRepoRequest } from '../../api/types'
+import type { JobDTO, ParentAction, RepoDTO, StorageDTO, UpdateRepoRequest } from '../../api/types'
 import { pickMountUsage, repoUsageLoading, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { isJobTerminal, useJobProgress } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
 
-import { spacing } from '../../tokens/palette'
+import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
@@ -85,20 +85,21 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     queryFn: () => api.getRepo(repoId)
   })
 
-  // 迁移弹窗的目标存储列表：只在打开弹窗时拉，避免每次进详情都多一个请求。
+  // 目标存储列表既用于「迁移」弹窗，也用于概览顶部的存储使用情况：
+  // 库记录一到就拉，弹窗打开时直接用缓存。
   const storagesQuery = useQuery({
     queryKey: ['storages'],
     queryFn: () => api.listStorages(),
-    enabled: moveOpen
+    enabled: Boolean(repoQuery.data)
   })
 
-  // 「母盘文件」页签的前置条件：维护态 + **已无差异盘**。
-  // 有差异盘时改母盘会让它们基于旧基线，因此页签与接口都必须拒绝（见 ParentMount）。
-  // 与「磁盘」tab 共用同一 query key，清理完成后自动刷新。
+  // 磁盘列表：
+  //   - 概览顶部的「存储使用情况」需要按磁盘物理占用汇总本库占用；
+  //   - 「母盘文件」页签与「磁盘」页签共用同一 query key，清理完成后自动刷新。
   const disksQuery = useQuery({
     queryKey: ['repo-disks', repoId],
     queryFn: () => api.listRepoDisks(repoId),
-    enabled: repoQuery.data?.parent_condition === 'maintenance'
+    enabled: Boolean(repoQuery.data)
   })
 
   // 概览里的「已用」也要是本机实测值（见下面 repoUsage 的说明）：页面在时按 10s 轮询。
@@ -114,6 +115,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     void queryClient.invalidateQueries({ queryKey: ['repo-disks', repoId] })
     // 母盘临时挂载的 @temp 占位分配也会随维护进入/退出出现/消失。
     void queryClient.invalidateQueries({ queryKey: ['repo-allocations', repoId] })
+    // 迁移/删除/建盘都会改变所在存储的占用与可用空间：概览顶部的存储使用情况要跟着刷新。
+    void queryClient.invalidateQueries({ queryKey: ['storages'] })
   }
 
   const updateMutation = useMutation({
@@ -318,6 +321,15 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   }
 
   const isMaintenance = repo?.parent_condition === 'maintenance'
+  // 概览顶部「存储使用情况」：本库磁盘的实测物理占用 + 所在存储的容量/可用。
+  // 用物理占用而不是配额口径（repo.used_bytes 只计已分配磁盘），否则预创建但尚未分配的
+  // 库会显示成 0 —— 而它的母盘和池位盘其实已经占着存储。
+  const currentStorage = storagesQuery.data?.items.find((storage) => storage.id === repo?.storage_id)
+  const repoStorageBytes = (disksQuery.data?.items ?? []).reduce(
+    (sum, disk) => sum + (disk.physical_bytes || 0),
+    0
+  )
+  const storageUsageLoading = storagesQuery.isLoading || disksQuery.isLoading
   // 刚发起的那一瞬间 repo 快照可能还是 active：以手头的任务状态补上，界面不要有一帧"看起来没反应"。
   const isMoving =
     repo?.state === 'moving' || (moveJob !== null && !isJobTerminal(moveProgress?.state))
@@ -459,6 +471,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                   <Button
                     size="small"
                     danger
+                    disabled={repo?.move?.phase === 'finalizing'}
                     loading={cancelMoveMutation.isPending}
                     onClick={() => cancelMoveMutation.mutate()}
                   >
@@ -542,6 +555,12 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
             label: t('repo.detail.overview'),
             children: (
               <SectionCard title={t('repo.detail.overview')}>
+                <RepoStorageUsage
+                  storage={currentStorage}
+                  repoBytes={repoStorageBytes}
+                  loading={storageUsageLoading}
+                  fallbackName={repo?.storage_name}
+                />
                 <Descriptions size="small" column={2} bordered>
                   <Descriptions.Item label={t('common.id')}>{repo?.id ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label={t('field.mode')}>{repo ? repoModeLabel(repo.mode) : '-'}</Descriptions.Item>
@@ -674,7 +693,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
         okText={t('common.confirm')}
         cancelText={t('common.cancel')}
         confirmLoading={moveMutation.isPending}
-        okButtonProps={{ disabled: !moveStorageID || targetStorages.length === 0 }}
+        okButtonProps={{
+          disabled: storagesQuery.isLoading || !moveStorageID || targetStorages.length === 0
+        }}
         onCancel={() => setMoveOpen(false)}
         onOk={() => {
           if (!moveStorageID) {
@@ -692,7 +713,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               <strong>{repo.storage_name}</strong>
             </Space>
           ) : null}
-          {targetStorages.length === 0 ? (
+          {storagesQuery.isLoading ? (
+            <Skeleton active title={false} paragraph={{ rows: 2 }} />
+          ) : targetStorages.length === 0 ? (
             <Alert type="info" showIcon message={t('repo.move.noTargets')} />
           ) : (
             <Select
@@ -700,7 +723,6 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               placeholder={t('repo.move.targetPlaceholder')}
               value={moveStorageID || undefined}
               onChange={setMoveStorageID}
-              loading={storagesQuery.isLoading}
               options={targetStorages.map((storage) => ({
                 value: storage.id,
                 label: `${storage.name} · ${storage.path}`
@@ -752,6 +774,115 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
 
       <RepoVerifyDiff repoId={repoId} open={verifyOpen} onClose={() => setVerifyOpen(false)} />
     </PageShell>
+  )
+}
+
+/**
+ * 概览顶部的「存储使用情况」：存储名 + 两段式进度条。
+ *
+ * 两段分别是**本存储库的物理占用**与**其他占用**（同卷其它库/文件），剩下的是可用。
+ * 这里刻意不用 repo.used_bytes：那是配额口径（只算已分配的盘），预创建了池位但还没
+ * 分配的库会显示 0，而它的母盘/池位盘其实已经占着存储。
+ */
+function RepoStorageUsage({
+  storage,
+  repoBytes,
+  loading,
+  fallbackName
+}: {
+  storage?: StorageDTO
+  repoBytes: number
+  loading: boolean
+  fallbackName?: string
+}): JSX.Element | null {
+  const { t } = useI18n()
+  const name = storage?.name ?? fallbackName
+  if (!name && !loading) return null
+  const total = storage ? (storage.size_bytes > 0 ? storage.size_bytes : storage.total_bytes) : 0
+  const volumeUsed = storage ? Math.max(0, total - storage.free_bytes) : 0
+  const otherBytes = Math.max(0, volumeUsed - repoBytes)
+  const repoPercent = total > 0 ? Math.min(100, (repoBytes / total) * 100) : 0
+  const otherPercent = total > 0 ? Math.min(100 - repoPercent, (otherBytes / total) * 100) : 0
+
+  return (
+    <div style={{ marginBottom: spacing.md }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'baseline',
+          justifyContent: 'space-between',
+          gap: spacing.sm,
+          flexWrap: 'wrap'
+        }}
+      >
+        <Space size={spacing.xs} style={{ minWidth: 0 }}>
+          <Typography.Text strong>{name ?? t('repo.storageUsage.title')}</Typography.Text>
+          {storage?.path ? (
+            <Typography.Text
+              type="secondary"
+              ellipsis={{ tooltip: storage.path }}
+              style={{ fontSize: fontSize.xs, maxWidth: 420 }}
+            >
+              {storage.path}
+            </Typography.Text>
+          ) : null}
+        </Space>
+        {storage ? (
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+            {`${t('repo.used')} ${formatBytes(volumeUsed)} / ${formatBytes(total)}`}
+          </Typography.Text>
+        ) : null}
+      </div>
+      {loading ? (
+        <Skeleton active title={false} paragraph={{ rows: 1, width: '100%' }} style={{ marginTop: spacing.xs }} />
+      ) : !storage ? (
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+          {t('storage.loadFailed')}
+        </Typography.Text>
+      ) : (
+        <>
+          <div
+            style={{
+              display: 'flex',
+              height: 8,
+              borderRadius: 4,
+              overflow: 'hidden',
+              background: palette.neutralFill,
+              marginTop: spacing.xs
+            }}
+          >
+            <div style={{ width: `${repoPercent}%`, background: palette.accent }} />
+            <div style={{ width: `${otherPercent}%`, background: palette.textTertiary }} />
+          </div>
+          <Space size={spacing.md} wrap style={{ marginTop: spacing.xs }}>
+            <UsageLegend color={palette.accent} label={t('repo.storageUsage.repo')} value={formatBytes(repoBytes)} />
+            <UsageLegend color={palette.textTertiary} label={t('repo.storageUsage.other')} value={formatBytes(otherBytes)} />
+            <UsageLegend color={palette.neutralFill} label={t('repo.storageUsage.free')} value={formatBytes(storage.free_bytes)} />
+          </Space>
+        </>
+      )}
+    </div>
+  )
+}
+
+/** 存储使用情况图例里的一项：色块 + 名称 + 数值。 */
+function UsageLegend({ color, label, value }: { color: string; label: string; value: string }): JSX.Element {
+  return (
+    <Space size={spacing.xxs}>
+      <span
+        style={{
+          display: 'inline-block',
+          width: 8,
+          height: 8,
+          borderRadius: 2,
+          background: color,
+          border: color === palette.neutralFill ? `1px solid ${palette.border}` : undefined
+        }}
+      />
+      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+        {`${label} ${value}`}
+      </Typography.Text>
+    </Space>
   )
 }
 
